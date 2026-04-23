@@ -1,15 +1,17 @@
 /**
- * 4DGS Viewer - ana uygulama.
+ * 4DGS Viewer — ana uygulama (tab navigation).
  *
- * KRITIK NOKTA: SplatViewer bir kere mount olduktan sonra UNMOUNT ETMEMELI.
- * Unmount etmek viewer.dispose() cagirir, mid-load ise scene disposed hatasi
- * + removeChild hatasi atar. Bu yuzden loadState "ready"ye alinir alinmaz
- * orada kalir; scene yukleme ilerlemesi ayrir bir state'te tutulur.
+ * Tab'lar:
+ *   - Yeni Job: video seç + hiperparametreler + submit
+ *   - Jobs: aktif + geçmiş job listesi, auto-refresh
+ *   - Viewer: seçilen job'ın 4D splat render'ı + timeline
  */
-import { useEffect, useState, useCallback } from "react";
+import { useCallback, useEffect, useState } from "react";
 import "./App.css";
 import { SplatViewer } from "./components/SplatViewer";
 import { TimelineSlider } from "./components/TimelineSlider";
+import { JobSubmitPanel } from "./components/JobSubmitPanel";
+import { JobsList } from "./components/JobsList";
 import {
   API_BASE,
   getHealth,
@@ -17,11 +19,14 @@ import {
   listJobs,
   listDiskScenes,
   type HealthResponse,
+  type Job,
   type SceneListItem,
   type SplatInfo,
 } from "./api";
 
-type LoadState =
+type Tab = "submit" | "jobs" | "viewer";
+
+type ViewerState =
   | { kind: "idle" }
   | { kind: "loading-info" }
   | { kind: "ready"; info: SplatInfo }
@@ -48,63 +53,82 @@ function formatTime(ts: number): string {
 }
 
 function App() {
-  const [jobIdInput, setJobIdInput] = useState("");
-  const [loadState, setLoadState] = useState<LoadState>({ kind: "idle" });
+  const [tab, setTab] = useState<Tab>("submit");
+  const [health, setHealth] = useState<HealthResponse | null>(null);
+
+  // Viewer state
+  const [viewerState, setViewerState] = useState<ViewerState>({ kind: "idle" });
   const [sceneProgress, setSceneProgress] = useState<SceneProgress | null>(null);
   const [currentFrame, setCurrentFrame] = useState(0);
-  const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [jobIdInput, setJobIdInput] = useState("");
   const [diskScenes, setDiskScenes] = useState<SceneListItem[] | null>(null);
   const [diskPanelOpen, setDiskPanelOpen] = useState(false);
   const [diskLoading, setDiskLoading] = useState(false);
 
+  // Health poll (her 5 sn)
   useEffect(() => {
-    getHealth()
-      .then(setHealth)
-      .catch((e) => console.warn("Health check fail:", e));
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const h = await getHealth();
+        if (!cancelled) setHealth(h);
+      } catch (e) {
+        if (!cancelled) setHealth(null);
+      }
+    };
+    tick();
+    const id = window.setInterval(tick, 5000);
+    return () => { cancelled = true; window.clearInterval(id); };
   }, []);
 
-  const loadJob = useCallback(async (identifier: string) => {
+  const loadInViewer = useCallback(async (identifier: string) => {
     const id = identifier.trim();
-    if (!id) {
-      setLoadState({ kind: "error", message: "Bos identifier" });
-      return;
-    }
-    // Yeni yukleme: onceki viewer'i varsa unmount olacak, yeni ready ile tekrar mount olacak
-    setLoadState({ kind: "loading-info" });
+    if (!id) return;
+    setViewerState({ kind: "loading-info" });
     setSceneProgress(null);
     setCurrentFrame(0);
     setDiskPanelOpen(false);
+    setTab("viewer");
     try {
       const info = await getSplatInfo(id);
       if (info.num_frames === 0) {
-        setLoadState({ kind: "error", message: "Bu sahnenin .ply ciktisi yok" });
+        setViewerState({ kind: "error", message: "Bu sahnenin .ply çıktısı yok" });
         return;
       }
       setSceneProgress({ loaded: 0, total: info.num_frames, done: false });
-      setLoadState({ kind: "ready", info });
+      setViewerState({ kind: "ready", info });
     } catch (e) {
-      setLoadState({ kind: "error", message: String(e) });
+      setViewerState({ kind: "error", message: String(e) });
     }
   }, []);
 
-  const loadLatest = useCallback(async () => {
+  const handleJobSubmitted = useCallback((_resp: any, _sceneName: string) => {
+    // Job başarıyla gönderildi, Jobs tab'ına geç — kullanıcı ilerlemeyi takip etsin
+    setTab("jobs");
+  }, []);
+
+  const handleViewJob = useCallback((job: Job) => {
+    // Job completed mı kontrol et, viewer'a yükle
+    if (job.status === "completed") {
+      setJobIdInput(job.id);
+      loadInViewer(job.id);
+    }
+  }, [loadInViewer]);
+
+  const loadLatestCompleted = useCallback(async () => {
     try {
       const { jobs } = await listJobs();
       const done = jobs.find((j) => j.status === "completed");
-      if (!done) {
-        setLoadState({
-          kind: "error",
-          message:
-            "Registry'de tamamlanmis job yok. 'Diskten yukle' ile eski sahneleri de gorebilirsin.",
-        });
-        return;
+      if (done) {
+        setJobIdInput(done.id);
+        loadInViewer(done.id);
+      } else {
+        setViewerState({ kind: "error", message: "Tamamlanmış job yok" });
       }
-      setJobIdInput(done.id);
-      loadJob(done.id);
     } catch (e) {
-      setLoadState({ kind: "error", message: String(e) });
+      setViewerState({ kind: "error", message: String(e) });
     }
-  }, [loadJob]);
+  }, [loadInViewer]);
 
   const toggleDiskPanel = useCallback(async () => {
     if (diskPanelOpen) {
@@ -117,148 +141,175 @@ function App() {
       const res = await listDiskScenes();
       setDiskScenes(res.scenes);
     } catch (e) {
-      setLoadState({ kind: "error", message: String(e) });
+      setViewerState({ kind: "error", message: String(e) });
       setDiskScenes([]);
     } finally {
       setDiskLoading(false);
     }
   }, [diskPanelOpen]);
 
-  const renderStatus = () => {
-    // Scene loading'i oncelik ver
-    if (sceneProgress && !sceneProgress.done && loadState.kind === "ready") {
-      return (
-        <p className="hint">
-          Scene'ler yukleniyor: {sceneProgress.loaded}/{sceneProgress.total}
-        </p>
-      );
-    }
-    switch (loadState.kind) {
-      case "idle":
-        return (
-          <p className="hint">
-            Bir job_id yapistir, "Diskten yukle" ile sahne sec, ya da
-            "Son tamamlanmis" butonuna bas.
-          </p>
-        );
-      case "loading-info":
-        return <p className="hint">Sahne bilgisi aliniyor...</p>;
-      case "ready":
-        return (
-          <p className="hint hint-ok">
-            {loadState.info.num_frames} frame yuklendi - "{loadState.info.scene}"
-            ({formatBytes(loadState.info.total_size_bytes)})
-            {loadState.info.source === "disk" ? " - diskten" : " - registry'den"}
-          </p>
-        );
-      case "error":
-        return <p className="hint hint-err">Hata: {loadState.message}</p>;
-    }
-  };
-
   const backendBadge = (() => {
-    if (!health) return <span className="badge badge-unknown">Backend: baglanti yok</span>;
+    if (!health) return <span className="badge badge-unknown">Backend: bağlantı yok</span>;
     const gpu = health.gpu_available ? `GPU: ${health.gpu_name ?? "?"}` : "GPU: yok";
     return (
       <span className="badge badge-ok">
-        Backend OK - {gpu} - Aktif job: {health.active_jobs}
+        Backend OK · {gpu} · Aktif: {health.active_jobs}
       </span>
     );
   })();
 
   return (
     <div className="app">
-      <header className="app-header">
-        <div className="title-row">
+      {/* Üst bar */}
+      <header className="app-topbar">
+        <div className="app-brand">
           <h1>4DGS Viewer</h1>
-          {backendBadge}
         </div>
-        <div className="control-row">
-          <input
-            type="text"
-            value={jobIdInput}
-            placeholder="job_id veya sahne adi (orn. api_test3)"
-            onChange={(e) => setJobIdInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") loadJob(jobIdInput);
-            }}
-          />
-          <button className="btn-primary" onClick={() => loadJob(jobIdInput)}>
-            Yukle
+        <nav className="app-tabs">
+          <button
+            className={`tab-btn ${tab === "submit" ? "active" : ""}`}
+            onClick={() => setTab("submit")}
+          >
+            Yeni Job
           </button>
-          <button className="btn-secondary" onClick={loadLatest}>
-            Son tamamlanmis
+          <button
+            className={`tab-btn ${tab === "jobs" ? "active" : ""}`}
+            onClick={() => setTab("jobs")}
+          >
+            Jobs
+            {health && health.active_jobs > 0 && (
+              <span className="tab-badge">{health.active_jobs}</span>
+            )}
           </button>
-          <button className="btn-secondary" onClick={toggleDiskPanel}>
-            Diskten yukle {diskPanelOpen ? "UP" : "DOWN"}
+          <button
+            className={`tab-btn ${tab === "viewer" ? "active" : ""}`}
+            onClick={() => setTab("viewer")}
+          >
+            Viewer
           </button>
-        </div>
+        </nav>
+        <div className="app-status">{backendBadge}</div>
+      </header>
 
-        {diskPanelOpen && (
-          <div className="disk-panel">
-            {diskLoading && <p className="hint">Disk taraniyor...</p>}
-            {!diskLoading && diskScenes && diskScenes.length === 0 && (
-              <p className="hint hint-err">
-                Diskte .ply ciktisi olan sahne bulunamadi.
-              </p>
-            )}
-            {!diskLoading && diskScenes && diskScenes.length > 0 && (
-              <ul className="scene-list">
-                {diskScenes.map((s) => (
-                  <li
-                    key={s.name}
-                    className="scene-item"
-                    onClick={() => {
-                      setJobIdInput(s.name);
-                      loadJob(s.name);
-                    }}
-                    title={`${s.num_frames} frame - ${formatBytes(s.total_size_bytes)}`}
-                  >
-                    <span className="scene-name">{s.name}</span>
-                    <span className="scene-meta">
-                      {s.num_frames} frame - {formatBytes(s.total_size_bytes)} -{" "}
-                      {formatTime(s.modified_ts)}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
+      {/* İçerik */}
+      <main className="app-content">
+        {tab === "submit" && (
+          <JobSubmitPanel onJobSubmitted={handleJobSubmitted} />
+        )}
+
+        {tab === "jobs" && (
+          <div className="tab-content">
+            <h2 className="tab-title">Tüm Jobs</h2>
+            <JobsList onViewJob={handleViewJob} />
           </div>
         )}
 
-        {renderStatus()}
-      </header>
+        {tab === "viewer" && (
+          <div className="viewer-tab">
+            <div className="viewer-controls">
+              <input
+                type="text"
+                value={jobIdInput}
+                placeholder="job_id veya sahne adı"
+                onChange={(e) => setJobIdInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") loadInViewer(jobIdInput);
+                }}
+              />
+              <button className="btn-primary" onClick={() => loadInViewer(jobIdInput)}>
+                Yükle
+              </button>
+              <button className="btn-secondary" onClick={loadLatestCompleted}>
+                Son tamamlanmış
+              </button>
+              <button className="btn-secondary" onClick={toggleDiskPanel}>
+                Diskten {diskPanelOpen ? "▲" : "▼"}
+              </button>
+            </div>
 
-      <main className="app-main">
-        {loadState.kind === "ready" && (
-          <SplatViewer
-            key={loadState.info.job_id}
-            jobId={loadState.info.job_id}
-            numFrames={loadState.info.num_frames}
-            currentFrame={currentFrame}
-            onLoadProgress={(loaded, total) =>
-              setSceneProgress({ loaded, total, done: false })
-            }
-            onReady={() =>
-              setSceneProgress((prev) =>
-                prev ? { ...prev, done: true } : prev
-              )
-            }
-            onError={(msg) => setLoadState({ kind: "error", message: msg })}
-          />
+            {diskPanelOpen && (
+              <div className="disk-panel">
+                {diskLoading && <p className="hint">Disk taranıyor…</p>}
+                {!diskLoading && diskScenes && diskScenes.length === 0 && (
+                  <p className="hint hint-err">Diskte .ply çıktısı yok.</p>
+                )}
+                {!diskLoading && diskScenes && diskScenes.length > 0 && (
+                  <ul className="scene-list">
+                    {diskScenes.map((s) => (
+                      <li
+                        key={s.name}
+                        className="scene-item"
+                        onClick={() => {
+                          setJobIdInput(s.name);
+                          loadInViewer(s.name);
+                        }}
+                      >
+                        <span className="scene-name">{s.name}</span>
+                        <span className="scene-meta">
+                          {s.num_frames} frame · {formatBytes(s.total_size_bytes)} · {formatTime(s.modified_ts)}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+
+            {/* Viewer state hint */}
+            {viewerState.kind === "idle" && (
+              <div className="viewer-empty">
+                <p className="hint">Bir job_id yapıştır veya "Diskten" butonundan seç.</p>
+              </div>
+            )}
+            {viewerState.kind === "loading-info" && (
+              <div className="viewer-empty"><p className="hint">Yükleniyor…</p></div>
+            )}
+            {viewerState.kind === "error" && (
+              <div className="viewer-empty">
+                <p className="hint hint-err">Hata: {viewerState.message}</p>
+              </div>
+            )}
+
+            {/* Viewer */}
+            {viewerState.kind === "ready" && (
+              <>
+                <div className="viewer-statusbar">
+                  {sceneProgress && !sceneProgress.done
+                    ? `Scene'ler yükleniyor: ${sceneProgress.loaded}/${sceneProgress.total}`
+                    : `${viewerState.info.num_frames} frame — "${viewerState.info.scene}" (${formatBytes(viewerState.info.total_size_bytes)})`}
+                </div>
+                <div className="viewer-canvas">
+                  <SplatViewer
+                    key={viewerState.info.job_id}
+                    jobId={viewerState.info.job_id}
+                    numFrames={viewerState.info.num_frames}
+                    currentFrame={currentFrame}
+                    onLoadProgress={(loaded, total) =>
+                      setSceneProgress({ loaded, total, done: false })
+                    }
+                    onReady={() =>
+                      setSceneProgress((prev) =>
+                        prev ? { ...prev, done: true } : prev
+                      )
+                    }
+                    onError={(msg) =>
+                      setViewerState({ kind: "error", message: msg })
+                    }
+                  />
+                </div>
+                <div className="viewer-timeline">
+                  <TimelineSlider
+                    numFrames={viewerState.info.num_frames}
+                    currentFrame={currentFrame}
+                    onFrameChange={setCurrentFrame}
+                    baseFps={10}
+                  />
+                </div>
+              </>
+            )}
+          </div>
         )}
       </main>
-
-      {loadState.kind === "ready" && (
-        <footer className="app-footer">
-          <TimelineSlider
-            numFrames={loadState.info.num_frames}
-            currentFrame={currentFrame}
-            onFrameChange={setCurrentFrame}
-            baseFps={10}
-          />
-        </footer>
-      )}
 
       <div className="api-base">API: {API_BASE}</div>
     </div>

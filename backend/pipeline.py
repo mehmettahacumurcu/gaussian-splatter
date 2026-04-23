@@ -176,6 +176,9 @@ def run_pipeline(
         prune_min_opacity=cfg.train.prune_min_opacity,
         prune_max_scale=cfg.train.prune_max_scale,
         lambda_ssim=cfg.train.lambda_ssim,
+        lambda_deform_reg=cfg.train.lambda_deform_reg,
+        lambda_smoothness=cfg.train.lambda_smoothness,
+        lambda_rigidity=cfg.train.lambda_rigidity,
     )
     # Trainer ilerlemesini pipeline callback'ine relay eden köprü:
     # trainer iç ilerlemesini (0-1 arası) "training" fazına map ederiz.

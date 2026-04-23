@@ -95,6 +95,10 @@ class TrainConfig:
     densify_grad_threshold: float = 2e-4
     prune_min_opacity: float = 0.005
     prune_max_scale: float = 0.1
+    # Motion regularizers (Stage 1)
+    lambda_deform_reg: float = 1e-3
+    lambda_smoothness: float = 1e-2
+    lambda_rigidity: float = 1e-2
     # Checkpoint
     ckpt_interval: int = 1000
     log_interval: int = 50

@@ -99,10 +99,32 @@ async def process_video(
     smoke_test: bool = Form(False, description="True: hızlı preset (500 iter, 480x270, 10 ts)"),
     cloud: bool = Form(False, description="True: cloud_config (1920x1080, 60k iter)"),
     skip_foundation: bool = Form(True, description="Foundation modelleri atla"),
-    # Override parametreleri (preset üzerine uygulanır)
+    # --- Override parametreleri (preset üzerine uygulanır) ---
+    # Temel training
     iters: int | None = Form(None, description="Override training iter sayısı"),
     resolution: str | None = Form(None, description='"WxH" format, örn. "640x360"'),
     num_timestamps: int | None = Form(None, description="Export edilecek timestamp sayısı"),
+    fps: int | None = Form(None, description="Frame extraction FPS"),
+    # Loss weights
+    lambda_ssim: float | None = Form(None, description="SSIM katkı oranı (0-1)"),
+    lambda_deform_reg: float | None = Form(None, description="Deformation L2 reg"),
+    lambda_smoothness: float | None = Form(None, description="Temporal smoothness"),
+    lambda_rigidity: float | None = Form(None, description="Isometric rigidity"),
+    # Learning rates
+    lr_deform: float | None = Form(None, description="Deformation field LR"),
+    lr_means: float | None = Form(None, description="Gaussian means LR"),
+    # Density control
+    density_start_iter: int | None = Form(None, description="Density control başlangıç iter"),
+    density_end_iter: int | None = Form(None, description="Density control bitiş iter"),
+    density_interval: int | None = Form(None, description="Kaç iter'de bir clone/split/prune"),
+    densify_grad_threshold: float | None = Form(None, description="Densify grad eşiği"),
+    prune_min_opacity: float | None = Form(None, description="Prune: opacity altı"),
+    prune_max_scale: float | None = Form(None, description="Prune: scale üstü"),
+    # Model mimarisi
+    sh_degree: int | None = Form(None, description="Spherical Harmonics derecesi (0-3)"),
+    hexplane_resolution: int | None = Form(None, description="HexPlane grid çözünürlük"),
+    hexplane_feat_dim: int | None = Form(None, description="HexPlane feature dim"),
+    mlp_width: int | None = Form(None, description="Deformation MLP genişlik"),
 ) -> ProcessResponse:
     """
     Video'yu upload et ve pipeline'ı kuyruğa al.
@@ -143,15 +165,17 @@ async def process_video(
             cfg.export.num_timestamps = 10
 
         # --- Override'lar (preset uzerine uygulanir) ---
+        # Temel
         if iters is not None:
             cfg.train.n_iters = iters
-            # Density control takvimini iter sayisina olcekle
+            # Density control takvimini iter sayisina olcekle (daha spesifik
+            # override'lar altta, bu sadece default hesaplama)
             cfg.train.density_start_iter = max(100, int(iters * 0.1))
             cfg.train.density_end_iter = max(
                 cfg.train.density_start_iter + 1, int(iters * 0.8)
             )
             cfg.train.density_interval = max(50, int(iters * 0.02))
-            cfg.train.ckpt_interval = iters  # sadece final checkpoint
+            cfg.train.ckpt_interval = iters
             cfg.train.log_interval = max(10, iters // 30)
         if resolution:
             try:
@@ -161,6 +185,44 @@ async def process_video(
                 raise HTTPException(400, f"resolution formati: WxH (orn. '640x360'). Hata: {e}")
         if num_timestamps is not None:
             cfg.export.num_timestamps = num_timestamps
+        if fps is not None:
+            cfg.preprocess.fps = fps
+        # Loss weights
+        if lambda_ssim is not None:
+            cfg.train.lambda_ssim = lambda_ssim
+        if lambda_deform_reg is not None:
+            cfg.train.lambda_deform_reg = lambda_deform_reg
+        if lambda_smoothness is not None:
+            cfg.train.lambda_smoothness = lambda_smoothness
+        if lambda_rigidity is not None:
+            cfg.train.lambda_rigidity = lambda_rigidity
+        # Learning rates
+        if lr_deform is not None:
+            cfg.train.lr_deform = lr_deform
+        if lr_means is not None:
+            cfg.train.lr_means = lr_means
+        # Density control — iter override'indan sonra uygulanır, spesifik değerleri yazar
+        if density_start_iter is not None:
+            cfg.train.density_start_iter = density_start_iter
+        if density_end_iter is not None:
+            cfg.train.density_end_iter = density_end_iter
+        if density_interval is not None:
+            cfg.train.density_interval = density_interval
+        if densify_grad_threshold is not None:
+            cfg.train.densify_grad_threshold = densify_grad_threshold
+        if prune_min_opacity is not None:
+            cfg.train.prune_min_opacity = prune_min_opacity
+        if prune_max_scale is not None:
+            cfg.train.prune_max_scale = prune_max_scale
+        # Model mimarisi
+        if sh_degree is not None:
+            cfg.model.sh_degree = sh_degree
+        if hexplane_resolution is not None:
+            cfg.model.hexplane_resolution = hexplane_resolution
+        if hexplane_feat_dim is not None:
+            cfg.model.hexplane_feat_dim = hexplane_feat_dim
+        if mlp_width is not None:
+            cfg.model.mlp_width = mlp_width
 
         return run_pipeline(
             str(video_path),

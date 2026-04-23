@@ -1,32 +1,28 @@
-feat(train): motion regularizers + override params + hypernerf helper
+feat(ui): hyperparameter panel + tab layout + job submission (Phase 8b)
 
 Backend:
-- backend/model/trainer.py: 3 motion regularizer eklendi:
-  - lambda_deform_reg (L2 on dpos/dquat/dscale): keeps deformation
-    near zero where no evidence of motion
-  - lambda_smoothness (D(t) vs D(t+dt)): pushes deformation toward
-    temporally coherent trajectories
-  - lambda_rigidity (pairwise dist preservation on sampled K gaussians):
-    maintains local scene structure, prevents collapse/explosion
-  Active from iter 100 onwards, log shows recon vs reg breakdown.
+- config.py: TrainConfig gets motion regularizer fields
+  (lambda_deform_reg, lambda_smoothness, lambda_rigidity)
+- pipeline.py: pass motion reg values to Trainer
+- api.py: /process accepts 18 optional hyperparameter overrides:
+  training (iters/resolution/num_timestamps/fps), loss weights,
+  learning rates, density control, model architecture
 
-- backend/api.py: /process now accepts optional override params
-  (iters, resolution "WxH", num_timestamps) that apply on top of
-  preset. Enables "medium" smoke tests without full 30k run.
+Frontend (Phase 8b):
+- api.ts: submitJob(File, opts) with FormData upload, full types
+- HyperparameterPanel: 5 collapsible groups, override count badges,
+  null preserves backend default
+- JobSubmitPanel: HTML file picker (no Tauri plugin needed), auto
+  scene name from filename, preset chips, skip_foundation toggle,
+  integrated hyperparameter panel
+- JobsList: polls /jobs every 2s, progress bars, expand with
+  traceback + "Viewer'da ac" + ".zip indir" actions
+- App.tsx: 3-tab navigation (Yeni Job / Jobs / Viewer), viewer
+  moved to own tab with key={job_id} remount guard
+- App.css: 200+ new lines for tabs, hparam groups, job rows,
+  progress bars, preset chips, file picker
 
-Scripts:
-- scripts/hypernerf_to_mp4.py: converts HyperNeRF frame sequence
-  to MP4 via ffmpeg concat demuxer. Supports 2x/4x/8x/16x res tiers.
-- scripts/start-backend.bat: fixed %ProgramFiles(x86)% paren trap
-  (was causing ". was unexpected" crash). Uses fixed VS 2022 paths.
-  Also: conda activate BEFORE vcvars64 to avoid PATH clobber.
-- run.bat: replaced `timeout /t` with `ping -n` (cross-shell safe,
-  works even when Git Bash's Unix timeout is ahead in PATH).
+CSS sizing fix: viewer-canvas gets flex:1 + min-height:300px
+to prevent collapse when grid math fails.
 
-Tested:
-- HyperNeRF chickchicken (456 frames) + cut-lemon1 smoke pipelines
-  through API end-to-end (colmap + training + export).
-- Motion analysis: deformation is applied (100% positions change
-  across frames) but magnitude is small and oscillates without
-  priors. Stage 1 regularizers aim to suppress jitter; Stage 2
-  (RAFT optical flow) will add real motion signal.
+No new runtime dependencies. Vite/React/Three.js stack unchanged.
