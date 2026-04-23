@@ -1,0 +1,32 @@
+feat(train): motion regularizers + override params + hypernerf helper
+
+Backend:
+- backend/model/trainer.py: 3 motion regularizer eklendi:
+  - lambda_deform_reg (L2 on dpos/dquat/dscale): keeps deformation
+    near zero where no evidence of motion
+  - lambda_smoothness (D(t) vs D(t+dt)): pushes deformation toward
+    temporally coherent trajectories
+  - lambda_rigidity (pairwise dist preservation on sampled K gaussians):
+    maintains local scene structure, prevents collapse/explosion
+  Active from iter 100 onwards, log shows recon vs reg breakdown.
+
+- backend/api.py: /process now accepts optional override params
+  (iters, resolution "WxH", num_timestamps) that apply on top of
+  preset. Enables "medium" smoke tests without full 30k run.
+
+Scripts:
+- scripts/hypernerf_to_mp4.py: converts HyperNeRF frame sequence
+  to MP4 via ffmpeg concat demuxer. Supports 2x/4x/8x/16x res tiers.
+- scripts/start-backend.bat: fixed %ProgramFiles(x86)% paren trap
+  (was causing ". was unexpected" crash). Uses fixed VS 2022 paths.
+  Also: conda activate BEFORE vcvars64 to avoid PATH clobber.
+- run.bat: replaced `timeout /t` with `ping -n` (cross-shell safe,
+  works even when Git Bash's Unix timeout is ahead in PATH).
+
+Tested:
+- HyperNeRF chickchicken (456 frames) + cut-lemon1 smoke pipelines
+  through API end-to-end (colmap + training + export).
+- Motion analysis: deformation is applied (100% positions change
+  across frames) but magnitude is small and oscillates without
+  priors. Stage 1 regularizers aim to suppress jitter; Stage 2
+  (RAFT optical flow) will add real motion signal.

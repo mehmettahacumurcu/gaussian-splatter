@@ -98,12 +98,25 @@ class Trainer4DGS:
         prune_max_scale: float = 0.1,
         # Loss
         lambda_ssim: float = 0.2,
+        # --- Motion regularizers (Stage 1) ---
+        # deformation field'in rastgele jitter üretmek yerine anlamlı
+        # coherent motion öğrenmesine yardımcı olur.
+        lambda_deform_reg: float = 1e-3,    # |Δpos|², |Δquat|², |Δscale|² — küçük tut
+        lambda_smoothness: float = 1e-2,    # D(t) - D(t+dt) pürüzsüzlük
+        lambda_rigidity: float = 1e-2,      # komşular arası mesafe korunsun
+        rigidity_sample_k: int = 512,       # rigidity için kaç gaussian örnekle
+        smoothness_dt: float = 0.02,        # t perturb adımı
     ):
         self.gs = gs.to(device)
         self.deform = deform.to(device)
         self.device = device
         self.scene_extent = scene_extent
         self.lambda_ssim = lambda_ssim
+        self.lambda_deform_reg = lambda_deform_reg
+        self.lambda_smoothness = lambda_smoothness
+        self.lambda_rigidity = lambda_rigidity
+        self.rigidity_sample_k = rigidity_sample_k
+        self.smoothness_dt = smoothness_dt
 
         self.density_start_iter = density_start_iter
         self.density_end_iter = density_end_iter
@@ -215,12 +228,58 @@ class Trainer4DGS:
                 sh_degree=self.gs.sh_degree,
             )
 
-            # Loss + backprop
-            loss = compute_loss(rgb, gt, self.lambda_ssim)
+            # Reconstruction loss (L1 + SSIM)
+            loss_recon = compute_loss(rgb, gt, self.lambda_ssim)
+            loss = loss_recon
+
+            # --- Motion regularizers (Stage 1) ---
+            # Deformation yeterince ısındıktan sonra devreye gir (ilk 100 iter bekle)
+            # ve sadece deformation field öğrenmeye başladığında etkili olsun.
+            if it > 100 and (
+                self.lambda_deform_reg > 0
+                or self.lambda_smoothness > 0
+                or self.lambda_rigidity > 0
+            ):
+                # Bu t anındaki ham deformation çıktıları (mesafe için tekrar çağırıyoruz
+                # çünkü _apply_deformation sadece sonucu döner)
+                dpos, dquat, dscale = self.deform(
+                    self.gs.means, t_norm, self.scene_extent,
+                )
+
+                # (a) Magnitude regularizer — hareket olmayan yerde delta 0'a yaklasın
+                if self.lambda_deform_reg > 0:
+                    reg = (dpos.pow(2).mean()
+                           + dquat.pow(2).mean()
+                           + dscale.pow(2).mean())
+                    loss = loss + self.lambda_deform_reg * reg
+
+                # (b) Temporal smoothness — t ve t+dt'de yakın deformation
+                if self.lambda_smoothness > 0:
+                    t2 = min(1.0, t_norm + self.smoothness_dt)
+                    if t2 != t_norm:
+                        dpos2, _, _ = self.deform(
+                            self.gs.means, t2, self.scene_extent,
+                        )
+                        smooth = (dpos - dpos2).pow(2).mean()
+                        loss = loss + self.lambda_smoothness * smooth
+
+                # (c) Isometric rigidity — rastgele K gaussian'ın komşuluk ilişkisi korunsun
+                #     (tam cdist NxN belleği yakar; rastgele örnek alıp KxK matrisi çıkarıyoruz)
+                N = self.gs.num_points
+                K = min(self.rigidity_sample_k, N)
+                if self.lambda_rigidity > 0 and K >= 8:
+                    sample_idx = torch.randint(0, N, (K,), device=self.device)
+                    base_pts = self.gs.means[sample_idx]
+                    deformed_pts = d_means[sample_idx]
+                    dist_base = torch.cdist(base_pts, base_pts)
+                    dist_def = torch.cdist(deformed_pts, deformed_pts)
+                    rigid = (dist_base - dist_def).abs().mean()
+                    loss = loss + self.lambda_rigidity * rigid
+
             self.optimizer.zero_grad(set_to_none=False)
             loss.backward()
 
-            # Density gradyanlarını biriktir, sonra step
+            # Density gradyanlarini biriktir, sonra step
             self.density.accumulate(self.gs)
             self.optimizer.step()
 
@@ -228,7 +287,6 @@ class Trainer4DGS:
             if (self.density_start_iter <= it < self.density_end_iter
                     and it % self.density_interval == 0):
                 stats = self.density.step(self.gs)
-                # Optimizer'ı yeni N ile yeniden kur (param tensor'leri değişti)
                 self._build_optimizer()
                 if it % log_interval == 0:
                     print(f"  ↳ density: clone={stats['cloned']} split={stats['split']} "
@@ -244,14 +302,15 @@ class Trainer4DGS:
                 history["n_pts"].append(self.gs.num_points)
                 elapsed = time.time() - t0
                 ips = it / max(elapsed, 1e-6)
-                print(f"[{it:>6}/{n_iters}] loss={loss.item():.4f} psnr={p:.2f} "
-                      f"N={self.gs.num_points:,} | {ips:.1f} it/s")
+                reg_part = loss.item() - loss_recon.item()
+                reg_str = f" (+reg={reg_part:.4f})" if reg_part > 1e-5 else ""
+                print(f"[{it:>6}/{n_iters}] loss={loss.item():.4f}{reg_str} "
+                      f"psnr={p:.2f} N={self.gs.num_points:,} | {ips:.1f} it/s")
                 if progress_callback is not None:
                     try:
                         progress_callback(it, n_iters, float(loss.item()),
                                           float(p), int(self.gs.num_points))
-                    except Exception as _e:  # noqa: BLE001
-                        # Callback hatası training'i yıkmasın — sadece uyarı ver
+                    except Exception as _e:
                         print(f"  ⚠ progress_callback exception: {_e}")
 
             # Checkpoint
@@ -268,12 +327,12 @@ class Trainer4DGS:
     def _save_checkpoint(self, ckpt_dir: Path, it: int, final: bool = False) -> None:
         ckpt_dir = Path(ckpt_dir); ckpt_dir.mkdir(parents=True, exist_ok=True)
         suffix = "final" if final else f"{it:06d}"
-        path = ckpt_dir / f"ckpt_{suffix}.pt"
+        p = ckpt_dir / f"ckpt_{suffix}.pt"
         torch.save({
             "iter": it,
             "gs":   self.gs.state_for_save(),
             "deform": self.deform.state_dict(),
             "scene_extent": self.scene_extent,
             "sh_degree": self.gs.sh_degree,
-        }, path)
-        print(f"  ✓ checkpoint → {path}")
+        }, p)
+        print(f"  ✓ checkpoint → {p}")

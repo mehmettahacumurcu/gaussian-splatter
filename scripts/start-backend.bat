@@ -8,21 +8,8 @@ echo   4DGS Backend  -  http://127.0.0.1:8000  (Swagger: /docs)
 echo ========================================================
 echo.
 
-REM vcvars64 bul (vswhere ile)
-set "VCVARS="
-if exist "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" (
-    for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -find "VC\Auxiliary\Build\vcvars64.bat" 2^>nul`) do set "VCVARS=%%i"
-)
-
-if defined VCVARS (
-    echo [OK] vcvars64 bulundu
-    call "%VCVARS%" >nul 2>&1
-) else (
-    echo [UYARI] vcvars64.bat bulunamadi - VS Build Tools yok ya da vswhere yok.
-    echo         gsplat cache varsa sorun yok, devam ediliyor...
-)
-echo.
-
+REM --- 1/3: conda ---
+echo [1/3] conda activate gs4d
 call conda activate gs4d
 if errorlevel 1 (
     echo.
@@ -32,10 +19,39 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM --- 2/3: vcvars64 ---
+REM %ProgramFiles(x86)%'i PATH'te parantez icerdigi icin if blogu bozuluyor.
+REM Ondan kacinmak icin direkt VS 2022 fixed pathlere bakiyoruz.
+echo [2/3] VS Build Tools
+set "VCVARS="
+for %%E in (BuildTools Community Professional Enterprise) do (
+    if not defined VCVARS if exist "C:\Program Files\Microsoft Visual Studio\2022\%%E\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files\Microsoft Visual Studio\2022\%%E\VC\Auxiliary\Build\vcvars64.bat"
+)
+if not defined VCVARS (
+    for %%E in (BuildTools Community Professional Enterprise) do (
+        if not defined VCVARS if exist "C:\Program Files (x86)\Microsoft Visual Studio\2022\%%E\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\%%E\VC\Auxiliary\Build\vcvars64.bat"
+    )
+)
+
+if defined VCVARS (
+    echo       bulundu: %VCVARS%
+    call "%VCVARS%" >nul
+    where cl >nul 2>&1
+    if errorlevel 1 (
+        echo       [UYARI] vcvars64 calisti ama 'cl' hala PATH'te degil.
+    ) else (
+        echo       [OK] cl.exe PATH'te
+    )
+) else (
+    echo       [UYARI] VS 2022 vcvars64 bulunamadi.
+    echo               VS 2022 Build Tools kurulu mu?
+    echo               gsplat cache varsa sorun yok; yoksa compile fail eder.
+)
+
+REM --- 3/3: uvicorn ---
+echo [3/3] UTF-8 stdout + uvicorn
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
-
-echo [OK] Conda env gs4d aktif, UTF-8 modu aktif.
 echo.
 echo --------------------------------------------------------
 echo   Baslatiliyor: uvicorn backend.api:app

@@ -99,6 +99,10 @@ async def process_video(
     smoke_test: bool = Form(False, description="True: hızlı preset (500 iter, 480x270, 10 ts)"),
     cloud: bool = Form(False, description="True: cloud_config (1920x1080, 60k iter)"),
     skip_foundation: bool = Form(True, description="Foundation modelleri atla"),
+    # Override parametreleri (preset üzerine uygulanır)
+    iters: int | None = Form(None, description="Override training iter sayısı"),
+    resolution: str | None = Form(None, description='"WxH" format, örn. "640x360"'),
+    num_timestamps: int | None = Form(None, description="Export edilecek timestamp sayısı"),
 ) -> ProcessResponse:
     """
     Video'yu upload et ve pipeline'ı kuyruğa al.
@@ -137,6 +141,26 @@ async def process_video(
             cfg.train.density_end_iter = 400
             cfg.train.density_interval = 50
             cfg.export.num_timestamps = 10
+
+        # --- Override'lar (preset uzerine uygulanir) ---
+        if iters is not None:
+            cfg.train.n_iters = iters
+            # Density control takvimini iter sayisina olcekle
+            cfg.train.density_start_iter = max(100, int(iters * 0.1))
+            cfg.train.density_end_iter = max(
+                cfg.train.density_start_iter + 1, int(iters * 0.8)
+            )
+            cfg.train.density_interval = max(50, int(iters * 0.02))
+            cfg.train.ckpt_interval = iters  # sadece final checkpoint
+            cfg.train.log_interval = max(10, iters // 30)
+        if resolution:
+            try:
+                w_str, h_str = resolution.lower().split("x")
+                cfg.train.image_resolution = (int(w_str), int(h_str))
+            except ValueError as e:
+                raise HTTPException(400, f"resolution formati: WxH (orn. '640x360'). Hata: {e}")
+        if num_timestamps is not None:
+            cfg.export.num_timestamps = num_timestamps
 
         return run_pipeline(
             str(video_path),
