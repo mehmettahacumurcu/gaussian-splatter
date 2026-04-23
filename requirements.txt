@@ -1,0 +1,46 @@
+# 4DGS Studio - Python bağımlılıkları
+#
+# ÖNEMLİ: torch + torchvision'u AYRICA, CUDA index URL ile kur.
+# Windows + RTX 3060 Ti + CUDA 12.6 toolkit için doğrulanmış kombinasyon:
+#
+#   pip install torch==2.5.1 torchvision==0.20.1 \
+#       --index-url https://download.pytorch.org/whl/cu124
+#
+# NOT: cu124 wheel'i CUDA 12.6 runtime'ı ile forward-compatible.
+# torch 2.11+ pre-release'leri gsplat 1.5.3 ile UYUMSUZ (CUDACachingAllocator.h
+# parse hatası verir). Ayrıntılar için docs/WINDOWS_SETUP.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+# CUDA Gaussian rasterizer (Windows'ta JIT compile — ilk import'ta ~2-3 dk)
+gsplat==1.5.3
+
+# SSIM loss
+pytorch-msssim>=1.0.0
+
+# Görüntü ve video işleme
+opencv-python>=4.8.0
+imageio>=2.31.0
+imageio-ffmpeg>=0.4.9
+Pillow>=10.0.0
+
+# İlerleme + log
+tqdm>=4.66.0
+rich>=13.7.0
+
+# Backend API (Faz 7)
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+
+# Veri formatları
+plyfile>=1.0.3
+numpy>=1.26.0,<2.0.0
+scipy>=1.11.0
+
+# Foundation modelleri (Faz 3)
+einops>=0.7.0
+timm>=0.9.0
+huggingface-hub>=0.22.0
+
+# Geliştirme
+pyyaml>=6.0.1

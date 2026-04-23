@@ -1,0 +1,21 @@
+# 4DGS Studio Conda environment
+# Kurulum:
+#   conda env create -f environment.yml
+#   conda activate gs4d
+#   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements.txt
+#
+# Windows kullanıcıları: Visual Studio 2022 Build Tools + CUDA 12.6 gerekli.
+# Detaylar için: docs/WINDOWS_SETUP.md
+name: gs4d
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - colmap          # Kamera pose tahmini (Structure-from-Motion)
+  - ffmpeg          # Video → frame
+  - git
+  - pip:
+      - -r requirements.txt

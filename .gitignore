@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Çıktılar / büyük dosyalar
+data/
+!data/.gitkeep
+*.ckpt
+*.pt
+*.pth
+*.ply
+*.splat
+*.npy
+*.npz
+
+# COLMAP
+*.db
+*.db-journal
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Loglar
+*.log
+build_log.txt
+full_run.txt
+adam_error.txt
+runs/
+wandb/
+
+# Derleyici / ninja cache
+torch_extensions/
+*.cuda.o
+*.cuda.o.d
+*.ninja_log
+*.ninja_deps
+build.ninja
+
+# OS
+*~
