@@ -18,7 +18,8 @@ from typing import Any
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
 
 from .api_models import (
     HealthResponse,
@@ -217,10 +218,144 @@ def download_result(job_id: str) -> StreamingResponse:
 
 
 # ---------------------------------------------------------------------------
-# Yardımcılar
+# Splat - viewer icin bireysel .ply erisimi (Faz 8a)
+# Hem in-memory job_id'den hem de diskteki scene name'den ply bulabilir.
+# ---------------------------------------------------------------------------
+class SplatInfo(BaseModel):
+    """Bir job/sahne'nin splat ciktilarinin metadata'si (viewer icin)."""
+    job_id: str           # gelen identifier (job_id ya da scene name)
+    scene: str            # cozulmus sahne adi
+    num_frames: int
+    frame_urls: list[str]
+    total_size_bytes: int
+    status: JobStatus
+    source: str           # "registry" ya da "disk"
+
+
+class SceneListItem(BaseModel):
+    """/scenes listesinin bir elemani."""
+    name: str
+    num_frames: int
+    total_size_bytes: int
+    modified_ts: float
+
+
+class SceneListResponse(BaseModel):
+    scenes: list[SceneListItem]
+    total: int
+
+
+def _resolve_ply_dir(identifier: str) -> tuple[Path, str, JobStatus, str]:
+    """
+    Bir identifier'i (job_id veya scene name) ply klasorune cevir.
+    Returns (ply_dir, scene_name, status, source).
+    source: "registry" | "disk"
+    """
+    # 1) Once in-memory job registry
+    manager: JobManager = app.state.manager
+    job = manager.get(identifier)
+    if job is not None:
+        if job.status != JobStatus.COMPLETED:
+            raise HTTPException(
+                409, f"Job henuz hazir degil (status: {job.status.value})"
+            )
+        ply_dir = Path(job.ply_dir) if job.ply_dir else scene_paths(job.scene)["output"] / "ply"
+        return ply_dir, job.scene, job.status, "registry"
+
+    # 2) Scene name olarak dene (data/<name>/output/ply)
+    safe = _safe_scene_name(identifier)
+    candidate = scene_paths(safe)["output"] / "ply"
+    if candidate.exists() and any(candidate.glob("*.ply")):
+        return candidate, safe, JobStatus.COMPLETED, "disk"
+
+    raise HTTPException(
+        404,
+        f"Job veya sahne bulunamadi: {identifier} "
+        f"(ne registry'de ne data/{safe}/output/ply altinda)",
+    )
+
+
+@app.get("/scenes", response_model=SceneListResponse, tags=["disk"])
+def list_disk_scenes() -> SceneListResponse:
+    """
+    data/ altinda output/ply iceren tum sahneleri listele.
+    Server restart olsa bile diskteki ciktilar burada gorunur.
+    """
+    data_root = Path("data")
+    items: list[SceneListItem] = []
+    if data_root.exists():
+        for scene_dir in sorted(data_root.iterdir()):
+            if not scene_dir.is_dir():
+                continue
+            ply_dir = scene_dir / "output" / "ply"
+            if not ply_dir.exists():
+                continue
+            ply_files = sorted(ply_dir.glob("*.ply"))
+            if not ply_files:
+                continue
+            total = sum(p.stat().st_size for p in ply_files)
+            items.append(SceneListItem(
+                name=scene_dir.name,
+                num_frames=len(ply_files),
+                total_size_bytes=total,
+                modified_ts=ply_dir.stat().st_mtime,
+            ))
+    # En yeni once
+    items.sort(key=lambda s: s.modified_ts, reverse=True)
+    return SceneListResponse(scenes=items, total=len(items))
+
+
+@app.get("/splat/{job_id}/info", response_model=SplatInfo, tags=["splat"])
+def splat_info(job_id: str) -> SplatInfo:
+    """
+    Viewer metadata: kac frame, hangi URL'lerden cekilecek, toplam boyut.
+    `job_id` parametresi hem UUID hem sahne adi olabilir.
+    """
+    ply_dir, scene, status, source = _resolve_ply_dir(job_id)
+    ply_files = sorted(ply_dir.glob("*.ply"))
+    if not ply_files:
+        raise HTTPException(404, f"{ply_dir} icinde .ply yok")
+
+    total = sum(p.stat().st_size for p in ply_files)
+    frame_urls = [f"/splat/{job_id}/frame/{i}" for i in range(len(ply_files))]
+    return SplatInfo(
+        job_id=job_id,
+        scene=scene,
+        num_frames=len(ply_files),
+        frame_urls=frame_urls,
+        total_size_bytes=total,
+        status=status,
+        source=source,
+    )
+
+
+@app.get("/splat/{job_id}/frame/{idx}", tags=["splat"])
+def splat_frame(job_id: str, idx: int) -> FileResponse:
+    """
+    Belirli bir timestamp icin .ply dosyasini dondur.
+    `job_id` hem UUID hem sahne adi olabilir.
+    """
+    ply_dir, _scene, _status, _source = _resolve_ply_dir(job_id)
+    ply_files = sorted(ply_dir.glob("*.ply"))
+    if idx < 0 or idx >= len(ply_files):
+        raise HTTPException(
+            404,
+            f"Frame index gecersiz: {idx} (mevcut: 0..{len(ply_files)-1})",
+        )
+
+    return FileResponse(
+        ply_files[idx],
+        media_type="application/octet-stream",
+        filename=ply_files[idx].name,
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Yardimcilar
 # ---------------------------------------------------------------------------
 def _safe_scene_name(raw: str) -> str:
     """Path traversal + weird chars sanitize. Sadece alfanumerik, _, -, nokta kabul."""
     safe = "".join(c if (c.isalnum() or c in "_-.") else "_" for c in raw)
     safe = safe.strip("._") or "unnamed_scene"
-    return safe[:64]  # max uzunluk
+    return safe[:64]

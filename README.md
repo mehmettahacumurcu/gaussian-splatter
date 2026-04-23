@@ -21,7 +21,8 @@ Tek bir videodan 4D Gaussian Splatting sahnesi üreten masaüstü uygulamasını
 | 5  | gsplat renderer + Trainer + ADC | hazır |
 | 6  | `.ply` export (3DGS uyumlu) | hazır |
 | 7  | FastAPI backend (`api.py`, `/process` `/status` `/download`) | hazır |
-| 8  | Tauri/React frontend | sonraki sprint |
+| 8a | Tauri + React 4D viewer (`frontend/`) | hazır |
+| 8b | Tam UI (job list, upload form, live progress) | sonraki sprint |
 
 ## Kurulum
 
@@ -152,6 +153,65 @@ Tek GPU var, bu yüzden `ThreadPoolExecutor(max_workers=1)` — eşzamanlı gele
 
 **Not:** Job state in-memory. Server restart'ında biten/bekleyen jobs bilgisi kaybolur. İleride SQLite persist eklenir.
 
+## Masaüstü 4D Viewer (Faz 8a)
+
+Tauri + React tabanlı native pencere. Eğittiğin .ply'ları 4D zaman çizgisiyle inceler.
+
+### Kurulum (tek seferlik)
+
+Gerekli: Node.js 18+, Rust (rustup), Microsoft Edge WebView2 (Windows 10/11'de genelde kurulu).
+
+```bash
+cd frontend
+npm install
+```
+
+### Hızlı başlangıç — tek tık
+
+Proje kökündeki **`run.bat`**'e çift tıkla. İki pencere otomatik açılır:
+
+- **4DGS Backend** penceresi: vcvars64 + conda env + UTF-8 + uvicorn
+- **4DGS Frontend** penceresi: node_modules kontrolü + `npm run tauri dev`
+
+`scripts/start-backend.bat` ve `scripts/start-frontend.bat` ayrı ayrı da çalışır (debug için).
+
+### Manuel — iki terminal
+
+**Terminal 1 (backend):**
+
+```cmd
+conda activate gs4d
+set PYTHONIOENCODING=utf-8
+set PYTHONUTF8=1
+uvicorn backend.api:app --host 127.0.0.1 --port 8000
+```
+
+**Terminal 2 (frontend, conda olmadan):**
+
+```cmd
+cd frontend
+npm run tauri dev
+```
+
+İlk sefer Rust compile eder (~1-2 dk). Sonra native Windows penceresi açılır.
+
+### Kullanım
+
+1. Backend'de önce bir job tamamla (curl ile `POST /process`, ya da mevcut bir job_id kullan)
+2. Viewer'da job_id'yi yapıştır → **Yükle**
+3. Ya da **"Son tamamlanmış"** butonu → otomatik bulur
+4. Splat yüklenince: mouse ile orbit, wheel ile zoom, right-click ile pan
+5. Altta timeline: scrubbable slider + ▶ play/pause + hız (0.25x-4x) + loop toggle
+
+### Production build
+
+```cmd
+cd frontend
+npm run tauri build
+```
+
+`src-tauri/target/release/` altında `.exe` + MSI installer çıkar.
+
 ## Faz faz çalıştır
 
 ```bash
@@ -180,7 +240,8 @@ Pipeline'ı cloud config ile çalıştırmak için: `--cloud` bayrağı.
 ## Sonraki adımlar
 
 - [x] ~~Faz 7: FastAPI backend (`api.py`, `/process`, `/status`, `/download`)~~
-- [ ] Faz 8: Tauri + React frontend (Viewer4D, TimelineSlider)
+- [x] ~~Faz 8a: Tauri + React 4D viewer~~
+- [ ] Faz 8b: Tam UI — job list, video upload form, live progress
 - [ ] Job state persistence (SQLite) — şu an in-memory
 - [ ] SAM2 entegrasyonu (gerçek dinamik maske, Farneback yerine)
 - [ ] Depth/track consistency loss → deformation training'i regularize et
@@ -210,9 +271,20 @@ Pipeline'ı cloud config ile çalıştırmak için: `--cloud` bayrağı.
 │   │   └── to_splat.py
 │   ├── config.py
 │   ├── pipeline.py
-│   ├── api.py          # Faz 7: FastAPI app
+│   ├── api.py          # Faz 7: FastAPI app (9 endpoint)
 │   ├── api_models.py   # Faz 7: Pydantic şemaları
 │   └── job_manager.py  # Faz 7: thread-safe job registry + executor
+├── frontend/         # Faz 8a: Tauri + React 4D viewer
+│   ├── src/
+│   │   ├── App.tsx               # Ana uygulama
+│   │   ├── App.css
+│   │   ├── api.ts                # FastAPI HTTP client
+│   │   └── components/
+│   │       ├── SplatViewer.tsx   # three.js + GaussianSplats3D
+│   │       └── TimelineSlider.tsx # scrubbable + play/pause
+│   ├── src-tauri/    # Rust shell
+│   ├── package.json
+│   └── tsconfig.json
 ├── docs/
 │   └── WINDOWS_SETUP.md
 ├── data/             # video, frames, colmap, output (gitignore)
