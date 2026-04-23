@@ -17,6 +17,7 @@ import sys
 import time
 import torch
 from pathlib import Path
+from typing import Any, Callable
 
 from .config import default_config, cloud_config, scene_paths, Config
 from .preprocess.extract_frames import extract_frames
@@ -28,6 +29,17 @@ from .model.trainer             import Trainer4DGS
 from .export.to_splat           import export_to_ply
 
 
+# progress_callback imzası:
+#   (phase_name: str, progress_0_1: float, message: str, details: dict) -> None
+ProgressCallback = Callable[[str, float, str, dict[str, Any]], None]
+
+
+def _noop_cb(phase: str, progress: float, message: str = "",
+             details: dict[str, Any] | None = None) -> None:
+    """Callback verilmediğinde kullanılan no-op."""
+    pass
+
+
 def run_pipeline(
     video_path: str | Path,
     scene_name: str = "test_scene",
@@ -35,28 +47,38 @@ def run_pipeline(
     skip_foundation: bool = True,
     skip_training: bool = False,
     skip_export: bool = False,
+    progress_callback: ProgressCallback | None = None,
 ) -> dict:
     """
     Returns: { phase: durum }
+
+    Args:
+        progress_callback: (phase, progress_0_1, message, details) → None
+            Her faz başlangıcında ve bitişinde, ayrıca training sırasında
+            periyodik olarak çağrılır. None ise hiçbir şey yapmaz.
     """
     if cfg is None:
         cfg = default_config()
     paths = scene_paths(scene_name)
     paths["base"].mkdir(parents=True, exist_ok=True)
 
+    cb: ProgressCallback = progress_callback or _noop_cb
     status = {}
 
     # -------- Faz 2a: Frame çıkarma --------
     print("\n[Faz 2a] Frame çıkarma")
+    cb("frames", 0.0, "Video karelere ayrılıyor", {})
     extract_frames(
         video_path, paths["frames"],
         fps=cfg.preprocess.fps,
         resize_long_edge=cfg.preprocess.resize_long_edge,
     )
     status["frames"] = "ok"
+    cb("frames", 1.0, "Kareler hazır", {})
 
     # -------- Faz 2b-c: COLMAP --------
     print("\n[Faz 2b] COLMAP SfM")
+    cb("colmap", 0.0, "Kamera pozları tahmin ediliyor (feature + match + mapper)", {})
     run_colmap(
         paths["frames"], paths["colmap"],
         camera_model=cfg.preprocess.colmap_camera_model,
@@ -67,24 +89,31 @@ def run_pipeline(
     cams = parse_cameras(paths["colmap"])
     xyz, rgb = load_points3d(paths["colmap"])
     status["colmap"] = f"{len(cams)} kamera, {len(xyz)} nokta"
+    cb("colmap", 1.0, f"{len(cams)} kamera, {len(xyz)} 3B nokta",
+       {"cameras": len(cams), "points": len(xyz)})
 
     # -------- Faz 3: Foundation modeller (opsiyonel) --------
     if not skip_foundation:
         print("\n[Faz 3a] Metric3D-v2 derinlik tahmini")
+        cb("foundation", 0.0, "Derinlik tahmini (Metric3D)", {})
         from .preprocess.depth_estimate import estimate_depth
         estimate_depth(paths["frames"], paths["depth"],
                        model_name=cfg.foundation.metric3d_model)
+        cb("foundation", 0.33, "CoTracker çalışıyor", {})
         print("\n[Faz 3b] CoTracker piksel takibi")
         from .preprocess.point_tracking import track_points
         track_points(paths["frames"], paths["tracks"] / "tracks.pt",
                      grid_size=cfg.foundation.cotracker_grid_size)
+        cb("foundation", 0.66, "Dinamik maske hesaplanıyor", {})
         print("\n[Faz 3c] Dinamik maske")
         from .preprocess.dynamic_mask import compute_dynamic_masks
         compute_dynamic_masks(paths["frames"], paths["masks"])
         status["foundation"] = "ok"
+        cb("foundation", 1.0, "Foundation modeller tamamlandı", {})
     else:
         print("\n[Faz 3] Foundation modeller atlandı (--skip-foundation)")
         status["foundation"] = "skipped"
+        cb("foundation", 1.0, "Atlandı", {"skipped": True})
 
     # -------- Faz 4-5: Model + Training --------
     if skip_training:
@@ -97,6 +126,7 @@ def run_pipeline(
         print("⚠ CUDA bulunamadı — training çok yavaş olacak (test amaçlı)")
 
     print("\n[Faz 4] Gaussian model + DeformationField")
+    cb("init", 0.0, "Model başlatılıyor", {})
     init_pts = torch.from_numpy(xyz)
     init_rgb = torch.from_numpy(rgb).float() / 255.0
     gs = GaussianModel(init_pts, init_colors=init_rgb,
@@ -108,6 +138,8 @@ def run_pipeline(
     )
     extent = compute_scene_extent(xyz)
     print(f"  Sahne kapsamı: {extent:.3f}, başlangıç Gaussian: {gs.num_points:,}")
+    cb("init", 1.0, f"Başlangıç Gaussian: {gs.num_points:,}",
+       {"num_points": gs.num_points, "scene_extent": float(extent)})
 
     # Frame yolları + kamera pozları (COLMAP'in kullandığı isim sırasına göre)
     frame_paths, w2c_list, K_first = [], [], None
@@ -145,6 +177,21 @@ def run_pipeline(
         prune_max_scale=cfg.train.prune_max_scale,
         lambda_ssim=cfg.train.lambda_ssim,
     )
+    # Trainer ilerlemesini pipeline callback'ine relay eden köprü:
+    # trainer iç ilerlemesini (0-1 arası) "training" fazına map ederiz.
+    def _train_progress(iter_idx: int, total: int, loss: float,
+                        psnr_val: float, n_pts: int) -> None:
+        cb(
+            "training",
+            iter_idx / max(total, 1),
+            f"iter {iter_idx}/{total} — loss={loss:.4f} psnr={psnr_val:.2f} N={n_pts:,}",
+            {
+                "iter": iter_idx, "total": total,
+                "loss": loss, "psnr": psnr_val, "num_points": n_pts,
+            },
+        )
+
+    cb("training", 0.0, "Training başlıyor", {"total_iters": cfg.train.n_iters})
     history = trainer.train(
         frame_paths, K_first, w2c_list,
         n_iters=cfg.train.n_iters,
@@ -152,8 +199,13 @@ def run_pipeline(
         ckpt_dir=paths["output"] / "ckpt",
         ckpt_interval=cfg.train.ckpt_interval,
         log_interval=cfg.train.log_interval,
+        progress_callback=_train_progress,
     )
     status["training"] = f"{cfg.train.n_iters} iter, son loss={history['loss'][-1]:.4f}"
+    cb("training", 1.0, f"Training bitti, son loss={history['loss'][-1]:.4f}",
+       {"final_loss": history["loss"][-1] if history["loss"] else None,
+        "final_psnr": history["psnr"][-1] if history["psnr"] else None,
+        "final_num_points": history["n_pts"][-1] if history["n_pts"] else None})
 
     # -------- Faz 6: Export --------
     if skip_export:
@@ -162,6 +214,7 @@ def run_pipeline(
         return status
 
     print("\n[Faz 6] PLY export")
+    cb("export", 0.0, f"{cfg.export.num_timestamps} timestamp export ediliyor", {})
     export_to_ply(
         gs=trainer.gs,
         deform=trainer.deform,
@@ -171,6 +224,9 @@ def run_pipeline(
         device=device,
     )
     status["export"] = f"{cfg.export.num_timestamps} timestamp"
+    cb("export", 1.0, f"{cfg.export.num_timestamps} .ply yazıldı",
+       {"num_timestamps": cfg.export.num_timestamps,
+        "ply_dir": str(paths["output"] / "ply")})
     return status
 
 

@@ -19,13 +19,44 @@ def quat_to_rotmat(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
 
 
 def _find_sparse_dir(colmap_dir: Path) -> Path:
-    """sparse/0 yoksa direkt verileni dene."""
-    cand = colmap_dir / "sparse" / "0"
-    if (cand / "cameras.txt").exists():
-        return cand
+    """
+    cameras.txt'yi içeren sparse sub-model'i bul.
+
+    COLMAP mapper birden fazla sub-model üretebilir (sparse/0, sparse/1, ...).
+    run_colmap en büyüğünü seçip SADECE ona model_converter (BIN→TXT) uyguluyor.
+    Yani .txt dosyaları her zaman 'sparse/0'da değil — en büyük parçada.
+
+    Strateji:
+      1) sparse/* alt klasörlerinde cameras.txt ara, bulduklarını dosya boyutuna göre
+         sırala (run_colmap ile tutarlı), en büyüğü döndür.
+      2) Düz yerleşim: colmap_dir/cameras.txt.
+      3) Yoksa hata.
+    """
+    sparse_root = colmap_dir / "sparse"
+    if sparse_root.exists() and sparse_root.is_dir():
+        candidates = [
+            d for d in sparse_root.iterdir()
+            if d.is_dir() and (d / "cameras.txt").exists()
+        ]
+        if candidates:
+            def _size(d: Path) -> int:
+                total = 0
+                for name in ("cameras.bin", "images.bin", "points3D.bin"):
+                    f = d / name
+                    if f.exists():
+                        total += f.stat().st_size
+                return total
+            candidates.sort(key=_size, reverse=True)
+            return candidates[0]
+
     if (colmap_dir / "cameras.txt").exists():
         return colmap_dir
-    raise FileNotFoundError(f"cameras.txt bulunamadı: {colmap_dir}")
+
+    raise FileNotFoundError(
+        f"cameras.txt bulunamadı: {colmap_dir}\n"
+        f"  Denenen: sparse/*/cameras.txt ve {colmap_dir}/cameras.txt\n"
+        f"  (run_colmap çalıştı mı? model_converter BIN→TXT adımı başarılı mı?)"
+    )
 
 
 def parse_cameras(colmap_dir: str | Path) -> Dict[str, Dict]:

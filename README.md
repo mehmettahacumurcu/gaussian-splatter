@@ -20,7 +20,7 @@ Tek bir videodan 4D Gaussian Splatting sahnesi üreten masaüstü uygulamasını
 | 4c | Kovaryans + EWA projeksiyon | hazır |
 | 5  | gsplat renderer + Trainer + ADC | hazır |
 | 6  | `.ply` export (3DGS uyumlu) | hazır |
-| 7  | FastAPI backend | sonraki sprint |
+| 7  | FastAPI backend (`api.py`, `/process` `/status` `/download`) | hazır |
 | 8  | Tauri/React frontend | sonraki sprint |
 
 ## Kurulum
@@ -92,6 +92,66 @@ python -m backend.pipeline data/test_scene/video.mp4 --scene test_scene
 
 `.ply` dosyaları [antimatter15/splat](https://antimatter15.com/splat/) gibi açık kaynak viewer'larda görüntülenebilir.
 
+## HTTP API (Faz 7)
+
+Pipeline'ı CLI'dan çalıştırmak yerine HTTP üzerinden kullanabilirsin. Uygulama içi (Tauri frontend, web browser) ya da dışarıdan (curl, httpie) erişim için.
+
+### Server'ı başlat
+
+```bash
+uvicorn backend.api:app --host 127.0.0.1 --port 8000
+```
+
+Geliştirme sırasında auto-reload:
+
+```bash
+uvicorn backend.api:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Swagger UI interaktif dokümantasyon: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+
+### Endpoint'ler
+
+| Method | Path | Amaç |
+|--------|------|------|
+| `GET` | `/` | Servis sağlığı + GPU durumu |
+| `POST` | `/process` | Video yükle + pipeline job'ı başlat |
+| `GET` | `/status/{job_id}` | Job ilerlemesi (faz, progress 0-1, mesaj) |
+| `GET` | `/jobs` | Tüm job'ların listesi |
+| `GET` | `/download/{job_id}` | Bitmiş job'un .ply'larını zip olarak indir |
+
+### Hızlı test — curl
+
+```bash
+# Health
+curl http://127.0.0.1:8000/
+
+# Job başlat (smoke test)
+curl -F "video=@data/test_scene/video.mp4" \
+     -F "scene=test_scene" \
+     -F "smoke_test=true" \
+     http://127.0.0.1:8000/process
+# → {"job_id": "abc-123...", "status": "queued", "status_url": "/status/abc-123..."}
+
+# İlerlemeyi poll et
+curl http://127.0.0.1:8000/status/abc-123...
+# → {"status": "running", "phase": {"name": "training", "progress": 0.42, ...}, ...}
+
+# Sonucu indir
+curl -o result.zip http://127.0.0.1:8000/download/abc-123...
+```
+
+### Job yaşam döngüsü
+
+```
+queued → running → completed   (başarılı)
+                 ↘ failed       (exception — error alanında traceback)
+```
+
+Tek GPU var, bu yüzden `ThreadPoolExecutor(max_workers=1)` — eşzamanlı gelen iki request sırayla işlenir. İkincisi `queued` statüsünde bekler.
+
+**Not:** Job state in-memory. Server restart'ında biten/bekleyen jobs bilgisi kaybolur. İleride SQLite persist eklenir.
+
 ## Faz faz çalıştır
 
 ```bash
@@ -119,11 +179,13 @@ Pipeline'ı cloud config ile çalıştırmak için: `--cloud` bayrağı.
 
 ## Sonraki adımlar
 
-- [ ] Faz 7: FastAPI backend (`api.py`, `/process`, `/status`, `/download`)
+- [x] ~~Faz 7: FastAPI backend (`api.py`, `/process`, `/status`, `/download`)~~
 - [ ] Faz 8: Tauri + React frontend (Viewer4D, TimelineSlider)
+- [ ] Job state persistence (SQLite) — şu an in-memory
 - [ ] SAM2 entegrasyonu (gerçek dinamik maske, Farneback yerine)
 - [ ] Depth/track consistency loss → deformation training'i regularize et
 - [ ] Multi-resolution training (coarse-to-fine)
+- [ ] Eval metrikleri: PSNR/SSIM/LPIPS scriptleri
 
 ## Klasör yapısı
 
@@ -147,7 +209,12 @@ Pipeline'ı cloud config ile çalıştırmak için: `--cloud` bayrağı.
 │   ├── export/       # Faz 6
 │   │   └── to_splat.py
 │   ├── config.py
-│   └── pipeline.py
+│   ├── pipeline.py
+│   ├── api.py          # Faz 7: FastAPI app
+│   ├── api_models.py   # Faz 7: Pydantic şemaları
+│   └── job_manager.py  # Faz 7: thread-safe job registry + executor
+├── docs/
+│   └── WINDOWS_SETUP.md
 ├── data/             # video, frames, colmap, output (gitignore)
 ├── requirements.txt
 ├── environment.yml

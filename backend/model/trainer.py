@@ -16,12 +16,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from .gaussian_model import GaussianModel
 from .deformation import DeformationField
 from .renderer import render_view
 from .density_control import DensityController
+
+
+# Trainer iç progress callback imzası:
+#   (iter_idx, total_iters, loss, psnr, num_points) → None
+TrainProgressCallback = Callable[[int, int, float, float, int], None]
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +157,7 @@ class Trainer4DGS:
         ckpt_dir: Path | None = None,
         ckpt_interval: int = 1000,
         log_interval: int = 50,
+        progress_callback: TrainProgressCallback | None = None,
     ) -> dict:
         """
         Args:
@@ -240,6 +246,13 @@ class Trainer4DGS:
                 ips = it / max(elapsed, 1e-6)
                 print(f"[{it:>6}/{n_iters}] loss={loss.item():.4f} psnr={p:.2f} "
                       f"N={self.gs.num_points:,} | {ips:.1f} it/s")
+                if progress_callback is not None:
+                    try:
+                        progress_callback(it, n_iters, float(loss.item()),
+                                          float(p), int(self.gs.num_points))
+                    except Exception as _e:  # noqa: BLE001
+                        # Callback hatası training'i yıkmasın — sadece uyarı ver
+                        print(f"  ⚠ progress_callback exception: {_e}")
 
             # Checkpoint
             if ckpt_dir is not None and it % ckpt_interval == 0:

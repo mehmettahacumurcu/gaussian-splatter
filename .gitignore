@@ -17,6 +17,7 @@ data/
 *.splat
 *.npy
 *.npz
+*.zip
 
 # COLMAP
 *.db
@@ -27,6 +28,10 @@ data/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Claude Code — kullanıcıya özel local ayarlar, paylaşılmaz
+# .claude/settings.json paylaşılabilir, ama .local.json KESİN hariç
+.claude/settings.local.json
 
 # Loglar
 *.log
