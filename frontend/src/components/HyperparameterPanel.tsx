@@ -50,6 +50,8 @@ const GROUPS: { title: string; icon: string; fields: FieldSpec[] }[] = [
       { key: "lambda_deform_reg", label: "λ deform L2", placeholder: "0.001", kind: "number", step: 0.001, help: "Δpos/Δquat/Δscale mag regularizer" },
       { key: "lambda_smoothness", label: "λ temporal smoothness", placeholder: "0.01", kind: "number", step: 0.005, help: "D(t) vs D(t+dt)" },
       { key: "lambda_rigidity", label: "λ isometric rigidity", placeholder: "0.01", kind: "number", step: 0.005, help: "local geometry koruma" },
+      { key: "lambda_depth", label: "λ depth (Metric3D)", placeholder: "0.1", kind: "number", step: 0.05, help: "Scale-invariant L1 between rendered & Metric3D depth" },
+      { key: "lambda_mask_motion", label: "λ mask-weighted recon", placeholder: "1.0", kind: "number", step: 0.1, help: "Dynamic mask'li bölgelerde reconstruction weight boost" },
     ],
   },
   {
@@ -77,9 +79,21 @@ const GROUPS: { title: string; icon: string; fields: FieldSpec[] }[] = [
     icon: "◇",
     fields: [
       { key: "sh_degree", label: "SH degree", placeholder: "3", kind: "number", min: 0, max: 3, step: 1 },
-      { key: "hexplane_resolution", label: "HexPlane resolution", placeholder: "64", kind: "number", min: 16, step: 16 },
-      { key: "hexplane_feat_dim", label: "HexPlane feature dim", placeholder: "32", kind: "number", min: 8, step: 8 },
-      { key: "mlp_width", label: "Deformation MLP width", placeholder: "256", kind: "number", min: 32, step: 32 },
+      { key: "hexplane_resolution", label: "HexPlane resolution", placeholder: "96", kind: "number", min: 16, step: 16, help: "v2 default 96 (eski: 64)" },
+      { key: "hexplane_feat_dim", label: "HexPlane feature dim", placeholder: "48", kind: "number", min: 8, step: 8, help: "v2 default 48 (eski: 32)" },
+      { key: "mlp_width", label: "Deformation MLP width", placeholder: "512", kind: "number", min: 32, step: 32, help: "v2 default 512 (eski: 256)" },
+      { key: "mlp_depth", label: "Deformation MLP depth", placeholder: "4", kind: "number", min: 1, max: 8, step: 1, help: "Hidden layer sayısı" },
+      { key: "num_time_freqs", label: "Fourier time freqs", placeholder: "6", kind: "number", min: 0, max: 12, step: 1, help: "0 = kapalı" },
+    ],
+  },
+  {
+    title: "Foundation modeller (Faz 3)",
+    icon: "🜚",
+    fields: [
+      { key: "metric3d_model", label: "Metric3D model", placeholder: "metric3d_vit_small", kind: "string", help: "small / large / giant2" },
+      { key: "cotracker_num_points", label: "CoTracker nokta sayısı", placeholder: "2048", kind: "number", min: 256, step: 256 },
+      { key: "cotracker_grid_size", label: "CoTracker grid NxN", placeholder: "30", kind: "number", min: 10, max: 60, step: 5 },
+      { key: "sam2_threshold", label: "SAM2 threshold", placeholder: "0.5", kind: "number", min: 0, max: 1, step: 0.05 },
     ],
   },
 ];

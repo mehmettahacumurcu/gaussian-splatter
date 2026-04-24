@@ -72,6 +72,8 @@ export interface HyperParams {
   lambda_deform_reg?: number | null;
   lambda_smoothness?: number | null;
   lambda_rigidity?: number | null;
+  lambda_depth?: number | null;
+  lambda_mask_motion?: number | null;
   // Learning rates
   lr_deform?: number | null;
   lr_means?: number | null;
@@ -87,6 +89,13 @@ export interface HyperParams {
   hexplane_resolution?: number | null;
   hexplane_feat_dim?: number | null;
   mlp_width?: number | null;
+  mlp_depth?: number | null;
+  num_time_freqs?: number | null;
+  // Foundation models
+  metric3d_model?: string | null;
+  cotracker_num_points?: number | null;
+  cotracker_grid_size?: number | null;
+  sam2_threshold?: number | null;
 }
 
 export interface SubmitJobOptions {

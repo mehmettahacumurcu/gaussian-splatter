@@ -76,40 +76,76 @@ def run_pipeline(
     status["frames"] = "ok"
     cb("frames", 1.0, "Kareler hazır", {})
 
-    # -------- Faz 2b-c: COLMAP --------
+    # -------- Faz 2b-c: COLMAP (cache'li + progress hook) --------
     print("\n[Faz 2b] COLMAP SfM")
-    cb("colmap", 0.0, "Kamera pozları tahmin ediliyor (feature + match + mapper)", {})
-    run_colmap(
-        paths["frames"], paths["colmap"],
-        camera_model=cfg.preprocess.colmap_camera_model,
-        use_gpu=cfg.preprocess.colmap_use_gpu,
-        sequential=True,
-        colmap_exe=cfg.preprocess.colmap_exe,
-    )
-    cams = parse_cameras(paths["colmap"])
-    xyz, rgb = load_points3d(paths["colmap"])
+    cb("colmap", 0.0, "COLMAP başlıyor", {})
+    # Cache check — eğer sparse zaten hazırsa tekrar koşma
+    try:
+        cams = parse_cameras(paths["colmap"])
+        xyz, rgb = load_points3d(paths["colmap"])
+        print(f"✓ COLMAP cache hit: {len(cams)} kamera, {len(xyz)} nokta (rerun atlandı)")
+        cb("colmap", 1.0, f"cache hit: {len(cams)} kamera", {"cache": True})
+    except (FileNotFoundError, RuntimeError):
+        # COLMAP stream progress → pipeline callback'e relay
+        def _colmap_on_progress(frac: float, msg: str) -> None:
+            cb("colmap", frac, msg, {"colmap_fraction": frac})
+
+        run_colmap(
+            paths["frames"], paths["colmap"],
+            camera_model=cfg.preprocess.colmap_camera_model,
+            use_gpu=cfg.preprocess.colmap_use_gpu,
+            sequential=True,
+            colmap_exe=cfg.preprocess.colmap_exe,
+            on_progress=_colmap_on_progress,
+        )
+        cams = parse_cameras(paths["colmap"])
+        xyz, rgb = load_points3d(paths["colmap"])
     status["colmap"] = f"{len(cams)} kamera, {len(xyz)} nokta"
     cb("colmap", 1.0, f"{len(cams)} kamera, {len(xyz)} 3B nokta",
        {"cameras": len(cams), "points": len(xyz)})
 
-    # -------- Faz 3: Foundation modeller (opsiyonel) --------
+    # -------- Faz 3: Foundation modeller (opsiyonel, resilient) --------
+    # Her fazın hatası diğerlerini etkilemesin — biri patlasa bile pipeline devam eder.
     if not skip_foundation:
-        print("\n[Faz 3a] Metric3D-v2 derinlik tahmini")
-        cb("foundation", 0.0, "Derinlik tahmini (Metric3D)", {})
-        from .preprocess.depth_estimate import estimate_depth
-        estimate_depth(paths["frames"], paths["depth"],
-                       model_name=cfg.foundation.metric3d_model)
-        cb("foundation", 0.33, "CoTracker çalışıyor", {})
+        foundation_status = {"depth": "pending", "tracks": "pending", "masks": "pending"}
+
+        # 3a — Depth
+        print("\n[Faz 3a] MiDaS derinlik tahmini")
+        cb("foundation", 0.0, "Derinlik tahmini", {})
+        try:
+            from .preprocess.depth_estimate import estimate_depth
+            estimate_depth(paths["frames"], paths["depth"],
+                           model_name=cfg.foundation.metric3d_model)
+            foundation_status["depth"] = "ok"
+        except Exception as e:
+            print(f"⚠ Derinlik tahmini başarısız, atlanıyor: {e}")
+            foundation_status["depth"] = f"failed: {e}"
+        cb("foundation", 0.33, "Depth done, CoTracker başlıyor", {})
+
+        # 3b — Tracks
         print("\n[Faz 3b] CoTracker piksel takibi")
-        from .preprocess.point_tracking import track_points
-        track_points(paths["frames"], paths["tracks"] / "tracks.pt",
-                     grid_size=cfg.foundation.cotracker_grid_size)
-        cb("foundation", 0.66, "Dinamik maske hesaplanıyor", {})
+        try:
+            from .preprocess.point_tracking import track_points
+            track_points(paths["frames"], paths["tracks"] / "tracks.pt",
+                         grid_size=cfg.foundation.cotracker_grid_size)
+            foundation_status["tracks"] = "ok"
+        except Exception as e:
+            print(f"⚠ Tracking başarısız, atlanıyor: {e}")
+            foundation_status["tracks"] = f"failed: {e}"
+        cb("foundation", 0.66, "Tracks done, dinamik maske başlıyor", {})
+
+        # 3c — Dynamic mask
         print("\n[Faz 3c] Dinamik maske")
-        from .preprocess.dynamic_mask import compute_dynamic_masks
-        compute_dynamic_masks(paths["frames"], paths["masks"])
-        status["foundation"] = "ok"
-        cb("foundation", 1.0, "Foundation modeller tamamlandı", {})
+        try:
+            from .preprocess.dynamic_mask import compute_dynamic_masks
+            compute_dynamic_masks(paths["frames"], paths["masks"])
+            foundation_status["masks"] = "ok"
+        except Exception as e:
+            print(f"⚠ Maske başarısız, atlanıyor: {e}")
+            foundation_status["masks"] = f"failed: {e}"
+
+        status["foundation"] = ", ".join(f"{k}={v}" for k, v in foundation_status.items())
+        cb("foundation", 1.0, f"Foundation bitti: {status['foundation']}", foundation_status)
     else:
         print("\n[Faz 3] Foundation modeller atlandı (--skip-foundation)")
         status["foundation"] = "skipped"
@@ -135,6 +171,8 @@ def run_pipeline(
         resolution=cfg.model.hexplane_resolution,
         feat_dim=cfg.model.hexplane_feat_dim,
         mlp_width=cfg.model.mlp_width,
+        mlp_depth=cfg.model.mlp_depth,
+        num_time_freqs=cfg.model.num_time_freqs,
     )
     extent = compute_scene_extent(xyz)
     print(f"  Sahne kapsamı: {extent:.3f}, başlangıç Gaussian: {gs.num_points:,}")
@@ -179,7 +217,12 @@ def run_pipeline(
         lambda_deform_reg=cfg.train.lambda_deform_reg,
         lambda_smoothness=cfg.train.lambda_smoothness,
         lambda_rigidity=cfg.train.lambda_rigidity,
+        lambda_depth=cfg.train.lambda_depth,
+        lambda_mask_motion=cfg.train.lambda_mask_motion,
     )
+    # Foundation çıktıları varsa trainer'a ver (stage 2 loss'lar için)
+    depth_dir_arg = paths["depth"] if (not skip_foundation and paths["depth"].exists()) else None
+    mask_dir_arg  = paths["masks"] if (not skip_foundation and paths["masks"].exists()) else None
     # Trainer ilerlemesini pipeline callback'ine relay eden köprü:
     # trainer iç ilerlemesini (0-1 arası) "training" fazına map ederiz.
     def _train_progress(iter_idx: int, total: int, loss: float,
@@ -203,6 +246,8 @@ def run_pipeline(
         ckpt_interval=cfg.train.ckpt_interval,
         log_interval=cfg.train.log_interval,
         progress_callback=_train_progress,
+        depth_dir=depth_dir_arg,
+        mask_dir=mask_dir_arg,
     )
     status["training"] = f"{cfg.train.n_iters} iter, son loss={history['loss'][-1]:.4f}"
     cb("training", 1.0, f"Training bitti, son loss={history['loss'][-1]:.4f}",
@@ -256,7 +301,6 @@ def main():
         cfg.preprocess.colmap_exe = args.colmap_exe
 
     if args.smoke_test:
-        # Uçtan uca her şeyin çalıştığını hızlıca doğrulayan preset
         cfg.train.n_iters = 500
         cfg.train.image_resolution = (480, 270)
         cfg.train.ckpt_interval = 500
@@ -278,7 +322,7 @@ def main():
         skip_training=args.skip_training,
         skip_export=args.skip_export,
     )
-    print(f"\n=== Pipeline tamamlandı ({time.time()-t0:.1f}s) ===")
+    print(f"\n=== Pipeline tamamlandi ({time.time()-t0:.1f}s) ===")
     for k, v in status.items():
         print(f"  {k}: {v}")
 

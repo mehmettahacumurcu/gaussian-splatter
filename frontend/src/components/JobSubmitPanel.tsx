@@ -20,7 +20,7 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [scene, setScene] = useState("");
   const [preset, setPreset] = useState<Preset>("smoke");
-  const [skipFoundation, setSkipFoundation] = useState(true);
+  const [skipFoundation, setSkipFoundation] = useState(false);
   const [hyperparams, setHyperparams] = useState<HyperParams>({});
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [submitting, setSubmitting] = useState(false);

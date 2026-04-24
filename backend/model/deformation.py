@@ -2,17 +2,25 @@
 
 Statik Gaussian'lar için zaman-bağımlı (Δpos, Δquat, Δscale) sapması öğrenir.
 HexPlane (4DGaussians paper) 4D uzayı 6 düzleme ayırarak O(n²) bellek kullanır.
+
+v2 — genişletilmiş mimari:
+  - Varsayılan mlp_width 256 → 512, mlp_depth 2 → 4 hidden layer
+  - HexPlane resolution 64 → 96, feat_dim 32 → 48
+  - Zaman t için Fourier positional encoding (num_time_freqs varsayılan 6)
+    Bu MLP'nin zaman boyutunu daha iyi ayırt etmesini sağlar —
+    linear t ile MLP genelde zamansız davranır.
 """
 from __future__ import annotations
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class HexPlane(nn.Module):
-    """6 düzlem: XY, XZ, YZ, XT, YT, ZT — feature dim'i çarp veya topla."""
+    """6 düzlem: XY, XZ, YZ, XT, YT, ZT — feature dim'i concat."""
 
-    def __init__(self, resolution: int = 64, feat_dim: int = 32):
+    def __init__(self, resolution: int = 96, feat_dim: int = 48):
         super().__init__()
         self.resolution = resolution
         self.feat_dim = feat_dim
@@ -23,22 +31,12 @@ class HexPlane(nn.Module):
 
     @staticmethod
     def _sample_plane(plane: torch.Tensor, c1: torch.Tensor, c2: torch.Tensor) -> torch.Tensor:
-        """
-        Bilinear sample (N, feat_dim).
-        c1, c2: (N,) ∈ [-1, 1]
-        """
         grid = torch.stack([c1, c2], dim=-1).view(1, 1, -1, 2)
-        feat = F.grid_sample(plane, grid, mode='bilinear',
-                             align_corners=True, padding_mode='border')
+        feat = F.grid_sample(plane, grid, mode="bilinear",
+                             align_corners=True, padding_mode="border")
         return feat.squeeze(0).squeeze(1).T   # (N, feat_dim)
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor, z: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x, y, z, t: (N,) ∈ [-1, 1]
-        Returns:
-            (N, feat_dim * 6) — 6 düzlemden örneklenmiş feature'lar concat
-        """
+    def forward(self, x, y, z, t):
         feats = [
             self._sample_plane(self.planes[0], x, y),  # XY
             self._sample_plane(self.planes[1], x, z),  # XZ
@@ -50,47 +48,80 @@ class HexPlane(nn.Module):
         return torch.cat(feats, dim=-1)
 
 
-class DeformationField(nn.Module):
-    """HexPlane + MLP → (Δpos, Δquat, Δscale)."""
+def fourier_encode_scalar(value: float, num_freqs: int, device) -> torch.Tensor:
+    """
+    [t, sin(πt), cos(πt), sin(2πt), cos(2πt), ..., sin(2^(L-1)·πt), cos(...)].
+    Size: 1 + 2*num_freqs.
+    """
+    base = torch.tensor([value], device=device)
+    encs = [base]
+    for i in range(num_freqs):
+        freq = (2.0 ** i) * math.pi
+        encs.append(torch.sin(freq * base))
+        encs.append(torch.cos(freq * base))
+    return torch.cat(encs, dim=0)
 
-    def __init__(self, resolution: int = 64, feat_dim: int = 32, mlp_width: int = 256):
+
+class DeformationField(nn.Module):
+    """HexPlane + MLP → (Δpos, Δquat, Δscale). Fourier-encoded t."""
+
+    def __init__(
+        self,
+        resolution: int = 96,
+        feat_dim: int = 48,
+        mlp_width: int = 512,
+        mlp_depth: int = 4,         # hidden layer sayısı (önceki: implicit 2)
+        num_time_freqs: int = 6,    # Fourier frekans sayısı (0 = kapalı)
+    ):
         super().__init__()
         self.hexplane = HexPlane(resolution, feat_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(feat_dim * 6, mlp_width), nn.SiLU(),
-            nn.Linear(mlp_width, mlp_width),    nn.SiLU(),
-            nn.Linear(mlp_width, 10),           # Δpos (3) + Δquat (4) + Δscale (3)
-        )
-        # Son katmanı sıfır ile başlat → eğitim başında identity deformation
+        self.num_time_freqs = num_time_freqs
+
+        # Girdi: HexPlane features (feat_dim*6) + Fourier time (1 + 2*L)
+        t_dim = 1 + 2 * num_time_freqs
+        input_dim = feat_dim * 6 + t_dim
+
+        # MLP: input → width → width → ... (mlp_depth katman) → 10
+        layers = []
+        prev = input_dim
+        for _ in range(mlp_depth):
+            layers.append(nn.Linear(prev, mlp_width))
+            layers.append(nn.SiLU())
+            prev = mlp_width
+        layers.append(nn.Linear(prev, 10))      # Δpos(3) + Δquat(4) + Δscale(3)
+        self.mlp = nn.Sequential(*layers)
+
+        # Son katmanı sıfır ile başlat → eğitim başında identity
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
     @staticmethod
     def _normalize_means(means: torch.Tensor, scene_extent: float) -> torch.Tensor:
-        """Means'i [-1, 1]'e normalize et (sahne kapsamına göre)."""
         return torch.clamp(means / max(scene_extent, 1e-6), -1.0, 1.0)
 
     def forward(
         self,
-        means: torch.Tensor,        # (N, 3) — orijinal ya da normalize edilmiş
+        means: torch.Tensor,        # (N, 3)
         t: float,                   # ∈ [0, 1]
-        scene_extent: float = 1.0,  # means henüz normalize değilse
+        scene_extent: float = 1.0,
         already_normalized: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            delta_pos:   (N, 3)
-            delta_quat:  (N, 4)
-            delta_scale: (N, 3)  — log-space (yani eklenir, sonra exp alınır)
-        """
+    ):
         if not already_normalized:
             means = self._normalize_means(means, scene_extent)
 
         x, y, z = means[:, 0], means[:, 1], means[:, 2]
-        t_vec = torch.full_like(x, t * 2.0 - 1.0)   # [0,1] → [-1,1]
+        t_norm = t * 2.0 - 1.0  # → [-1, 1]
+        t_vec = torch.full_like(x, t_norm)
 
-        feat = self.hexplane(x, y, z, t_vec)        # (N, feat_dim * 6)
-        delta = self.mlp(feat)                      # (N, 10)
+        # HexPlane feat (N, feat_dim*6)
+        hex_feat = self.hexplane(x, y, z, t_vec)
+
+        # Fourier time encoding — aynı değer her gaussian için (N kopyası)
+        t_enc = fourier_encode_scalar(t_norm, self.num_time_freqs, means.device)
+        t_enc_broadcast = t_enc.unsqueeze(0).expand(means.shape[0], -1)
+
+        feat = torch.cat([hex_feat, t_enc_broadcast], dim=-1)
+        delta = self.mlp(feat)
 
         return delta[:, :3], delta[:, 3:7], delta[:, 7:10]
 
@@ -99,12 +130,13 @@ class DeformationField(nn.Module):
 # Hızlı sağlık testi
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    field = DeformationField(resolution=32, feat_dim=16, mlp_width=64)
+    field = DeformationField()
     means = torch.randn(500, 3)
     dpos, dquat, dscale = field(means, t=0.5, scene_extent=2.0)
-    print(f"Δpos:   {dpos.shape}, max abs = {dpos.abs().max():.6f} (zero-init → 0 olmalı)")
-    print(f"Δquat:  {dquat.shape}")
-    print(f"Δscale: {dscale.shape}")
-    # Param sayısı
     n_params = sum(p.numel() for p in field.parameters())
-    print(f"Toplam parametre: {n_params:,}")
+    print(f"Default config params: {n_params:,}")
+    print(f"Δpos max abs (zero-init): {dpos.abs().max():.6f}")
+
+    field_small = DeformationField(resolution=64, feat_dim=32, mlp_width=256, mlp_depth=2)
+    n_small = sum(p.numel() for p in field_small.parameters())
+    print(f"Previous default config params: {n_small:,}")

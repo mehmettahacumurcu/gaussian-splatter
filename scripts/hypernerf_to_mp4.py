@@ -92,12 +92,15 @@ def main():
     print(f"[info] {len(frames)} frame (çözünürlük {args.res}, {args.fps} fps) -> {out}")
     print(f"[info] beklenen süre: {len(frames) / args.fps:.1f} saniye")
 
+    # -fps_mode cfr: constant frame rate zorla. VFR çıktı, downstream
+    # ffmpeg -vf fps=10 filtresini yanıltıyordu (beklenenin 3x'i frame).
     cmd = [
         "ffmpeg", "-y", "-hide_banner",
         "-loglevel", "warning",
         "-f", "concat", "-safe", "0",
         "-i", str(list_file),
-        "-vsync", "vfr",
+        "-fps_mode", "cfr",
+        "-r", str(args.fps),
         "-pix_fmt", "yuv420p",
         "-c:v", "libx264",
         "-preset", "medium",

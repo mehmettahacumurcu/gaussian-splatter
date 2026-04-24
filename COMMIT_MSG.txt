@@ -1,28 +1,64 @@
-feat(ui): hyperparameter panel + tab layout + job submission (Phase 8b)
+feat(stage2): foundation losses + bigger MLP + pipeline hardening
 
-Backend:
-- config.py: TrainConfig gets motion regularizer fields
-  (lambda_deform_reg, lambda_smoothness, lambda_rigidity)
-- pipeline.py: pass motion reg values to Trainer
-- api.py: /process accepts 18 optional hyperparameter overrides:
-  training (iters/resolution/num_timestamps/fps), loss weights,
-  learning rates, density control, model architecture
+Backend — Stage 2 motion priors:
+- trainer.py: depth consistency loss (scale-invariant L1 via
+  median ratio alignment) + mask-weighted reconstruction
+  (dynamic pixels get 1 + lambda_mask × mask weight)
+- deformation.py: MLP width 256→512, depth 2→4 hidden layers,
+  Fourier time encoding (num_time_freqs=6, 2L+1 dims appended
+  to HexPlane features). ~3.6× parameter count vs v1, still
+  trivial compared to N×300K gaussians.
+- config.py: new TrainConfig fields (lambda_deform_reg=1e-3,
+  lambda_smoothness=1e-2, lambda_rigidity=1e-2, lambda_depth=0.1,
+  lambda_mask_motion=1.0) + ModelConfig (mlp_depth, num_time_freqs)
+- renderer.py: with_depth=True now runs TWO separate gsplat
+  rasterization calls (RGB + ED) instead of RGB+D mode —
+  works around version-specific background shape quirks.
 
-Frontend (Phase 8b):
-- api.ts: submitJob(File, opts) with FormData upload, full types
-- HyperparameterPanel: 5 collapsible groups, override count badges,
-  null preserves backend default
-- JobSubmitPanel: HTML file picker (no Tauri plugin needed), auto
-  scene name from filename, preset chips, skip_foundation toggle,
-  integrated hyperparameter panel
-- JobsList: polls /jobs every 2s, progress bars, expand with
-  traceback + "Viewer'da ac" + ".zip indir" actions
-- App.tsx: 3-tab navigation (Yeni Job / Jobs / Viewer), viewer
-  moved to own tab with key={job_id} remount guard
-- App.css: 200+ new lines for tabs, hparam groups, job rows,
-  progress bars, preset chips, file picker
+Backend — robustness:
+- pipeline.py: foundation phase now resilient (try/except per
+  subphase, one failure doesn't abort pipeline). COLMAP cache
+  check: if parse_cameras succeeds on existing data/<scene>/colmap,
+  skip rerun. Threads depth_dir/mask_dir to trainer when
+  foundation ran.
+- run_colmap.py: subprocess.Popen with line streaming, regex
+  parsing of feature_extractor / matcher / mapper stdout, calls
+  on_progress(fraction, message) with phase-mapped ranges
+  (feat 0-0.15, match 0.15-0.40, mapper 0.40-0.95, converter
+  0.95-1.0). End of 6% progress freezes.
 
-CSS sizing fix: viewer-canvas gets flex:1 + min-height:300px
-to prevent collapse when grid math fails.
+Backend — Metric3D → MiDaS:
+- depth_estimate.py rewritten: intel-isl/MiDaS via torch.hub
+  (no mmcv/mmengine dependency which was Windows install hell).
+  Supports DPT_Small/Hybrid/Large. Old metric3d_vit_* names
+  auto-map. Outputs are inverse-depth → inverted to depth for
+  intuitive scale-invariant comparison.
 
-No new runtime dependencies. Vite/React/Three.js stack unchanged.
+Backend — API surface:
+- api.py: /process accepts 24 optional hyperparameter overrides
+  grouped (training, losses, lr, density, model, foundation).
+  All default None → backend preset/default used if unset.
+
+Frontend (Phase 8b continuation):
+- HyperparameterPanel: 6 collapsible groups with override badges,
+  Foundation models group added, lambda_depth + lambda_mask_motion
+  + mlp_depth + num_time_freqs fields wired to API.
+- JobSubmitPanel: skip_foundation default changed to False (now
+  that foundation actually runs and integrates with trainer).
+- api.ts: HyperParams interface expanded with all new fields.
+
+Scripts:
+- hypernerf_to_mp4.py: switched from -vsync vfr to -fps_mode cfr
+  with -r <fps>, prevents VFR output that confused downstream
+  ffmpeg fps filter (was extracting 3× expected frame count).
+
+Verified via smoke tests:
+- Foundation phase end-to-end (MiDaS depth + CoTracker tracks +
+  Farneback masks all produce expected .npy/.pt/.png outputs).
+- Training completes with depth + mask losses active (log shows
+  "Depth loss aktif" / "Mask-weighted recon aktif").
+- COLMAP progress hook streams %-progress per phase.
+
+Motion still subtle — next session will connect CoTracker tracks
+into trainer (currently generated but not consumed) for stronger
+motion supervision signal. Task #41 RAFT dense flow still deferred.

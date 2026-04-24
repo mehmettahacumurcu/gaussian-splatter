@@ -13,7 +13,6 @@ from pathlib import Path
 # Yollar
 # ---------------------------------------------------------------------------
 
-# Proje kökü (bu dosyanın iki üstü)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = PROJECT_ROOT / "data"
 
@@ -39,12 +38,12 @@ def scene_paths(scene_name: str) -> dict[str, Path]:
 
 @dataclass
 class PreprocessConfig:
-    fps: int = 10                    # Frame çıkarma fps
-    resize_long_edge: int | None = 960  # Frame'leri yeniden boyutlandır (None = orijinal)
-    colmap_camera_model: str = "PINHOLE"  # ya da SIMPLE_RADIAL
+    fps: int = 10
+    resize_long_edge: int | None = 960
+    colmap_camera_model: str = "PINHOLE"
     colmap_use_gpu: bool = True
-    sequential_overlap: int = 10     # Sequential matcher overlap
-    colmap_exe: str | None = None    # None → COLMAP_EXE env var / PATH'te ara
+    sequential_overlap: int = 10
+    colmap_exe: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +52,7 @@ class PreprocessConfig:
 
 @dataclass
 class FoundationConfig:
-    metric3d_model: str = "metric3d_vit_small"   # _small: hızlı, _large: kaliteli
+    metric3d_model: str = "metric3d_vit_small"
     cotracker_num_points: int = 2048
     cotracker_grid_size: int = 30
     sam2_threshold: float = 0.5
@@ -65,19 +64,20 @@ class FoundationConfig:
 
 @dataclass
 class ModelConfig:
-    # Başlangıç
-    init_random_points: int = 0      # 0 = sadece COLMAP noktalarını kullan
-    sh_degree: int = 3               # Spherical Harmonics derecesi
-    # Deformation field
-    hexplane_resolution: int = 64
-    hexplane_feat_dim: int = 32
-    mlp_width: int = 256
+    init_random_points: int = 0
+    sh_degree: int = 3
+    # Deformation field — v2 genişletildi
+    hexplane_resolution: int = 96
+    hexplane_feat_dim: int = 48
+    mlp_width: int = 512
+    mlp_depth: int = 4
+    num_time_freqs: int = 6
 
 
 @dataclass
 class TrainConfig:
     n_iters: int = 30_000
-    image_resolution: tuple[int, int] = (640, 360)  # (W, H)
+    image_resolution: tuple[int, int] = (640, 360)
     batch_size: int = 1
     lambda_ssim: float = 0.2
     # Adam learning rates
@@ -99,6 +99,9 @@ class TrainConfig:
     lambda_deform_reg: float = 1e-3
     lambda_smoothness: float = 1e-2
     lambda_rigidity: float = 1e-2
+    # Foundation model losses (Stage 2)
+    lambda_depth: float = 0.1
+    lambda_mask_motion: float = 1.0
     # Checkpoint
     ckpt_interval: int = 1000
     log_interval: int = 50
@@ -106,8 +109,8 @@ class TrainConfig:
 
 @dataclass
 class ExportConfig:
-    num_timestamps: int = 60         # Kaç zaman adımı export edilecek
-    format: str = "ply"              # "ply" | "splat"
+    num_timestamps: int = 60
+    format: str = "ply"
 
 
 # ---------------------------------------------------------------------------

@@ -110,6 +110,8 @@ async def process_video(
     lambda_deform_reg: float | None = Form(None, description="Deformation L2 reg"),
     lambda_smoothness: float | None = Form(None, description="Temporal smoothness"),
     lambda_rigidity: float | None = Form(None, description="Isometric rigidity"),
+    lambda_depth: float | None = Form(None, description="Depth consistency (Metric3D)"),
+    lambda_mask_motion: float | None = Form(None, description="Dynamic mask weight"),
     # Learning rates
     lr_deform: float | None = Form(None, description="Deformation field LR"),
     lr_means: float | None = Form(None, description="Gaussian means LR"),
@@ -125,6 +127,13 @@ async def process_video(
     hexplane_resolution: int | None = Form(None, description="HexPlane grid çözünürlük"),
     hexplane_feat_dim: int | None = Form(None, description="HexPlane feature dim"),
     mlp_width: int | None = Form(None, description="Deformation MLP genişlik"),
+    mlp_depth: int | None = Form(None, description="Deformation MLP hidden layer sayısı"),
+    num_time_freqs: int | None = Form(None, description="Fourier time encoding frekans sayısı"),
+    # Foundation models (Faz 3)
+    metric3d_model: str | None = Form(None, description="metric3d_vit_small | _large | _giant2"),
+    cotracker_num_points: int | None = Form(None, description="CoTracker nokta sayısı"),
+    cotracker_grid_size: int | None = Form(None, description="CoTracker grid NxN"),
+    sam2_threshold: float | None = Form(None, description="SAM2 confidence eşiği"),
 ) -> ProcessResponse:
     """
     Video'yu upload et ve pipeline'ı kuyruğa al.
@@ -196,6 +205,10 @@ async def process_video(
             cfg.train.lambda_smoothness = lambda_smoothness
         if lambda_rigidity is not None:
             cfg.train.lambda_rigidity = lambda_rigidity
+        if lambda_depth is not None:
+            cfg.train.lambda_depth = lambda_depth
+        if lambda_mask_motion is not None:
+            cfg.train.lambda_mask_motion = lambda_mask_motion
         # Learning rates
         if lr_deform is not None:
             cfg.train.lr_deform = lr_deform
@@ -223,6 +236,19 @@ async def process_video(
             cfg.model.hexplane_feat_dim = hexplane_feat_dim
         if mlp_width is not None:
             cfg.model.mlp_width = mlp_width
+        if mlp_depth is not None:
+            cfg.model.mlp_depth = mlp_depth
+        if num_time_freqs is not None:
+            cfg.model.num_time_freqs = num_time_freqs
+        # Foundation models
+        if metric3d_model is not None:
+            cfg.foundation.metric3d_model = metric3d_model
+        if cotracker_num_points is not None:
+            cfg.foundation.cotracker_num_points = cotracker_num_points
+        if cotracker_grid_size is not None:
+            cfg.foundation.cotracker_grid_size = cotracker_grid_size
+        if sam2_threshold is not None:
+            cfg.foundation.sam2_threshold = sam2_threshold
 
         return run_pipeline(
             str(video_path),
