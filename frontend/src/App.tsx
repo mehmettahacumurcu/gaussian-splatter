@@ -12,6 +12,7 @@ import { SplatViewer } from "./components/SplatViewer";
 import { TimelineSlider } from "./components/TimelineSlider";
 import { JobSubmitPanel } from "./components/JobSubmitPanel";
 import { JobsList } from "./components/JobsList";
+import { TrainingAnalytics } from "./components/TrainingAnalytics";
 import {
   API_BASE,
   getHealth,
@@ -24,7 +25,7 @@ import {
   type SplatInfo,
 } from "./api";
 
-type Tab = "submit" | "jobs" | "viewer";
+type Tab = "submit" | "jobs" | "viewer" | "analytics";
 
 type ViewerState =
   | { kind: "idle" }
@@ -64,6 +65,8 @@ function App() {
   const [diskScenes, setDiskScenes] = useState<SceneListItem[] | null>(null);
   const [diskPanelOpen, setDiskPanelOpen] = useState(false);
   const [diskLoading, setDiskLoading] = useState(false);
+  // Analytics — son/aktif job için
+  const [analyticsScene, setAnalyticsScene] = useState<string>("");
 
   // Health poll (her 5 sn)
   useEffect(() => {
@@ -102,8 +105,10 @@ function App() {
     }
   }, []);
 
-  const handleJobSubmitted = useCallback((_resp: any, _sceneName: string) => {
+  const handleJobSubmitted = useCallback((_resp: any, sceneName: string) => {
     // Job başarıyla gönderildi, Jobs tab'ına geç — kullanıcı ilerlemeyi takip etsin
+    // Analytics'e de aynı sahneyi otomatik bağla
+    setAnalyticsScene(sceneName);
     setTab("jobs");
   }, []);
 
@@ -187,6 +192,12 @@ function App() {
           >
             Viewer
           </button>
+          <button
+            className={`tab-btn ${tab === "analytics" ? "active" : ""}`}
+            onClick={() => setTab("analytics")}
+          >
+            Analiz
+          </button>
         </nav>
         <div className="app-status">{backendBadge}</div>
       </header>
@@ -201,6 +212,50 @@ function App() {
           <div className="tab-content">
             <h2 className="tab-title">Tüm Jobs</h2>
             <JobsList onViewJob={handleViewJob} />
+          </div>
+        )}
+
+        {tab === "analytics" && (
+          <div className="tab-content">
+            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 20px 0" }}>
+              <input
+                type="text"
+                value={analyticsScene}
+                placeholder="sahne adı (örn. cutlemon_v3_1_micro) veya job id"
+                onChange={(e) => setAnalyticsScene(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") setAnalyticsScene((v) => v.trim());
+                }}
+                style={{ flex: 1, maxWidth: 500 }}
+              />
+              <button
+                className="btn-secondary"
+                onClick={async () => {
+                  try {
+                    const { jobs } = await listJobs();
+                    const active = jobs.find(
+                      (j) => j.status === "running" || j.status === "queued",
+                    );
+                    if (active) setAnalyticsScene(active.scene);
+                    else {
+                      const last = jobs[0];
+                      if (last) setAnalyticsScene(last.scene);
+                    }
+                  } catch {
+                    /* ignore */
+                  }
+                }}
+              >
+                Aktif/son job
+              </button>
+            </div>
+            {analyticsScene ? (
+              <TrainingAnalytics scene={analyticsScene} autoRefresh={true} />
+            ) : (
+              <div style={{ padding: 20, color: "#888" }}>
+                Sahne adını gir ve Enter — ya da "Aktif/son job" butonuna bas.
+              </div>
+            )}
           </div>
         )}
 

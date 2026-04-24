@@ -14,7 +14,7 @@ interface Props {
   onJobSubmitted: (response: ProcessResponse, sceneName: string) => void;
 }
 
-type Preset = "smoke" | "full" | "cloud";
+type Preset = "micro" | "smoke" | "full" | "cloud";
 
 export function JobSubmitPanel({ onJobSubmitted }: Props) {
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -50,6 +50,7 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
     try {
       const res = await submitJob(videoFile, {
         scene: scene.trim(),
+        micro_test: preset === "micro",
         smoke_test: preset === "smoke",
         cloud: preset === "cloud",
         skip_foundation: skipFoundation,
@@ -113,6 +114,17 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
       <div className="submit-section">
         <label className="submit-label">Preset</label>
         <div className="preset-row">
+          <label className={`preset-chip ${preset === "micro" ? "active" : ""}`}>
+            <input
+              type="radio"
+              checked={preset === "micro"}
+              onChange={() => setPreset("micro")}
+            />
+            <div>
+              <div className="preset-name">Micro ⚡</div>
+              <div className="preset-desc">200 iter, 320x180, 5 ts · foundation kapalı ~30 sn · açık ~5-10 dk</div>
+            </div>
+          </label>
           <label className={`preset-chip ${preset === "smoke" ? "active" : ""}`}>
             <input
               type="radio"
@@ -121,7 +133,7 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
             />
             <div>
               <div className="preset-name">Smoke</div>
-              <div className="preset-desc">500 iter, 480x270, 10 ts · ~1-2 dk</div>
+              <div className="preset-desc">500 iter, 480x270, 10 ts · ~5-15 dk</div>
             </div>
           </label>
           <label className={`preset-chip ${preset === "full" ? "active" : ""}`}>
@@ -147,6 +159,14 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
             </div>
           </label>
         </div>
+        {preset === "micro" && (
+          <p className="submit-hint">
+            ⚡ Dev iteration / preflight.
+            Foundation <strong>atla</strong> → ~30 sn (cache hit), sadece recon test.
+            Foundation <strong>aç</strong> → ~5-10 dk, tam Stage 2 preflight (MiDaS+CoTracker+tracks/depth loss).
+            CoTracker grid 30→15, MiDaS small — tümü hız optimize.
+          </p>
+        )}
       </div>
 
       {/* Foundation models toggle */}

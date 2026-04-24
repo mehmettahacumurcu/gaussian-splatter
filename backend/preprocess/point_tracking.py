@@ -68,12 +68,54 @@ def track_points(
     model = torch.hub.load("facebookresearch/co-tracker", model_name)
     model = model.to(device).eval()
 
-    print(f"→ Video tensoru yükleniyor (max_long_edge={max_long_edge})")
-    video = _load_video_tensor(Path(frames_dir), max_long_edge).to(device)
+    # OOM auto-fallback: grid / resolution'ı kademeli olarak düşürerek tekrar dene.
+    # cutlemon_full'de grid=30 + 720px @ 8GB VRAM → OOM oldu.
+    # Bu mekanizma "başarıyla küçültüp" tamamlar: 30→20→15 + 720→540→360.
+    attempts = [
+        (grid_size, max_long_edge),
+        (max(15, grid_size - 10), max_long_edge),
+        (15, 540),
+        (15, 360),
+    ]
+    # Dedup (aynı attempt'i tekrarlamasın)
+    seen = set()
+    unique_attempts = []
+    for a in attempts:
+        if a not in seen:
+            unique_attempts.append(a)
+            seen.add(a)
 
-    print(f"→ Tracking ({grid_size}x{grid_size} grid = {grid_size**2} nokta)")
-    with torch.no_grad():
-        pred_tracks, pred_visibility = model(video, grid_size=grid_size)
+    pred_tracks = None
+    pred_visibility = None
+    final_grid = None
+    final_edge = None
+    for attempt_i, (g, edge) in enumerate(unique_attempts):
+        try:
+            if attempt_i > 0:
+                print(f"→ OOM fallback attempt #{attempt_i + 1}: grid={g}, max_edge={edge}")
+                torch.cuda.empty_cache()
+            print(f"→ Video tensoru yükleniyor (max_long_edge={edge})")
+            video = _load_video_tensor(Path(frames_dir), edge).to(device)
+            print(f"→ Tracking ({g}x{g} grid = {g ** 2} nokta)")
+            with torch.no_grad():
+                pred_tracks, pred_visibility = model(video, grid_size=g)
+            final_grid, final_edge = g, edge
+            break
+        except torch.cuda.OutOfMemoryError as oom:
+            print(f"⚠ CUDA OOM (grid={g}, edge={edge}): {str(oom)[:80]}...")
+            try:
+                del video
+            except NameError:
+                pass
+            torch.cuda.empty_cache()
+            if attempt_i == len(unique_attempts) - 1:
+                print("⚠ Tüm fallback'ler başarısız, CoTracker atlanıyor")
+                raise
+
+    if pred_tracks is None:
+        raise RuntimeError("CoTracker başarılı bir attempt üretemedi")
+    if (final_grid, final_edge) != (grid_size, max_long_edge):
+        print(f"ℹ CoTracker grid={grid_size}→{final_grid}, edge={max_long_edge}→{final_edge} fallback oldu")
 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)

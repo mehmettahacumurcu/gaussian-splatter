@@ -87,21 +87,37 @@ class TrainConfig:
     lr_opacities: float = 5e-2
     lr_sh_dc: float = 2.5e-3
     lr_sh_rest: float = 2.5e-3 / 20
-    lr_deform: float = 1e-3
-    # Density control
+    lr_deform: float = 3e-3             # v3: 1e-3 → 3e-3 — motion'un daha hızlı öğrenilmesi için (ÇALIŞIYOR)
+    # Density control — v3.1: aggressive prune revert, extended end korundu
     density_start_iter: int = 500
-    density_end_iter: int = 15_000
+    density_end_iter: int = 22_000      # v3: 15k → 22k (final prune'lar için)
     density_interval: int = 100
     densify_grad_threshold: float = 2e-4
     prune_min_opacity: float = 0.005
-    prune_max_scale: float = 0.1
-    # Motion regularizers (Stage 1)
-    lambda_deform_reg: float = 1e-3
-    lambda_smoothness: float = 1e-2
-    lambda_rigidity: float = 1e-2
-    # Foundation model losses (Stage 2)
+    prune_max_scale: float = 0.02       # v3.2: FRACTION of scene_extent (INRIA original intent)
+                                        # trainer.py içinde: effective = prune_max_scale * scene_extent
+                                        # 0.02 × 70 = 1.4 units → reasonable bloat cap
+    # Opacity reset — v3.1: kapatıldı (density control zaten prune yapıyor,
+    # bu interval aggressive prune ile birleşince %95 gaussian öldü)
+    opacity_reset_interval: int = 0     # v3.1: 3000 → 0 (KAPA)
+    # Motion regularizers (Stage 1) — v3.4: DENGE.
+    # v3.2: reg güçlü → motion yok
+    # v3.3: reg=0 → scales inf, training patladı
+    # v3.4: reg 1/10 of v3.2 — stability için minimum, motion'u killing değil
+    lambda_deform_reg: float = 3e-5     # v3.4: was 3e-4 (v3.2), 0 (v3.3) → 3e-5 (1/10)
+    lambda_smoothness: float = 2e-4     # v3.4: was 2e-3 (v3.2), 0 (v3.3) → 2e-4 (1/10)
+    lambda_rigidity: float = 2e-4       # v3.4: aynı, 1/10 of v3.2
+    # Scale regularizer — v3.1: ASIMETRIK hinge (sadece scene_extent %5 üzerini cezalandır)
+    # v3'te symmetric formul tüm scale'leri 1'e itip homogenization yaratmıştı.
+    # v3.1'de trainer.py içinde threshold-based hinge kullanılıyor (bkz. orada).
+    lambda_scale: float = 5e-3          # v3: 1e-3 → 5e-3 (5× güçlü ama asimetrik, sadece outlier hit)
+    # Foundation model losses (Stage 2) — v3.4 denge
     lambda_depth: float = 0.1
-    lambda_mask_motion: float = 1.0
+    lambda_mask_motion: float = 2.0     # v3.4: 1.0 → 2.0 (denge, v3.3'teki 3.0 overshoot)
+    lambda_track: float = 0.3           # v3.4: 0.1 (v3.2) × 3 = 0.3 (v3.3'teki 1.0 patlattı)
+    track_sample_k: int = 256           # Her iter kaç track sample'lansın
+    # Warmup (regularizer'lar linear 0 → full over first N iter)
+    warmup_iters: int = 500             # v3: 2000 → 500 (reg'ler erken devreye girsin ama yumuşak)
     # Checkpoint
     ckpt_interval: int = 1000
     log_interval: int = 50

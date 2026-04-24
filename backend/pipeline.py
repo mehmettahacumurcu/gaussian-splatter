@@ -27,6 +27,7 @@ from .model.gaussian_model      import GaussianModel
 from .model.deformation         import DeformationField
 from .model.trainer             import Trainer4DGS
 from .export.to_splat           import export_to_ply
+from .run_logger                import RunLogger
 
 
 # progress_callback imzası:
@@ -61,9 +62,28 @@ def run_pipeline(
         cfg = default_config()
     paths = scene_paths(scene_name)
     paths["base"].mkdir(parents=True, exist_ok=True)
+    (paths["output"] / "logs").mkdir(parents=True, exist_ok=True)
 
     cb: ProgressCallback = progress_callback or _noop_cb
     status = {}
+
+    # Run logger — tüm pipeline'ı takip eder, metrics/events/summary yazar
+    run_logger = RunLogger(paths["output"] / "logs", scene=scene_name)
+    run_logger.log_event(
+        "config",
+        skip_foundation=skip_foundation,
+        skip_training=skip_training,
+        skip_export=skip_export,
+        video_path=str(video_path),
+    )
+    try:
+        # Config'i de event olarak yaz (dataclass → dict)
+        from dataclasses import asdict as _asdict
+        run_logger.log_event("config_snapshot", **{
+            "cfg": _asdict(cfg),
+        })
+    except Exception:
+        pass
 
     # -------- Faz 2a: Frame çıkarma --------
     print("\n[Faz 2a] Frame çıkarma")
@@ -219,10 +239,17 @@ def run_pipeline(
         lambda_rigidity=cfg.train.lambda_rigidity,
         lambda_depth=cfg.train.lambda_depth,
         lambda_mask_motion=cfg.train.lambda_mask_motion,
+        lambda_track=cfg.train.lambda_track,
+        track_sample_k=cfg.train.track_sample_k,
+        lambda_scale=cfg.train.lambda_scale,
+        opacity_reset_interval=cfg.train.opacity_reset_interval,
+        warmup_iters=cfg.train.warmup_iters,
     )
     # Foundation çıktıları varsa trainer'a ver (stage 2 loss'lar için)
     depth_dir_arg = paths["depth"] if (not skip_foundation and paths["depth"].exists()) else None
     mask_dir_arg  = paths["masks"] if (not skip_foundation and paths["masks"].exists()) else None
+    tracks_file = paths["tracks"] / "tracks.pt"
+    tracks_path_arg = tracks_file if (not skip_foundation and tracks_file.exists()) else None
     # Trainer ilerlemesini pipeline callback'ine relay eden köprü:
     # trainer iç ilerlemesini (0-1 arası) "training" fazına map ederiz.
     def _train_progress(iter_idx: int, total: int, loss: float,
@@ -238,6 +265,7 @@ def run_pipeline(
         )
 
     cb("training", 0.0, "Training başlıyor", {"total_iters": cfg.train.n_iters})
+    run_logger.phase_start("training")
     history = trainer.train(
         frame_paths, K_first, w2c_list,
         n_iters=cfg.train.n_iters,
@@ -248,8 +276,25 @@ def run_pipeline(
         progress_callback=_train_progress,
         depth_dir=depth_dir_arg,
         mask_dir=mask_dir_arg,
+        tracks_path=tracks_path_arg,
+        run_logger=run_logger,
     )
-    status["training"] = f"{cfg.train.n_iters} iter, son loss={history['loss'][-1]:.4f}"
+    run_logger.phase_end(
+        "training",
+        final_loss=history["loss"][-1] if history["loss"] else None,
+        final_psnr=history["psnr"][-1] if history["psnr"] else None,
+        final_n=history["n_pts"][-1] if history["n_pts"] else None,
+    )
+    # Gerçek log entry sayısından effective iter hesapla (cfg.n_iters değil — aborted olabilir)
+    actual_logs = len(history.get("loss", []))
+    effective_iters = actual_logs * cfg.train.log_interval
+    if effective_iters < cfg.train.n_iters:
+        status["training"] = f"⚠ {effective_iters} iter (konfigdeki {cfg.train.n_iters} tamamlanamadı), son loss={history['loss'][-1]:.4f}"
+        run_logger.warn("training_incomplete",
+                        effective_iters=effective_iters,
+                        config_iters=cfg.train.n_iters)
+    else:
+        status["training"] = f"{effective_iters} iter, son loss={history['loss'][-1]:.4f}"
     cb("training", 1.0, f"Training bitti, son loss={history['loss'][-1]:.4f}",
        {"final_loss": history["loss"][-1] if history["loss"] else None,
         "final_psnr": history["psnr"][-1] if history["psnr"] else None,
@@ -275,6 +320,26 @@ def run_pipeline(
     cb("export", 1.0, f"{cfg.export.num_timestamps} .ply yazıldı",
        {"num_timestamps": cfg.export.num_timestamps,
         "ply_dir": str(paths["output"] / "ply")})
+
+    # Run summary — final metrics, config, PLY stats, phase durations
+    try:
+        ply_dir = paths["output"] / "ply"
+        ply_files = sorted(ply_dir.glob("*.ply")) if ply_dir.exists() else []
+        total_ply_bytes = sum(p.stat().st_size for p in ply_files)
+        run_logger.save_summary({
+            "status": status,
+            "config": cfg,
+            "final_loss": history["loss"][-1] if history.get("loss") else None,
+            "final_psnr": history["psnr"][-1] if history.get("psnr") else None,
+            "final_n_points": history["n_pts"][-1] if history.get("n_pts") else None,
+            "ply_count": len(ply_files),
+            "ply_total_bytes": total_ply_bytes,
+            "scene_extent": float(extent),
+        })
+    except Exception as _e:
+        print(f"  ⚠ summary save failed: {_e}")
+    run_logger.close()
+
     return status
 
 

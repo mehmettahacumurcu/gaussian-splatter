@@ -1,64 +1,97 @@
-feat(stage2): foundation losses + bigger MLP + pipeline hardening
+feat(train): v3.x stability + run logger + analytics dashboard
 
-Backend — Stage 2 motion priors:
-- trainer.py: depth consistency loss (scale-invariant L1 via
-  median ratio alignment) + mask-weighted reconstruction
-  (dynamic pixels get 1 + lambda_mask × mask weight)
-- deformation.py: MLP width 256→512, depth 2→4 hidden layers,
-  Fourier time encoding (num_time_freqs=6, 2L+1 dims appended
-  to HexPlane features). ~3.6× parameter count vs v1, still
-  trivial compared to N×300K gaussians.
-- config.py: new TrainConfig fields (lambda_deform_reg=1e-3,
-  lambda_smoothness=1e-2, lambda_rigidity=1e-2, lambda_depth=0.1,
-  lambda_mask_motion=1.0) + ModelConfig (mlp_depth, num_time_freqs)
-- renderer.py: with_depth=True now runs TWO separate gsplat
-  rasterization calls (RGB + ED) instead of RGB+D mode —
-  works around version-specific background shape quirks.
+Bu commit 12 iterasyonluk training tuning + loglama + analiz altyapısını
+kapsıyor. Tüm değişiklikler NaN guard + post-step param check + gradient
+clipping ile korunuyor — artık silent disaster imkansız.
 
-Backend — robustness:
-- pipeline.py: foundation phase now resilient (try/except per
-  subphase, one failure doesn't abort pipeline). COLMAP cache
-  check: if parse_cameras succeeds on existing data/<scene>/colmap,
-  skip rerun. Threads depth_dir/mask_dir to trainer when
-  foundation ran.
-- run_colmap.py: subprocess.Popen with line streaming, regex
-  parsing of feature_extractor / matcher / mapper stdout, calls
-  on_progress(fraction, message) with phase-mapped ranges
-  (feat 0-0.15, match 0.15-0.40, mapper 0.40-0.95, converter
-  0.95-1.0). End of 6% progress freezes.
+--- Training stability (v3.0 → v3.5) ---
 
-Backend — Metric3D → MiDaS:
-- depth_estimate.py rewritten: intel-isl/MiDaS via torch.hub
-  (no mmcv/mmengine dependency which was Windows install hell).
-  Supports DPT_Small/Hybrid/Large. Old metric3d_vit_* names
-  auto-map. Outputs are inverse-depth → inverted to depth for
-  intuitive scale-invariant comparison.
+v3.0 (başarısız): symmetric scale_reg + opacity reset + aggressive prune
+→ 57k gaussian %95 öldü, motion da kötüydü.
 
-Backend — API surface:
-- api.py: /process accepts 24 optional hyperparameter overrides
-  grouped (training, losses, lr, density, model, foundation).
-  All default None → backend preset/default used if unset.
+v3.1: prune_max_scale revert (0.05→0.1), opacity_reset disable,
+lambda_scale asimetrik hinge — sadece scene_extent'in %5 üstü cezalandırılır.
 
-Frontend (Phase 8b continuation):
-- HyperparameterPanel: 6 collapsible groups with override badges,
-  Foundation models group added, lambda_depth + lambda_mask_motion
-  + mlp_depth + num_time_freqs fields wired to API.
-- JobSubmitPanel: skip_foundation default changed to False (now
-  that foundation actually runs and integrates with trainer).
-- api.ts: HyperParams interface expanded with all new fields.
+v3.2: Bir KRITIK bug fix keşfedildi — prune_max_scale absolute 0.1 units
+olarak yorumlanıyordu. Scene extent 70 olan sahnede bu ilk density step'te
+%35 gaussian öldürüyordu. Artık FRACTION: effective = fraction × scene_extent.
+Ayrıca warmup_factor hardcoded "it - 100" delay kaldırıldı — reg'ler iter
+1'den itibaren yumuşak ramp, lr_deform de warmup'la 0→target.
 
-Scripts:
-- hypernerf_to_mp4.py: switched from -vsync vfr to -fps_mode cfr
-  with -r <fps>, prevents VFR output that confused downstream
-  ffmpeg fps filter (was extracting 3× expected frame count).
+v3.3: Motion reg'leri (smoothness, rigidity, deform_reg) tamamen 0 +
+lambda_track 10× → MLP dizginsiz → scales log-space 70+'a patladı, PLY'de
+max_scale=inf. Silent disaster — training 75 iter sonra her iter non-finite
+loss yüzünden skip edildi ama abort olmadı, 500 iter tamamlandı gözüktü.
 
-Verified via smoke tests:
-- Foundation phase end-to-end (MiDaS depth + CoTracker tracks +
-  Farneback masks all produce expected .npy/.pt/.png outputs).
-- Training completes with depth + mask losses active (log shows
-  "Depth loss aktif" / "Mask-weighted recon aktif").
-- COLMAP progress hook streams %-progress per phase.
+v3.4: Denge — reg'ler 1/10 of v3.2 (stabilite için minimum), track 0.3,
+mask 2.0. Consecutive-skip counter: 10 ardışık non-finite → RuntimeError.
+Post-step scales/quats da NaN check. log_scale hard clamp (scene_extent).
 
-Motion still subtle — next session will connect CoTracker tracks
-into trainer (currently generated but not consumed) for stronger
-motion supervision signal. Task #41 RAFT dense flow still deferred.
+v3.5: dscale (MLP output delta scale) clamp'i eklendi: ±2 log-space.
+Export'ta da aynı clamp — eski checkpoint'lerde safety.
+
+--- Run logger + analytics ---
+
+backend/run_logger.py (yeni): RunLogger sınıfı. Her sahne için
+data/<scene>/output/logs/ altına 3 dosya:
+  - metrics.jsonl : per-iter loss components, PSNR, N, Δpos, it/s
+  - events.log    : phase changes, density ops, opacity resets, warnings
+  - summary.json  : config + final metrics + phase durations + PLY stats
+
+Trainer ve pipeline hook'landı. Summary'de gerçek iter sayısı (aborted
+olduysa "⚠ X iter (konfigdeki Y tamamlanamadı)" gösterir).
+
+--- Backend API endpoints (analytics) ---
+
+api.py'ye 3 yeni endpoint:
+  - GET /jobs/<id>/metrics → metrics.jsonl JSON array
+  - GET /jobs/<id>/summary → summary.json
+  - GET /jobs/<id>/events  → events.log (son N satır)
+
+Tamamı scene adıyla veya job_id ile resolve.
+
+--- Frontend Analytics panel ---
+
+TrainingAnalytics.tsx (yeni): pure SVG chart component (recharts dep yok).
+  - Stat cards: progress, loss, PSNR, N, Δpos, speed
+  - 5 chart: total loss (log), PSNR, N, Δpos, loss components (6 series overlay)
+  - Events log (son 100)
+  - Summary display
+  - Auto-refresh 3 sn — training live takip
+
+App.tsx'e "Analiz" tab eklendi. Job submit edilince analyticsScene
+otomatik set oluyor.
+
+--- Helper scripts ---
+
+scripts/recover_scene.py (yeni): NaN'lı PLY'ler oluşursa son valid
+ckpt'ten re-export. cutlemon_full'da ihtiyaç olmuştu.
+
+scripts/cleanup_ply.py (yeni): outlier/streak gaussian post-prune. Bloat
+gaussian'ları PLY seviyesinde temizler (scale > %3 scene, anisotropy > 30x).
+
+docs/DEFORMATION_ARCHITECTURE_IDEAS.md (yeni): gelecek iterasyon için 7
+mimari yaklaşımın karşılaştırması. Per-Gaussian Fourier (4DGS paper's
+SOTA approach) sıradaki adım olarak işaretli.
+
+--- CoTracker OOM fallback ---
+
+preprocess/point_tracking.py: CUDA OOM olursa grid/resolution kademeli
+küçültülür: (30, 720) → (20, 720) → (15, 540) → (15, 360). Elinde
+3060 Ti 8GB olanlar için güvenli.
+
+--- Verified ---
+
+- cutlemon_v3_1_micro: prune_max_scale absolute bug reproduced & fixed
+- chickchicken_v3_2_smoke: static OK (PSNR 22) ama motion suppressed (Δpos 0.05)
+- chickchicken_v3_3_smoke: reg'siz chaos kanıtlandı (scales inf)
+- chickchicken_v3_4_smoke: denge bulundu (Δpos 0.22, PSNR 20)
+- chickchicken_v3_5_full: 30k iter tamamlandı. PSNR 29.35, N 16493,
+  Δpos mean 0.35 (mid vs frame 0), %10.7 gaussian hareket ediyor.
+  max_scale=76 (< scene_extent 195) — clamp etkili.
+
+--- Known limitations ---
+
+Motion hâlâ subtle. Mimari limit: global MLP 16k gaussian için spatial
+locality eksik. Per-Gaussian Fourier trajectories sıradaki adım.
+Bknz: docs/DEFORMATION_ARCHITECTURE_IDEAS.md

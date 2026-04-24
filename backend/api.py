@@ -10,6 +10,7 @@ Swagger UI:
 """
 from __future__ import annotations
 import io
+import json
 import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -18,7 +19,7 @@ from typing import Any
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .api_models import (
@@ -97,6 +98,7 @@ async def process_video(
     video: UploadFile = File(..., description="Girdi video dosyası (mp4/mov)"),
     scene: str = Form("unnamed_scene", description="Sahne ismi — data/<scene>/ altında çalışılır"),
     smoke_test: bool = Form(False, description="True: hızlı preset (500 iter, 480x270, 10 ts)"),
+    micro_test: bool = Form(False, description="True: ULTRA hızlı preset (200 iter, 320x180, 5 ts, fps=2, no foundation) — dev iteration için, cache'li scene'de ~30 sn"),
     cloud: bool = Form(False, description="True: cloud_config (1920x1080, 60k iter)"),
     skip_foundation: bool = Form(True, description="Foundation modelleri atla"),
     # --- Override parametreleri (preset üzerine uygulanır) ---
@@ -112,6 +114,11 @@ async def process_video(
     lambda_rigidity: float | None = Form(None, description="Isometric rigidity"),
     lambda_depth: float | None = Form(None, description="Depth consistency (Metric3D)"),
     lambda_mask_motion: float | None = Form(None, description="Dynamic mask weight"),
+    lambda_track: float | None = Form(None, description="CoTracker 3D-anchored track loss"),
+    lambda_scale: float | None = Form(None, description="Scale regularizer (outlier blow-up önleme)"),
+    opacity_reset_interval: int | None = Form(None, description="Opacity reset aralığı (iter), 0=kapalı"),
+    track_sample_k: int | None = Form(None, description="Her iter sample edilecek track sayısı"),
+    warmup_iters: int | None = Form(None, description="Regularizer warmup süresi (iter)"),
     # Learning rates
     lr_deform: float | None = Form(None, description="Deformation field LR"),
     lr_means: float | None = Form(None, description="Gaussian means LR"),
@@ -171,7 +178,30 @@ async def process_video(
             cfg.train.density_start_iter = 100
             cfg.train.density_end_iter = 400
             cfg.train.density_interval = 50
+            cfg.train.warmup_iters = 100   # smoke'ta kısa: iter 200'de full
             cfg.export.num_timestamps = 10
+
+        # MICRO TEST — ultra hızlı dev iteration / preflight
+        # skip_foundation user'ın seçimine bırakıldı:
+        #   - Foundation OFF: ~30-60 sn (cache hit) — pipeline mekanik kontrolü
+        #   - Foundation ON:  ~5-10 dk — tam Stage 2 stack preflight (MiDaS + CoTracker + Farneback + tracks/depth loss)
+        effective_skip_foundation = skip_foundation
+        if micro_test:
+            cfg.preprocess.fps = 2                       # 55sn × 2 = ~110 frame → COLMAP hızlı
+            cfg.preprocess.resize_long_edge = 480        # yarı çözünürlük
+            cfg.train.n_iters = 200
+            cfg.train.image_resolution = (320, 180)
+            cfg.train.ckpt_interval = 200
+            cfg.train.log_interval = 10
+            cfg.train.density_start_iter = 50
+            cfg.train.density_end_iter = 150
+            cfg.train.density_interval = 25
+            cfg.train.warmup_iters = 50
+            cfg.export.num_timestamps = 5
+            # Foundation hafifletme — micro'da küçük modeller / az nokta:
+            cfg.foundation.metric3d_model = "MiDaS_small"    # en küçük, en hızlı
+            cfg.foundation.cotracker_grid_size = 15          # 30→15 (225 nokta, 4x hızlı)
+            cfg.foundation.cotracker_num_points = 900
 
         # --- Override'lar (preset uzerine uygulanir) ---
         # Temel
@@ -209,6 +239,16 @@ async def process_video(
             cfg.train.lambda_depth = lambda_depth
         if lambda_mask_motion is not None:
             cfg.train.lambda_mask_motion = lambda_mask_motion
+        if lambda_track is not None:
+            cfg.train.lambda_track = lambda_track
+        if lambda_scale is not None:
+            cfg.train.lambda_scale = lambda_scale
+        if opacity_reset_interval is not None:
+            cfg.train.opacity_reset_interval = opacity_reset_interval
+        if track_sample_k is not None:
+            cfg.train.track_sample_k = track_sample_k
+        if warmup_iters is not None:
+            cfg.train.warmup_iters = warmup_iters
         # Learning rates
         if lr_deform is not None:
             cfg.train.lr_deform = lr_deform
@@ -254,7 +294,7 @@ async def process_video(
             str(video_path),
             safe_scene,
             cfg,
-            skip_foundation=skip_foundation,
+            skip_foundation=effective_skip_foundation,
             progress_callback=on_progress,
         )
 
@@ -461,6 +501,77 @@ def splat_frame(job_id: str, idx: int) -> FileResponse:
         filename=ply_files[idx].name,
         headers={"Cache-Control": "public, max-age=3600"},
     )
+
+
+# ---------------------------------------------------------------------------
+# Analytics — training logs & summary
+# ---------------------------------------------------------------------------
+def _resolve_logs_dir(identifier: str) -> Path:
+    """identifier (scene adı veya job id) → data/<scene>/output/logs/."""
+    manager: JobManager = app.state.manager
+    job = manager.get(identifier)
+    if job is not None:
+        return scene_paths(job.scene)["output"] / "logs"
+    # Scene adı olarak dene
+    safe = _safe_scene_name(identifier)
+    candidate = scene_paths(safe)["output"] / "logs"
+    if candidate.exists():
+        return candidate
+    raise HTTPException(
+        404,
+        f"Log klasoru bulunamadi: identifier='{identifier}'. "
+        f"Train sirasinda yazilan dosyalar data/<scene>/output/logs/ altinda olmali.",
+    )
+
+
+@app.get("/jobs/{identifier}/metrics", tags=["analytics"])
+def job_metrics(identifier: str) -> JSONResponse:
+    """
+    Training sirasinda yazilan metrics.jsonl dosyasini parse edip JSON array dondurur.
+    Her entry: {iter, loss, recon, depth, track, ..., psnr, n_points, dpos_mean, dpos_max, warmup, t, it_per_sec}
+    """
+    logs_dir = _resolve_logs_dir(identifier)
+    metrics_file = logs_dir / "metrics.jsonl"
+    if not metrics_file.exists():
+        return JSONResponse({"metrics": [], "count": 0, "note": "metrics.jsonl yok (henuz training basslamadi olabilir)"})
+    records = []
+    with open(metrics_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return JSONResponse({"metrics": records, "count": len(records)})
+
+
+@app.get("/jobs/{identifier}/summary", tags=["analytics"])
+def job_summary(identifier: str) -> JSONResponse:
+    """Run summary.json — final metrics + config + phase durations."""
+    logs_dir = _resolve_logs_dir(identifier)
+    summary_file = logs_dir / "summary.json"
+    if not summary_file.exists():
+        raise HTTPException(404, "summary.json yok (run bitmedi veya eski run loglamadan once calistirildi)")
+    try:
+        data = json.loads(summary_file.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(500, f"summary.json parse edilemedi: {e}")
+    return JSONResponse(data)
+
+
+@app.get("/jobs/{identifier}/events", tags=["analytics"])
+def job_events(identifier: str, tail: int | None = None) -> JSONResponse:
+    """Insan-okunabilir events.log — density ops, opacity resets, phase transitions, warnings."""
+    logs_dir = _resolve_logs_dir(identifier)
+    events_file = logs_dir / "events.log"
+    if not events_file.exists():
+        return JSONResponse({"events": [], "count": 0})
+    lines = events_file.read_text(encoding="utf-8").splitlines()
+    if tail is not None and tail > 0:
+        lines = lines[-tail:]
+    return JSONResponse({"events": lines, "count": len(lines)})
 
 
 # ---------------------------------------------------------------------------

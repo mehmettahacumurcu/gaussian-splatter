@@ -23,20 +23,32 @@ _MODEL_CACHE: dict = {}
 
 
 def _resolve_model_name(name: str) -> str:
-    """Eski Metric3D isimlerini MiDaS karşılıklarına çevir."""
+    """
+    Eski Metric3D isimlerini MiDaS hub'da GERÇEKTEN var olan isimlere çevir.
+    Intel-ISL MiDaS hub callable'ları (https://github.com/isl-org/MiDaS/blob/master/hubconf.py):
+      - MiDaS, MiDaS_small         (klasik + küçük)
+      - DPT_Large, DPT_Hybrid      (DPT ailesi)
+      - DPT_BEiT_L_512 vb.         (daha yeni BEiT/SwinV2)
+    DPT_Small diye bir callable YOK — onun yerine MiDaS_small.
+    """
     mapping = {
-        "metric3d_vit_small":  "DPT_Small",
-        "metric3d_vit_large":  "DPT_Large",
-        "metric3d_vit_giant2": "DPT_Large",
+        "metric3d_vit_small":  "MiDaS_small",   # ~80 MB, hızlı
+        "metric3d_vit_large":  "DPT_Large",     # ~1.4 GB, kaliteli
+        "metric3d_vit_giant2": "DPT_Large",     # giant karşılığı yok
     }
     if name in mapping:
         return mapping[name]
-    # MiDaS ismi olarak direkt kabul et
-    if name.startswith(("DPT_", "MiDaS")):
+    valid_hub_names = {
+        "MiDaS", "MiDaS_small",
+        "DPT_Large", "DPT_Hybrid",
+        "DPT_BEiT_L_512", "DPT_BEiT_L_384", "DPT_BEiT_B_384",
+        "DPT_SwinV2_L_384", "DPT_SwinV2_B_384", "DPT_SwinV2_T_256",
+        "DPT_Swin_L_384", "DPT_LeViT_224",
+    }
+    if name in valid_hub_names:
         return name
-    # Bilinmeyen ise default
-    print(f"⚠ Bilinmeyen depth model '{name}', DPT_Small kullaniliyor")
-    return "DPT_Small"
+    print(f"⚠ Bilinmeyen depth model '{name}', MiDaS_small fallback")
+    return "MiDaS_small"
 
 
 def _load_model(model_name: str, device: str):
@@ -50,10 +62,27 @@ def _load_model(model_name: str, device: str):
     model = model.to(device).eval()
 
     transforms_hub = torch.hub.load("intel-isl/MiDaS", "transforms", trust_repo=True)
-    if model_name in ("DPT_Large", "DPT_Hybrid", "DPT_Small"):
+    # Transform seçimi model type'ına göre
+    if "DPT_BEiT" in model_name or "DPT_SwinV2" in model_name or "DPT_Swin_L" in model_name:
+        # Yeni BEiT/Swin tabanlı DPT'ler için beit_512_transform / swin_384_transform vs.
+        # Hub'da transforms objesinin attr'ları: beit512, swin384 vs.
+        tname = {
+            "DPT_BEiT_L_512":    "beit512_transform",
+            "DPT_BEiT_L_384":    "beit384_transform",
+            "DPT_BEiT_B_384":    "beit384_transform",
+            "DPT_SwinV2_L_384":  "swin384_transform",
+            "DPT_SwinV2_B_384":  "swin384_transform",
+            "DPT_SwinV2_T_256":  "swin256_transform",
+            "DPT_Swin_L_384":    "swin384_transform",
+            "DPT_LeViT_224":     "levit_transform",
+        }.get(model_name, "dpt_transform")
+        transform = getattr(transforms_hub, tname, transforms_hub.dpt_transform)
+    elif model_name in ("DPT_Large", "DPT_Hybrid"):
         transform = transforms_hub.dpt_transform
-    else:
+    elif model_name == "MiDaS_small":
         transform = transforms_hub.small_transform
+    else:  # "MiDaS" classic
+        transform = transforms_hub.default_transform
 
     _MODEL_CACHE[key] = (model, transform)
     return model, transform
@@ -104,7 +133,6 @@ def estimate_depth(
 
         with torch.no_grad():
             prediction = model(input_batch)
-            # Upsample to original size
             prediction = torch.nn.functional.interpolate(
                 prediction.unsqueeze(1),
                 size=(h, w),
@@ -121,7 +149,7 @@ def estimate_depth(
         if (i + 1) % 20 == 0 or (i + 1) == len(frames):
             print(f"  depth {i+1}/{len(frames)}")
 
-    print(f"✓ {len(out_paths)} derinlik haritasi üretildi (MiDaS {midas_name}) → {out}")
+    print(f"✓ {len(out_paths)} derinlik haritasi uretildi (MiDaS {midas_name}) → {out}")
     return out_paths
 
 
@@ -130,8 +158,8 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="MiDaS derinlik tahmini")
     p.add_argument("frames_dir", type=str)
     p.add_argument("output_dir", type=str)
-    p.add_argument("--model", default="DPT_Small",
-                   help="DPT_Small | DPT_Hybrid | DPT_Large | MiDaS_small")
+    p.add_argument("--model", default="MiDaS_small",
+                   help="MiDaS_small | DPT_Hybrid | DPT_Large | DPT_BEiT_L_512 ...")
     p.add_argument("--device", default="cuda")
     p.add_argument("--overwrite", action="store_true")
     args = p.parse_args()

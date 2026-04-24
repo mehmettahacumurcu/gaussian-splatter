@@ -47,7 +47,7 @@ export function SplatViewer({
       cameraUp: [0, -1, 0],
       initialCameraPosition: [0, 0, 5],
       initialCameraLookAt: [0, 0, 0],
-      sphericalHarmonicsDegree: 2,
+      sphericalHarmonicsDegree: 3, // Backend config.py default sh_degree=3 ile eşleş — aksi halde f_rest field count mismatch
       sharedMemoryForWorkers: false, // Tauri/Electron ortamında güvenli default
     });
     viewerRef.current = viewer;

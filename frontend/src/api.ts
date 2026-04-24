@@ -74,6 +74,11 @@ export interface HyperParams {
   lambda_rigidity?: number | null;
   lambda_depth?: number | null;
   lambda_mask_motion?: number | null;
+  lambda_track?: number | null;
+  lambda_scale?: number | null;           // v3 — scale regularizer (outlier blow-up önleme)
+  opacity_reset_interval?: number | null; // v3 — INRIA-style opacity reset
+  track_sample_k?: number | null;
+  warmup_iters?: number | null;
   // Learning rates
   lr_deform?: number | null;
   lr_means?: number | null;
@@ -101,6 +106,7 @@ export interface HyperParams {
 export interface SubmitJobOptions {
   scene: string;
   smoke_test?: boolean;
+  micro_test?: boolean;
   cloud?: boolean;
   skip_foundation?: boolean;
   hyperparams?: HyperParams;
@@ -142,6 +148,53 @@ export async function getSplatInfo(identifier: string): Promise<SplatInfo> {
   return fetchJson<SplatInfo>(`${API_BASE}/splat/${identifier}/info`);
 }
 
+// ---------------------------------------------------------------------------
+// Analytics — training metrics + summary
+// ---------------------------------------------------------------------------
+export interface TrainMetric {
+  t: number;              // seconds since run start
+  iter: number;
+  n_iters: number;
+  loss: number;
+  psnr: number;
+  n_points: number;
+  dpos_mean: number;
+  dpos_max: number;
+  warmup: number;
+  it_per_sec: number;
+  recon: number;
+  depth: number;
+  track: number;
+  deform_reg: number;
+  smooth: number;
+  rigid: number;
+  scale: number;
+}
+
+export interface MetricsResponse {
+  metrics: TrainMetric[];
+  count: number;
+  note?: string;
+}
+
+export interface EventsResponse {
+  events: string[];
+  count: number;
+}
+
+export async function getJobMetrics(identifier: string): Promise<MetricsResponse> {
+  return fetchJson<MetricsResponse>(`${API_BASE}/jobs/${identifier}/metrics`);
+}
+
+export async function getJobSummary(identifier: string): Promise<Record<string, unknown>> {
+  return fetchJson(`${API_BASE}/jobs/${identifier}/summary`);
+}
+
+export async function getJobEvents(identifier: string, tail?: number): Promise<EventsResponse> {
+  const q = tail ? `?tail=${tail}` : "";
+  return fetchJson<EventsResponse>(`${API_BASE}/jobs/${identifier}/events${q}`);
+}
+
 export function frameUrl(identifier: string, idx: number): string {
   return `${API_BASE}/splat/${identifier}/frame/${idx}`;
 }
@@ -159,6 +212,8 @@ export async function submitJob(
   fd.append("scene", options.scene);
   if (options.smoke_test !== undefined)
     fd.append("smoke_test", String(options.smoke_test));
+  if (options.micro_test !== undefined)
+    fd.append("micro_test", String(options.micro_test));
   if (options.cloud !== undefined)
     fd.append("cloud", String(options.cloud));
   if (options.skip_foundation !== undefined)
@@ -173,7 +228,7 @@ export async function submitJob(
     }
   }
 
-  const res = await fetch(`${API_BASE}/process`, {
+    const res = await fetch(`${API_BASE}/process`, {
     method: "POST",
     body: fd,
   });

@@ -98,9 +98,15 @@ def export_to_ply(
     for t_idx, t in enumerate(timestamps):
         if deform is not None:
             dpos, dquat, dscale = deform(gs.means, t, scene_extent)
+            # v3.5 safety: dscale clamp (trainer'da zaten clamp'lanıyor ama
+            # eski checkpoint'lerde uygulanmamış olabilir, export burada da yapsın)
+            dscale = dscale.clamp(min=-2.0, max=2.0)
             d_means       = (gs.means + dpos)
             d_log_scales  = (gs.scales + dscale)         # log-space toplam
             d_quats       = F.normalize(gs.quats + dquat, dim=-1)
+            # Final clamp on absolute log_scale — scene_extent cap
+            max_log = torch.log(torch.tensor(max(scene_extent, 1.0), device=d_log_scales.device))
+            d_log_scales = d_log_scales.clamp(max=float(max_log))
         else:
             d_means       = gs.means
             d_log_scales  = gs.scales
