@@ -196,7 +196,18 @@ def run_pipeline(
         cb("foundation", 0.33, "Depth done, CoTracker başlıyor", {})
 
         # 3b — Tracks
+        # v3.7.5: MiDaS modelini eksplisit release et — module-level cache'te
+        # 700MB-1.4GB tutuyordu. empty_cache() bunu temizlemiyor.
+        # Sonra CoTracker yer bulamadığı için OOM oluyordu.
         print("\n[Faz 3b] CoTracker piksel takibi")
+        try:
+            from .preprocess.depth_estimate import release_models as release_depth_models
+            release_depth_models()
+        except Exception as _e:
+            print(f"  ⚠ depth model release: {_e}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
         try:
             from .preprocess.point_tracking import track_points
             track_points(paths["frames"], paths["tracks"] / "tracks.pt",
@@ -205,6 +216,10 @@ def run_pipeline(
         except Exception as e:
             print(f"⚠ Tracking başarısız, atlanıyor: {e}")
             foundation_status["tracks"] = f"failed: {e}"
+        # Cleanup after CoTracker too
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
         cb("foundation", 0.66, "Tracks done, dinamik maske başlıyor", {})
 
         # 3c — Dynamic mask
@@ -238,6 +253,26 @@ def run_pipeline(
     cb("init", 0.0, "Model başlatılıyor", {})
     init_pts = torch.from_numpy(xyz)
     init_rgb = torch.from_numpy(rgb).float() / 255.0
+
+    # v3.7.3: Initial point subsample. COLMAP bazen banana gibi sahnelerde 100k+
+    # sparse point döndürüyor. max_gaussians cap sadece split/clone'u durduruyor,
+    # initial N'i shrink etmiyor → render aşırı yavaşlar (banana_ultra_v2'de
+    # 112k init → 0.19 it/s = 117 saat ETA).
+    # Bu fix: Eğer N_init > max_gaussians × 0.7, random downsample yap (cap'in
+    # %70'i, density'nin büyümeye yer bırakması için).
+    if cfg.train.max_gaussians > 0:
+        target_init = int(cfg.train.max_gaussians * 0.7)
+        if init_pts.shape[0] > target_init:
+            print(f"⚠ Initial COLMAP points ({init_pts.shape[0]:,}) > target "
+                  f"({target_init:,}) — random subsample (max_gaussians × 0.7)")
+            perm = torch.randperm(init_pts.shape[0])[:target_init]
+            init_pts = init_pts[perm]
+            init_rgb = init_rgb[perm]
+            run_logger.log_event("init_subsample",
+                                 before=int(xyz.shape[0]),
+                                 after=int(init_pts.shape[0]),
+                                 max_gaussians=cfg.train.max_gaussians)
+
     gs = GaussianModel(init_pts, init_colors=init_rgb,
                        sh_degree=cfg.model.sh_degree,
                        fourier_K=cfg.model.fourier_K)

@@ -772,11 +772,12 @@ class Trainer4DGS:
                     f"Last good checkpoint: run scripts/recover_scene.py <scene>"
                 )
 
-            # v3.4: Hard clamp on log_scale — safety net against runaway growth.
-            # Upper bound: scene_extent (absolute size). log(scene_extent) is max reasonable.
-            # Without this, Δpos huge spike can push scales via gradient to log_scale=70+.
+            # v3.7.4: Hard clamp on log_scale — TIGHTER bound.
+            # Önce scene_extent idi (gaussian sahnenin tamamı kadar olabiliyordu),
+            # banana_high'ta max_scale=108=scene_extent → streak/overlap.
+            # Şimdi: scene_extent × 0.05 = sahnenin %5'i max.
             with torch.no_grad():
-                max_log_scale = math.log(max(self.scene_extent, 1.0))
+                max_log_scale = math.log(max(self.scene_extent * 0.05, 1e-3))
                 self.gs.scales.data.clamp_(max=max_log_scale)
 
                 # v3.6.1: Hard clamp on Fourier coefficients.

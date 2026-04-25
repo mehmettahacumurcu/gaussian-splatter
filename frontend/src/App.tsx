@@ -65,6 +65,8 @@ function App() {
   const [diskScenes, setDiskScenes] = useState<SceneListItem[] | null>(null);
   const [diskPanelOpen, setDiskPanelOpen] = useState(false);
   const [diskLoading, setDiskLoading] = useState(false);
+  // v3.7.7 Debug: tek frame yükleme modu — visibility toggle bypass
+  const [singleFrameMode, setSingleFrameMode] = useState(false);
   // Analytics — son/aktif job için
   const [analyticsScene, setAnalyticsScene] = useState<string>("");
 
@@ -280,6 +282,26 @@ function App() {
               <button className="btn-secondary" onClick={toggleDiskPanel}>
                 Diskten {diskPanelOpen ? "▲" : "▼"}
               </button>
+              <label
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  marginLeft: 12,
+                  fontSize: 12,
+                  color: "#888",
+                  cursor: "pointer",
+                }}
+                title="v3.7.7'den itibaren default: cached blob swap. Bu kapatılamaz (multi-mode broken)."
+              >
+                <input
+                  type="checkbox"
+                  checked={true}
+                  disabled
+                  readOnly
+                />
+                ✅ Cached single-frame swap (auto)
+              </label>
             </div>
 
             {diskPanelOpen && (
@@ -335,10 +357,12 @@ function App() {
                 </div>
                 <div className="viewer-canvas">
                   <SplatViewer
-                    key={viewerState.info.job_id}
+                    // key includes singleFrameMode → mode değişince viewer remount
+                    key={`${viewerState.info.job_id}-${singleFrameMode ? "single" : "multi"}`}
                     jobId={viewerState.info.job_id}
                     numFrames={viewerState.info.num_frames}
                     currentFrame={currentFrame}
+                    singleFrameMode={singleFrameMode}
                     onLoadProgress={(loaded, total) =>
                       setSceneProgress({ loaded, total, done: false })
                     }

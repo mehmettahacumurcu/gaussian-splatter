@@ -14,7 +14,7 @@ interface Props {
   onJobSubmitted: (response: ProcessResponse, sceneName: string) => void;
 }
 
-type Preset = "micro" | "smoke" | "full" | "cloud" | "ultra";
+type Preset = "micro" | "smoke" | "full" | "high" | "cloud" | "ultra";
 
 export function JobSubmitPanel({ onJobSubmitted }: Props) {
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -53,6 +53,7 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
         micro_test: preset === "micro",
         smoke_test: preset === "smoke",
         cloud: preset === "cloud",
+        high_test: preset === "high",
         ultra_test: preset === "ultra",
         skip_foundation: skipFoundation,
         hyperparams,
@@ -148,6 +149,17 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
               <div className="preset-desc">30k iter, 640x360, 60 ts · ~30-60 dk</div>
             </div>
           </label>
+          <label className={`preset-chip ${preset === "high" ? "active" : ""}`}>
+            <input
+              type="radio"
+              checked={preset === "high"}
+              onChange={() => setPreset("high")}
+            />
+            <div>
+              <div className="preset-name">High ⭐ (3-4 saat)</div>
+              <div className="preset-desc">50k iter, 640x360, 90 ts, Fourier K=10, N cap 60k · enhanced quality</div>
+            </div>
+          </label>
           <label className={`preset-chip ${preset === "cloud" ? "active" : ""}`}>
             <input
               type="radio"
@@ -177,6 +189,15 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
             Foundation <strong>atla</strong> → ~30 sn (cache hit), sadece recon test.
             Foundation <strong>aç</strong> → ~5-10 dk, tam Stage 2 preflight (MiDaS+CoTracker+tracks/depth loss).
             CoTracker grid 30→15, MiDaS small — tümü hız optimize.
+          </p>
+        )}
+        {preset === "high" && (
+          <p className="submit-hint">
+            ⭐ <strong>3-4 saat enhanced quality</strong> (Full ile Ultra arası).
+            50k iter, 640×360 (Full ile aynı), Fourier K=10, density end @ 35k,
+            <strong>N hard cap 60k</strong> (init 42k subsample), num_ts 90.
+            Model parametreleri default — render hızı korunmuş.
+            Banana/cookie gibi standart sahneler için ideal denge.
           </p>
         )}
         {preset === "ultra" && (

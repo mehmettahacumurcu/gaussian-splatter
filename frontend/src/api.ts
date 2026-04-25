@@ -113,6 +113,7 @@ export interface SubmitJobOptions {
   smoke_test?: boolean;
   micro_test?: boolean;
   cloud?: boolean;
+  high_test?: boolean;
   ultra_test?: boolean;
   skip_foundation?: boolean;
   hyperparams?: HyperParams;
@@ -222,6 +223,8 @@ export async function submitJob(
     fd.append("micro_test", String(options.micro_test));
   if (options.cloud !== undefined)
     fd.append("cloud", String(options.cloud));
+  if (options.high_test !== undefined)
+    fd.append("high_test", String(options.high_test));
   if (options.ultra_test !== undefined)
     fd.append("ultra_test", String(options.ultra_test));
   if (options.skip_foundation !== undefined)

@@ -69,13 +69,16 @@ def track_points(
     model = model.to(device).eval()
 
     # OOM auto-fallback: grid / resolution'ı kademeli olarak düşürerek tekrar dene.
-    # cutlemon_full'de grid=30 + 720px @ 8GB VRAM → OOM oldu.
-    # Bu mekanizma "başarıyla küçültüp" tamamlar: 30→20→15 + 720→540→360.
+    # v3.7.4: banana high'ta MiDaS+align sonrası VRAM dolunca grid=25@720
+    # de OOM oldu. Daha kademeli kademeler ekle:
     attempts = [
         (grid_size, max_long_edge),
+        (max(15, grid_size - 5), max_long_edge),     # YENİ: -5 küçük adım
         (max(15, grid_size - 10), max_long_edge),
         (15, 540),
+        (15, 480),                                    # YENİ: 540 ile 360 arası
         (15, 360),
+        (10, 360),                                    # YENİ: en az 100 nokta, son çare
     ]
     # Dedup (aynı attempt'i tekrarlamasın)
     seen = set()
@@ -103,13 +106,30 @@ def track_points(
             break
         except torch.cuda.OutOfMemoryError as oom:
             print(f"⚠ CUDA OOM (grid={g}, edge={edge}): {str(oom)[:80]}...")
+            # v3.7.6: AGRESİF CLEANUP — fallback'ler arası birikim olmasın
+            import gc
             try:
                 del video
             except NameError:
                 pass
+            try:
+                del pred_tracks
+                del pred_visibility
+            except NameError:
+                pass
+            gc.collect()
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
             if attempt_i == len(unique_attempts) - 1:
                 print("⚠ Tüm fallback'ler başarısız, CoTracker atlanıyor")
+                # Final cleanup — model release et
+                try:
+                    model.cpu()
+                    del model
+                except Exception:
+                    pass
+                gc.collect()
+                torch.cuda.empty_cache()
                 raise
 
     if pred_tracks is None:

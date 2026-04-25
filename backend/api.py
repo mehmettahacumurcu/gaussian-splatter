@@ -100,7 +100,8 @@ async def process_video(
     smoke_test: bool = Form(False, description="True: hızlı preset (500 iter, 480x270, 10 ts)"),
     micro_test: bool = Form(False, description="True: ULTRA hızlı preset (200 iter, 320x180, 5 ts, fps=2, no foundation) — dev iteration için, cache'li scene'de ~30 sn"),
     cloud: bool = Form(False, description="True: cloud_config (1920x1080, 60k iter)"),
-    ultra_test: bool = Form(False, description="True: 10-12 saat ULTRA preset (150k iter, 960x540, HexPlane 128/64, MLP 768/5, Fourier K=16, density_end=100k, 120 ts) — RTX 3060 Ti stress test"),
+    high_test: bool = Form(False, description="True: 3-4 saat HIGH preset (50k iter, 640x360, HexPlane 96/48, MLP 512/4, Fourier K=10, density_end=35k, 90 ts, N cap 60k)"),
+    ultra_test: bool = Form(False, description="True: 6-9 saat ULTRA preset (80k iter, 720x405, HexPlane 112/56, MLP 640/4, Fourier K=12, density_end=50k, 90 ts, N cap 80k)"),
     skip_foundation: bool = Form(True, description="Foundation modelleri atla"),
     # --- Override parametreleri (preset üzerine uygulanır) ---
     # Temel training
@@ -208,6 +209,43 @@ async def process_video(
             cfg.foundation.metric3d_model = "MiDaS_small"    # en küçük, en hızlı
             cfg.foundation.cotracker_grid_size = 15          # 30→15 (225 nokta, 4x hızlı)
             cfg.foundation.cotracker_num_points = 900
+
+        # HIGH TEST — 3-4 saat enhanced quality (Full ile Ultra arası)
+        # Full preset (30k iter, 640x360) yeterli motion için ama daha derin
+        # iterasyon ve modest scale-up ile daha temiz sonuç:
+        #   - n_iters 50k (Full 30k → Ultra 80k arası)
+        #   - density_end 35k (uzatılmış density window)
+        #   - max_gaussians 60k (cap)
+        #   - Fourier K=10 (Full 8 → Ultra 12 arası)
+        #   - num_timestamps 90 (Full 60 → Ultra 90)
+        # Resolution Full ile aynı (640x360) — render hızı korunur.
+        # Tahmini süre 3060 Ti: 3-4 saat
+        if high_test:
+            cfg.preprocess.fps = 10
+            cfg.preprocess.resize_long_edge = 960
+            cfg.train.n_iters = 50_000
+            cfg.train.image_resolution = (640, 360)
+            cfg.train.ckpt_interval = 5000
+            cfg.train.log_interval = 100
+            cfg.train.density_start_iter = 500
+            cfg.train.density_end_iter = 35_000
+            cfg.train.density_interval = 200
+            cfg.train.densify_grad_threshold = 3e-4   # Default 2e-4'ten biraz sıkı
+            cfg.train.warmup_iters = 1000
+            cfg.train.max_gaussians = 60_000
+            # Model — modest scale-up
+            cfg.model.hexplane_resolution = 96    # Full default
+            cfg.model.hexplane_feat_dim = 48
+            cfg.model.mlp_width = 512
+            cfg.model.mlp_depth = 4
+            cfg.model.fourier_K = 10
+            # Export
+            cfg.export.num_timestamps = 90
+            # Foundation — v3.7.4: 3060 Ti 8GB için CoTracker güvenli ayar
+            # Önceden 25 idi ama banana_high'ta OOM oldu. 20 daha güvenli, fallback hazır.
+            cfg.foundation.metric3d_model = "metric3d_vit_small"
+            cfg.foundation.cotracker_grid_size = 20
+            cfg.foundation.cotracker_num_points = 1024
 
         # ULTRA TEST v2 — 8-12 saat max-quality render (REVISED)
         # ÖNCEKİ ULTRA v1 BAŞARISIZ: banana'da N=164k, 0.08 it/s → 21 gün ETA.
