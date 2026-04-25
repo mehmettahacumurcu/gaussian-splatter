@@ -100,6 +100,7 @@ async def process_video(
     smoke_test: bool = Form(False, description="True: hızlı preset (500 iter, 480x270, 10 ts)"),
     micro_test: bool = Form(False, description="True: ULTRA hızlı preset (200 iter, 320x180, 5 ts, fps=2, no foundation) — dev iteration için, cache'li scene'de ~30 sn"),
     cloud: bool = Form(False, description="True: cloud_config (1920x1080, 60k iter)"),
+    ultra_test: bool = Form(False, description="True: 10-12 saat ULTRA preset (150k iter, 960x540, HexPlane 128/64, MLP 768/5, Fourier K=16, density_end=100k, 120 ts) — RTX 3060 Ti stress test"),
     skip_foundation: bool = Form(True, description="Foundation modelleri atla"),
     # --- Override parametreleri (preset üzerine uygulanır) ---
     # Temel training
@@ -136,6 +137,11 @@ async def process_video(
     mlp_width: int | None = Form(None, description="Deformation MLP genişlik"),
     mlp_depth: int | None = Form(None, description="Deformation MLP hidden layer sayısı"),
     num_time_freqs: int | None = Form(None, description="Fourier time encoding frekans sayısı"),
+    # v3.6 / Yol C — Per-gaussian Fourier trajectory
+    deform_pos_mode: str | None = Form(None, description="mlp | fourier | hybrid (default: hybrid)"),
+    fourier_K: int | None = Form(None, description="Per-gaussian Fourier trajectory frekans sayısı (default 8)"),
+    lr_fourier: float | None = Form(None, description="Fourier coefficient LR"),
+    lambda_fourier_reg: float | None = Form(None, description="Fourier high-freq L2 reg"),
     # Foundation models (Faz 3)
     metric3d_model: str | None = Form(None, description="metric3d_vit_small | _large | _giant2"),
     cotracker_num_points: int | None = Form(None, description="CoTracker nokta sayısı"),
@@ -202,6 +208,49 @@ async def process_video(
             cfg.foundation.metric3d_model = "MiDaS_small"    # en küçük, en hızlı
             cfg.foundation.cotracker_grid_size = 15          # 30→15 (225 nokta, 4x hızlı)
             cfg.foundation.cotracker_num_points = 900
+
+        # ULTRA TEST v2 — 8-12 saat max-quality render (REVISED)
+        # ÖNCEKİ ULTRA v1 BAŞARISIZ: banana'da N=164k, 0.08 it/s → 21 gün ETA.
+        # Sebepler:
+        #   1. densify_grad_threshold=2e-4 default → ultra res'te aşırı split
+        #   2. N için hard cap yoktu
+        #   3. resolution 960x540 + büyük model + Fourier K=16 = aşırı yük
+        # ULTRA v2 fixleri:
+        #   - max_gaussians = 80k cap (N hard limit)
+        #   - densify_grad_threshold 2e-4 → 5e-4 (1/2.5 split rate)
+        #   - resolution 720x405 (3.5× pixel base, manageable)
+        #   - n_iters 80k (150k yerine)
+        #   - density_end 50k (100k yerine)
+        #   - HexPlane 112/56 (128/64 yerine — modest scale)
+        #   - MLP 640/4 (768/5 yerine — daha hafif)
+        #   - Fourier K=12 (16 yerine)
+        # Tahmini süre 3060 Ti: 6-9 saat (cookie-banana scale scenes)
+        if ultra_test:
+            cfg.preprocess.fps = 10
+            cfg.preprocess.resize_long_edge = 960
+            cfg.train.n_iters = 80_000
+            cfg.train.image_resolution = (720, 405)
+            cfg.train.ckpt_interval = 4000
+            cfg.train.log_interval = 100
+            cfg.train.density_start_iter = 500
+            cfg.train.density_end_iter = 50_000
+            cfg.train.density_interval = 200
+            cfg.train.densify_grad_threshold = 5e-4   # YÜKSELT! 2e-4'ten 2.5×
+            cfg.train.warmup_iters = 1500
+            # N hard cap — banana 164k olayı tekrarlamasın
+            cfg.train.max_gaussians = 80_000
+            # Model mimarisi — modest scale-up
+            cfg.model.hexplane_resolution = 112
+            cfg.model.hexplane_feat_dim = 56
+            cfg.model.mlp_width = 640
+            cfg.model.mlp_depth = 4
+            cfg.model.fourier_K = 12
+            # Export
+            cfg.export.num_timestamps = 90
+            # Foundation
+            cfg.foundation.metric3d_model = "metric3d_vit_small"
+            cfg.foundation.cotracker_grid_size = 25
+            cfg.foundation.cotracker_num_points = 1600
 
         # --- Override'lar (preset uzerine uygulanir) ---
         # Temel
@@ -280,6 +329,17 @@ async def process_video(
             cfg.model.mlp_depth = mlp_depth
         if num_time_freqs is not None:
             cfg.model.num_time_freqs = num_time_freqs
+        # v3.6 / Yol C
+        if deform_pos_mode is not None:
+            if deform_pos_mode not in ("mlp", "fourier", "hybrid"):
+                raise HTTPException(400, f"deform_pos_mode geçersiz: {deform_pos_mode}")
+            cfg.model.deform_pos_mode = deform_pos_mode
+        if fourier_K is not None:
+            cfg.model.fourier_K = max(0, fourier_K)
+        if lr_fourier is not None:
+            cfg.train.lr_fourier = lr_fourier
+        if lambda_fourier_reg is not None:
+            cfg.train.lambda_fourier_reg = lambda_fourier_reg
         # Foundation models
         if metric3d_model is not None:
             cfg.foundation.metric3d_model = metric3d_model

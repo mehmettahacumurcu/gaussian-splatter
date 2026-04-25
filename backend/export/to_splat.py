@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import List
 
 from ..model.gaussian_model import GaussianModel
-from ..model.deformation import DeformationField
+from ..model.deformation import DeformationField, decode_fourier_trajectory
 
 
 def write_ply(
@@ -97,10 +97,24 @@ def export_to_ply(
     written: List[Path] = []
     for t_idx, t in enumerate(timestamps):
         if deform is not None:
-            dpos, dquat, dscale = deform(gs.means, t, scene_extent)
+            dpos_mlp, dquat, dscale = deform(gs.means, t, scene_extent)
             # v3.5 safety: dscale clamp (trainer'da zaten clamp'lanıyor ama
             # eski checkpoint'lerde uygulanmamış olabilir, export burada da yapsın)
             dscale = dscale.clamp(min=-2.0, max=2.0)
+            # v3.6.2: dpos_mlp clamp
+            mlp_cap = scene_extent * 0.1
+            dpos_mlp = dpos_mlp.clamp(min=-mlp_cap, max=mlp_cap)
+
+            # v3.6 / Yol C: Fourier trajectory ekle (varsa)
+            if getattr(gs, "fourier_pos_coeffs", None) is not None:
+                dpos_fourier = decode_fourier_trajectory(gs.fourier_pos_coeffs, t)
+                dpos = dpos_mlp + dpos_fourier
+            else:
+                dpos = dpos_mlp
+            # v3.6.2: total dpos clamp
+            total_cap = scene_extent * 0.2
+            dpos = dpos.clamp(min=-total_cap, max=total_cap)
+
             d_means       = (gs.means + dpos)
             d_log_scales  = (gs.scales + dscale)         # log-space toplam
             d_quats       = F.normalize(gs.quats + dquat, dim=-1)

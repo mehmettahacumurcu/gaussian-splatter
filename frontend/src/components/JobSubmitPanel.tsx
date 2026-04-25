@@ -14,7 +14,7 @@ interface Props {
   onJobSubmitted: (response: ProcessResponse, sceneName: string) => void;
 }
 
-type Preset = "micro" | "smoke" | "full" | "cloud";
+type Preset = "micro" | "smoke" | "full" | "cloud" | "ultra";
 
 export function JobSubmitPanel({ onJobSubmitted }: Props) {
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -53,6 +53,7 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
         micro_test: preset === "micro",
         smoke_test: preset === "smoke",
         cloud: preset === "cloud",
+        ultra_test: preset === "ultra",
         skip_foundation: skipFoundation,
         hyperparams,
       });
@@ -158,6 +159,17 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
               <div className="preset-desc">60k iter, 1920x1080, 120 ts</div>
             </div>
           </label>
+          <label className={`preset-chip ${preset === "ultra" ? "active" : ""}`}>
+            <input
+              type="radio"
+              checked={preset === "ultra"}
+              onChange={() => setPreset("ultra")}
+            />
+            <div>
+              <div className="preset-name">Ultra 🔥 (6-9 saat)</div>
+              <div className="preset-desc">80k iter, 720x405, 90 ts, HexPlane 112/56, MLP 640/4, Fourier K=12, N cap 80k · 3060 Ti optimize</div>
+            </div>
+          </label>
         </div>
         {preset === "micro" && (
           <p className="submit-hint">
@@ -165,6 +177,16 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
             Foundation <strong>atla</strong> → ~30 sn (cache hit), sadece recon test.
             Foundation <strong>aç</strong> → ~5-10 dk, tam Stage 2 preflight (MiDaS+CoTracker+tracks/depth loss).
             CoTracker grid 30→15, MiDaS small — tümü hız optimize.
+          </p>
+        )}
+        {preset === "ultra" && (
+          <p className="submit-hint">
+            🔥 <strong>6-9 saat max-quality render</strong> (3060 Ti için optimize).
+            v2 (revised — v1 banana'da 164k gaussian patladı, 21 gün ETA).
+            80k iter, 720×405, HexPlane 112/56, MLP 640/4, Fourier K=12,
+            <strong>N hard cap 80k</strong> (densify threshold 5e-4 ile yavaş büyüme),
+            density end @ 50k, num_ts 90, CoTracker grid 25.
+            Video 20-40 sn ideal. <strong>Bilgisayarı uyutma</strong>.
           </p>
         )}
       </div>

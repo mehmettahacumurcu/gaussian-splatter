@@ -28,12 +28,16 @@ class GaussianModel(nn.Module):
         init_points: torch.Tensor,
         init_colors: torch.Tensor | None = None,
         sh_degree: int = 3,
+        fourier_K: int = 8,
     ):
         """
         Args:
             init_points: (N, 3) — COLMAP sparse point cloud
             init_colors: (N, 3) — [0, 1] başlangıç renkleri (None → gri)
             sh_degree:   Spherical Harmonics derecesi (0–3)
+            fourier_K:   Per-gaussian Fourier trajectory frekans sayısı (0 = kapalı).
+                         Default 8 → K frekans × 2 (sin/cos) × 3 axis = 48 float/gaussian.
+                         4DGS paper (Yang et al 2024) SOTA mimari.
         """
         super().__init__()
         N = len(init_points)
@@ -43,6 +47,7 @@ class GaussianModel(nn.Module):
         self.sh_degree = sh_degree
         # Toplam SH katsayı sayısı (deg+1)²; rest = total - 1
         self.num_sh_rest = (sh_degree + 1) ** 2 - 1
+        self.fourier_K = int(fourier_K)
 
         # ----- Pozisyon -----
         self.means = nn.Parameter(init_points.float())                                # (N, 3)
@@ -68,6 +73,18 @@ class GaussianModel(nn.Module):
         sh_dc = _rgb_to_sh_dc(init_colors).unsqueeze(1)                               # (N, 1, 3)
         self.sh_dc = nn.Parameter(sh_dc)
         self.sh_rest = nn.Parameter(torch.zeros(N, self.num_sh_rest, 3))              # (N, K, 3)
+
+        # ----- Per-gaussian Fourier trajectory (v3.6 / Yol C) -----
+        # Δpos(gaussian_i, t) = Σ_{k=1}^{K} [A_{ik} sin(2πkt) + B_{ik} cos(2πkt)]
+        # Shape: (N, K, 2, 3) — son axes: [sin_coef, cos_coef] × [x, y, z]
+        # Zero-init → başlangıçta motion yok, MLP'ninki gibi identity davranış.
+        if self.fourier_K > 0:
+            self.fourier_pos_coeffs = nn.Parameter(
+                torch.zeros(N, self.fourier_K, 2, 3)
+            )
+        else:
+            # Dummy placeholder — kapalı mod için (backward compat)
+            self.register_parameter("fourier_pos_coeffs", None)
 
     # ------------------------------------------------------------------
     # Yardımcı: başlangıç scale'ini KNN ile tahmin et
@@ -139,6 +156,11 @@ class GaussianModel(nn.Module):
         self.opacities = nn.Parameter(self.opacities[mask].contiguous())
         self.sh_dc     = nn.Parameter(self.sh_dc[mask].contiguous())
         self.sh_rest   = nn.Parameter(self.sh_rest[mask].contiguous())
+        # v3.6: fourier trajectory senkronu
+        if self.fourier_pos_coeffs is not None:
+            self.fourier_pos_coeffs = nn.Parameter(
+                self.fourier_pos_coeffs[mask].contiguous()
+            )
 
     @torch.no_grad()
     def append_gaussians(
@@ -149,6 +171,7 @@ class GaussianModel(nn.Module):
         new_opacities: torch.Tensor,
         new_sh_dc: torch.Tensor,
         new_sh_rest: torch.Tensor,
+        new_fourier_coeffs: torch.Tensor | None = None,
     ) -> None:
         """Yeni Gaussian'ları (clone/split sonucu) listenin sonuna ekle."""
         device = self.means.device
@@ -159,6 +182,17 @@ class GaussianModel(nn.Module):
         self.opacities = nn.Parameter(cat(self.opacities, new_opacities))
         self.sh_dc     = nn.Parameter(cat(self.sh_dc, new_sh_dc))
         self.sh_rest   = nn.Parameter(cat(self.sh_rest, new_sh_rest))
+        # v3.6: fourier trajectory senkronu
+        if self.fourier_pos_coeffs is not None:
+            n_new = new_means.shape[0]
+            if new_fourier_coeffs is None:
+                # Yeni gaussian için trajectory zero-init (motion yok, öğrensin)
+                new_fourier_coeffs = torch.zeros(
+                    n_new, self.fourier_K, 2, 3, device=device
+                )
+            self.fourier_pos_coeffs = nn.Parameter(
+                cat(self.fourier_pos_coeffs, new_fourier_coeffs)
+            )
 
     # ------------------------------------------------------------------
     # I/O
@@ -168,6 +202,7 @@ class GaussianModel(nn.Module):
         return {k: v.detach().cpu() for k, v in self.state_dict().items()} | {
             "sh_degree": self.sh_degree,
             "num_points": self.num_points,
+            "fourier_K": self.fourier_K,
         }
 
     @classmethod
@@ -175,12 +210,14 @@ class GaussianModel(nn.Module):
         """Boş bir model oluştur ve ağırlıkları yükle."""
         N = int(ckpt["num_points"])
         sh_deg = int(ckpt.get("sh_degree", 3))
+        fourier_K = int(ckpt.get("fourier_K", 0))  # Eski ckpt'lerde yok → 0
         # Dummy noktalar — sonra state_dict ile üzerine yazılacak
         dummy = torch.zeros(N, 3)
-        m = cls(dummy, sh_degree=sh_deg)
+        m = cls(dummy, sh_degree=sh_deg, fourier_K=fourier_K)
         # state_dict yalnızca tensor key'leri içersin
         sd = {k: v for k, v in ckpt.items() if isinstance(v, torch.Tensor)}
-        m.load_state_dict(sd, strict=True)
+        # Backward compat: eski ckpt'lerde fourier_pos_coeffs yok
+        m.load_state_dict(sd, strict=False)
         return m
 
 

@@ -62,6 +62,48 @@ def fourier_encode_scalar(value: float, num_freqs: int, device) -> torch.Tensor:
     return torch.cat(encs, dim=0)
 
 
+def decode_fourier_trajectory(
+    coeffs: torch.Tensor,   # (N, K, 2, 3) — sin/cos × xyz
+    t: float,               # ∈ [0, 1]
+) -> torch.Tensor:
+    """
+    Per-gaussian Fourier trajectory decode.
+    4DGS paper (Yang et al 2024) yaklaşımı: her gaussian kendi trajectory'sini öğrenir.
+
+    Δpos(i, t) = Σ_{k=1}^{K} [A_{ik} · sin(2πkt) + B_{ik} · cos(2πkt)]
+
+    Ama DC koşulu için: t=0'da Δpos=0 olsun istiyoruz (tüm B_k = 0 başta, öğrenilir).
+    Yani B term'leri t=0'da toplamı 0 olmayabilir ama bu OK, sadece motion relative.
+
+    Args:
+        coeffs: (N, K, 2, 3) tensor. son axes: [sin_coef, cos_coef] × [x, y, z]
+        t: zaman değeri [0, 1]
+
+    Returns:
+        (N, 3) Δpos tensor
+    """
+    if coeffs is None or coeffs.shape[1] == 0:
+        return torch.zeros(coeffs.shape[0] if coeffs is not None else 0, 3,
+                           device=coeffs.device if coeffs is not None else "cpu")
+
+    N, K, _, _ = coeffs.shape
+    device = coeffs.device
+    # Frekanslar: 2π·1, 2π·2, ..., 2π·K
+    freqs = torch.arange(1, K + 1, device=device, dtype=coeffs.dtype)  # (K,)
+    phases = 2.0 * math.pi * freqs * t                                 # (K,)
+    sin_vals = torch.sin(phases)                                       # (K,)
+    cos_vals = torch.cos(phases)                                       # (K,)
+
+    # coeffs[:, :, 0, :] → A (sin coef), shape (N, K, 3)
+    # coeffs[:, :, 1, :] → B (cos coef), shape (N, K, 3)
+    # Çıkış: Σ_k A_k·sin(2πkt) + B_k·cos(2πkt)  → (N, 3)
+    delta = (
+        (coeffs[:, :, 0, :] * sin_vals[None, :, None]).sum(dim=1) +
+        (coeffs[:, :, 1, :] * cos_vals[None, :, None]).sum(dim=1)
+    )
+    return delta
+
+
 class DeformationField(nn.Module):
     """HexPlane + MLP → (Δpos, Δquat, Δscale). Fourier-encoded t."""
 

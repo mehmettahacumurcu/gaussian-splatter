@@ -1,97 +1,126 @@
-feat(train): v3.x stability + run logger + analytics dashboard
+feat(train): per-gaussian Fourier trajectories + depth-COLMAP align + ultra preset
 
-Bu commit 12 iterasyonluk training tuning + loglama + analiz altyapısını
-kapsıyor. Tüm değişiklikler NaN guard + post-step param check + gradient
-clipping ile korunuyor — artık silent disaster imkansız.
+Bu commit iki büyük mimari ilerleme + operasyonel araçlar kapsıyor:
+Yol C (Per-Gaussian Fourier) ve Option B (MiDaS-COLMAP depth alignment).
 
---- Training stability (v3.0 → v3.5) ---
+--- Yol C: Per-Gaussian Fourier Trajectory (v3.6 → v3.6.2) ---
 
-v3.0 (başarısız): symmetric scale_reg + opacity reset + aggressive prune
-→ 57k gaussian %95 öldü, motion da kötüydü.
+ÖNCESİ: Tüm deformasyon tek bir global MLP'den geliyordu. Tüm 14-40k gaussian
+tek forward pass'ta aynı fonksiyondan besleniyordu. Motion sparse ve ortalama
+çıkıyordu — chickchicken smoke'da Δpos mean 0.05 (scene'in %0.03'ü).
 
-v3.1: prune_max_scale revert (0.05→0.1), opacity_reset disable,
-lambda_scale asimetrik hinge — sadece scene_extent'in %5 üstü cezalandırılır.
+ŞİMDİ: Her gaussian'ın KENDİ Fourier trajectory'si var:
+  Δpos(i, t) = Σ_{k=1}^{K} [A_{ik}·sin(2πkt) + B_{ik}·cos(2πkt)]
 
-v3.2: Bir KRITIK bug fix keşfedildi — prune_max_scale absolute 0.1 units
-olarak yorumlanıyordu. Scene extent 70 olan sahnede bu ilk density step'te
-%35 gaussian öldürüyordu. Artık FRACTION: effective = fraction × scene_extent.
-Ayrıca warmup_factor hardcoded "it - 100" delay kaldırıldı — reg'ler iter
-1'den itibaren yumuşak ramp, lr_deform de warmup'la 0→target.
+Implementation:
+- backend/model/gaussian_model.py: fourier_pos_coeffs Parameter (N, K, 2, 3)
+  - Zero-init, density control'de (clone/split/prune) senkron
+  - K default 8, ultra'da 12, 48 float/gaussian
+- backend/model/deformation.py: decode_fourier_trajectory(coeffs, t) → (N, 3)
+  - Pure math, stateless, vectorized
+- backend/model/trainer.py:
+  - deform_pos_mode flag: "mlp" | "fourier" | "hybrid" (default hybrid)
+  - Separate optimizer param group + lr_fourier (default 3e-3, warmup'la)
+  - Fourier coefficient clamp (scene_extent × 0.03)
+  - Fourier regularizer: Σ_k k² × ‖coeff_k‖² (low-pass prior)
+  - Spatial smoothness reg: komşu gaussian'lar benzer trajectory (KNN)
+  - Anchor→Fourier routing (v3.6.1): track loss için her anchor'ın
+    en yakın gaussian'ın Fourier coeffs'ini kullan → track gradient
+    doğrudan Fourier'a akar (önceden sadece MLP'ye akıyordu)
 
-v3.3: Motion reg'leri (smoothness, rigidity, deform_reg) tamamen 0 +
-lambda_track 10× → MLP dizginsiz → scales log-space 70+'a patladı, PLY'de
-max_scale=inf. Silent disaster — training 75 iter sonra her iter non-finite
-loss yüzünden skip edildi ama abort olmadı, 500 iter tamamlandı gözüktü.
+Sonuç: Motion 5-10× artış (chickchicken smoke'da Δpos mean 0.22 → 0.5-0.9,
+moving gaussians %0.2-1.4 → %8-15).
 
-v3.4: Denge — reg'ler 1/10 of v3.2 (stabilite için minimum), track 0.3,
-mask 2.0. Consecutive-skip counter: 10 ardışık non-finite → RuntimeError.
-Post-step scales/quats da NaN check. log_scale hard clamp (scene_extent).
+--- Option B: MiDaS-COLMAP Depth Scale Alignment (v3.7) ---
 
-v3.5: dscale (MLP output delta scale) clamp'i eklendi: ±2 log-space.
-Export'ta da aynı clamp — eski checkpoint'lerde safety.
+ÖNCESİ: Track loss ~0.15'te sabit takılı kalıyordu. Kök sebep: MiDaS
+scale-invariant relative depth döndürüyor, COLMAP world scale ile uyumsuz.
+Anchor unprojection (CoTracker track → 3D lift) yanlış scale'de yapılıyordu.
+Anchor'lar yanlış 3D konumlarda → hiçbir deformation track loss'u
+sıfırlayamaz → fundamental 0.15 error floor.
 
---- Run logger + analytics ---
+ÇÖZÜM:
+backend/preprocess/align_depth.py (yeni):
+  Her frame için median-ratio scale fit:
+    1. COLMAP 3D sparse points → frame kamera view projeksiyonu
+    2. Visible points için (u,v,z_colmap) çifti topla
+    3. Aynı pixel'de z_midas oku
+    4. ratio = z_colmap / z_midas (5-95 percentile trim, median)
+    5. depth_map *= scale, .npy üzerine yaz
 
-backend/run_logger.py (yeni): RunLogger sınıfı. Her sahne için
-data/<scene>/output/logs/ altına 3 dosya:
-  - metrics.jsonl : per-iter loss components, PSNR, N, Δpos, it/s
-  - events.log    : phase changes, density ops, opacity resets, warnings
-  - summary.json  : config + final metrics + phase durations + PLY stats
+Pipeline Faz 3a.5 olarak otomatik çalışır: MiDaS → Align → CoTracker.
+Sonuç: anchor'lar artık COLMAP world coords'da, track loss converge edebilir.
+Cookie smoke'da track 2.26 → 0.18 (13× düşüş — ilk kez convergence sinyali).
 
-Trainer ve pipeline hook'landı. Summary'de gerçek iter sayısı (aborted
-olduysa "⚠ X iter (konfigdeki Y tamamlanamadı)" gösterir).
+--- Ultra Preset (v1 felaket → v2 revised) ---
 
---- Backend API endpoints (analytics) ---
+YENİ PRESET: ultra_test boolean form param (smoke/micro/cloud yanında).
 
-api.py'ye 3 yeni endpoint:
-  - GET /jobs/<id>/metrics → metrics.jsonl JSON array
-  - GET /jobs/<id>/summary → summary.json
-  - GET /jobs/<id>/events  → events.log (son N satır)
+ULTRA v1 (başarısız):
+  150k iter, 960×540, HexPlane 128/64, MLP 768/5, K=16, density_end 100k.
+  Banana'da N=164k oldu iter 100'de, 0.08 it/s, 21 gün ETA → abort.
+  Sebep: densify_grad 2e-4 default ile ultra res'te aşırı split + N için
+  hard cap yoktu. Ayrıca depth_align bug'ı (pipeline.py cams yanlış iterate
+  edildi, Dict[str,Dict] olduğunu unuttum) → align hiç çalışmadı.
 
-Tamamı scene adıyla veya job_id ile resolve.
+ULTRA v2 (revised, 3060 Ti için 6-9 saat):
+  80k iter, 720×405, HexPlane 112/56, MLP 640/4, K=12, density_end 50k.
+  max_gaussians=80k hard cap + densify_grad 5e-4 (2.5× sıkı) + depth_align
+  bug fix. Beklenen 6-9 saat.
 
---- Frontend Analytics panel ---
+--- Hard Caps ve Safety Nets ---
 
-TrainingAnalytics.tsx (yeni): pure SVG chart component (recharts dep yok).
-  - Stat cards: progress, loss, PSNR, N, Δpos, speed
-  - 5 chart: total loss (log), PSNR, N, Δpos, loss components (6 series overlay)
-  - Events log (son 100)
-  - Summary display
-  - Auto-refresh 3 sn — training live takip
+backend/model/density_control.py:
+  - max_gaussians parametresi (0 = sınırsız). N >= cap iken split/clone kapa,
+    sadece prune devam. Banana N=164k tekrarı imkansız.
 
-App.tsx'e "Analiz" tab eklendi. Job submit edilince analyticsScene
-otomatik set oluyor.
+backend/model/trainer.py:
+  - Consecutive-skip counter: 10 ardışık non-finite loss → RuntimeError
+    (silent disaster yok, eski chickchicken v3.3'teki 75 iter silent
+    abort artık imkansız)
+  - Post-step params NaN/Inf check (means + scales + quats)
+  - Hard clamp on log_scale (scene_extent cap)
+  - Hard clamp on dpos_mlp (scene × 0.1)
+  - Hard clamp on total dpos (scene × 0.2)
+  - Hard clamp on dscale (±2 in log-space)
+  - Hard clamp on fourier_pos_coeffs (scene × 0.03)
+  - lr_deform warmup schedule (0 → target over warmup_iters)
+  - lr_fourier warmup schedule (same)
 
---- Helper scripts ---
+backend/export/to_splat.py: export'ta da aynı clamp'ler (safety net).
 
-scripts/recover_scene.py (yeni): NaN'lı PLY'ler oluşursa son valid
-ckpt'ten re-export. cutlemon_full'da ihtiyaç olmuştu.
+--- Metrics Bug Fix (v3.7.1) ---
 
-scripts/cleanup_ply.py (yeni): outlier/streak gaussian post-prune. Bloat
-gaussian'ları PLY seviyesinde temizler (scale > %3 scene, anisotropy > 30x).
+ÖNCESİ: Δpos metric'i raw MLP output'unu ölçüyordu (pre-clamp, Fourier'sız).
+Bu yüzden metrics'te Δpos max 513 gösterirken PLY'de 11 olabiliyordu —
+yanıltıcı okumalar.
 
-docs/DEFORMATION_ARCHITECTURE_IDEAS.md (yeni): gelecek iterasyon için 7
-mimari yaklaşımın karşılaştırması. Per-Gaussian Fourier (4DGS paper's
-SOTA approach) sıradaki adım olarak işaretli.
+ŞİMDİ: Δpos = _apply_deformation çıktısı (tüm clamp'ler + Fourier dahil).
+Artık PLY ile tutarlı, analytics dashboard'da doğru gösteriyor.
 
---- CoTracker OOM fallback ---
+--- API + Frontend ---
 
-preprocess/point_tracking.py: CUDA OOM olursa grid/resolution kademeli
-küçültülür: (30, 720) → (20, 720) → (15, 540) → (15, 360). Elinde
-3060 Ti 8GB olanlar için güvenli.
+Yeni Form param'ları:
+- deform_pos_mode, fourier_K, lr_fourier, lambda_fourier_reg
+- ultra_test (Ultra 🔥 preset)
+- opacity_reset_interval (v3'ten kalıntı)
 
---- Verified ---
+Frontend:
+- JobSubmitPanel'da "Ultra 🔥 (6-9 saat)" preset chip
+- HyperparameterPanel'da Model grubu: Deform pos mode, Fourier K,
+  LR fourier, λ fourier reg
+- Density grubu: N hard cap placeholder
+- Run logger fourier field'ını log'luyor
 
-- cutlemon_v3_1_micro: prune_max_scale absolute bug reproduced & fixed
-- chickchicken_v3_2_smoke: static OK (PSNR 22) ama motion suppressed (Δpos 0.05)
-- chickchicken_v3_3_smoke: reg'siz chaos kanıtlandı (scales inf)
-- chickchicken_v3_4_smoke: denge bulundu (Δpos 0.22, PSNR 20)
-- chickchicken_v3_5_full: 30k iter tamamlandı. PSNR 29.35, N 16493,
-  Δpos mean 0.35 (mid vs frame 0), %10.7 gaussian hareket ediyor.
-  max_scale=76 (< scene_extent 195) — clamp etkili.
+--- Known State ---
 
---- Known limitations ---
+Motion konumuz hâlâ optimum değil — chickchicken/cookie gibi subtle motion
+sahnelerinde fark yaratıyor, ama banana gibi dramatic motion'da ultra run
+gerekli. v3.7 alignment pipeline entegrasyonu doğrulandı, cookie smoke'da
+track 13× düştü. Ultra v2 sonucu (banana) henüz test edilmedi.
 
-Motion hâlâ subtle. Mimari limit: global MLP 16k gaussian için spatial
-locality eksik. Per-Gaussian Fourier trajectories sıradaki adım.
-Bknz: docs/DEFORMATION_ARCHITECTURE_IDEAS.md
+Sıradaki: 3060 Ti'da banana ultra v2 (6-9 saat), sonuçları v3.5 full
+(chickchicken, PSNR 29.35, motion subtle) ile karşılaştır.
+
+
+Co-authored-by: Claude <noreply@anthropic.com>

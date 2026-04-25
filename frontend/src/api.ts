@@ -96,6 +96,11 @@ export interface HyperParams {
   mlp_width?: number | null;
   mlp_depth?: number | null;
   num_time_freqs?: number | null;
+  // v3.6 / Yol C — Per-gaussian Fourier trajectory
+  deform_pos_mode?: string | null;        // "mlp" | "fourier" | "hybrid"
+  fourier_K?: number | null;               // Frekans sayısı
+  lr_fourier?: number | null;
+  lambda_fourier_reg?: number | null;
   // Foundation models
   metric3d_model?: string | null;
   cotracker_num_points?: number | null;
@@ -108,6 +113,7 @@ export interface SubmitJobOptions {
   smoke_test?: boolean;
   micro_test?: boolean;
   cloud?: boolean;
+  ultra_test?: boolean;
   skip_foundation?: boolean;
   hyperparams?: HyperParams;
 }
@@ -216,6 +222,8 @@ export async function submitJob(
     fd.append("micro_test", String(options.micro_test));
   if (options.cloud !== undefined)
     fd.append("cloud", String(options.cloud));
+  if (options.ultra_test !== undefined)
+    fd.append("ultra_test", String(options.ultra_test));
   if (options.skip_foundation !== undefined)
     fd.append("skip_foundation", String(options.skip_foundation));
 

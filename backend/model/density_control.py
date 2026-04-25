@@ -20,11 +20,13 @@ class DensityController:
         scale_split_threshold: float = 0.01,
         min_opacity: float = 0.005,
         max_scale: float = 0.1,
+        max_gaussians: int = 0,   # 0 = sınırsız; >0 ise N >= cap iken split kapalı
     ):
         self.grad_threshold = grad_threshold
         self.scale_split_threshold = scale_split_threshold
         self.min_opacity = min_opacity
         self.max_scale = max_scale
+        self.max_gaussians = int(max_gaussians)
 
         self._grad_accum: torch.Tensor | None = None
         self._n_obs: torch.Tensor | None = None
@@ -60,6 +62,12 @@ class DensityController:
 
             clone_mask = high_grad & small
             split_mask = high_grad & large
+
+            # v3.7.2: Hard cap on N — eğer cap'i aştıysak split/clone kapa,
+            # sadece prune yapsın. Banana ultra'da N=164k oldu, render çöktü.
+            if self.max_gaussians > 0 and gs.num_points >= self.max_gaussians:
+                clone_mask = torch.zeros_like(clone_mask)
+                split_mask = torch.zeros_like(split_mask)
 
             # Clone: aynı parametrelerle kopyala
             n_cloned = int(clone_mask.sum().item())

@@ -72,6 +72,12 @@ class ModelConfig:
     mlp_width: int = 512
     mlp_depth: int = 4
     num_time_freqs: int = 6
+    # v3.6 / Yol C — Per-gaussian Fourier trajectory (4DGS paper SOTA)
+    # "mlp"     → eski global MLP (tüm pozisyon MLP'den)
+    # "fourier" → saf per-gaussian trajectory (MLP dpos kullanılmaz, dquat/dscale için MLP)
+    # "hybrid"  → her ikisi (MLP global bias + per-gaussian özgün trajectory)
+    deform_pos_mode: str = "hybrid"
+    fourier_K: int = 8               # Frekans sayısı: 48 param/gaussian (K × 2 × 3)
 
 
 @dataclass
@@ -88,12 +94,18 @@ class TrainConfig:
     lr_sh_dc: float = 2.5e-3
     lr_sh_rest: float = 2.5e-3 / 20
     lr_deform: float = 3e-3             # v3: 1e-3 → 3e-3 — motion'un daha hızlı öğrenilmesi için (ÇALIŞIYOR)
+    lr_fourier: float = 3e-3            # v3.6.1: 5e-3 → 3e-3 (kontrolsüz büyümeyi azalt)
+    # Fourier regularizer — high-freq katsayıları bastır (low-pass prior, overfitting önle)
+    lambda_fourier_reg: float = 1e-3    # v3.6.1: 1e-4 → 1e-3 (10× güçlü, 0.12 → 6.38 explosion engelle)
     # Density control — v3.1: aggressive prune revert, extended end korundu
     density_start_iter: int = 500
     density_end_iter: int = 22_000      # v3: 15k → 22k (final prune'lar için)
     density_interval: int = 100
     densify_grad_threshold: float = 2e-4
     prune_min_opacity: float = 0.005
+    # v3.7.2: Hard cap on N — banana ultra'da 164k oldu, render saatte 1k iter yapamadı.
+    # 0 = sınırsız. Ultra için 80k güvenli sınır.
+    max_gaussians: int = 0
     prune_max_scale: float = 0.02       # v3.2: FRACTION of scene_extent (INRIA original intent)
                                         # trainer.py içinde: effective = prune_max_scale * scene_extent
                                         # 0.02 × 70 = 1.4 units → reasonable bloat cap
@@ -114,7 +126,7 @@ class TrainConfig:
     # Foundation model losses (Stage 2) — v3.4 denge
     lambda_depth: float = 0.1
     lambda_mask_motion: float = 2.0     # v3.4: 1.0 → 2.0 (denge, v3.3'teki 3.0 overshoot)
-    lambda_track: float = 0.3           # v3.4: 0.1 (v3.2) × 3 = 0.3 (v3.3'teki 1.0 patlattı)
+    lambda_track: float = 0.5           # v3.6.1: 0.3 → 0.5 (fourier artık track sinyali alıyor, boost)
     track_sample_k: int = 256           # Her iter kaç track sample'lansın
     # Warmup (regularizer'lar linear 0 → full over first N iter)
     warmup_iters: int = 500             # v3: 2000 → 500 (reg'ler erken devreye girsin ama yumuşak)

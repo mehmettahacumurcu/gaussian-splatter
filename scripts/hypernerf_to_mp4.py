@@ -42,8 +42,8 @@ def main():
         help="Çıktı MP4 yolu (ör. data/hypernerf_chickchicken/video.mp4)",
     )
     p.add_argument(
-        "--res", default="2x", choices=["2x", "4x", "8x", "16x"],
-        help="Çözünürlük tier'i (2x=yarı, 4x=çeyrek ... 16x=on altıda bir)",
+        "--res", default="2x", choices=["1x", "2x", "4x", "8x", "16x"],
+        help="Çözünürlük tier'i (1x=full, 2x=yarı, 4x=çeyrek ... 16x=on altıda bir)",
     )
     p.add_argument("--fps", type=int, default=30, help="Çıktı video FPS (default 30)")
     p.add_argument("--start", type=int, default=1,
