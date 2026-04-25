@@ -140,6 +140,59 @@ def run_pipeline(
         except Exception as e:
             print(f"⚠ Derinlik tahmini başarısız, atlanıyor: {e}")
             foundation_status["depth"] = f"failed: {e}"
+
+        # 3a.5 — MiDaS → COLMAP scale alignment (v3.7 / Option B)
+        # MiDaS relative depth üretiyor, COLMAP world scale ile uyumsuz.
+        # Anchor unprojection doğru 3D koordinat üretebilsin diye align ediyoruz.
+        # Track loss'un 0.15'te takılmasının ana sebebi bu uyumsuzluktu.
+        run_logger.log_event("phase:start", phase="depth_align")
+        if foundation_status["depth"] == "ok":
+            try:
+                print("\n[Faz 3a.5] Depth → COLMAP scale alignment")
+                from .preprocess.align_depth import align_depth_to_colmap
+                # cams = Dict[image_name, {K, w2c, width, height}]
+                # Sıralı isim listesi al, frame_paths ile uyumlu sırada w2c topla
+                frame_paths_all = sorted(paths["frames"].glob("frame_*.png"))
+                cam_names_sorted = sorted(cams.keys())
+                first_cam = cams[cam_names_sorted[0]]
+                w2c_list = [
+                    torch.from_numpy(cams[n]["w2c"]).float()
+                    for n in cam_names_sorted
+                ]
+                K_first = torch.from_numpy(first_cam["K"]).float()
+                W_frame = int(first_cam["width"])
+                H_frame = int(first_cam["height"])
+                xyz_t = torch.from_numpy(xyz).float()
+
+                # Frame sayısı eşleşmesini garantile (bazen COLMAP az register edebilir)
+                n = min(len(frame_paths_all), len(w2c_list))
+                align_stats = align_depth_to_colmap(
+                    depth_dir=paths["depth"],
+                    frame_paths=frame_paths_all[:n],
+                    cam_K=K_first,
+                    cam_w2c_per_frame=w2c_list[:n],
+                    colmap_xyz=xyz_t,
+                    frame_size=(W_frame, H_frame),
+                    overwrite=True,
+                )
+                foundation_status["depth"] = f"ok (COLMAP-aligned, scale={align_stats['global_scale_median']:.3f})"
+                run_logger.log_event(
+                    "depth_align:ok",
+                    n_aligned=align_stats["n_frames_aligned"],
+                    n_skipped=align_stats["n_frames_skipped"],
+                    global_scale=align_stats["global_scale_median"],
+                )
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                print(f"⚠ Depth align başarısız (kritik değil, training devam): {e}")
+                print(tb)
+                run_logger.log_event("depth_align:failed", error=str(e)[:200])
+                # Alignment opsiyonel, pipeline devam eder
+        else:
+            run_logger.log_event("depth_align:skipped",
+                                 reason=f"depth status={foundation_status['depth']}")
+
         cb("foundation", 0.33, "Depth done, CoTracker başlıyor", {})
 
         # 3b — Tracks
@@ -186,7 +239,8 @@ def run_pipeline(
     init_pts = torch.from_numpy(xyz)
     init_rgb = torch.from_numpy(rgb).float() / 255.0
     gs = GaussianModel(init_pts, init_colors=init_rgb,
-                       sh_degree=cfg.model.sh_degree)
+                       sh_degree=cfg.model.sh_degree,
+                       fourier_K=cfg.model.fourier_K)
     deform = DeformationField(
         resolution=cfg.model.hexplane_resolution,
         feat_dim=cfg.model.hexplane_feat_dim,
@@ -244,6 +298,12 @@ def run_pipeline(
         lambda_scale=cfg.train.lambda_scale,
         opacity_reset_interval=cfg.train.opacity_reset_interval,
         warmup_iters=cfg.train.warmup_iters,
+        # v3.6 / Yol C — Per-gaussian Fourier trajectory
+        deform_pos_mode=cfg.model.deform_pos_mode,
+        lr_fourier=cfg.train.lr_fourier,
+        lambda_fourier_reg=cfg.train.lambda_fourier_reg,
+        # v3.7.2 — N hard cap
+        max_gaussians=cfg.train.max_gaussians,
     )
     # Foundation çıktıları varsa trainer'a ver (stage 2 loss'lar için)
     depth_dir_arg = paths["depth"] if (not skip_foundation and paths["depth"].exists()) else None

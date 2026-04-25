@@ -89,6 +89,10 @@ const GROUPS: { title: string; icon: string; fields: FieldSpec[] }[] = [
       { key: "mlp_width", label: "Deformation MLP width", placeholder: "512", kind: "number", min: 32, step: 32, help: "v2 default 512 (eski: 256)" },
       { key: "mlp_depth", label: "Deformation MLP depth", placeholder: "4", kind: "number", min: 1, max: 8, step: 1, help: "Hidden layer sayısı" },
       { key: "num_time_freqs", label: "Fourier time freqs", placeholder: "6", kind: "number", min: 0, max: 12, step: 1, help: "0 = kapalı" },
+      { key: "deform_pos_mode", label: "Deform pos mode (v3.6)", placeholder: "hybrid", kind: "string", help: "mlp | fourier | hybrid. Hybrid = per-gaussian Fourier + global MLP (4DGS paper SOTA)" },
+      { key: "fourier_K", label: "Fourier trajectory K", placeholder: "8", kind: "number", min: 0, max: 32, step: 1, help: "Per-gaussian frekans sayısı (0 = kapalı, motion için 8 default)" },
+      { key: "lr_fourier", label: "LR fourier coeffs", placeholder: "0.005", kind: "number", step: 0.001, help: "Fourier katsayıları için ayrı LR" },
+      { key: "lambda_fourier_reg", label: "λ fourier reg", placeholder: "0.0001", kind: "number", step: 0.0001, help: "High-freq bastırma (noise önleme)" },
     ],
   },
   {

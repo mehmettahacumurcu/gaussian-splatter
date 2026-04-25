@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .gaussian_model import GaussianModel
-from .deformation import DeformationField
+from .deformation import DeformationField, decode_fourier_trajectory
 from .renderer import render_view
 from .density_control import DensityController
 
@@ -190,8 +190,14 @@ class Trainer4DGS:
         lambda_scale: float = 1e-3,
         # Opacity reset — INRIA 3DGS trick (her N iter low-opacity'yi topluca reset)
         opacity_reset_interval: int = 3000,
+        # v3.7.2: Hard cap on N (0 = sınırsız). Banana ultra'da N=164k oldu, çöktü.
+        max_gaussians: int = 0,
         # Warmup
         warmup_iters: int = 2000,
+        # v3.6 / Yol C — Per-gaussian Fourier trajectory
+        deform_pos_mode: str = "hybrid",     # "mlp" | "fourier" | "hybrid"
+        lr_fourier: float = 5e-3,
+        lambda_fourier_reg: float = 1e-4,
     ):
         self.gs = gs.to(device)
         self.deform = deform.to(device)
@@ -210,6 +216,20 @@ class Trainer4DGS:
         self.lambda_scale = lambda_scale
         self.opacity_reset_interval = int(opacity_reset_interval)
         self.warmup_iters = max(1, warmup_iters)
+        # v3.6 / Yol C
+        self.deform_pos_mode = deform_pos_mode
+        self.lr_fourier = lr_fourier
+        self.lambda_fourier_reg = lambda_fourier_reg
+        if deform_pos_mode not in ("mlp", "fourier", "hybrid"):
+            raise ValueError(f"deform_pos_mode geçersiz: {deform_pos_mode}")
+        if deform_pos_mode != "mlp" and (
+            self.gs.fourier_pos_coeffs is None or self.gs.fourier_K == 0
+        ):
+            raise ValueError(
+                f"deform_pos_mode='{deform_pos_mode}' ama GaussianModel fourier_K=0. "
+                f"GaussianModel'i fourier_K>0 ile başlat."
+            )
+        print(f"[trainer] deform_pos_mode={deform_pos_mode} fourier_K={self.gs.fourier_K}")
 
         self.density_start_iter = density_start_iter
         self.density_end_iter = density_end_iter
@@ -225,7 +245,10 @@ class Trainer4DGS:
             grad_threshold=densify_grad_threshold,
             min_opacity=prune_min_opacity,
             max_scale=effective_max_scale,
+            max_gaussians=max_gaussians,
         )
+        if max_gaussians > 0:
+            print(f"[trainer] N hard cap: {max_gaussians:,} (cap dolunca split kapalı, prune devam)")
 
         self.lr_specs = {
             "means":     lr_means,
@@ -248,15 +271,39 @@ class Trainer4DGS:
             {"params": [self.gs.sh_rest],   "lr": self.lr_specs["sh_rest"]},
             {"params": list(self.deform.parameters()), "lr": self.lr_deform},
         ]
+        # v3.6: Fourier trajectory param group (eğer açıksa)
+        if self.gs.fourier_pos_coeffs is not None:
+            groups.append(
+                {"params": [self.gs.fourier_pos_coeffs], "lr": self.lr_fourier}
+            )
         self.optimizer = torch.optim.Adam(groups, eps=1e-15)
 
     def _apply_deformation(self, t: float):
-        dpos, dquat, dscale = self.deform(self.gs.means, t, self.scene_extent)
+        # MLP her zaman çağrılır (dquat, dscale için gerekli, dpos opsiyonel)
+        dpos_mlp, dquat, dscale = self.deform(self.gs.means, t, self.scene_extent)
         # v3.5: dscale clamp — MLP'nin scale delta'sı ±2 ile sınırlı.
-        # ±2 log-space = scale factor in [exp(-2)=0.135, exp(2)=7.39].
-        # Bu, scale'lerin aşırı büyümesini / küçülmesini engelliyor.
-        # Önceden dscale 700+'a gidebilirdi → exp() → inf → PLY inf scales.
         dscale = dscale.clamp(min=-2.0, max=2.0)
+
+        # v3.6.2: dpos_mlp clamp — MLP serbest yazabildiği için 500+ unit
+        # jump'lara yol açıyordu (chickchicken_fourier_v2'de Δpos max=513 görüldü).
+        # Max motion per iter = scene_extent × 0.1 (yumuşak caydırıcı).
+        mlp_cap = self.scene_extent * 0.1
+        dpos_mlp = dpos_mlp.clamp(min=-mlp_cap, max=mlp_cap)
+
+        # v3.6 / Yol C: Pozisyon deformasyonunu pos_mode'a göre seç
+        if self.deform_pos_mode == "mlp":
+            dpos = dpos_mlp
+        elif self.deform_pos_mode == "fourier":
+            dpos = decode_fourier_trajectory(self.gs.fourier_pos_coeffs, t)
+        else:  # "hybrid"
+            dpos_fourier = decode_fourier_trajectory(self.gs.fourier_pos_coeffs, t)
+            dpos = dpos_mlp + dpos_fourier
+
+        # v3.6.2: FINAL dpos clamp — overall motion cap
+        # Herhangi bir gaussian maks sahne'nin %20'si kadar oynayabilir.
+        total_cap = self.scene_extent * 0.2
+        dpos = dpos.clamp(min=-total_cap, max=total_cap)
+
         deformed_means  = self.gs.means + dpos
         deformed_quats  = F.normalize(self.gs.quats + dquat, dim=-1)
         deformed_scales = self.gs.get_scales * torch.exp(dscale)
@@ -422,17 +469,23 @@ class Trainer4DGS:
 
         # v3.2: lr_deform için warmup — ilk warmup_iters iter'de 0 → target'a ramp up
         # Önce yüksek lr_deform MLP'yi patlatıp Δpos=41 spike'ları yaratıyordu.
-        deform_param_group_idx = len(self.optimizer.param_groups) - 1
+        # v3.6: param group 6 = deform (MLP), group 7 (varsa) = fourier_pos_coeffs.
+        # Her ikisini de warmup'la ramp up.
+        DEFORM_GROUP_IDX = 6   # deform MLP
+        FOURIER_GROUP_IDX = 7  # fourier (yoksa len < 8)
         target_lr_deform = self.lr_deform
+        target_lr_fourier = self.lr_fourier
+        has_fourier_group = len(self.optimizer.param_groups) > FOURIER_GROUP_IDX
 
         for it in range(1, n_iters + 1):
             idx = int(torch.randint(0, T, (1,)).item())
             t_norm = idx / max(T - 1, 1)
             warmup = self._warmup_factor(it)
 
-            # Update lr_deform per iter (warmup schedule)
-            current_lr_deform = target_lr_deform * warmup
-            self.optimizer.param_groups[deform_param_group_idx]["lr"] = current_lr_deform
+            # Update lr_deform + lr_fourier per iter (warmup schedule)
+            self.optimizer.param_groups[DEFORM_GROUP_IDX]["lr"] = target_lr_deform * warmup
+            if has_fourier_group:
+                self.optimizer.param_groups[FOURIER_GROUP_IDX]["lr"] = target_lr_fourier * warmup
 
             # --- Ground truth load ---
             if frames_cached[idx] is None:
@@ -474,7 +527,8 @@ class Trainer4DGS:
 
             # Loss bileşenlerini ayrı tut (diagnostics için)
             comp = {"recon": loss_recon.item(), "depth": 0.0, "track": 0.0,
-                    "deform_reg": 0.0, "smooth": 0.0, "rigid": 0.0}
+                    "deform_reg": 0.0, "smooth": 0.0, "rigid": 0.0,
+                    "scale": 0.0, "fourier": 0.0}
 
             # --- Depth consistency (log-space, warmup-gated, clamped) ---
             # Log-space L1 scale-invariant ve outlier'a karşı dayanıklı.
@@ -515,8 +569,21 @@ class Trainer4DGS:
                     gt_uv = gt_tracks_scaled[sel]
 
                     # Apply deformation at t to anchors (static base + delta)
-                    # Treat anchors as if they were gaussian means at t=0, apply deform
-                    d_anchors_pos, _, _ = self.deform(anchors_sel, t_norm, self.scene_extent)
+                    # v3.6.1: HEM MLP hem nearest-gaussian fourier trajectory.
+                    # Bu sayede track loss gradient'i hem MLP'ye hem Fourier'a akar.
+                    # Önceden sadece MLP'ye akıyordu → Fourier motion rastgele öğreniliyordu.
+                    d_anchors_mlp, _, _ = self.deform(anchors_sel, t_norm, self.scene_extent)
+                    if (self.deform_pos_mode != "mlp" and
+                            self.gs.fourier_pos_coeffs is not None):
+                        # KNN: her anchor için en yakın gaussian
+                        with torch.no_grad():
+                            dists = torch.cdist(anchors_sel, self.gs.means)  # (A, N)
+                            nearest_idx = dists.argmin(dim=-1)                # (A,)
+                        nearest_coeffs = self.gs.fourier_pos_coeffs[nearest_idx]  # (A, K, 2, 3)
+                        d_anchors_fourier = decode_fourier_trajectory(nearest_coeffs, t_norm)
+                        d_anchors_pos = d_anchors_mlp + d_anchors_fourier
+                    else:
+                        d_anchors_pos = d_anchors_mlp
                     deformed_anchors = anchors_sel + d_anchors_pos
 
                     # Project to training image space
@@ -576,6 +643,51 @@ class Trainer4DGS:
                 scale_reg = excess.pow(2).mean()
                 loss = loss + self.lambda_scale * scale_reg
                 comp["scale"] = scale_reg.item()
+
+            # --- Fourier trajectory regularizer (v3.6 / Yol C) ---
+            # High-freq katsayıları bastır — noise/overfitting önle.
+            # Frekansa göre ağırlıklı L2: yüksek k → büyük ceza (low-pass prior).
+            if (self.lambda_fourier_reg > 0 and
+                    self.gs.fourier_pos_coeffs is not None and
+                    self.deform_pos_mode != "mlp"):
+                K = self.gs.fourier_K
+                # Frekans ağırlığı: k² (k=1,2,...,K). Yüksek k'lar daha çok cezalandırılır.
+                freq_weights = torch.arange(1, K + 1, device=self.gs.fourier_pos_coeffs.device,
+                                            dtype=self.gs.fourier_pos_coeffs.dtype)
+                freq_weights = freq_weights ** 2  # (K,)
+                # coeffs: (N, K, 2, 3) → per-coeff squared magnitude × freq weight
+                sq = self.gs.fourier_pos_coeffs.pow(2)  # (N, K, 2, 3)
+                # Sum over sin/cos + xyz, mean over N, weighted sum over K
+                per_freq_energy = sq.sum(dim=(0, 2, 3)) / max(self.gs.num_points, 1)  # (K,)
+                fourier_reg = (per_freq_energy * freq_weights).sum()
+                loss = loss + self.lambda_fourier_reg * fourier_reg
+                comp["fourier"] = fourier_reg.item()
+
+            # --- Fourier SPATIAL smoothness (v3.6.2) ---
+            # Komşu gaussian'lar benzer trajectory'ye sahip olsun. Motion diffuse et.
+            # Aksi halde sadece track anchor'larına yakın gaussian hareket ediyor,
+            # geri kalan statik — chickchicken'da %92 gaussian durgundu.
+            # Her iter random K=128 gaussian sample + 1-NN üzerinden smoothness.
+            if (self.lambda_fourier_reg > 0 and
+                    self.gs.fourier_pos_coeffs is not None and
+                    self.deform_pos_mode != "mlp" and
+                    self.gs.num_points > 16):
+                Ns = min(128, self.gs.num_points)
+                sample_idx = torch.randint(0, self.gs.num_points, (Ns,), device=self.device)
+                sampled_means = self.gs.means[sample_idx].detach()  # (Ns, 3)
+                # Her sample için en yakın komşu (kendisi hariç)
+                with torch.no_grad():
+                    dists = torch.cdist(sampled_means, self.gs.means)  # (Ns, N)
+                    # En yakın ilk 2'yi al (0 = kendisi eğer sample gaussian ise)
+                    _, nearest_k = torch.topk(dists, k=2, largest=False, dim=-1)
+                    # Ikinci en yakını (ilki kendisi olabilir)
+                    neighbor_idx = nearest_k[:, 1]  # (Ns,)
+                sampled_coeffs = self.gs.fourier_pos_coeffs[sample_idx]      # (Ns, K, 2, 3)
+                neighbor_coeffs = self.gs.fourier_pos_coeffs[neighbor_idx]   # (Ns, K, 2, 3)
+                spatial_smooth = (sampled_coeffs - neighbor_coeffs).pow(2).mean()
+                # Weight: reg'in %50'si kadar — motion'u öldürmeden smooth
+                loss = loss + self.lambda_fourier_reg * 0.5 * spatial_smooth
+                # comp'ta ayrı tutmayalım, fourier ile toplu logla
 
             # --- NaN/Inf guard (pre-backward) ---
             # Loss patlıyorsa backward yapma, bu iter'i atla. 30k iter'de
@@ -667,6 +779,15 @@ class Trainer4DGS:
                 max_log_scale = math.log(max(self.scene_extent, 1.0))
                 self.gs.scales.data.clamp_(max=max_log_scale)
 
+                # v3.6.1: Hard clamp on Fourier coefficients.
+                # Her katsayı büyüklüğü scene_extent × 0.05 = max 5% motion contribution.
+                # Bir gaussian maksimum motion = K × max_coeff = 8 × 0.05 × scene = 40% scene.
+                # Reg çalışsa bile katsayılar kontrolsüz büyüyordu (0.12 → 6.38 in 500 iter)
+                # — bu clamp hard limit.
+                if self.gs.fourier_pos_coeffs is not None:
+                    max_coeff = self.scene_extent * 0.03  # 3% of scene per coefficient
+                    self.gs.fourier_pos_coeffs.data.clamp_(min=-max_coeff, max=max_coeff)
+
             # --- Density control ---
             if (self.density_start_iter <= it < self.density_end_iter
                     and it % self.density_interval == 0):
@@ -727,9 +848,14 @@ class Trainer4DGS:
             if it % log_interval == 0:
                 with torch.no_grad():
                     p = psnr(rgb, gt)
-                    dpos_dbg, _, _ = self.deform(self.gs.means, t_norm, self.scene_extent)
-                    dpos_mean = dpos_dbg.abs().mean().item()
-                    dpos_max = dpos_dbg.abs().max().item()
+                    # v3.7.1 METRIC FIX: Önceden Δpos = raw MLP dpos (pre-clamp, Fourier'sız).
+                    # Artık _apply_deformation'un gerçek dpos çıktısını ölçüyor
+                    # (MLP clamp + Fourier + total clamp dahil). Bu, PLY export'taki
+                    # gerçek motion'la tutarlı. Önceden metrics yanıltıcıydı.
+                    d_means_dbg, _, _ = self._apply_deformation(t_norm)
+                    dpos_applied = d_means_dbg - self.gs.means
+                    dpos_mean = dpos_applied.abs().mean().item()
+                    dpos_max = dpos_applied.abs().max().item()
                 history["loss"].append(loss.item())
                 history["psnr"].append(p)
                 history["n_pts"].append(self.gs.num_points)
@@ -770,6 +896,7 @@ class Trainer4DGS:
                             smooth=float(comp.get("smooth", 0.0)),
                             rigid=float(comp.get("rigid", 0.0)),
                             scale=float(comp.get("scale", 0.0)),
+                            fourier=float(comp.get("fourier", 0.0)),
                         )
                     except Exception as _e:
                         print(f"  ⚠ run_logger exception: {_e}")
