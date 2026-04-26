@@ -331,6 +331,10 @@ def run_pipeline(
         lambda_track=cfg.train.lambda_track,
         track_sample_k=cfg.train.track_sample_k,
         lambda_scale=cfg.train.lambda_scale,
+        # v3.8 — anisotropy + tightened dpos clamp
+        lambda_aniso=cfg.train.lambda_aniso,
+        aniso_threshold=cfg.train.aniso_threshold,
+        dpos_total_cap_frac=cfg.train.dpos_total_cap_frac,
         opacity_reset_interval=cfg.train.opacity_reset_interval,
         warmup_iters=cfg.train.warmup_iters,
         # v3.6 / Yol C — Per-gaussian Fourier trajectory

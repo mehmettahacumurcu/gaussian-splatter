@@ -102,6 +102,7 @@ async def process_video(
     cloud: bool = Form(False, description="True: cloud_config (1920x1080, 60k iter)"),
     high_test: bool = Form(False, description="True: 3-4 saat HIGH preset (50k iter, 640x360, HexPlane 96/48, MLP 512/4, Fourier K=10, density_end=35k, 90 ts, N cap 60k)"),
     ultra_test: bool = Form(False, description="True: 6-9 saat ULTRA preset (80k iter, 720x405, HexPlane 112/56, MLP 640/4, Fourier K=12, density_end=50k, 90 ts, N cap 80k)"),
+    ultra_clean: bool = Form(False, description="True: 7-9 saat ULTRA CLEAN preset (v3.8 anti-streak: aniso reg + sıkı dpos clamp + rigid 5× + fourier_reg 10× + density_end 30k + sh_degree 2). Banana_demo bulanıklık fix'i."),
     skip_foundation: bool = Form(True, description="Foundation modelleri atla"),
     # --- Override parametreleri (preset üzerine uygulanır) ---
     # Temel training
@@ -118,6 +119,9 @@ async def process_video(
     lambda_mask_motion: float | None = Form(None, description="Dynamic mask weight"),
     lambda_track: float | None = Form(None, description="CoTracker 3D-anchored track loss"),
     lambda_scale: float | None = Form(None, description="Scale regularizer (outlier blow-up önleme)"),
+    lambda_aniso: float | None = Form(None, description="v3.8: Anisotropy regularizer (streak/needle gaussian fix)"),
+    aniso_threshold: float | None = Form(None, description="v3.8: max/min scale ratio threshold (default 5)"),
+    dpos_total_cap_frac: float | None = Form(None, description="v3.8: Per-iter dpos clamp × scene_extent (default 0.2)"),
     opacity_reset_interval: int | None = Form(None, description="Opacity reset aralığı (iter), 0=kapalı"),
     track_sample_k: int | None = Form(None, description="Her iter sample edilecek track sayısı"),
     warmup_iters: int | None = Form(None, description="Regularizer warmup süresi (iter)"),
@@ -290,6 +294,53 @@ async def process_video(
             cfg.foundation.cotracker_grid_size = 25
             cfg.foundation.cotracker_num_points = 1600
 
+        # ULTRA CLEAN PRESET — v3.8 anti-streak.
+        # banana_demo Ultra (PSNR 19.9, görseldeki streak'ler) post-mortem fix'i.
+        # Ultra v2 base + 8 değişiklik:
+        #   1. lambda_aniso 0.02 (anisotropy regularizer açık — streak fix)
+        #   2. aniso_threshold 5.0 (max/min ratio < 5 serbest, üstü ceza)
+        #   3. dpos_total_cap_frac 0.05 (Ultra'da 0.2; 4× sıkı, motion daha kısıtlı)
+        #   4. lambda_rigidity 1e-3 (Ultra 2e-4'ten 5×; KNN motion uniformity zorla)
+        #   5. lambda_fourier_reg 1e-2 (Ultra 1e-3'ten 10×; Fourier coeff overfit bastır)
+        #   6. density_end_iter 30000 (Ultra 50k; geri kalan 50k iter sadece refine)
+        #   7. prune_max_scale 0.01 (Ultra 0.02; daha küçük max gaussian)
+        #   8. sh_degree 2 (Ultra 3; daha smooth color, gaussian-spike incentive azalır)
+        # Beklenen: PSNR 22+ (Ultra 19.9'dan +2-3 dB), streak'siz, kontrollü motion.
+        # Tahmini süre 3060 Ti: 7-9 saat.
+        if ultra_clean:
+            cfg.preprocess.fps = 10
+            cfg.preprocess.resize_long_edge = 960
+            cfg.train.n_iters = 80_000
+            cfg.train.image_resolution = (720, 405)
+            cfg.train.ckpt_interval = 4000
+            cfg.train.log_interval = 100
+            cfg.train.density_start_iter = 500
+            cfg.train.density_end_iter = 30_000        # Ultra 50k → 30k
+            cfg.train.density_interval = 200
+            cfg.train.densify_grad_threshold = 5e-4
+            cfg.train.warmup_iters = 1500
+            cfg.train.max_gaussians = 80_000
+            cfg.train.prune_max_scale = 0.01            # Ultra 0.02 → 0.01
+            # v3.8 ANTI-STREAK
+            cfg.train.lambda_aniso = 0.02               # KAPALI (0) → 0.02 AÇIK
+            cfg.train.aniso_threshold = 5.0
+            cfg.train.dpos_total_cap_frac = 0.05        # default 0.2 → 0.05 (4× sıkı)
+            cfg.train.lambda_rigidity = 1e-3            # default 2e-4 → 1e-3 (5× sıkı)
+            cfg.train.lambda_fourier_reg = 1e-2         # default 1e-3 → 1e-2 (10× sıkı)
+            # Model — sh_degree azalt
+            cfg.model.sh_degree = 2                     # Ultra 3 → 2 (overfit azalt)
+            cfg.model.hexplane_resolution = 112
+            cfg.model.hexplane_feat_dim = 56
+            cfg.model.mlp_width = 640
+            cfg.model.mlp_depth = 4
+            cfg.model.fourier_K = 12
+            # Export
+            cfg.export.num_timestamps = 90
+            # Foundation
+            cfg.foundation.metric3d_model = "metric3d_vit_small"
+            cfg.foundation.cotracker_grid_size = 25
+            cfg.foundation.cotracker_num_points = 1600
+
         # --- Override'lar (preset uzerine uygulanir) ---
         # Temel
         if iters is not None:
@@ -330,6 +381,12 @@ async def process_video(
             cfg.train.lambda_track = lambda_track
         if lambda_scale is not None:
             cfg.train.lambda_scale = lambda_scale
+        if lambda_aniso is not None:
+            cfg.train.lambda_aniso = lambda_aniso
+        if aniso_threshold is not None:
+            cfg.train.aniso_threshold = aniso_threshold
+        if dpos_total_cap_frac is not None:
+            cfg.train.dpos_total_cap_frac = dpos_total_cap_frac
         if opacity_reset_interval is not None:
             cfg.train.opacity_reset_interval = opacity_reset_interval
         if track_sample_k is not None:

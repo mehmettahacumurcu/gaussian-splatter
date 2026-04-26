@@ -38,6 +38,81 @@ def _load_video_tensor(frames_dir: Path, max_long_edge: int = 720) -> torch.Tens
     return tensor.unsqueeze(0)                              # (1, T, 3, H, W)
 
 
+def _track_online_streaming(
+    model,
+    video: "torch.Tensor",
+    grid_size: int,
+    device: str,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """
+    cotracker2_online sliding window inference.
+
+    v3.8: Offline cotracker2 343 frame için 22.4 GiB peak allocation gerektiriyor,
+    8 GB karta sığmıyor (sliding window olmadan tüm video tek tensor'da işleniyor).
+    Online variant sliding 8-frame window kullanır → peak ~1.5-2 GB.
+
+    Args:
+        model: torch.hub.load(..., "cotracker2_online") instance
+        video: (1, T, 3, H, W) GPU tensor
+        grid_size: NxN grid (toplam N² query point)
+        device: "cuda" | "cpu"
+
+    Returns:
+        pred_tracks: (1, T, N², 2)
+        pred_visibility: (1, T, N²)
+    """
+    T = video.shape[1]
+    step = int(getattr(model, "step", 8))  # window stride, default 8
+    print(f"  → Online streaming: T={T}, step={step}, total chunks≈{T // step}")
+
+    pred_tracks = None
+    pred_visibility = None
+    is_first_step = True
+
+    # Online predictor internal buffer kullanır.
+    # Her chunk = step sayıda frame. Predictor ilk chunk'ta queries init eder
+    # (grid_size'a göre), sonraki chunk'larda track update.
+    # Output: cumulative (1, T_so_far, N, 2) — son chunk'tan sonra full T.
+    chunk_count = 0
+    for i in range(0, T, step):
+        end = min(i + step, T)
+        if end - i < 2:  # < 2 frame'lik trailing yetersiz
+            break
+        chunk = video[:, i:end]
+        try:
+            with torch.no_grad():
+                tracks, vis = model(
+                    chunk,
+                    is_first_step=is_first_step,
+                    grid_size=grid_size,
+                )
+            chunk_count += 1
+            if is_first_step:
+                is_first_step = False
+                print(f"  ✓ İlk chunk ({chunk.shape[1]} frame) — query init OK, "
+                      f"N={tracks.shape[2] if tracks is not None else '?'}")
+            elif chunk_count % 10 == 0:
+                print(f"  → Chunk {chunk_count} processed (frame {end}/{T})")
+            if tracks is not None:
+                pred_tracks = tracks
+            if vis is not None:
+                pred_visibility = vis
+        except torch.cuda.OutOfMemoryError as e:
+            # Online variant'ta bile OOM olursa hata fatal
+            print(f"⚠ Online variant OOM at chunk {chunk_count} "
+                  f"(frame {i}/{T}): {str(e)[:120]}")
+            raise
+
+    if pred_tracks is None or pred_visibility is None:
+        raise RuntimeError(
+            f"Online tracker hiç chunk üretemedi (T={T}, step={step})"
+        )
+
+    print(f"  ✓ Online streaming bitti: {chunk_count} chunk, "
+          f"final tracks shape: {tuple(pred_tracks.shape)}")
+    return pred_tracks, pred_visibility
+
+
 def track_points(
     frames_dir: str | Path,
     output_path: str | Path,
@@ -48,6 +123,10 @@ def track_points(
 ) -> Path:
     """
     Bir grid noktasını video boyunca takip et.
+
+    v3.8: Online variant fallback — offline cotracker2 343 frame için
+    22.4 GiB peak gerektiriyor (model.interp_shape=384x512 fixed, max_long_edge
+    fallback boş). Otomatik olarak cotracker2_online sliding window'a düşüyor.
 
     Args:
         frames_dir: PNG karelerin bulunduğu klasör
@@ -121,8 +200,13 @@ def track_points(
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
             if attempt_i == len(unique_attempts) - 1:
-                print("⚠ Tüm fallback'ler başarısız, CoTracker atlanıyor")
-                # Final cleanup — model release et
+                # v3.8: Tüm offline fallback'ler battı.
+                # SON ÇARE: cotracker2_online sliding window variant.
+                # banana_demo testlerinde offline 22.4 GiB peak gerektirdi (343 frame),
+                # 8 GB karta sığmıyor. Online ~1.5-2 GB peak, sliding 8 frame window.
+                print("⚠ Tüm offline fallback'ler battı.")
+                print("→ ONLINE variant'a düşüyoruz: cotracker2_online (sliding window)")
+                # Offline modeli release et
                 try:
                     model.cpu()
                     del model
@@ -130,7 +214,38 @@ def track_points(
                     pass
                 gc.collect()
                 torch.cuda.empty_cache()
-                raise
+                torch.cuda.synchronize()
+                # Online variant yükle ve sliding inference yap
+                try:
+                    print("→ cotracker2_online yükleniyor")
+                    online_model = torch.hub.load(
+                        "facebookresearch/co-tracker", "cotracker2_online"
+                    )
+                    online_model = online_model.to(device).eval()
+                    # Online en agresif edge'le başlasın (daha küçük tensor)
+                    online_edge = min(edge, 480)
+                    online_grid = max(g, 15)  # online'da daha az nokta da kabul
+                    print(f"→ Online video tensor (max_edge={online_edge})")
+                    video = _load_video_tensor(Path(frames_dir), online_edge).to(device)
+                    print(f"→ Online streaming ({online_grid}x{online_grid} grid)")
+                    pred_tracks, pred_visibility = _track_online_streaming(
+                        online_model, video, grid_size=online_grid, device=device
+                    )
+                    final_grid, final_edge = online_grid, online_edge
+                    # Online success — fall through to save
+                    try:
+                        online_model.cpu()
+                        del online_model
+                    except Exception:
+                        pass
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    print(f"✓ Online variant başarılı, fallback OK")
+                    break  # while loop'undan çık, save'e git
+                except Exception as e_online:
+                    print(f"⚠ Online variant da fail: {e_online}")
+                    print("⚠ CoTracker tamamen atlanıyor (track loss disabled)")
+                    raise
 
     if pred_tracks is None:
         raise RuntimeError("CoTracker başarılı bir attempt üretemedi")
