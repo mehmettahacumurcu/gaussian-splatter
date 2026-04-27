@@ -110,11 +110,14 @@ def run_pipeline(
         def _colmap_on_progress(frac: float, msg: str) -> None:
             cb("colmap", frac, msg, {"colmap_fraction": frac})
 
+        # v3.9: COLMAP matching strategy config'ten okunur
+        is_sequential = getattr(cfg.preprocess, "colmap_matching", "sequential") != "exhaustive"
+        print(f"[pipeline] COLMAP matching: {getattr(cfg.preprocess, 'colmap_matching', 'sequential')} (sequential={is_sequential})")
         run_colmap(
             paths["frames"], paths["colmap"],
             camera_model=cfg.preprocess.colmap_camera_model,
             use_gpu=cfg.preprocess.colmap_use_gpu,
-            sequential=True,
+            sequential=is_sequential,
             colmap_exe=cfg.preprocess.colmap_exe,
             on_progress=_colmap_on_progress,
         )
@@ -254,24 +257,44 @@ def run_pipeline(
     init_pts = torch.from_numpy(xyz)
     init_rgb = torch.from_numpy(rgb).float() / 255.0
 
-    # v3.7.3: Initial point subsample. COLMAP bazen banana gibi sahnelerde 100k+
-    # sparse point döndürüyor. max_gaussians cap sadece split/clone'u durduruyor,
-    # initial N'i shrink etmiyor → render aşırı yavaşlar (banana_ultra_v2'de
-    # 112k init → 0.19 it/s = 117 saat ETA).
-    # Bu fix: Eğer N_init > max_gaussians × 0.7, random downsample yap (cap'in
-    # %70'i, density'nin büyümeye yer bırakması için).
+    # v3.7.3 -> v3.9: Initial point subsample.
+    # Mode:
+    #   - "random" (default): cap'in %70'ine random downsample (eski davranis)
+    #   - "confidence": COLMAP track length / (1 + reproj_error) skoruyla
+    #     top-K se?, outlier'lari at. Static quality icin onerilen.
     if cfg.train.max_gaussians > 0:
         target_init = int(cfg.train.max_gaussians * 0.7)
         if init_pts.shape[0] > target_init:
+            mode = getattr(cfg.preprocess, "init_subsample_mode", "random")
             print(f"⚠ Initial COLMAP points ({init_pts.shape[0]:,}) > target "
-                  f"({target_init:,}) — random subsample (max_gaussians × 0.7)")
-            perm = torch.randperm(init_pts.shape[0])[:target_init]
+                  f"({target_init:,}) — mode={mode}")
+            if mode == "confidence":
+                try:
+                    import numpy as np
+                    from .preprocess.parse_colmap import load_points3d_with_confidence
+                    _xyz, _rgb, track_len, reproj_err = load_points3d_with_confidence(paths["colmap"])
+                    if track_len.shape[0] != init_pts.shape[0]:
+                        print(f"  ⚠ confidence shape mismatch ({track_len.shape[0]} vs {init_pts.shape[0]}), random fallback")
+                        perm = torch.randperm(init_pts.shape[0])[:target_init]
+                    else:
+                        confidence = track_len.astype(np.float32) / (1.0 + reproj_err)
+                        top_idx = np.argsort(-confidence)[:target_init]
+                        perm = torch.from_numpy(top_idx.astype("int64"))
+                        median_kept = float(np.median(track_len[top_idx]))
+                        median_err  = float(np.median(reproj_err[top_idx]))
+                        print(f"  ✓ confidence subsample: track_len median={median_kept:.0f}, err median={median_err:.2f}")
+                except Exception as e:
+                    print(f"  ⚠ confidence subsample fail ({e}), random fallback")
+                    perm = torch.randperm(init_pts.shape[0])[:target_init]
+            else:
+                perm = torch.randperm(init_pts.shape[0])[:target_init]
             init_pts = init_pts[perm]
             init_rgb = init_rgb[perm]
             run_logger.log_event("init_subsample",
                                  before=int(xyz.shape[0]),
                                  after=int(init_pts.shape[0]),
-                                 max_gaussians=cfg.train.max_gaussians)
+                                 max_gaussians=cfg.train.max_gaussians,
+                                 mode=mode)
 
     gs = GaussianModel(init_pts, init_colors=init_rgb,
                        sh_degree=cfg.model.sh_degree,

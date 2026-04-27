@@ -43,6 +43,16 @@ class PreprocessConfig:
     colmap_camera_model: str = "PINHOLE"
     colmap_use_gpu: bool = True
     sequential_overlap: int = 10
+    # v3.9: COLMAP matching strategy.
+    # - "sequential": yakin frame'leri match eder (hizli, default)
+    # - "exhaustive": tum frame'ler birbirleriyle match (yavas N^2,
+    #   orbital camera icin loop closure saglar)
+    colmap_matching: str = "sequential"
+    # v3.9: Initial point subsample mode.
+    # - "random": cap'in %70'ine random downsample (eski, hizli)
+    # - "confidence": COLMAP track length / (1 + reproj_error) skoruyla
+    #   high-confidence noktalari sec, outlier'lari at
+    init_subsample_mode: str = "random"
     colmap_exe: str | None = None
 
 

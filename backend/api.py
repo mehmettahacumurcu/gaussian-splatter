@@ -103,6 +103,7 @@ async def process_video(
     high_test: bool = Form(False, description="True: 3-4 saat HIGH preset (50k iter, 640x360, HexPlane 96/48, MLP 512/4, Fourier K=10, density_end=35k, 90 ts, N cap 60k)"),
     ultra_test: bool = Form(False, description="True: 6-9 saat ULTRA preset (80k iter, 720x405, HexPlane 112/56, MLP 640/4, Fourier K=12, density_end=50k, 90 ts, N cap 80k)"),
     ultra_clean: bool = Form(False, description="True: 7-9 saat ULTRA CLEAN preset (v3.8 anti-streak: aniso reg + sıkı dpos clamp + rigid 5× + fourier_reg 10× + density_end 30k + sh_degree 2). Banana_demo bulanıklık fix'i."),
+    static_max: bool = Form(False, description="True: STATIC MAX preset (v3.9). Tum preprocessing iyilestirmeleri: fps=20, metric3d_vit_large, COLMAP exhaustive, confidence init subsample, resolution=720x405, sh_degree=3. Ultra Clean fix'leri + max input quality."),
     skip_foundation: bool = Form(True, description="Foundation modelleri atla"),
     # --- Override parametreleri (preset üzerine uygulanır) ---
     # Temel training
@@ -152,6 +153,10 @@ async def process_video(
     cotracker_num_points: int | None = Form(None, description="CoTracker nokta sayısı"),
     cotracker_grid_size: int | None = Form(None, description="CoTracker grid NxN"),
     sam2_threshold: float | None = Form(None, description="SAM2 confidence eşiği"),
+    # v3.9 — Preprocessing
+    resize_long_edge: int | None = Form(None, description="Frame extract long edge px (default 960)"),
+    colmap_matching: str | None = Form(None, description="sequential | exhaustive (default sequential)"),
+    init_subsample_mode: str | None = Form(None, description="random | confidence (default random)"),
 ) -> ProcessResponse:
     """
     Video'yu upload et ve pipeline'ı kuyruğa al.
@@ -341,6 +346,48 @@ async def process_video(
             cfg.foundation.cotracker_grid_size = 25
             cfg.foundation.cotracker_num_points = 1600
 
+        # STATIC MAX PRESET — v3.9 input pipeline iyilestirmeleri.
+        # Hipotez: 5k iter ve 80k iter ayni static quality verdigi icin
+        # bottleneck training'de degil INPUT PIPELINE'da. Bu preset tum
+        # input iyilestirmelerini AYNI ANDA uygular:
+        #   1. fps 10 -> 20 (2x more frames, daha dense view)
+        #   2. metric3d_vit_small -> vit_large (daha keskin depth)
+        #   3. COLMAP sequential -> exhaustive (loop closure, orbital fix)
+        #   4. init subsample random -> confidence (track + error tabanli)
+        #   5. sh_degree 2 -> 3 (Ultra Clean'den geri, color expressiveness)
+        # + Ultra Clean'in tum anti-streak fix'leri korunur.
+        if static_max:
+            cfg.preprocess.fps = 20
+            cfg.preprocess.resize_long_edge = 1280
+            cfg.preprocess.colmap_matching = "exhaustive"
+            cfg.preprocess.init_subsample_mode = "confidence"
+            cfg.train.n_iters = 80_000
+            cfg.train.image_resolution = (720, 405)
+            cfg.train.ckpt_interval = 4000
+            cfg.train.log_interval = 100
+            cfg.train.density_start_iter = 500
+            cfg.train.density_end_iter = 30_000
+            cfg.train.density_interval = 200
+            cfg.train.densify_grad_threshold = 5e-4
+            cfg.train.warmup_iters = 1500
+            cfg.train.max_gaussians = 80_000
+            cfg.train.prune_max_scale = 0.01
+            cfg.train.lambda_aniso = 0.02
+            cfg.train.aniso_threshold = 5.0
+            cfg.train.dpos_total_cap_frac = 0.05
+            cfg.train.lambda_rigidity = 1e-3
+            cfg.train.lambda_fourier_reg = 1e-2
+            cfg.model.sh_degree = 3
+            cfg.model.hexplane_resolution = 112
+            cfg.model.hexplane_feat_dim = 56
+            cfg.model.mlp_width = 640
+            cfg.model.mlp_depth = 4
+            cfg.model.fourier_K = 12
+            cfg.export.num_timestamps = 90
+            cfg.foundation.metric3d_model = "metric3d_vit_large"
+            cfg.foundation.cotracker_grid_size = 25
+            cfg.foundation.cotracker_num_points = 1600
+
         # --- Override'lar (preset uzerine uygulanir) ---
         # Temel
         if iters is not None:
@@ -444,6 +491,17 @@ async def process_video(
             cfg.foundation.cotracker_grid_size = cotracker_grid_size
         if sam2_threshold is not None:
             cfg.foundation.sam2_threshold = sam2_threshold
+        # v3.9 — Preprocessing overrides
+        if resize_long_edge is not None:
+            cfg.preprocess.resize_long_edge = resize_long_edge
+        if colmap_matching is not None:
+            if colmap_matching not in ("sequential", "exhaustive"):
+                raise HTTPException(400, f"colmap_matching: sequential | exhaustive ({colmap_matching})")
+            cfg.preprocess.colmap_matching = colmap_matching
+        if init_subsample_mode is not None:
+            if init_subsample_mode not in ("random", "confidence"):
+                raise HTTPException(400, f"init_subsample_mode: random | confidence ({init_subsample_mode})")
+            cfg.preprocess.init_subsample_mode = init_subsample_mode
 
         return run_pipeline(
             str(video_path),

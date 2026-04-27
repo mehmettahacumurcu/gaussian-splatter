@@ -49,7 +49,14 @@ def _track_online_streaming(
 
     v3.8: Offline cotracker2 343 frame için 22.4 GiB peak allocation gerektiriyor,
     8 GB karta sığmıyor (sliding window olmadan tüm video tek tensor'da işleniyor).
-    Online variant sliding 8-frame window kullanır → peak ~1.5-2 GB.
+    Online variant 2*step (typical 8) frame'lik sliding window kullanır → peak ~1.5 GB.
+
+    API NOTLARI:
+      - model.step = STRIDE (yarı window). Tam window_len = 2 * step.
+      - Predictor her call'da WINDOW_SIZE frame ister (last 2*step frames).
+      - is_first_step=True: queries init (grid_size'a göre N² query point). Output ignore.
+      - is_first_step=False: gerçek track + visibility output (cumulative T_so_far ile).
+      - Iteration: window'u step kadar kaydır, model son window_size frame'i process eder.
 
     Args:
         model: torch.hub.load(..., "cotracker2_online") instance
@@ -62,53 +69,63 @@ def _track_online_streaming(
         pred_visibility: (1, T, N²)
     """
     T = video.shape[1]
-    step = int(getattr(model, "step", 8))  # window stride, default 8
-    print(f"  → Online streaming: T={T}, step={step}, total chunks≈{T // step}")
+    step = int(getattr(model, "step", 4))  # stride; window_len = 2*step
+    window_size = 2 * step
+
+    if T < window_size:
+        # Çok kısa video: online API gereksiz, single call yeter
+        print(f"  → Video kısa (T={T} < window={window_size}), single call mode")
+        with torch.no_grad():
+            tracks, vis = model(video, grid_size=grid_size)
+        return tracks, vis
+
+    print(f"  → Online streaming: T={T}, step={step}, window_size={window_size}")
 
     pred_tracks = None
     pred_visibility = None
-    is_first_step = True
 
-    # Online predictor internal buffer kullanır.
-    # Her chunk = step sayıda frame. Predictor ilk chunk'ta queries init eder
-    # (grid_size'a göre), sonraki chunk'larda track update.
-    # Output: cumulative (1, T_so_far, N, 2) — son chunk'tan sonra full T.
+    # 1) INIT CALL — ilk window_size frame, is_first_step=True (queries grid init)
+    init_chunk = video[:, :window_size]
+    with torch.no_grad():
+        _ = model(init_chunk, is_first_step=True, grid_size=grid_size)
+    print(f"  ✓ Init chunk OK ({window_size} frame, query grid {grid_size}x{grid_size})")
+
+    # 2) SLIDING — window'u step kadar kaydır, is_first_step=False
+    # End index'leri: window_size + step, window_size + 2*step, ..., last <= T
     chunk_count = 0
-    for i in range(0, T, step):
-        end = min(i + step, T)
-        if end - i < 2:  # < 2 frame'lik trailing yetersiz
-            break
-        chunk = video[:, i:end]
-        try:
-            with torch.no_grad():
-                tracks, vis = model(
-                    chunk,
-                    is_first_step=is_first_step,
-                    grid_size=grid_size,
-                )
-            chunk_count += 1
-            if is_first_step:
-                is_first_step = False
-                print(f"  ✓ İlk chunk ({chunk.shape[1]} frame) — query init OK, "
-                      f"N={tracks.shape[2] if tracks is not None else '?'}")
-            elif chunk_count % 10 == 0:
-                print(f"  → Chunk {chunk_count} processed (frame {end}/{T})")
-            if tracks is not None:
-                pred_tracks = tracks
-            if vis is not None:
-                pred_visibility = vis
-        except torch.cuda.OutOfMemoryError as e:
-            # Online variant'ta bile OOM olursa hata fatal
-            print(f"⚠ Online variant OOM at chunk {chunk_count} "
-                  f"(frame {i}/{T}): {str(e)[:120]}")
-            raise
+    end_idx = window_size + step  # ilk sliding call sonu
+
+    while end_idx <= T:
+        chunk = video[:, end_idx - window_size : end_idx]  # son window_size frame
+        with torch.no_grad():
+            tracks, vis = model(chunk, is_first_step=False, grid_size=grid_size)
+        chunk_count += 1
+        if tracks is not None and tracks.numel() > 0:
+            pred_tracks = tracks
+            pred_visibility = vis
+        if chunk_count == 1 and pred_tracks is not None:
+            print(f"  ✓ İlk gerçek output: tracks shape {tuple(pred_tracks.shape)}")
+        elif chunk_count % 20 == 0:
+            print(f"  → Chunk {chunk_count}, frame {end_idx}/{T} "
+                  f"(tracks T_so_far={pred_tracks.shape[1] if pred_tracks is not None else '?'})")
+        end_idx += step
+
+    # 3) FINAL — son partial window (T window'a tam bölünmediyse)
+    if end_idx - step < T:
+        chunk = video[:, T - window_size : T]
+        with torch.no_grad():
+            tracks, vis = model(chunk, is_first_step=False, grid_size=grid_size)
+        chunk_count += 1
+        if tracks is not None and tracks.numel() > 0:
+            pred_tracks = tracks
+            pred_visibility = vis
 
     if pred_tracks is None or pred_visibility is None:
         raise RuntimeError(
-            f"Online tracker hiç chunk üretemedi (T={T}, step={step})"
+            f"Online tracker output üretmedi (T={T}, step={step}, chunks={chunk_count})"
         )
 
-    print(f"  ✓ Online streaming bitti: {chunk_count} chunk, "
+    print(f"  ✓ Online streaming bitti: {chunk_count} sliding chunk, "
           f"final tracks shape: {tuple(pred_tracks.shape)}")
     return pred_tracks, pred_visibility
 

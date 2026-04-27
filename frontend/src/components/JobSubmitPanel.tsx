@@ -14,7 +14,7 @@ interface Props {
   onJobSubmitted: (response: ProcessResponse, sceneName: string) => void;
 }
 
-type Preset = "micro" | "smoke" | "full" | "high" | "cloud" | "ultra";
+type Preset = "micro" | "smoke" | "full" | "high" | "cloud" | "ultra" | "ultra_clean" | "static_max";
 
 export function JobSubmitPanel({ onJobSubmitted }: Props) {
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -55,6 +55,8 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
         cloud: preset === "cloud",
         high_test: preset === "high",
         ultra_test: preset === "ultra",
+        ultra_clean: preset === "ultra_clean",
+        static_max: preset === "static_max",
         skip_foundation: skipFoundation,
         hyperparams,
       });
@@ -180,6 +182,28 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
             <div>
               <div className="preset-name">Ultra 🔥 (6-9 saat)</div>
               <div className="preset-desc">80k iter, 720x405, 90 ts, HexPlane 112/56, MLP 640/4, Fourier K=12, N cap 80k · 3060 Ti optimize</div>
+            </div>
+          </label>
+          <label className={`preset-chip ${preset === "ultra_clean" ? "active" : ""}`}>
+            <input
+              type="radio"
+              checked={preset === "ultra_clean"}
+              onChange={() => setPreset("ultra_clean")}
+            />
+            <div>
+              <div className="preset-name">Ultra Clean ✨ (7-9 saat)</div>
+              <div className="preset-desc">v3.8 anti-streak: aniso reg + sıkı dpos clamp + rigid 5× + fourier_reg 10× + density_end 30k + sh_degree 2 · banana streak fix</div>
+            </div>
+          </label>
+          <label className={`preset-chip ${preset === "static_max" ? "active" : ""}`}>
+            <input
+              type="radio"
+              checked={preset === "static_max"}
+              onChange={() => setPreset("static_max")}
+            />
+            <div>
+              <div className="preset-name">Static Max 🎯 (v3.9, ~3-4 saat preprocessing + 7-9 saat training)</div>
+              <div className="preset-desc">Tüm preprocessing iyileştirmeleri: fps=20, vit_large depth, COLMAP exhaustive, confidence init subsample, sh_degree=3 · Ultra Clean fix'leri + max input quality. Banana halo testi.</div>
             </div>
           </label>
         </div>

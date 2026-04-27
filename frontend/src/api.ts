@@ -106,6 +106,14 @@ export interface HyperParams {
   cotracker_num_points?: number | null;
   cotracker_grid_size?: number | null;
   sam2_threshold?: number | null;
+  // v3.8 — Anti-streak
+  lambda_aniso?: number | null;
+  aniso_threshold?: number | null;
+  dpos_total_cap_frac?: number | null;
+  // v3.9 — Preprocessing
+  resize_long_edge?: number | null;
+  colmap_matching?: string | null;        // "sequential" | "exhaustive"
+  init_subsample_mode?: string | null;    // "random" | "confidence"
 }
 
 export interface SubmitJobOptions {
@@ -115,6 +123,8 @@ export interface SubmitJobOptions {
   cloud?: boolean;
   high_test?: boolean;
   ultra_test?: boolean;
+  ultra_clean?: boolean;
+  static_max?: boolean;
   skip_foundation?: boolean;
   hyperparams?: HyperParams;
 }
@@ -227,6 +237,10 @@ export async function submitJob(
     fd.append("high_test", String(options.high_test));
   if (options.ultra_test !== undefined)
     fd.append("ultra_test", String(options.ultra_test));
+  if (options.ultra_clean !== undefined)
+    fd.append("ultra_clean", String(options.ultra_clean));
+  if (options.static_max !== undefined)
+    fd.append("static_max", String(options.static_max));
   if (options.skip_foundation !== undefined)
     fd.append("skip_foundation", String(options.skip_foundation));
 

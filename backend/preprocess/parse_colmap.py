@@ -161,6 +161,54 @@ def load_points3d(colmap_dir: str | Path) -> Tuple[np.ndarray, np.ndarray]:
     return xyz, rgb
 
 
+def load_points3d_with_confidence(
+    colmap_dir: str | Path,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    v3.9: Sparse 3D nokta + COLMAP confidence verileri.
+
+    points3D.txt: POINT3D_ID X Y Z R G B ERROR TRACK[(IMAGE_ID, POINT2D_IDX), ...]
+
+    Confidence = track_length / (1 + reproj_error)
+
+    Returns:
+        xyz: (N, 3) float32
+        rgb: (N, 3) uint8
+        track_length: (N,) int32
+        reproj_error: (N,) float32
+    """
+    sparse = _find_sparse_dir(Path(colmap_dir))
+    pts_file = sparse / "points3D.txt"
+    if not pts_file.exists():
+        raise FileNotFoundError(f"points3D.txt yok: {pts_file}")
+
+    xyz_l = []
+    rgb_l = []
+    tracks_l = []
+    errs_l = []
+    with open(pts_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            xyz_l.append([float(parts[1]), float(parts[2]), float(parts[3])])
+            rgb_l.append([int(parts[4]), int(parts[5]), int(parts[6])])
+            errs_l.append(float(parts[7]))
+            n_track = (len(parts) - 8) // 2
+            tracks_l.append(n_track)
+    if not xyz_l:
+        raise RuntimeError("points3D.txt bos")
+    xyz_a = np.array(xyz_l, dtype=np.float32)
+    rgb_a = np.array(rgb_l, dtype=np.uint8)
+    tracks_a = np.array(tracks_l, dtype=np.int32)
+    errs_a = np.array(errs_l, dtype=np.float32)
+    print(f"✓ {len(xyz_a)} sparse + confidence yuklendi "
+          f"(track_len median={np.median(tracks_a):.0f} max={tracks_a.max()}; "
+          f"err median={np.median(errs_a):.2f} max={errs_a.max():.2f})")
+    return xyz_a, rgb_a, tracks_a, errs_a
+
+
 def scene_extent(xyz: np.ndarray) -> float:
     """Sahnenin radyal kapsamı — density control için kullanılır."""
     centroid = xyz.mean(axis=0, keepdims=True)
