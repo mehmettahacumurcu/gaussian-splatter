@@ -51,3 +51,4 @@ build.ninja
 
 # OS
 *~
+COMMIT_MSG*.txt
