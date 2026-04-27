@@ -52,6 +52,10 @@ REM --- 3/3: uvicorn ---
 echo [3/3] UTF-8 stdout + uvicorn
 set "PYTHONIOENCODING=utf-8"
 set "PYTHONUTF8=1"
+REM v3.7.6: PyTorch fragmentation fix — expandable memory segments
+REM 8GB VRAM'de MiDaS+CoTracker peşpeşe yüklenince fragment OOM oluyordu.
+REM Bu env var pool'un genişlemesine izin verir, fragmentation engeller.
+set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512"
 echo.
 echo --------------------------------------------------------
 echo   Baslatiliyor: uvicorn backend.api:app

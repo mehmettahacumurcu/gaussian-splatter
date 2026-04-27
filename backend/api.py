@@ -100,7 +100,10 @@ async def process_video(
     smoke_test: bool = Form(False, description="True: hızlı preset (500 iter, 480x270, 10 ts)"),
     micro_test: bool = Form(False, description="True: ULTRA hızlı preset (200 iter, 320x180, 5 ts, fps=2, no foundation) — dev iteration için, cache'li scene'de ~30 sn"),
     cloud: bool = Form(False, description="True: cloud_config (1920x1080, 60k iter)"),
-    ultra_test: bool = Form(False, description="True: 10-12 saat ULTRA preset (150k iter, 960x540, HexPlane 128/64, MLP 768/5, Fourier K=16, density_end=100k, 120 ts) — RTX 3060 Ti stress test"),
+    high_test: bool = Form(False, description="True: 3-4 saat HIGH preset (50k iter, 640x360, HexPlane 96/48, MLP 512/4, Fourier K=10, density_end=35k, 90 ts, N cap 60k)"),
+    ultra_test: bool = Form(False, description="True: 6-9 saat ULTRA preset (80k iter, 720x405, HexPlane 112/56, MLP 640/4, Fourier K=12, density_end=50k, 90 ts, N cap 80k)"),
+    ultra_clean: bool = Form(False, description="True: 7-9 saat ULTRA CLEAN preset (v3.8 anti-streak: aniso reg + sıkı dpos clamp + rigid 5× + fourier_reg 10× + density_end 30k + sh_degree 2). Banana_demo bulanıklık fix'i."),
+    static_max: bool = Form(False, description="True: STATIC MAX preset (v3.9). Tum preprocessing iyilestirmeleri: fps=20, metric3d_vit_large, COLMAP exhaustive, confidence init subsample, resolution=720x405, sh_degree=3. Ultra Clean fix'leri + max input quality."),
     skip_foundation: bool = Form(True, description="Foundation modelleri atla"),
     # --- Override parametreleri (preset üzerine uygulanır) ---
     # Temel training
@@ -117,6 +120,9 @@ async def process_video(
     lambda_mask_motion: float | None = Form(None, description="Dynamic mask weight"),
     lambda_track: float | None = Form(None, description="CoTracker 3D-anchored track loss"),
     lambda_scale: float | None = Form(None, description="Scale regularizer (outlier blow-up önleme)"),
+    lambda_aniso: float | None = Form(None, description="v3.8: Anisotropy regularizer (streak/needle gaussian fix)"),
+    aniso_threshold: float | None = Form(None, description="v3.8: max/min scale ratio threshold (default 5)"),
+    dpos_total_cap_frac: float | None = Form(None, description="v3.8: Per-iter dpos clamp × scene_extent (default 0.2)"),
     opacity_reset_interval: int | None = Form(None, description="Opacity reset aralığı (iter), 0=kapalı"),
     track_sample_k: int | None = Form(None, description="Her iter sample edilecek track sayısı"),
     warmup_iters: int | None = Form(None, description="Regularizer warmup süresi (iter)"),
@@ -147,6 +153,10 @@ async def process_video(
     cotracker_num_points: int | None = Form(None, description="CoTracker nokta sayısı"),
     cotracker_grid_size: int | None = Form(None, description="CoTracker grid NxN"),
     sam2_threshold: float | None = Form(None, description="SAM2 confidence eşiği"),
+    # v3.9 — Preprocessing
+    resize_long_edge: int | None = Form(None, description="Frame extract long edge px (default 960)"),
+    colmap_matching: str | None = Form(None, description="sequential | exhaustive (default sequential)"),
+    init_subsample_mode: str | None = Form(None, description="random | confidence (default random)"),
 ) -> ProcessResponse:
     """
     Video'yu upload et ve pipeline'ı kuyruğa al.
@@ -209,6 +219,43 @@ async def process_video(
             cfg.foundation.cotracker_grid_size = 15          # 30→15 (225 nokta, 4x hızlı)
             cfg.foundation.cotracker_num_points = 900
 
+        # HIGH TEST — 3-4 saat enhanced quality (Full ile Ultra arası)
+        # Full preset (30k iter, 640x360) yeterli motion için ama daha derin
+        # iterasyon ve modest scale-up ile daha temiz sonuç:
+        #   - n_iters 50k (Full 30k → Ultra 80k arası)
+        #   - density_end 35k (uzatılmış density window)
+        #   - max_gaussians 60k (cap)
+        #   - Fourier K=10 (Full 8 → Ultra 12 arası)
+        #   - num_timestamps 90 (Full 60 → Ultra 90)
+        # Resolution Full ile aynı (640x360) — render hızı korunur.
+        # Tahmini süre 3060 Ti: 3-4 saat
+        if high_test:
+            cfg.preprocess.fps = 10
+            cfg.preprocess.resize_long_edge = 960
+            cfg.train.n_iters = 50_000
+            cfg.train.image_resolution = (640, 360)
+            cfg.train.ckpt_interval = 5000
+            cfg.train.log_interval = 100
+            cfg.train.density_start_iter = 500
+            cfg.train.density_end_iter = 35_000
+            cfg.train.density_interval = 200
+            cfg.train.densify_grad_threshold = 3e-4   # Default 2e-4'ten biraz sıkı
+            cfg.train.warmup_iters = 1000
+            cfg.train.max_gaussians = 60_000
+            # Model — modest scale-up
+            cfg.model.hexplane_resolution = 96    # Full default
+            cfg.model.hexplane_feat_dim = 48
+            cfg.model.mlp_width = 512
+            cfg.model.mlp_depth = 4
+            cfg.model.fourier_K = 10
+            # Export
+            cfg.export.num_timestamps = 90
+            # Foundation — v3.7.4: 3060 Ti 8GB için CoTracker güvenli ayar
+            # Önceden 25 idi ama banana_high'ta OOM oldu. 20 daha güvenli, fallback hazır.
+            cfg.foundation.metric3d_model = "metric3d_vit_small"
+            cfg.foundation.cotracker_grid_size = 20
+            cfg.foundation.cotracker_num_points = 1024
+
         # ULTRA TEST v2 — 8-12 saat max-quality render (REVISED)
         # ÖNCEKİ ULTRA v1 BAŞARISIZ: banana'da N=164k, 0.08 it/s → 21 gün ETA.
         # Sebepler:
@@ -252,6 +299,95 @@ async def process_video(
             cfg.foundation.cotracker_grid_size = 25
             cfg.foundation.cotracker_num_points = 1600
 
+        # ULTRA CLEAN PRESET — v3.8 anti-streak.
+        # banana_demo Ultra (PSNR 19.9, görseldeki streak'ler) post-mortem fix'i.
+        # Ultra v2 base + 8 değişiklik:
+        #   1. lambda_aniso 0.02 (anisotropy regularizer açık — streak fix)
+        #   2. aniso_threshold 5.0 (max/min ratio < 5 serbest, üstü ceza)
+        #   3. dpos_total_cap_frac 0.05 (Ultra'da 0.2; 4× sıkı, motion daha kısıtlı)
+        #   4. lambda_rigidity 1e-3 (Ultra 2e-4'ten 5×; KNN motion uniformity zorla)
+        #   5. lambda_fourier_reg 1e-2 (Ultra 1e-3'ten 10×; Fourier coeff overfit bastır)
+        #   6. density_end_iter 30000 (Ultra 50k; geri kalan 50k iter sadece refine)
+        #   7. prune_max_scale 0.01 (Ultra 0.02; daha küçük max gaussian)
+        #   8. sh_degree 2 (Ultra 3; daha smooth color, gaussian-spike incentive azalır)
+        # Beklenen: PSNR 22+ (Ultra 19.9'dan +2-3 dB), streak'siz, kontrollü motion.
+        # Tahmini süre 3060 Ti: 7-9 saat.
+        if ultra_clean:
+            cfg.preprocess.fps = 10
+            cfg.preprocess.resize_long_edge = 960
+            cfg.train.n_iters = 80_000
+            cfg.train.image_resolution = (720, 405)
+            cfg.train.ckpt_interval = 4000
+            cfg.train.log_interval = 100
+            cfg.train.density_start_iter = 500
+            cfg.train.density_end_iter = 30_000        # Ultra 50k → 30k
+            cfg.train.density_interval = 200
+            cfg.train.densify_grad_threshold = 5e-4
+            cfg.train.warmup_iters = 1500
+            cfg.train.max_gaussians = 80_000
+            cfg.train.prune_max_scale = 0.01            # Ultra 0.02 → 0.01
+            # v3.8 ANTI-STREAK
+            cfg.train.lambda_aniso = 0.02               # KAPALI (0) → 0.02 AÇIK
+            cfg.train.aniso_threshold = 5.0
+            cfg.train.dpos_total_cap_frac = 0.05        # default 0.2 → 0.05 (4× sıkı)
+            cfg.train.lambda_rigidity = 1e-3            # default 2e-4 → 1e-3 (5× sıkı)
+            cfg.train.lambda_fourier_reg = 1e-2         # default 1e-3 → 1e-2 (10× sıkı)
+            # Model — sh_degree azalt
+            cfg.model.sh_degree = 2                     # Ultra 3 → 2 (overfit azalt)
+            cfg.model.hexplane_resolution = 112
+            cfg.model.hexplane_feat_dim = 56
+            cfg.model.mlp_width = 640
+            cfg.model.mlp_depth = 4
+            cfg.model.fourier_K = 12
+            # Export
+            cfg.export.num_timestamps = 90
+            # Foundation
+            cfg.foundation.metric3d_model = "metric3d_vit_small"
+            cfg.foundation.cotracker_grid_size = 25
+            cfg.foundation.cotracker_num_points = 1600
+
+        # STATIC MAX PRESET — v3.9 input pipeline iyilestirmeleri.
+        # Hipotez: 5k iter ve 80k iter ayni static quality verdigi icin
+        # bottleneck training'de degil INPUT PIPELINE'da. Bu preset tum
+        # input iyilestirmelerini AYNI ANDA uygular:
+        #   1. fps 10 -> 20 (2x more frames, daha dense view)
+        #   2. metric3d_vit_small -> vit_large (daha keskin depth)
+        #   3. COLMAP sequential -> exhaustive (loop closure, orbital fix)
+        #   4. init subsample random -> confidence (track + error tabanli)
+        #   5. sh_degree 2 -> 3 (Ultra Clean'den geri, color expressiveness)
+        # + Ultra Clean'in tum anti-streak fix'leri korunur.
+        if static_max:
+            cfg.preprocess.fps = 20
+            cfg.preprocess.resize_long_edge = 1280
+            cfg.preprocess.colmap_matching = "exhaustive"
+            cfg.preprocess.init_subsample_mode = "confidence"
+            cfg.train.n_iters = 80_000
+            cfg.train.image_resolution = (720, 405)
+            cfg.train.ckpt_interval = 4000
+            cfg.train.log_interval = 100
+            cfg.train.density_start_iter = 500
+            cfg.train.density_end_iter = 30_000
+            cfg.train.density_interval = 200
+            cfg.train.densify_grad_threshold = 5e-4
+            cfg.train.warmup_iters = 1500
+            cfg.train.max_gaussians = 80_000
+            cfg.train.prune_max_scale = 0.01
+            cfg.train.lambda_aniso = 0.02
+            cfg.train.aniso_threshold = 5.0
+            cfg.train.dpos_total_cap_frac = 0.05
+            cfg.train.lambda_rigidity = 1e-3
+            cfg.train.lambda_fourier_reg = 1e-2
+            cfg.model.sh_degree = 3
+            cfg.model.hexplane_resolution = 112
+            cfg.model.hexplane_feat_dim = 56
+            cfg.model.mlp_width = 640
+            cfg.model.mlp_depth = 4
+            cfg.model.fourier_K = 12
+            cfg.export.num_timestamps = 90
+            cfg.foundation.metric3d_model = "metric3d_vit_large"
+            cfg.foundation.cotracker_grid_size = 25
+            cfg.foundation.cotracker_num_points = 1600
+
         # --- Override'lar (preset uzerine uygulanir) ---
         # Temel
         if iters is not None:
@@ -292,6 +428,12 @@ async def process_video(
             cfg.train.lambda_track = lambda_track
         if lambda_scale is not None:
             cfg.train.lambda_scale = lambda_scale
+        if lambda_aniso is not None:
+            cfg.train.lambda_aniso = lambda_aniso
+        if aniso_threshold is not None:
+            cfg.train.aniso_threshold = aniso_threshold
+        if dpos_total_cap_frac is not None:
+            cfg.train.dpos_total_cap_frac = dpos_total_cap_frac
         if opacity_reset_interval is not None:
             cfg.train.opacity_reset_interval = opacity_reset_interval
         if track_sample_k is not None:
@@ -349,6 +491,17 @@ async def process_video(
             cfg.foundation.cotracker_grid_size = cotracker_grid_size
         if sam2_threshold is not None:
             cfg.foundation.sam2_threshold = sam2_threshold
+        # v3.9 — Preprocessing overrides
+        if resize_long_edge is not None:
+            cfg.preprocess.resize_long_edge = resize_long_edge
+        if colmap_matching is not None:
+            if colmap_matching not in ("sequential", "exhaustive"):
+                raise HTTPException(400, f"colmap_matching: sequential | exhaustive ({colmap_matching})")
+            cfg.preprocess.colmap_matching = colmap_matching
+        if init_subsample_mode is not None:
+            if init_subsample_mode not in ("random", "confidence"):
+                raise HTTPException(400, f"init_subsample_mode: random | confidence ({init_subsample_mode})")
+            cfg.preprocess.init_subsample_mode = init_subsample_mode
 
         return run_pipeline(
             str(video_path),

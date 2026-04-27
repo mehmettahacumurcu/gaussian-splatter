@@ -225,11 +225,14 @@ html, body, #root {
 .file-size { font-size: 11px; color: var(--text-muted); }
 
 /* Preset chips */
-.preset-row { display: flex; gap: 8px; }
+.preset-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 8px;
+}
 .preset-chip {
-  flex: 1;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   padding: 10px 12px;
   background: var(--bg-1);
@@ -237,7 +240,10 @@ html, body, #root {
   border-radius: 4px;
   cursor: pointer;
   transition: border-color 0.1s, background 0.1s;
+  min-height: 90px;
 }
+.preset-chip > div { flex: 1; min-width: 0; }
+.preset-chip input[type="radio"] { margin-top: 2px; flex-shrink: 0; }
 .preset-chip:hover { background: var(--bg-3); }
 .preset-chip.active {
   background: #1a2a4a;
@@ -245,7 +251,7 @@ html, body, #root {
 }
 .preset-chip input[type="radio"] { accent-color: var(--accent); }
 .preset-name { font-weight: 600; font-size: 13px; }
-.preset-desc { font-size: 11px; color: var(--text-muted); }
+.preset-desc { font-size: 11px; color: var(--text-muted); line-height: 1.35; word-wrap: break-word; }
 
 /* Advanced toggle */
 .advanced-toggle {
@@ -622,3 +628,27 @@ html, body, #root {
   font-family: "SF Mono", Consolas, Monaco, monospace;
   pointer-events: none;
 }
+
+
+/* Viewer engine toggle */
+.viewer-engine-btn {
+  background: var(--bg-1);
+  border: 1px solid var(--border-1);
+  color: var(--text-muted);
+  padding: 3px 8px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-family: inherit;
+  cursor: pointer;
+  transition: border-color 0.1s, background 0.1s, color 0.1s;
+}
+.viewer-engine-btn:hover {
+  background: var(--bg-3);
+  color: var(--text-primary);
+}
+.viewer-engine-btn.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+

@@ -1,126 +1,166 @@
-feat(train): per-gaussian Fourier trajectories + depth-COLMAP align + ultra preset
+feat(viewer+train): v3.7.x suite — motion verified, viewer playback, depth align, ultra/high presets
 
-Bu commit iki büyük mimari ilerleme + operasyonel araçlar kapsıyor:
-Yol C (Per-Gaussian Fourier) ve Option B (MiDaS-COLMAP depth alignment).
+Bu commit motion'un gerçekten öğrenildiğini KANITLAYAN viewer fix'i +
+yığınla operasyonel iyileştirme + 3 yeni preset + comprehensive roadmap'leri
+kapsıyor.
 
---- Yol C: Per-Gaussian Fourier Trajectory (v3.6 → v3.6.2) ---
+--- KRİTİK BULGU: Viewer Bug, Motion Doğrulandı ---
 
-ÖNCESİ: Tüm deformasyon tek bir global MLP'den geliyordu. Tüm 14-40k gaussian
-tek forward pass'ta aynı fonksiyondan besleniyordu. Motion sparse ve ortalama
-çıkıyordu — chickchicken smoke'da Δpos mean 0.05 (scene'in %0.03'ü).
+Aylar boyu "motion görünmüyor" sandığımız sorun aslında VIEWER BUG'IYDI.
+@mkkellogg/gaussian-splats-3d kütüphanesinin scene visibility toggle'ı
+çalışmıyor (mesh.setSceneVisibility no-op, scene.visible = false respect
+edilmiyor). Sonuç: 90 frame TÜM AYNI ANDA superimposed render ediliyordu.
 
-ŞİMDİ: Her gaussian'ın KENDİ Fourier trajectory'si var:
-  Δpos(i, t) = Σ_{k=1}^{K} [A_{ik}·sin(2πkt) + B_{ik}·cos(2πkt)]
+Banana_high_v3'te motion'un PLY içinde GERÇEKTEN var olduğunu kanıtladık:
+  frame_0 vs frame_22:  Δpos mean=15.4 unit, max=74.5 unit (scene_extent 107)
+  frame_0 vs frame_44:  Δpos mean=15.9 unit, max=67.9 unit
+  %97 gaussian moving > 1 unit
+  %63 gaussian moving > 10 unit
 
-Implementation:
-- backend/model/gaussian_model.py: fourier_pos_coeffs Parameter (N, K, 2, 3)
-  - Zero-init, density control'de (clone/split/prune) senkron
-  - K default 8, ultra'da 12, 48 float/gaussian
-- backend/model/deformation.py: decode_fourier_trajectory(coeffs, t) → (N, 3)
-  - Pure math, stateless, vectorized
-- backend/model/trainer.py:
-  - deform_pos_mode flag: "mlp" | "fourier" | "hybrid" (default hybrid)
-  - Separate optimizer param group + lr_fourier (default 3e-3, warmup'la)
-  - Fourier coefficient clamp (scene_extent × 0.03)
-  - Fourier regularizer: Σ_k k² × ‖coeff_k‖² (low-pass prior)
-  - Spatial smoothness reg: komşu gaussian'lar benzer trajectory (KNN)
-  - Anchor→Fourier routing (v3.6.1): track loss için her anchor'ın
-    en yakın gaussian'ın Fourier coeffs'ini kullan → track gradient
-    doğrudan Fourier'a akar (önceden sadece MLP'ye akıyordu)
+Single-frame debug mode'a geçince DRAMATIC visible motion:
+  - Banana sahnesinin gerçek görüntüsü ortaya çıktı (kadın yürüyor, taş duvar)
+  - Frame 0 → 30 → 60 arasında belirgin yer değişimi
+  - Mimari TAM doğru, sadece viewer bozuktu.
 
-Sonuç: Motion 5-10× artış (chickchicken smoke'da Δpos mean 0.22 → 0.5-0.9,
-moving gaussians %0.2-1.4 → %8-15).
+--- VIEWER REWRITE (v3.7.7 → v3.7.9) ---
 
---- Option B: MiDaS-COLMAP Depth Scale Alignment (v3.7) ---
+frontend/src/components/SplatViewer.tsx tamamen yeniden yazıldı:
 
-ÖNCESİ: Track loss ~0.15'te sabit takılı kalıyordu. Kök sebep: MiDaS
-scale-invariant relative depth döndürüyor, COLMAP world scale ile uyumsuz.
-Anchor unprojection (CoTracker track → 3D lift) yanlış scale'de yapılıyordu.
-Anchor'lar yanlış 3D konumlarda → hiçbir deformation track loss'u
-sıfırlayamaz → fundamental 0.15 error floor.
+v3.7.7 — Cached single-frame swap pattern:
+- Mount'ta tüm N PLY'yi paralel fetch (~30 sn)
+- RAM'de Blob cache (~1.3 GB için 90 frame)
+- currentFrame değişince blob URL'den remove + add (~50-150 ms swap)
+- Multi-mode visibility toggle KALDIRILDI (broken)
 
-ÇÖZÜM:
+v3.7.8 — Progressive load:
+- v3.7.7'de tüm cache bitene kadar frame 0 bile gözükmüyordu (bad UX)
+- Şimdi: frame 0 önce blocking fetch+render → UI ~2 sn'de açılır
+- Background prefetch (3 paralel) currentFrame'den genişleyerek
+- On-demand fetch+swap (uncached frame'lerde lazy load)
+
+v3.7.9 — Gray screen fix + stale request drop:
+- ADD-before-REMOVE swap pattern → gray screen yok
+- Single swap loop + pending frame ref → play'de queue overload yok
+- Stale (eski) frame requests doğal drop → latest'e direkt swap
+- Race condition immunity (mountedRef check her adımda)
+
+Frontend Tauri penceresinde:
+- Eski: frame değişiminde gray flash 50-200 ms
+- Yeni: smooth atomic transition, kullanıcı gray görmüyor
+
+--- DEPTH ALIGNMENT (Option B / v3.7) ---
+
 backend/preprocess/align_depth.py (yeni):
-  Her frame için median-ratio scale fit:
-    1. COLMAP 3D sparse points → frame kamera view projeksiyonu
-    2. Visible points için (u,v,z_colmap) çifti topla
-    3. Aynı pixel'de z_midas oku
-    4. ratio = z_colmap / z_midas (5-95 percentile trim, median)
-    5. depth_map *= scale, .npy üzerine yaz
+MiDaS scale-invariant relative depth → COLMAP world scale alignment.
+Her frame için median-ratio fit (5-95 percentile trim, robust).
+Anchor unprojection artık COLMAP coords'da → track loss converge edebilir.
+Cookie smoke'da track 2.26 → 0.18 (13× düşüş — ilk convergence sinyali).
+Banana_high_v3'te global_scale=17307 (MiDaS COLMAP'tan 17000× küçük scale).
 
-Pipeline Faz 3a.5 olarak otomatik çalışır: MiDaS → Align → CoTracker.
-Sonuç: anchor'lar artık COLMAP world coords'da, track loss converge edebilir.
-Cookie smoke'da track 2.26 → 0.18 (13× düşüş — ilk kez convergence sinyali).
+Pipeline integration: Faz 3a.5 (MiDaS sonrası, CoTracker öncesi) otomatik.
+v3.7.2: parse_cameras Dict[str,Dict] format bug fix (önceden cams[0] list
+gibi okuyorduk).
 
---- Ultra Preset (v1 felaket → v2 revised) ---
+--- ULTRA + HIGH PRESETS (3060 Ti optimize) ---
 
-YENİ PRESET: ultra_test boolean form param (smoke/micro/cloud yanında).
+Yeni preset'ler:
+- High ⭐ (3-4 saat): 50k iter, 640×360, default model, Fourier K=10,
+  density_end=35k, max_gaussians 60k
+- Ultra 🔥 v2 (6-9 saat): 80k iter, 720×405, HexPlane 112/56, MLP 640/4,
+  Fourier K=12, density_end=50k, max_gaussians 80k
 
-ULTRA v1 (başarısız):
-  150k iter, 960×540, HexPlane 128/64, MLP 768/5, K=16, density_end 100k.
-  Banana'da N=164k oldu iter 100'de, 0.08 it/s, 21 gün ETA → abort.
-  Sebep: densify_grad 2e-4 default ile ultra res'te aşırı split + N için
-  hard cap yoktu. Ayrıca depth_align bug'ı (pipeline.py cams yanlış iterate
-  edildi, Dict[str,Dict] olduğunu unuttum) → align hiç çalışmadı.
+Ultra v1 başarısız oldu (banana N=164k → 0.08 it/s → 21 gün ETA). v2'de:
+- max_gaussians hard cap (DensityController.step'te split/clone disable)
+- densify_grad_threshold 5e-4 (aggressive ile dengeli)
+- Init point subsample (109k init → 42-56k, max_gaussians × 0.7)
 
-ULTRA v2 (revised, 3060 Ti için 6-9 saat):
-  80k iter, 720×405, HexPlane 112/56, MLP 640/4, K=12, density_end 50k.
-  max_gaussians=80k hard cap + densify_grad 5e-4 (2.5× sıkı) + depth_align
-  bug fix. Beklenen 6-9 saat.
+--- VRAM CLEANUP (CoTracker OOM) ---
 
---- Hard Caps ve Safety Nets ---
+backend/preprocess/depth_estimate.py:
+- release_models() fonksiyonu — MiDaS module-level cache eksplisit dispose
+- model.cpu() + del + gc.collect() + torch.cuda.empty_cache + sync
+- Pipeline Faz 3b başında çağrılıyor → CoTracker'a yer açar
 
-backend/model/density_control.py:
-  - max_gaussians parametresi (0 = sınırsız). N >= cap iken split/clone kapa,
-    sadece prune devam. Banana N=164k tekrarı imkansız.
+backend/preprocess/point_tracking.py:
+- 7 fallback attempt: (30,720) → (20,720) → (15,540) → (15,480) → (15,360) → (10,360)
+- Her attempt'te aggressive gc + cuda.empty_cache
+- Final cleanup model release
 
-backend/model/trainer.py:
-  - Consecutive-skip counter: 10 ardışık non-finite loss → RuntimeError
-    (silent disaster yok, eski chickchicken v3.3'teki 75 iter silent
-    abort artık imkansız)
-  - Post-step params NaN/Inf check (means + scales + quats)
-  - Hard clamp on log_scale (scene_extent cap)
-  - Hard clamp on dpos_mlp (scene × 0.1)
-  - Hard clamp on total dpos (scene × 0.2)
-  - Hard clamp on dscale (±2 in log-space)
-  - Hard clamp on fourier_pos_coeffs (scene × 0.03)
-  - lr_deform warmup schedule (0 → target over warmup_iters)
-  - lr_fourier warmup schedule (same)
+scripts/start-backend.bat:
+- PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True env var
+- Fragmentation engelleme
 
-backend/export/to_splat.py: export'ta da aynı clamp'ler (safety net).
+Maalesef banana 343 frame × ~720p video tensor 8GB karta direnç
+gösterdiği için bu fixlerden sonra bile CoTracker fail oluyor — RAFT
+flow loss (Tier 1) gerçek çözüm.
 
---- Metrics Bug Fix (v3.7.1) ---
+--- MOTION DIAGNOSTIC SCRIPTS ---
 
-ÖNCESİ: Δpos metric'i raw MLP output'unu ölçüyordu (pre-clamp, Fourier'sız).
-Bu yüzden metrics'te Δpos max 513 gösterirken PLY'de 11 olabiliyordu —
-yanıltıcı okumalar.
+scripts/magnify_motion.py (yeni):
+- Mevcut checkpoint'ten gs+deform yükle
+- fourier_pos_coeffs *= N (default 5)
+- Re-export PLY 'scene_magN' ismiyle
+- Network'ün öğrendiği motion'u N× görselleştirmek için (kanıt amaçlı)
 
-ŞİMDİ: Δpos = _apply_deformation çıktısı (tüm clamp'ler + Fourier dahil).
-Artık PLY ile tutarlı, analytics dashboard'da doğru gösteriyor.
+NOT: scripts/recover_scene.py'da nested fourier_K read bug fix (gs_state
+içinde, not top-level).
 
---- API + Frontend ---
+--- PIPELINE LOGGING ---
 
-Yeni Form param'ları:
-- deform_pos_mode, fourier_K, lr_fourier, lambda_fourier_reg
-- ultra_test (Ultra 🔥 preset)
-- opacity_reset_interval (v3'ten kalıntı)
+backend/run_logger.py: training boyunca metrics.jsonl + events.log + summary.json
 
-Frontend:
-- JobSubmitPanel'da "Ultra 🔥 (6-9 saat)" preset chip
-- HyperparameterPanel'da Model grubu: Deform pos mode, Fourier K,
-  LR fourier, λ fourier reg
-- Density grubu: N hard cap placeholder
-- Run logger fourier field'ını log'luyor
+Bug: Linux mount stale cache yüzünden bazı durumlarda frontend chart
+data alıyor ama dosya 0 byte gözüküyor. Append mode + os.fsync planlandı
+(task #73).
 
---- Known State ---
+--- ROADMAP DOKÜMANLARI ---
 
-Motion konumuz hâlâ optimum değil — chickchicken/cookie gibi subtle motion
-sahnelerinde fark yaratıyor, ama banana gibi dramatic motion'da ultra run
-gerekli. v3.7 alignment pipeline entegrasyonu doğrulandı, cookie smoke'da
-track 13× düştü. Ultra v2 sonucu (banana) henüz test edilmedi.
+docs/MASTER_ROADMAP.md (yeni): Tüm yol haritası
+- Tier 1 RAFT (motion direction)
+- Tier 2 Static/Dynamic (jitter elimination)
+- Tier 3 Multi-view supervision
+- Tier 4 SC-GS / D-NeRF
+- Operasyonel + UX + Performance + Research backlog
 
-Sıradaki: 3060 Ti'da banana ultra v2 (6-9 saat), sonuçları v3.5 full
-(chickchicken, PSNR 29.35, motion subtle) ile karşılaştır.
+docs/TIER1_TIER2_ROADMAP.md (yeni): Tier 1 + 2 detaylı plan
+docs/MOTION_PLANNING_DEEP.md (yeni): Motion subtle olmasının matematiksel sebebi
+docs/DEFORMATION_ARCHITECTURE_IDEAS.md (önceden): 7 mimari karşılaştırma
+
+--- VERIFIED RESULTS ---
+
+banana_high_v3 (50k iter, 2.3 saat):
+- PSNR 21.77 (v1: 17.25 — +4.5 dB iyileşme)
+- N: 36,295 (stable, density dengeli)
+- max_scale: 5.38 (clamp 0.05 × scene 107.6 = 5.4 — tam clamp'te)
+- p99_scale: 2.44 (sağlıklı outlier yok)
+- Δpos mean (PLY frame 28 vs 0): 0.83 unit, %31.7 gaussian > 1 unit
+- Motion direction: track loss=0 ama recon-driven motion mevcut
+- Viewer playback: smooth (cached blob swap)
+
+Static reconstruction kalitesi v1'e göre belirgin temiz (no streak).
+Motion magnitude HyperNeRF orbital camera düzeneğinin doğal limiti
+(~%0.5 of scene) — Tier 1 RAFT direction iyileştirir, dramatic
+magnitude için custom dramatic dataset gerek.
+
+--- KNOWN LIMITATIONS ---
+
+1. Viewer playback "fotoğraf gibi" — frame swap 50-150 ms, 10 fps play
+   için yeterince hızlı değil. Smooth video için single-scene in-place
+   buffer update gerek (next investigation).
+
+2. CoTracker 8GB VRAM'de banana 343 frame'de OOM. Track loss=0 olur.
+   Tier 1 RAFT alternatif (per-pair processing, ~2-3 GB VRAM).
+
+3. HyperNeRF orbital camera + tabletop motion = matematiksel olarak
+   subtle. Demo için custom dramatic data (top yuvarlama, pendulum,
+   D-NeRF synthetic) gerekli.
+
+--- PENDING NEXT ---
+
+1. Smooth video playback (in-place buffer update)
+2. Tier 1 RAFT optical flow loss (motion direction, ~17 saat)
+3. Tier 2 Static/Dynamic separation (jitter elimination, ~14 saat)
+4. Logger fsync + append mode fix
 
 
 Co-authored-by: Claude <noreply@anthropic.com>

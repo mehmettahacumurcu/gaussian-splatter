@@ -188,6 +188,13 @@ class Trainer4DGS:
         track_sample_k: int = 256,
         # Scale regularizer (v3 — outlier blow-up önleme)
         lambda_scale: float = 1e-3,
+        # v3.8: Anisotropy regularizer — streak/needle gaussian fix.
+        # max_scale/min_scale ratio threshold üstünde quadratic ceza.
+        # banana_demo'da scene'in etrafında uzun parlak çizgiler oluşturdu.
+        lambda_aniso: float = 0.0,           # 0 = kapalı, 0.01-0.05 önerilen
+        aniso_threshold: float = 5.0,        # ratio max/min < threshold serbest
+        # v3.8: Total dpos clamp tightening (per-iter motion cap, fraction of scene)
+        dpos_total_cap_frac: float = 0.2,    # v3.6.2 default, 0.05 daha sıkı
         # Opacity reset — INRIA 3DGS trick (her N iter low-opacity'yi topluca reset)
         opacity_reset_interval: int = 3000,
         # v3.7.2: Hard cap on N (0 = sınırsız). Banana ultra'da N=164k oldu, çöktü.
@@ -214,6 +221,10 @@ class Trainer4DGS:
         self.lambda_track = lambda_track
         self.track_sample_k = track_sample_k
         self.lambda_scale = lambda_scale
+        # v3.8: Anisotropy + tightened clamp
+        self.lambda_aniso = float(lambda_aniso)
+        self.aniso_threshold = float(aniso_threshold)
+        self.dpos_total_cap_frac = float(dpos_total_cap_frac)
         self.opacity_reset_interval = int(opacity_reset_interval)
         self.warmup_iters = max(1, warmup_iters)
         # v3.6 / Yol C
@@ -299,9 +310,10 @@ class Trainer4DGS:
             dpos_fourier = decode_fourier_trajectory(self.gs.fourier_pos_coeffs, t)
             dpos = dpos_mlp + dpos_fourier
 
-        # v3.6.2: FINAL dpos clamp — overall motion cap
-        # Herhangi bir gaussian maks sahne'nin %20'si kadar oynayabilir.
-        total_cap = self.scene_extent * 0.2
+        # v3.6.2 → v3.8: FINAL dpos clamp — overall motion cap
+        # Default scene_extent × 0.2; Ultra Clean preset 0.05 (4× daha sıkı).
+        # banana_demo Ultra'da Δpos max=13 (cap=21'de, ama görsel streak'leri için sıkıştırma faydalı).
+        total_cap = self.scene_extent * self.dpos_total_cap_frac
         dpos = dpos.clamp(min=-total_cap, max=total_cap)
 
         deformed_means  = self.gs.means + dpos
@@ -644,6 +656,25 @@ class Trainer4DGS:
                 loss = loss + self.lambda_scale * scale_reg
                 comp["scale"] = scale_reg.item()
 
+            # --- Anisotropy regularizer v3.8 — STREAK / NEEDLE GAUSSIAN FIX ---
+            # banana_demo Ultra'da scene'in etrafında uzun parlak çizgiler oluştu.
+            # Sebep: gaussian (0.05, 2, 0.05) gibi extreme aspect ratio (max/min=40).
+            # Magnitude reg (yukarıdaki scale_reg) sadece büyük scale'leri cezalandırır,
+            # küçük-iğne'ye dokunmaz. Aspect ratio reg eksikti.
+            #
+            # Quadratic hinge: ratio > threshold (default 5) ise (ratio - threshold)² ceza.
+            # threshold = 5 normal 3DGS aspect ratio; 10+ kuyruklu yıldız.
+            if self.lambda_aniso > 0 and self.gs.num_points > 0:
+                # gs.scales is log-space → linear scales pozitif
+                lin_scales = torch.exp(self.gs.scales)  # (N, 3)
+                sc_max = lin_scales.max(dim=-1).values  # (N,)
+                sc_min = lin_scales.min(dim=-1).values.clamp(min=1e-6)  # (N,)
+                aniso_ratio = sc_max / sc_min  # (N,) — ≥ 1
+                aniso_excess = (aniso_ratio - self.aniso_threshold).clamp(min=0)
+                aniso_reg = aniso_excess.pow(2).mean()
+                loss = loss + self.lambda_aniso * warmup * aniso_reg
+                comp["aniso"] = aniso_reg.item()
+
             # --- Fourier trajectory regularizer (v3.6 / Yol C) ---
             # High-freq katsayıları bastır — noise/overfitting önle.
             # Frekansa göre ağırlıklı L2: yüksek k → büyük ceza (low-pass prior).
@@ -772,11 +803,12 @@ class Trainer4DGS:
                     f"Last good checkpoint: run scripts/recover_scene.py <scene>"
                 )
 
-            # v3.4: Hard clamp on log_scale — safety net against runaway growth.
-            # Upper bound: scene_extent (absolute size). log(scene_extent) is max reasonable.
-            # Without this, Δpos huge spike can push scales via gradient to log_scale=70+.
+            # v3.7.4: Hard clamp on log_scale — TIGHTER bound.
+            # Önce scene_extent idi (gaussian sahnenin tamamı kadar olabiliyordu),
+            # banana_high'ta max_scale=108=scene_extent → streak/overlap.
+            # Şimdi: scene_extent × 0.05 = sahnenin %5'i max.
             with torch.no_grad():
-                max_log_scale = math.log(max(self.scene_extent, 1.0))
+                max_log_scale = math.log(max(self.scene_extent * 0.05, 1e-3))
                 self.gs.scales.data.clamp_(max=max_log_scale)
 
                 # v3.6.1: Hard clamp on Fourier coefficients.

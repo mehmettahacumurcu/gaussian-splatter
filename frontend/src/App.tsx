@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useState } from "react";
 import "./App.css";
 import { SplatViewer } from "./components/SplatViewer";
+import { SplatViewerSpark } from "./components/SplatViewerSpark";
 import { TimelineSlider } from "./components/TimelineSlider";
 import { JobSubmitPanel } from "./components/JobSubmitPanel";
 import { JobsList } from "./components/JobsList";
@@ -65,6 +66,9 @@ function App() {
   const [diskScenes, setDiskScenes] = useState<SceneListItem[] | null>(null);
   const [diskPanelOpen, setDiskPanelOpen] = useState(false);
   const [diskLoading, setDiskLoading] = useState(false);
+  // v3.7.7 Debug: tek frame yükleme modu — visibility toggle bypass
+  const [singleFrameMode, setSingleFrameMode] = useState(false);
+  const [viewerEngine, setViewerEngine] = useState<"legacy" | "spark">("legacy");
   // Analytics — son/aktif job için
   const [analyticsScene, setAnalyticsScene] = useState<string>("");
 
@@ -280,6 +284,26 @@ function App() {
               <button className="btn-secondary" onClick={toggleDiskPanel}>
                 Diskten {diskPanelOpen ? "▲" : "▼"}
               </button>
+              <label
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 6,
+                  marginLeft: 12,
+                  fontSize: 12,
+                  color: "#888",
+                  cursor: "pointer",
+                }}
+                title="v3.7.7'den itibaren default: cached blob swap. Bu kapatılamaz (multi-mode broken)."
+              >
+                <input
+                  type="checkbox"
+                  checked={true}
+                  disabled
+                  readOnly
+                />
+                ✅ Cached single-frame swap (auto)
+              </label>
             </div>
 
             {diskPanelOpen && (
@@ -329,28 +353,69 @@ function App() {
             {viewerState.kind === "ready" && (
               <>
                 <div className="viewer-statusbar">
-                  {sceneProgress && !sceneProgress.done
-                    ? `Scene'ler yükleniyor: ${sceneProgress.loaded}/${sceneProgress.total}`
-                    : `${viewerState.info.num_frames} frame — "${viewerState.info.scene}" (${formatBytes(viewerState.info.total_size_bytes)})`}
+                  <span>
+                    {sceneProgress && !sceneProgress.done
+                      ? `Scene'ler yükleniyor: ${sceneProgress.loaded}/${sceneProgress.total}`
+                      : `${viewerState.info.num_frames} frame — "${viewerState.info.scene}" (${formatBytes(viewerState.info.total_size_bytes)})`}
+                  </span>
+                  <span style={{ marginLeft: 16, display: "inline-flex", gap: 6, alignItems: "center" }}>
+                    <span style={{ fontSize: 11, color: "var(--text-muted)" }}>Engine:</span>
+                    <button
+                      type="button"
+                      onClick={() => setViewerEngine("legacy")}
+                      className={viewerEngine === "legacy" ? "viewer-engine-btn active" : "viewer-engine-btn"}
+                    >
+                      legacy (mkkellogg)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setViewerEngine("spark")}
+                      className={viewerEngine === "spark" ? "viewer-engine-btn active" : "viewer-engine-btn"}
+                    >
+                      Spark (4DGS) ✨
+                    </button>
+                  </span>
                 </div>
                 <div className="viewer-canvas">
-                  <SplatViewer
-                    key={viewerState.info.job_id}
-                    jobId={viewerState.info.job_id}
-                    numFrames={viewerState.info.num_frames}
-                    currentFrame={currentFrame}
-                    onLoadProgress={(loaded, total) =>
-                      setSceneProgress({ loaded, total, done: false })
-                    }
-                    onReady={() =>
-                      setSceneProgress((prev) =>
-                        prev ? { ...prev, done: true } : prev
-                      )
-                    }
-                    onError={(msg) =>
-                      setViewerState({ kind: "error", message: msg })
-                    }
-                  />
+                  {viewerEngine === "spark" ? (
+                    <SplatViewerSpark
+                      key={`spark-${viewerState.info.job_id}`}
+                      jobId={viewerState.info.job_id}
+                      numFrames={viewerState.info.num_frames}
+                      currentFrame={currentFrame}
+                      onLoadProgress={(loaded, total) =>
+                        setSceneProgress({ loaded, total, done: false })
+                      }
+                      onReady={() =>
+                        setSceneProgress((prev) =>
+                          prev ? { ...prev, done: true } : prev
+                        )
+                      }
+                      onError={(msg) =>
+                        setViewerState({ kind: "error", message: msg })
+                      }
+                    />
+                  ) : (
+                    <SplatViewer
+                      // key includes singleFrameMode → mode değişince viewer remount
+                      key={`${viewerState.info.job_id}-${singleFrameMode ? "single" : "multi"}`}
+                      jobId={viewerState.info.job_id}
+                      numFrames={viewerState.info.num_frames}
+                      currentFrame={currentFrame}
+                      singleFrameMode={singleFrameMode}
+                      onLoadProgress={(loaded, total) =>
+                        setSceneProgress({ loaded, total, done: false })
+                      }
+                      onReady={() =>
+                        setSceneProgress((prev) =>
+                          prev ? { ...prev, done: true } : prev
+                        )
+                      }
+                      onError={(msg) =>
+                        setViewerState({ kind: "error", message: msg })
+                      }
+                    />
+                  )}
                 </div>
                 <div className="viewer-timeline">
                   <TimelineSlider

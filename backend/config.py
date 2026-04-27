@@ -43,6 +43,16 @@ class PreprocessConfig:
     colmap_camera_model: str = "PINHOLE"
     colmap_use_gpu: bool = True
     sequential_overlap: int = 10
+    # v3.9: COLMAP matching strategy.
+    # - "sequential": yakin frame'leri match eder (hizli, default)
+    # - "exhaustive": tum frame'ler birbirleriyle match (yavas N^2,
+    #   orbital camera icin loop closure saglar)
+    colmap_matching: str = "sequential"
+    # v3.9: Initial point subsample mode.
+    # - "random": cap'in %70'ine random downsample (eski, hizli)
+    # - "confidence": COLMAP track length / (1 + reproj_error) skoruyla
+    #   high-confidence noktalari sec, outlier'lari at
+    init_subsample_mode: str = "random"
     colmap_exe: str | None = None
 
 
@@ -123,6 +133,15 @@ class TrainConfig:
     # v3'te symmetric formul tüm scale'leri 1'e itip homogenization yaratmıştı.
     # v3.1'de trainer.py içinde threshold-based hinge kullanılıyor (bkz. orada).
     lambda_scale: float = 5e-3          # v3: 1e-3 → 5e-3 (5× güçlü ama asimetrik, sadece outlier hit)
+    # v3.8: Anisotropy regularizer — STREAK / NEEDLE GAUSSIAN FIX.
+    # banana_demo Ultra'da uzun parlak çizgiler oluştu. Magnitude reg kontrol
+    # etmiyordu çünkü iğne şeklinde gaussian (max=2 küçük min=0.05) magnitude'u
+    # küçük ama ratio 40. Ultra Clean preset 0.02 default açar.
+    lambda_aniso: float = 0.0           # 0 = kapalı (geriye uyumlu); Ultra Clean = 0.02
+    aniso_threshold: float = 5.0        # ratio < 5 serbest, üstü quadratic ceza
+    # v3.8: Total dpos clamp fraction — per-iter motion cap (× scene_extent).
+    # banana_demo Δpos max ortalama 6, peak 13 (cap 21'de). Daha sıkı için 0.05.
+    dpos_total_cap_frac: float = 0.2    # v3.6.2 default; Ultra Clean = 0.05
     # Foundation model losses (Stage 2) — v3.4 denge
     lambda_depth: float = 0.1
     lambda_mask_motion: float = 2.0     # v3.4: 1.0 → 2.0 (denge, v3.3'teki 3.0 overshoot)

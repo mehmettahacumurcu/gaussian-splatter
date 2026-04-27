@@ -14,7 +14,7 @@ interface Props {
   onJobSubmitted: (response: ProcessResponse, sceneName: string) => void;
 }
 
-type Preset = "micro" | "smoke" | "full" | "cloud" | "ultra";
+type Preset = "micro" | "smoke" | "full" | "high" | "cloud" | "ultra" | "ultra_clean" | "static_max";
 
 export function JobSubmitPanel({ onJobSubmitted }: Props) {
   const [videoFile, setVideoFile] = useState<File | null>(null);
@@ -53,7 +53,10 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
         micro_test: preset === "micro",
         smoke_test: preset === "smoke",
         cloud: preset === "cloud",
+        high_test: preset === "high",
         ultra_test: preset === "ultra",
+        ultra_clean: preset === "ultra_clean",
+        static_max: preset === "static_max",
         skip_foundation: skipFoundation,
         hyperparams,
       });
@@ -148,6 +151,17 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
               <div className="preset-desc">30k iter, 640x360, 60 ts · ~30-60 dk</div>
             </div>
           </label>
+          <label className={`preset-chip ${preset === "high" ? "active" : ""}`}>
+            <input
+              type="radio"
+              checked={preset === "high"}
+              onChange={() => setPreset("high")}
+            />
+            <div>
+              <div className="preset-name">High ⭐ (3-4 saat)</div>
+              <div className="preset-desc">50k iter, 640x360, 90 ts, Fourier K=10, N cap 60k · enhanced quality</div>
+            </div>
+          </label>
           <label className={`preset-chip ${preset === "cloud" ? "active" : ""}`}>
             <input
               type="radio"
@@ -170,6 +184,28 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
               <div className="preset-desc">80k iter, 720x405, 90 ts, HexPlane 112/56, MLP 640/4, Fourier K=12, N cap 80k · 3060 Ti optimize</div>
             </div>
           </label>
+          <label className={`preset-chip ${preset === "ultra_clean" ? "active" : ""}`}>
+            <input
+              type="radio"
+              checked={preset === "ultra_clean"}
+              onChange={() => setPreset("ultra_clean")}
+            />
+            <div>
+              <div className="preset-name">Ultra Clean ✨ (7-9 saat)</div>
+              <div className="preset-desc">v3.8 anti-streak: aniso reg + sıkı dpos clamp + rigid 5× + fourier_reg 10× + density_end 30k + sh_degree 2 · banana streak fix</div>
+            </div>
+          </label>
+          <label className={`preset-chip ${preset === "static_max" ? "active" : ""}`}>
+            <input
+              type="radio"
+              checked={preset === "static_max"}
+              onChange={() => setPreset("static_max")}
+            />
+            <div>
+              <div className="preset-name">Static Max 🎯 (v3.9, ~3-4 saat preprocessing + 7-9 saat training)</div>
+              <div className="preset-desc">Tüm preprocessing iyileştirmeleri: fps=20, vit_large depth, COLMAP exhaustive, confidence init subsample, sh_degree=3 · Ultra Clean fix'leri + max input quality. Banana halo testi.</div>
+            </div>
+          </label>
         </div>
         {preset === "micro" && (
           <p className="submit-hint">
@@ -177,6 +213,15 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
             Foundation <strong>atla</strong> → ~30 sn (cache hit), sadece recon test.
             Foundation <strong>aç</strong> → ~5-10 dk, tam Stage 2 preflight (MiDaS+CoTracker+tracks/depth loss).
             CoTracker grid 30→15, MiDaS small — tümü hız optimize.
+          </p>
+        )}
+        {preset === "high" && (
+          <p className="submit-hint">
+            ⭐ <strong>3-4 saat enhanced quality</strong> (Full ile Ultra arası).
+            50k iter, 640×360 (Full ile aynı), Fourier K=10, density end @ 35k,
+            <strong>N hard cap 60k</strong> (init 42k subsample), num_ts 90.
+            Model parametreleri default — render hızı korunmuş.
+            Banana/cookie gibi standart sahneler için ideal denge.
           </p>
         )}
         {preset === "ultra" && (

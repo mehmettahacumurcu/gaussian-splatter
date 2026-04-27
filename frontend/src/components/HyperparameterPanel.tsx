@@ -99,10 +99,28 @@ const GROUPS: { title: string; icon: string; fields: FieldSpec[] }[] = [
     title: "Foundation modeller (Faz 3)",
     icon: "🜚",
     fields: [
-      { key: "metric3d_model", label: "Metric3D model", placeholder: "metric3d_vit_small", kind: "string", help: "small / large / giant2" },
+      { key: "metric3d_model", label: "Metric3D model", placeholder: "metric3d_vit_small", kind: "string", help: "metric3d_vit_small (default, hızlı) | metric3d_vit_large (daha keskin depth) | metric3d_vit_giant2 (en iyi)" },
       { key: "cotracker_num_points", label: "CoTracker nokta sayısı", placeholder: "2048", kind: "number", min: 256, step: 256 },
       { key: "cotracker_grid_size", label: "CoTracker grid NxN", placeholder: "30", kind: "number", min: 10, max: 60, step: 5 },
       { key: "sam2_threshold", label: "SAM2 threshold", placeholder: "0.5", kind: "number", min: 0, max: 1, step: 0.05 },
+    ],
+  },
+  {
+    title: "Preprocessing (v3.9 STATIC MAX)",
+    icon: "🎬",
+    fields: [
+      { key: "resize_long_edge", label: "Frame extract long edge (px)", placeholder: "960", kind: "number", min: 480, step: 160, help: "Default 960. 1280-1440 daha çok detail ama COLMAP yavaşlar." },
+      { key: "colmap_matching", label: "COLMAP matching", placeholder: "sequential", kind: "string", help: "sequential (default, hızlı) | exhaustive (yavaş N², orbital camera için loop closure sağlar)" },
+      { key: "init_subsample_mode", label: "Init subsample mode", placeholder: "random", kind: "string", help: "random (default) | confidence (track length / reproj error tabanlı, kaliteli noktaları korur)" },
+    ],
+  },
+  {
+    title: "Anti-streak (v3.8)",
+    icon: "★",
+    fields: [
+      { key: "lambda_aniso", label: "λ anisotropy", placeholder: "0", kind: "number", step: 0.005, help: "max/min scale ratio threshold üstü gauss'ları cezalandır. 0=kapalı, 0.02=Ultra Clean default" },
+      { key: "aniso_threshold", label: "Aniso threshold", placeholder: "5", kind: "number", min: 1, step: 0.5, help: "max/min < threshold serbest. Düşük=daha agresif streak fix." },
+      { key: "dpos_total_cap_frac", label: "Δpos total cap fraction", placeholder: "0.2", kind: "number", min: 0.01, max: 0.5, step: 0.01, help: "Per-iter motion cap × scene_extent. Default 0.2; Ultra Clean 0.05 (4× sıkı)." },
     ],
   },
 ];

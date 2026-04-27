@@ -118,8 +118,9 @@ def export_to_ply(
             d_means       = (gs.means + dpos)
             d_log_scales  = (gs.scales + dscale)         # log-space toplam
             d_quats       = F.normalize(gs.quats + dquat, dim=-1)
-            # Final clamp on absolute log_scale — scene_extent cap
-            max_log = torch.log(torch.tensor(max(scene_extent, 1.0), device=d_log_scales.device))
+            # v3.7.4: TIGHTER scale clamp — scene_extent × 0.05 (önceden tamamı idi).
+            # Outlier streak/overlap önleme.
+            max_log = torch.log(torch.tensor(max(scene_extent * 0.05, 1e-3), device=d_log_scales.device))
             d_log_scales = d_log_scales.clamp(max=float(max_log))
         else:
             d_means       = gs.means

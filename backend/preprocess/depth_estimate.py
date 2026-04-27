@@ -22,6 +22,35 @@ from typing import List
 _MODEL_CACHE: dict = {}
 
 
+def release_models() -> None:
+    """
+    v3.7.5: VRAM cleanup. MiDaS modeli module-level cache'te tutulduğundan
+    torch.cuda.empty_cache() onu temizleyemez. Bu fonksiyon explicit dispose:
+      1. Cache'teki modeli CPU'ya taşı / sil
+      2. gc.collect (Python-level)
+      3. torch.cuda.empty_cache (PyTorch reserved temizle)
+    Pipeline Faz 3a sonrası çağrılır → CoTracker OOM olmaz.
+    """
+    import gc
+    global _MODEL_CACHE
+    n_freed = len(_MODEL_CACHE)
+    for key in list(_MODEL_CACHE.keys()):
+        model, transform = _MODEL_CACHE.pop(key)
+        try:
+            model.cpu()
+            del model
+            del transform
+        except Exception:
+            pass
+    _MODEL_CACHE.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    if n_freed > 0:
+        print(f"✓ Depth model cache released ({n_freed} model)")
+
+
 def _resolve_model_name(name: str) -> str:
     """
     Eski Metric3D isimlerini MiDaS hub'da GERÇEKTEN var olan isimlere çevir.

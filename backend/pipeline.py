@@ -110,11 +110,14 @@ def run_pipeline(
         def _colmap_on_progress(frac: float, msg: str) -> None:
             cb("colmap", frac, msg, {"colmap_fraction": frac})
 
+        # v3.9: COLMAP matching strategy config'ten okunur
+        is_sequential = getattr(cfg.preprocess, "colmap_matching", "sequential") != "exhaustive"
+        print(f"[pipeline] COLMAP matching: {getattr(cfg.preprocess, 'colmap_matching', 'sequential')} (sequential={is_sequential})")
         run_colmap(
             paths["frames"], paths["colmap"],
             camera_model=cfg.preprocess.colmap_camera_model,
             use_gpu=cfg.preprocess.colmap_use_gpu,
-            sequential=True,
+            sequential=is_sequential,
             colmap_exe=cfg.preprocess.colmap_exe,
             on_progress=_colmap_on_progress,
         )
@@ -196,7 +199,18 @@ def run_pipeline(
         cb("foundation", 0.33, "Depth done, CoTracker başlıyor", {})
 
         # 3b — Tracks
+        # v3.7.5: MiDaS modelini eksplisit release et — module-level cache'te
+        # 700MB-1.4GB tutuyordu. empty_cache() bunu temizlemiyor.
+        # Sonra CoTracker yer bulamadığı için OOM oluyordu.
         print("\n[Faz 3b] CoTracker piksel takibi")
+        try:
+            from .preprocess.depth_estimate import release_models as release_depth_models
+            release_depth_models()
+        except Exception as _e:
+            print(f"  ⚠ depth model release: {_e}")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
         try:
             from .preprocess.point_tracking import track_points
             track_points(paths["frames"], paths["tracks"] / "tracks.pt",
@@ -205,6 +219,10 @@ def run_pipeline(
         except Exception as e:
             print(f"⚠ Tracking başarısız, atlanıyor: {e}")
             foundation_status["tracks"] = f"failed: {e}"
+        # Cleanup after CoTracker too
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
         cb("foundation", 0.66, "Tracks done, dinamik maske başlıyor", {})
 
         # 3c — Dynamic mask
@@ -238,6 +256,46 @@ def run_pipeline(
     cb("init", 0.0, "Model başlatılıyor", {})
     init_pts = torch.from_numpy(xyz)
     init_rgb = torch.from_numpy(rgb).float() / 255.0
+
+    # v3.7.3 -> v3.9: Initial point subsample.
+    # Mode:
+    #   - "random" (default): cap'in %70'ine random downsample (eski davranis)
+    #   - "confidence": COLMAP track length / (1 + reproj_error) skoruyla
+    #     top-K se?, outlier'lari at. Static quality icin onerilen.
+    if cfg.train.max_gaussians > 0:
+        target_init = int(cfg.train.max_gaussians * 0.7)
+        if init_pts.shape[0] > target_init:
+            mode = getattr(cfg.preprocess, "init_subsample_mode", "random")
+            print(f"⚠ Initial COLMAP points ({init_pts.shape[0]:,}) > target "
+                  f"({target_init:,}) — mode={mode}")
+            if mode == "confidence":
+                try:
+                    import numpy as np
+                    from .preprocess.parse_colmap import load_points3d_with_confidence
+                    _xyz, _rgb, track_len, reproj_err = load_points3d_with_confidence(paths["colmap"])
+                    if track_len.shape[0] != init_pts.shape[0]:
+                        print(f"  ⚠ confidence shape mismatch ({track_len.shape[0]} vs {init_pts.shape[0]}), random fallback")
+                        perm = torch.randperm(init_pts.shape[0])[:target_init]
+                    else:
+                        confidence = track_len.astype(np.float32) / (1.0 + reproj_err)
+                        top_idx = np.argsort(-confidence)[:target_init]
+                        perm = torch.from_numpy(top_idx.astype("int64"))
+                        median_kept = float(np.median(track_len[top_idx]))
+                        median_err  = float(np.median(reproj_err[top_idx]))
+                        print(f"  ✓ confidence subsample: track_len median={median_kept:.0f}, err median={median_err:.2f}")
+                except Exception as e:
+                    print(f"  ⚠ confidence subsample fail ({e}), random fallback")
+                    perm = torch.randperm(init_pts.shape[0])[:target_init]
+            else:
+                perm = torch.randperm(init_pts.shape[0])[:target_init]
+            init_pts = init_pts[perm]
+            init_rgb = init_rgb[perm]
+            run_logger.log_event("init_subsample",
+                                 before=int(xyz.shape[0]),
+                                 after=int(init_pts.shape[0]),
+                                 max_gaussians=cfg.train.max_gaussians,
+                                 mode=mode)
+
     gs = GaussianModel(init_pts, init_colors=init_rgb,
                        sh_degree=cfg.model.sh_degree,
                        fourier_K=cfg.model.fourier_K)
@@ -296,6 +354,10 @@ def run_pipeline(
         lambda_track=cfg.train.lambda_track,
         track_sample_k=cfg.train.track_sample_k,
         lambda_scale=cfg.train.lambda_scale,
+        # v3.8 — anisotropy + tightened dpos clamp
+        lambda_aniso=cfg.train.lambda_aniso,
+        aniso_threshold=cfg.train.aniso_threshold,
+        dpos_total_cap_frac=cfg.train.dpos_total_cap_frac,
         opacity_reset_interval=cfg.train.opacity_reset_interval,
         warmup_iters=cfg.train.warmup_iters,
         # v3.6 / Yol C — Per-gaussian Fourier trajectory
