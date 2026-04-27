@@ -55,6 +55,12 @@ export function SplatViewerSpark({
   const currentFrameRef = useRef<number>(0);
   const mountedRef = useRef<boolean>(true);
   const animFrameIdRef = useRef<number | null>(null);
+  // v4.1 — Frame interpolation: smooth float time + auto-play detection
+  const smoothTimeRef = useRef<number>(0);
+  const lastFrameChangeAtRef = useRef<number>(0);  // performance.now() of last currentFrame update
+  const lastFrameValueRef = useRef<number>(0);     // previous currentFrame for delta detection
+  const detectedFpsRef = useRef<number>(10);       // adaptive: parent'in update hızını ölç
+  const lastAnimateAtRef = useRef<number>(0);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -158,18 +164,82 @@ export function SplatViewerSpark({
     };
     window.addEventListener("resize", onResize);
 
-    // --- Animation loop ---
+    // --- Animation loop with smooth interpolation (v4.1) ---
+    //
+    // Strategy:
+    //   - Parent yalnizca discrete currentFrame (integer) gonderir
+    //   - Burda kendi smooth float time ilerletilir
+    //   - Eger parent currentFrame son ~300 ms icinde degistiyse → auto-play algilandi,
+    //     smooth time her tick advance edilir (detected fps × dt)
+    //   - Aksi halde (slider drag, idle) → smooth time = currentFrame (snap)
+    //   - Render: 2 komsu frame visible, opacity lerp (1-α, α)
+    //
+    const setMeshOpacity = (mesh: any, value: number) => {
+      // Spark SplatMesh material'inde opacity hem standart property'de hem
+      // custom uniform'da olabilir. Ikisini de set et — non-existent olan no-op.
+      try {
+        if (mesh.material) {
+          mesh.material.transparent = true;
+          if ("opacity" in mesh.material) (mesh.material as any).opacity = value;
+          const u = (mesh.material as any).uniforms;
+          if (u && u.opacity && "value" in u.opacity) u.opacity.value = value;
+          if (u && u.uOpacity && "value" in u.uOpacity) u.uOpacity.value = value;
+        }
+        if ("opacity" in mesh) (mesh as any).opacity = value;
+      } catch (_) {
+        /* fallback: only visible flag */
+      }
+    };
+
     const animate = () => {
       if (!mountedRef.current) return;
       animFrameIdRef.current = requestAnimationFrame(animate);
 
-      // Visibility update (her frame'de cheap)
-      const targetIdx = currentFrameRef.current;
+      const now = performance.now();
+      const dtSec = lastAnimateAtRef.current > 0
+        ? Math.min((now - lastAnimateAtRef.current) / 1000, 0.1)
+        : 0;
+      lastAnimateAtRef.current = now;
+
+      // Auto-play detection: son 300 ms icinde parent currentFrame degisti mi?
+      const elapsedSinceParentUpdate = now - lastFrameChangeAtRef.current;
+      const isAutoPlay = elapsedSinceParentUpdate < 300 && elapsedSinceParentUpdate > 1;
+
+      let t: number;
+      if (isAutoPlay && numFrames > 1) {
+        // Smooth advance — detected fps × dt
+        smoothTimeRef.current += dtSec * detectedFpsRef.current;
+        // Wrap [0, numFrames)
+        smoothTimeRef.current = ((smoothTimeRef.current % numFrames) + numFrames) % numFrames;
+        // Sync drift correction: smooth time parent currentFrame'den ±1 frame fazla uzaklasmasin
+        const drift = smoothTimeRef.current - currentFrameRef.current;
+        if (drift > 1.5 || drift < -1.5) {
+          // Reset to current
+          smoothTimeRef.current = currentFrameRef.current;
+        }
+        t = smoothTimeRef.current;
+      } else {
+        // Static: snap to currentFrame
+        smoothTimeRef.current = currentFrameRef.current;
+        t = smoothTimeRef.current;
+      }
+
+      // Dual-frame blend
+      const f0 = Math.floor(t) % numFrames;
+      const f1 = (f0 + 1) % numFrames;
+      const alpha = t - Math.floor(t);  // 0..1
+
       meshesRef.current.forEach((mesh, i) => {
-        if (mesh) {
-          // Sadece aktif frame visible. Komşular gizli.
-          // (İleride: blend desteği için ±1 visible + opacity manipule)
-          mesh.visible = i === targetIdx;
+        if (!mesh) return;
+        if (i === f0) {
+          mesh.visible = true;
+          setMeshOpacity(mesh, alpha < 0.001 ? 1.0 : 1.0 - alpha);
+        } else if (i === f1 && alpha > 0.001) {
+          mesh.visible = true;
+          setMeshOpacity(mesh, alpha);
+        } else {
+          mesh.visible = false;
+          setMeshOpacity(mesh, 1.0); // reset for when reused
         }
       });
 
@@ -260,8 +330,23 @@ export function SplatViewerSpark({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, numFrames]);
 
-  // currentFrame değişince ref'i güncelle (animate loop kullansın)
+  // currentFrame değişince ref'i güncelle + auto-play detection (v4.1)
   useEffect(() => {
+    const now = performance.now();
+    const prev = lastFrameValueRef.current;
+    const elapsed = now - lastFrameChangeAtRef.current;
+    // Eger parent her N ms'de bir frame ilerletiyorsa, fps = 1000 / N
+    if (elapsed > 0 && elapsed < 1000 && currentFrame !== prev) {
+      const delta = Math.abs(currentFrame - prev);
+      // Wrap-around detection: numFrames-1 → 0 jumps, ignore
+      if (delta < 5) {
+        const detectedFps = (1000 / elapsed) * Math.max(1, delta);
+        // Smooth detected fps with EMA
+        detectedFpsRef.current = detectedFpsRef.current * 0.7 + detectedFps * 0.3;
+      }
+    }
+    lastFrameValueRef.current = currentFrame;
+    lastFrameChangeAtRef.current = now;
     currentFrameRef.current = currentFrame;
   }, [currentFrame]);
 
