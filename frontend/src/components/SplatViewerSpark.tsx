@@ -61,6 +61,11 @@ export function SplatViewerSpark({
   const lastFrameValueRef = useRef<number>(0);     // previous currentFrame for delta detection
   const detectedFpsRef = useRef<number>(10);       // adaptive: parent'in update hızını ölç
   const lastAnimateAtRef = useRef<number>(0);
+  // v4.2 — WASD free-fly camera (FPS-style)
+  const yawRef = useRef<number>(0);                // mouse look horizontal angle
+  const pitchRef = useRef<number>(0);              // mouse look vertical angle (clamped)
+  const keysRef = useRef<Set<string>>(new Set());  // pressed keys (lowercase)
+  const moveSpeedRef = useRef<number>(2.0);        // unit/sec base speed (wheel adjusts)
 
   useEffect(() => {
     mountedRef.current = true;
@@ -95,34 +100,47 @@ export function SplatViewerSpark({
     const spark = new SparkRenderer({ renderer });
     sparkRef.current = spark;
 
-    // --- Basic mouse controls (orbit-style) ---
+    // --- v4.2: Free-fly camera (FPS-style) — WASD + mouse look + wheel speed ---
+    //
+    // Controls:
+    //   Mouse drag (sol klik) → look around (yaw + pitch)
+    //   W / A / S / D         → forward / strafe-left / back / strafe-right
+    //   Q / E or Space / Ctrl → up / down (world axis)
+    //   Shift                 → sprint (3× speed)
+    //   Mouse wheel           → speed control (move faster/slower)
+    //
+    // Note: banana scene uses camera.up = (0, -1, 0). For statik room sahneler
+    // user may need invert button. Bu state diff implementation'da yok henuz.
+
+    // Initial camera position — scene icine bakacak sekilde
+    camera.position.set(0, 0, 5);
+    yawRef.current = 0;
+    pitchRef.current = 0;
+
+    const updateCameraOrientation = () => {
+      // Yaw + pitch → forward vector
+      // camera.up = (0, -1, 0) (banana). Real "up" world = camera.up.negate() = (0, 1, 0)
+      // Spherical → cartesian: forward unit vector
+      const cy = Math.cos(yawRef.current);
+      const sy = Math.sin(yawRef.current);
+      const cp = Math.cos(pitchRef.current);
+      const sp = Math.sin(pitchRef.current);
+      // Banana convention: -Y is "up", so pitch increases downward in world space
+      const forward = new THREE.Vector3(sy * cp, -sp, -cy * cp);
+      const lookTarget = camera.position.clone().add(forward);
+      camera.lookAt(lookTarget);
+    };
+    updateCameraOrientation();
+
     let isDragging = false;
     let lastX = 0;
     let lastY = 0;
-    const sphericalCamera = {
-      radius: 5,
-      theta: 0,
-      phi: Math.PI / 2,
-    };
-    const updateCameraPosition = () => {
-      camera.position.x =
-        sphericalCamera.radius *
-        Math.sin(sphericalCamera.phi) *
-        Math.cos(sphericalCamera.theta);
-      camera.position.y =
-        sphericalCamera.radius * Math.cos(sphericalCamera.phi);
-      camera.position.z =
-        sphericalCamera.radius *
-        Math.sin(sphericalCamera.phi) *
-        Math.sin(sphericalCamera.theta);
-      camera.lookAt(0, 0, 0);
-    };
-    updateCameraPosition();
 
     const onMouseDown = (e: MouseEvent) => {
       isDragging = true;
       lastX = e.clientX;
       lastY = e.clientY;
+      // Pointer lock daha iyi UX olur ama basit tutmak icin direkt drag tracking
     };
     const onMouseMove = (e: MouseEvent) => {
       if (!isDragging) return;
@@ -130,28 +148,58 @@ export function SplatViewerSpark({
       const dy = e.clientY - lastY;
       lastX = e.clientX;
       lastY = e.clientY;
-      sphericalCamera.theta -= dx * 0.005;
-      sphericalCamera.phi = Math.max(
-        0.1,
-        Math.min(Math.PI - 0.1, sphericalCamera.phi - dy * 0.005)
-      );
-      updateCameraPosition();
+      const sensitivity = 0.003;
+      yawRef.current -= dx * sensitivity;
+      pitchRef.current = Math.max(-1.4, Math.min(1.4, pitchRef.current - dy * sensitivity));
+      updateCameraOrientation();
     };
     const onMouseUp = () => {
       isDragging = false;
     };
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
-      sphericalCamera.radius = Math.max(
-        0.5,
-        Math.min(50, sphericalCamera.radius + e.deltaY * 0.01)
-      );
-      updateCameraPosition();
+      // v4.3: Wheel default = forward/back (orbit-zoom tarzi, FPS hibrit)
+      //   Shift+wheel = speed control (FPS standardi)
+      if (e.shiftKey) {
+        // Speed adjust
+        const factor = e.deltaY > 0 ? 0.9 : 1.1;
+        moveSpeedRef.current = Math.max(0.05, Math.min(50, moveSpeedRef.current * factor));
+      } else {
+        // Forward/back hareket — wheel down = backward (mantikli)
+        const forward = new THREE.Vector3();
+        camera.getWorldDirection(forward);
+        const distance = e.deltaY * 0.01 * moveSpeedRef.current;
+        camera.position.add(forward.multiplyScalar(-distance));
+        updateCameraOrientation();
+      }
     };
+
+    // Keyboard listeners — global window'a (canvas focus gerekli degil)
+    const onKeyDown = (e: KeyboardEvent) => {
+      keysRef.current.add(e.key.toLowerCase());
+      // Browser default'lari engelle (space scroll, vs)
+      if ([" ", "w", "a", "s", "d", "q", "e"].includes(e.key.toLowerCase())) {
+        e.preventDefault();
+      }
+    };
+    const onKeyUp = (e: KeyboardEvent) => {
+      keysRef.current.delete(e.key.toLowerCase());
+    };
+
+    // v4.3: Bug fix — focus kaybinda (Alt+Tab, browser switch, viewer remount) tuslarin
+    // "stuck" kalmasini engelle. Window blur olunca tum tuslari serbest birak.
+    const onBlur = () => {
+      keysRef.current.clear();
+      isDragging = false;
+    };
+
     renderer.domElement.addEventListener("mousedown", onMouseDown);
     window.addEventListener("mousemove", onMouseMove);
     window.addEventListener("mouseup", onMouseUp);
     renderer.domElement.addEventListener("wheel", onWheel, { passive: false });
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", onBlur);
 
     // --- Resize handler ---
     const onResize = () => {
@@ -243,7 +291,46 @@ export function SplatViewerSpark({
         }
       });
 
-      renderer.render(scene, camera);
+      // --- v4.2: WASD camera movement update (try/catch for safety) ---
+      try {
+        const keys = keysRef.current;
+        if (keys.size > 0 && dtSec > 0) {
+          const sprint = keys.has("shift") ? 3.0 : 1.0;
+          const speed = moveSpeedRef.current * sprint * dtSec;
+
+          // Forward direction (where camera looks)
+          const forward = new THREE.Vector3();
+          camera.getWorldDirection(forward);
+
+          // Right direction (forward × world up)
+          const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
+
+          const move = new THREE.Vector3();
+          if (keys.has("w") || keys.has("arrowup")) move.add(forward);
+          if (keys.has("s") || keys.has("arrowdown")) move.sub(forward);
+          if (keys.has("d") || keys.has("arrowright")) move.add(right);
+          if (keys.has("a") || keys.has("arrowleft")) move.sub(right);
+          // Q/E or Space/Ctrl — world up/down (banana camera.up=(0,-1,0))
+          const worldUp = camera.up.clone().negate();
+          if (keys.has("e") || keys.has(" ")) move.add(worldUp);
+          if (keys.has("q") || keys.has("control")) move.sub(worldUp);
+
+          if (move.lengthSq() > 0) {
+            move.normalize().multiplyScalar(speed);
+            camera.position.add(move);
+            updateCameraOrientation();
+          }
+        }
+      } catch (err) {
+        console.warn("[SplatViewerSpark] WASD movement error:", err);
+        keysRef.current.clear();  // safety: stuck tuslari serbest birak
+      }
+
+      try {
+        renderer.render(scene, camera);
+      } catch (err) {
+        console.warn("[SplatViewerSpark] render error:", err);
+      }
     };
     animate();
 
@@ -325,7 +412,12 @@ export function SplatViewerSpark({
       window.removeEventListener("mousemove", onMouseMove);
       window.removeEventListener("mouseup", onMouseUp);
       renderer.domElement.removeEventListener("wheel", onWheel);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", onBlur);
       window.removeEventListener("resize", onResize);
+      // v4.3: cleanup'da key state'i de temizle
+      keysRef.current.clear();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, numFrames]);
