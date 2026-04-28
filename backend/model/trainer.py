@@ -377,6 +377,99 @@ class Trainer4DGS:
             return 0.0
         return min(1.0, max(0.0, (it - static_phase) / max(1, self.warmup_iters)))
 
+    @torch.no_grad()
+    def _setup_static_dynamic_from_masks(
+        self,
+        masks_mv_dir: Path,
+        train_cams: list,
+        mv_cam_K: dict,
+        mv_w2c: dict,
+        threshold_frac: float = 0.10,
+    ) -> None:
+        """Phase 2.1 — Per-cam motion mask voting ile dynamic gauss seçimi.
+
+        Algoritma:
+          - Her cam icin masks_multiview/cam{N}/mask_*.png yukle (binary motion)
+          - Her gauss center'i o cam'a project (pinhole)
+          - In-frame ise: pixel mask'te ise +1 vote
+          - Toplam vote / toplam view > threshold_frac -> DYNAMIC
+
+        Args:
+            masks_mv_dir: paths['masks_mv'] (cam{N}/mask_*.png yapisi)
+            train_cams: train cam id list ['cam01', ..., 'cam20']
+            mv_cam_K, mv_w2c: per-cam intrinsic + extrinsic dict (raw resolution)
+            threshold_frac: gauss en az %X view'da motion -> dynamic
+        """
+        import cv2
+        from pathlib import Path
+
+        masks_mv_dir = Path(masks_mv_dir)
+        if not masks_mv_dir.exists():
+            print(f"[trainer.static_dyn] masks_mv yok: {masks_mv_dir}, skip")
+            return
+        if not hasattr(self.gs, "promote_dynamic"):
+            print(f"[trainer.static_dyn] gs.promote_dynamic API yok, skip")
+            return
+
+        n_pts = self.gs.num_points
+        device = self.gs.means.device
+        dynamic_votes = torch.zeros(n_pts, dtype=torch.int32, device=device)
+        n_total_views = 0
+
+        means = self.gs.means.detach()  # [N, 3]
+        for cam_id in train_cams:
+            cam_mask_dir = masks_mv_dir / cam_id
+            if not cam_mask_dir.exists():
+                continue
+            mask_files = sorted(cam_mask_dir.glob("mask_*.png"))
+            if not mask_files:
+                continue
+            K = mv_cam_K[cam_id].to(device)
+            w2c = mv_w2c[cam_id].to(device)
+            R = w2c[:3, :3]
+            t = w2c[:3, 3]
+
+            for mask_path in mask_files:
+                m_np = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+                if m_np is None:
+                    continue
+                H_m, W_m = m_np.shape
+                mask_t = torch.from_numpy(m_np > 127).to(device)
+
+                # Project gauss centers to this cam
+                pts_cam = (R @ means.T).T + t  # [N, 3]
+                z = pts_cam[:, 2]
+                valid_z = z > 0.1
+                # Project (in raw resolution that K maps to)
+                uv_h = (K @ pts_cam.T).T
+                u = uv_h[:, 0] / uv_h[:, 2].clamp(min=0.1)
+                v = uv_h[:, 1] / uv_h[:, 2].clamp(min=0.1)
+                # Map to mask resolution if different (K and mask should match)
+                in_frame = valid_z & (u >= 0) & (u < W_m) & (v >= 0) & (v < H_m)
+                if not in_frame.any():
+                    continue
+
+                ui = u[in_frame].long().clamp(0, W_m - 1)
+                vi = v[in_frame].long().clamp(0, H_m - 1)
+                pix_motion = mask_t[vi, ui]  # [N_in_frame] bool
+                # Update votes for in-frame gauss
+                idx_in = torch.where(in_frame)[0]
+                dynamic_votes[idx_in[pix_motion]] += 1
+                n_total_views += 1
+
+        if n_total_views == 0:
+            print(f"[trainer.static_dyn] Hicbir mask okunamadi, skip")
+            return
+
+        threshold = max(1, int(n_total_views * threshold_frac))
+        dynamic_mask = dynamic_votes > threshold
+        n_promoted = self.gs.promote_dynamic(dynamic_mask)
+        self.use_static_dynamic_split = True
+        print(f"[trainer.static_dyn] {n_promoted:,} gauss DYNAMIC "
+              f"({100 * n_promoted / max(n_pts, 1):.1f}%) "
+              f"(threshold {threshold}/{n_total_views} views)")
+        print(f"  Static: {self.gs.num_static:,}, Dynamic: {self.gs.num_dynamic:,}")
+
     def _prepare_tracks(
         self,
         tracks_path: Path,
@@ -484,6 +577,15 @@ class Trainer4DGS:
         mv_cam_K=None,
         mv_w2c=None,
         mv_test_camera=None,
+        # Phase 1.4 — Per-cam MV depth supervision
+        depth_mv_dir: Path | None = None,
+        # Phase 1.5 — Per-cam MV dynamic mask (Phase 2.1 promote için)
+        masks_mv_dir: Path | None = None,
+        # Phase 1.8 — Per-cam MV RAFT optical flow
+        flow_mv_dir: Path | None = None,
+        # Phase 2.1 — Static/Dynamic auto-promote
+        auto_static_dynamic: bool = False,
+        static_dynamic_threshold: float = 0.10,
     ) -> dict:
         # v5.0: Multi-view detect
         is_multiview = mv_frame_paths is not None
@@ -599,17 +701,56 @@ class Trainer4DGS:
                       f"start_iter={self.cam_refine_start_iter}")
             print(f"[trainer.mv] K scaled per-cam, {len(train_cams)} entries")
 
+        # Phase 2.1 — Static/Dynamic auto-promote (multi-view only).
+        # Mask voting ile ilk N iter'den ONCE statik/dinamik secimini yap,
+        # boylece training boyunca statik bolgeler deformation BYPASS eder.
+        if (is_multiview and auto_static_dynamic and masks_mv_dir is not None
+                and hasattr(self.gs, "promote_dynamic")):
+            print(f"\n[trainer.static_dyn] Phase 2.1 auto-promote — "
+                  f"mask voting threshold={static_dynamic_threshold}")
+            self._setup_static_dynamic_from_masks(
+                masks_mv_dir=masks_mv_dir,
+                train_cams=train_cams,
+                mv_cam_K=mv_cam_K,
+                mv_w2c=mv_w2c,
+                threshold_frac=static_dynamic_threshold,
+            )
+
         # Cache'ler
         frames_cached: list = [None] * T
         depth_cached:  list = [None] * T
         mask_cached:   list = [None] * T
         # v5.0: Multi-view per-cam frame cache
         frames_cached_mv = {c: [None] * T for c in train_cams} if is_multiview else None
+        # Phase 1.4 — Multi-view per-cam depth cache
+        depth_cached_mv = (
+            {c: [None] * T for c in train_cams}
+            if (is_multiview and depth_mv_dir is not None and self.lambda_depth > 0)
+            else None
+        )
+        # Phase 1.8 — Multi-view per-cam flow cache (sparse, only if file exists)
+        flow_cached_mv = (
+            {c: [None] * T for c in train_cams}
+            if (is_multiview and flow_mv_dir is not None and self.lambda_flow > 0)
+            else None
+        )
 
         use_depth = depth_dir is not None and self.lambda_depth > 0
         use_mask  = mask_dir is not None
+        use_depth_mv = (
+            is_multiview and depth_mv_dir is not None and self.lambda_depth > 0
+        )
+        use_flow_mv = (
+            is_multiview and flow_mv_dir is not None and self.lambda_flow > 0
+        )
         if use_depth:
             print(f"[trainer] Depth loss aktif (lambda={self.lambda_depth})")
+        if use_depth_mv:
+            print(f"[trainer.mv] Phase 1.4 Depth-MV supervision: "
+                  f"lambda={self.lambda_depth}, dir={depth_mv_dir}")
+        if use_flow_mv:
+            print(f"[trainer.mv] Phase 1.8 Flow-MV supervision: "
+                  f"lambda={self.lambda_flow}, dir={flow_mv_dir}")
         if use_mask:
             print(f"[trainer] Mask-weighted recon aktif (lambda={self.lambda_mask_motion})")
 
@@ -671,6 +812,15 @@ class Trainer4DGS:
                         # frame cache invalidate (yeni resolution ile reload)
                         for c in train_cams:
                             frames_cached_mv[c] = [None] * T
+                        # Phase 1.4 fix: depth_mv cache da invalidate (resolution
+                        # degisti — eski 240p depth + yeni 320p render = mismatch)
+                        if depth_cached_mv is not None:
+                            for c in train_cams:
+                                depth_cached_mv[c] = [None] * T
+                        # Phase 1.8 fix: flow_mv cache invalidate ayni sebep
+                        if flow_cached_mv is not None:
+                            for c in train_cams:
+                                flow_cached_mv[c] = [None] * T
                     else:
                         frames_cached = [None] * T
                         if use_depth:
@@ -687,7 +837,21 @@ class Trainer4DGS:
                         Path(mv_frame_paths[cam_id][idx]), (Ws, Hs)
                     )
                 gt = frames_cached_mv[cam_id][idx].to(self.device)
+                # Phase 1.4 — Per-cam depth load (MV path)
                 gt_depth = None
+                if use_depth_mv:
+                    if depth_cached_mv[cam_id][idx] is None:
+                        # frame_path'in stem'inden depth dosyası adı
+                        frame_stem = Path(mv_frame_paths[cam_id][idx]).stem
+                        depth_path = depth_mv_dir / cam_id / f"{frame_stem}_depth.npy"
+                        if depth_path.exists():
+                            depth_cached_mv[cam_id][idx] = _load_depth_for_frame(
+                                depth_mv_dir / cam_id,
+                                Path(mv_frame_paths[cam_id][idx]),
+                                (Ws, Hs),
+                            )
+                    if depth_cached_mv[cam_id][idx] is not None:
+                        gt_depth = depth_cached_mv[cam_id][idx].to(self.device)
                 frame_mask = None
                 K_active = K_scaled_mv[cam_id]
                 w2c_active = w2c_mv[cam_id]
@@ -740,9 +904,10 @@ class Trainer4DGS:
                 K=K_active, w2c=w2c_active,
                 width=Ws, height=Hs,
                 sh_degree=self.gs.sh_degree,
-                with_depth=(use_depth and not is_multiview),
+                with_depth=((use_depth and not is_multiview) or use_depth_mv),
             )
-            if use_depth:
+            # Phase 1.4 fix: with_depth MV path'te de True olabilir, RGB extract et
+            if use_depth or use_depth_mv:
                 rgb = render_out[..., :3]
                 rendered_depth = render_out[..., 3]
             else:
@@ -810,11 +975,70 @@ class Trainer4DGS:
                     if it < 50:
                         print(f"  ⚠ mv_consistency failed iter {it}: {_e}")
 
+            # --- Phase 1.8: RAFT optical flow supervision (multi-view) ---
+            # Yaklasim A (proxy): t ve t+1 frame'lerini ayni cam'da render et,
+            # RGB diff magnitude'i RAFT flow magnitude ile L1 ile esitle.
+            # Gercek 2D motion vector degil — proxy ama motion supervision sinyali iyi.
+            if (use_flow_mv and self.lambda_flow > 0
+                    and idx < T - 1
+                    and it > getattr(self, "_static_phase_iters", 0)):
+                try:
+                    flow_path = flow_mv_dir / cam_id / f"forward_{idx:04d}.pt"
+                    if flow_path.exists():
+                        if flow_cached_mv[cam_id][idx] is None:
+                            flow_cached_mv[cam_id][idx] = torch.load(
+                                flow_path, map_location=self.device
+                            ).float()
+                        gt_flow = flow_cached_mv[cam_id][idx]  # [2, H_raw, W_raw]
+                        # Resize flow to training resolution
+                        gt_flow_resized = F.interpolate(
+                            gt_flow.unsqueeze(0), size=(Hs, Ws),
+                            mode='bilinear', align_corners=False,
+                        ).squeeze(0)
+                        gt_flow_mag = gt_flow_resized.norm(dim=0)  # [Hs, Ws]
+                        # Render frame t+1 same cam (extra render)
+                        t_next_norm = (idx + 1) / max(T - 1, 1)
+                        d_means_n, d_quats_n, d_scales_n = self._apply_deformation(t_next_norm)
+                        if (self.use_static_dynamic_split
+                                and hasattr(self.gs, "is_static")):
+                            bypass = self.gs.is_static.to(d_means_n.device)
+                            if hasattr(self.gs, "is_background"):
+                                bypass = bypass | self.gs.is_background.to(d_means_n.device)
+                            if bypass.any():
+                                m_und = self.gs.means
+                                q_und = F.normalize(self.gs.quats, dim=-1)
+                                s_und = self.gs.get_scales
+                                d_means_n = torch.where(bypass.unsqueeze(-1), m_und, d_means_n)
+                                d_quats_n = torch.where(bypass.unsqueeze(-1), q_und, d_quats_n)
+                                d_scales_n = torch.where(bypass.unsqueeze(-1), s_und, d_scales_n)
+                        ro_n, _, _ = render_view(
+                            means=d_means_n, quats=d_quats_n, scales=d_scales_n,
+                            opacities=self.gs.get_opacities, colors=self.gs.get_colors,
+                            K=K_active, w2c=w2c_active,
+                            width=Ws, height=Hs,
+                            sh_degree=self.gs.sh_degree,
+                            with_depth=False,
+                        )
+                        rgb_n = ro_n if ro_n.shape[-1] == 3 else ro_n[..., :3]
+                        rendered_diff_mag = (rgb_n - rgb).abs().mean(dim=-1)  # [Hs, Ws]
+                        # Normalize gt_flow magnitude by max + threshold high-motion regions
+                        flow_warmup = min(1.0, it / max(1, self.flow_warmup_iters))
+                        # Loss: rendered diff magnitude high motion'da yuksek olmali
+                        gt_norm = gt_flow_mag / (gt_flow_mag.max() + 1e-6)
+                        diff_norm = rendered_diff_mag / (rendered_diff_mag.max() + 1e-6)
+                        flow_l1 = (diff_norm - gt_norm).abs().mean().clamp(max=1.0)
+                        if torch.isfinite(flow_l1):
+                            loss = loss + self.lambda_flow * flow_warmup * flow_l1
+                            comp["flow"] = float(flow_l1.item())
+                except Exception as _e:
+                    if it < 50:
+                        print(f"  ⚠ flow loss failed iter {it}: {_e}")
+
             # --- Depth consistency (log-space, warmup-gated, clamped) ---
             # Log-space L1 scale-invariant ve outlier'a karşı dayanıklı.
             # Warmup gate: ilk 100 iter statik GS otursun, sonra depth devreye.
             # Clamp(2.0): tek frame outlier'ı tüm run'ı batırmasın.
-            if use_depth and gt_depth is not None and rendered_depth is not None:
+            if (use_depth or use_depth_mv) and gt_depth is not None and rendered_depth is not None:
                 valid = (gt_depth > 0.01) & (rendered_depth > 0.01)
                 if valid.sum() > 100:
                     gt_v = gt_depth[valid].clamp(min=0.01, max=100.0)

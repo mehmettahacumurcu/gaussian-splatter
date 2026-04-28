@@ -624,6 +624,27 @@ def run_pipeline(
     cb("init", 1.0, f"Başlangıç Gaussian: {gs.num_points:,}",
        {"num_points": gs.num_points, "scene_extent": float(extent)})
 
+    # Phase 2.4 — Background auto-flag (distant gauss bypass deformation).
+    # Scene center'dan 'ratio*extent' uzakta olan gauss'lar BG flag'lenir,
+    # trainer render'da bunlar deformation almaz (floater azaltma).
+    bg_ratio = float(getattr(cfg.train, "bg_distance_ratio", 2.0))
+    if bg_ratio > 0 and hasattr(gs, "flag_background_by_distance"):
+        if is_mv:
+            scene_center_arr = mv_ctx.get("scene_center", None)
+            if scene_center_arr is None:
+                scene_center_arr = xyz.mean(axis=0)
+        else:
+            scene_center_arr = xyz.mean(axis=0)
+        scene_center_t = torch.from_numpy(np.asarray(scene_center_arr)).float()
+        n_bg = gs.flag_background_by_distance(
+            scene_center=scene_center_t,
+            scene_extent=extent,
+            ratio=bg_ratio,
+        )
+        print(f"  [Phase 2.4] Background auto-flag: {n_bg:,} gauss "
+              f"({100 * n_bg / max(gs.num_points, 1):.1f}%) "
+              f"distant > {bg_ratio * extent:.2f} units")
+
     # Frame yolları + kamera pozları
     if is_mv:
         # v5.0: Multi-view — primary cam frame_paths fallback (single-view path için)
@@ -738,6 +759,27 @@ def run_pipeline(
         print(f"[pipeline.mv] Trainer multi-view args: "
               f"{len(mv_frame_paths_arg)} cams, test={mv_test_camera_arg}")
 
+    # Phase 1.4 + 1.5 + 1.8 — Multi-view foundation directories (cache-only).
+    # depth_mv_dir/masks_mv_dir/flow_mv_dir trainer-side wired ile aktif olur.
+    depth_mv_dir_arg = (
+        paths["depth_mv"]
+        if (is_mv and paths["depth_mv"].exists()
+            and any(paths["depth_mv"].rglob("*_depth.npy")))
+        else None
+    )
+    masks_mv_dir_arg = (
+        paths["masks_mv"]
+        if (is_mv and paths["masks_mv"].exists()
+            and any(paths["masks_mv"].rglob("mask_*.png")))
+        else None
+    )
+    flow_mv_dir_arg = (
+        paths["flow_mv"]
+        if (is_mv and paths["flow_mv"].exists()
+            and any(paths["flow_mv"].rglob("forward_*.pt")))
+        else None
+    )
+
     history = trainer.train(
         frame_paths, K_first, w2c_list,
         n_iters=cfg.train.n_iters,
@@ -754,6 +796,13 @@ def run_pipeline(
         mv_cam_K=mv_cam_K_arg,
         mv_w2c=mv_w2c_arg,
         mv_test_camera=mv_test_camera_arg,
+        # Phase 1.4 / 1.8 — multi-view depth + flow trainer wire
+        depth_mv_dir=depth_mv_dir_arg,
+        masks_mv_dir=masks_mv_dir_arg,
+        flow_mv_dir=flow_mv_dir_arg,
+        # Phase 2.1 — Static/Dynamic auto-promote
+        auto_static_dynamic=getattr(cfg.train, "auto_static_dynamic", True),
+        static_dynamic_threshold=getattr(cfg.train, "static_dynamic_threshold", 0.10),
     )
     run_logger.phase_end(
         "training",

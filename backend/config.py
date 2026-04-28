@@ -212,11 +212,12 @@ class TrainConfig:
     # Multi-view consistency loss: ayni 3D point farkli cam'lardan benzer renk vermeli.
     # 0 = kapali (default), >0 = aktif (Phase 1.7 implementation).
     lambda_multiview_consistency: float = 0.0
-    # Phase 1.6 — LPIPS perceptual loss (AlexNet/VGG). 0 = off.
-    # 0.05-0.1 onerilen. Ek ~10-15% iter time, 0.5-1.0 dB PSNR yukselir.
+    # Phase 1.6 — LPIPS perceptual loss. 0 = off.
+    # VGG (kaliteli, edge sharpness) vs alex (hizli ama low-detail).
+    # Production tier: vgg + lambda 0.1+. Mini smoke: alex + 0.05.
     lambda_lpips: float = 0.0
-    lpips_net: str = "alex"  # "alex" (hizli) | "vgg" (kaliteli) | "squeeze"
-    lpips_warmup_iters: int = 1000  # ilk N iter'de scale lineer artar
+    lpips_net: str = "vgg"  # vgg (kaliteli, default) | alex (hizli) | squeeze
+    lpips_warmup_iters: int = 1000
     # Phase 1.8 — RAFT optical flow loss. 0 = off.
     lambda_flow: float = 0.0
     flow_warmup_iters: int = 1000
@@ -232,6 +233,13 @@ class TrainConfig:
     lr_cam_K: float = 0.0
     lr_cam_w2c: float = 0.0
     cam_refine_start_iter: int = 5000  # warmup sonrasi cam refine basla
+    # Phase 2.4 — Background distance ratio. 0 = kapali, 2.0 = 2x scene_extent ote
+    bg_distance_ratio: float = 2.0
+    # Phase 2.1 — Static/Dynamic auto-promote (multi-view only).
+    # masks_mv'dan motion vote toplayip dinamik gauss seçer.
+    # 0 = kapali (manuel API), >0 = auto-promote threshold (motion-vote frac).
+    auto_static_dynamic: bool = True
+    static_dynamic_threshold: float = 0.10  # gauss %10+ frame motion -> dynamic
 
 
 @dataclass
