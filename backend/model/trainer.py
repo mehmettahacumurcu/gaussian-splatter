@@ -327,8 +327,14 @@ class Trainer4DGS:
         v3.2 fix: hardcoded 100 iter delay kaldırıldı — reg'ler iter 1'den
         itibaren yumuşak devreye giriyor. Önce 0-100 arası unregulated
         training yüzünden deformasyon MLP patlıyordu (Δpos 41, track 196).
+
+        v5.0 multi-view fix: static warmup phase sirasinda warmup=0 (deformation
+        donuk). Static phase bittikten sonra warmup_iters icinde 0->1.
         """
-        return min(1.0, max(0.0, it / max(1, self.warmup_iters)))
+        static_phase = getattr(self, "_static_phase_iters", 0)
+        if it <= static_phase:
+            return 0.0
+        return min(1.0, max(0.0, (it - static_phase) / max(1, self.warmup_iters)))
 
     def _prepare_tracks(
         self,
@@ -433,27 +439,79 @@ class Trainer4DGS:
         mask_dir: Path | None = None,
         tracks_path: Path | None = None,
         run_logger: Any = None,   # RunLogger instance, opsiyonel
+        mv_frame_paths=None,
+        mv_cam_K=None,
+        mv_w2c=None,
+        mv_test_camera=None,
     ) -> dict:
-        T = len(frame_paths)
-        if len(cam_w2c_per_frame) != T:
-            raise ValueError(
-                f"frame_paths ve cam_w2c_per_frame uzunlukları farklı: {T} vs {len(cam_w2c_per_frame)}"
-            )
+        # v5.0: Multi-view detect
+        is_multiview = mv_frame_paths is not None
+        # v5.0 ARCHITECTURAL FIX: Static warmup phase.
+        # Multi-view'da deformation MLP, statik geometri oturmadan aktive
+        # olursa per-cam noise'u "deformasyon" olarak ogrenip patliyor.
+        # Standart 4DGaussians yaklasimi: ilk N iter sadece statik gaussian
+        # + densify, sonra deformation devreye.
+        #
+        # v5.0.1 (uzun run optimizasyonu): static phase'i CAP'le. Geometry
+        # genelde 5-8k iter'de oturur. 50k iter run icin 25k static phase
+        # gereksiz uzun, dynamic phase'e zaman birak. min(n_iters//2, 8000).
+        # Single-view'da bu sorun yok, iter 1'den deformation aktif kalabilir.
+        self._static_phase_iters = min(n_iters // 2, 8000) if is_multiview else 0
+        if is_multiview:
+            print(f"[trainer.mv] Static warmup phase: {self._static_phase_iters} iter "
+                  f"(deformation tamamen donuk)")
 
-        cam_K_orig = cam_K.to(self.device)   # frame resolution
-        w2c_list = [w.to(self.device) for w in cam_w2c_per_frame]
+        if is_multiview:
+            train_cams = sorted([c for c in mv_frame_paths.keys() if c != mv_test_camera])
+            if not train_cams:
+                raise ValueError("mv_frame_paths bos veya test_camera disinda cam yok")
+            cam_T_set = {len(mv_frame_paths[c]) for c in train_cams}
+            if len(cam_T_set) != 1:
+                raise ValueError(f"Cam'lar arasinda farkli frame sayisi: {cam_T_set}")
+            T = cam_T_set.pop()
+            print(f"[trainer.mv] Multi-view: {len(train_cams)} train cam x {T} frame "
+                  f"(test_cam={mv_test_camera})")
+            ref_cam = train_cams[0]
+            cam_K_orig = mv_cam_K[ref_cam].to(self.device)
+            w2c_list = None
+        else:
+            T = len(frame_paths)
+            if len(cam_w2c_per_frame) != T:
+                raise ValueError(
+                    f"frame_paths ve cam_w2c_per_frame uzunluklari farkli: {T} vs {len(cam_w2c_per_frame)}"
+                )
+            cam_K_orig = cam_K.to(self.device)
+            w2c_list = [w.to(self.device) for w in cam_w2c_per_frame]
+
         Ws, Hs = image_size
-        sample = load_frame_tensor(Path(frame_paths[0]))
+        if is_multiview:
+            sample = load_frame_tensor(Path(mv_frame_paths[train_cams[0]][0]))
+        else:
+            sample = load_frame_tensor(Path(frame_paths[0]))
         H0, W0 = sample.shape[:2]             # original frame resolution
         sx, sy = Ws / W0, Hs / H0
-        K_scaled = cam_K_orig.clone()         # training resolution
+        K_scaled = cam_K_orig.clone()         # training resolution (single-view fallback)
         K_scaled[0, 0] *= sx; K_scaled[0, 2] *= sx
         K_scaled[1, 1] *= sy; K_scaled[1, 2] *= sy
 
+        # v5.0: Per-cam K_scaled + w2c cache (multi-view)
+        K_scaled_mv = {}
+        w2c_mv = {}
+        if is_multiview:
+            for c in train_cams:
+                K_c = mv_cam_K[c].to(self.device).clone()
+                K_c[0, 0] *= sx; K_c[0, 2] *= sx
+                K_c[1, 1] *= sy; K_c[1, 2] *= sy
+                K_scaled_mv[c] = K_c
+                w2c_mv[c] = mv_w2c[c].to(self.device)
+            print(f"[trainer.mv] K scaled per-cam, {len(train_cams)} entries")
+
         # Cache'ler
-        frames_cached: list[torch.Tensor | None] = [None] * T
-        depth_cached:  list[torch.Tensor | None] = [None] * T
-        mask_cached:   list[torch.Tensor | None] = [None] * T
+        frames_cached: list = [None] * T
+        depth_cached:  list = [None] * T
+        mask_cached:   list = [None] * T
+        # v5.0: Multi-view per-cam frame cache
+        frames_cached_mv = {c: [None] * T for c in train_cams} if is_multiview else None
 
         use_depth = depth_dir is not None and self.lambda_depth > 0
         use_mask  = mask_dir is not None
@@ -500,28 +558,52 @@ class Trainer4DGS:
                 self.optimizer.param_groups[FOURIER_GROUP_IDX]["lr"] = target_lr_fourier * warmup
 
             # --- Ground truth load ---
-            if frames_cached[idx] is None:
-                frames_cached[idx] = load_frame_tensor(Path(frame_paths[idx]), (Ws, Hs))
-            gt = frames_cached[idx].to(self.device)
+            if is_multiview:
+                # v5.0: random cam selection
+                cam_id = train_cams[int(torch.randint(0, len(train_cams), (1,)).item())]
+                if frames_cached_mv[cam_id][idx] is None:
+                    frames_cached_mv[cam_id][idx] = load_frame_tensor(
+                        Path(mv_frame_paths[cam_id][idx]), (Ws, Hs)
+                    )
+                gt = frames_cached_mv[cam_id][idx].to(self.device)
+                gt_depth = None
+                frame_mask = None
+                K_active = K_scaled_mv[cam_id]
+                w2c_active = w2c_mv[cam_id]
+            else:
+                if frames_cached[idx] is None:
+                    frames_cached[idx] = load_frame_tensor(Path(frame_paths[idx]), (Ws, Hs))
+                gt = frames_cached[idx].to(self.device)
 
-            if use_depth and depth_cached[idx] is None:
-                depth_cached[idx] = _load_depth_for_frame(depth_dir, frame_paths[idx], (Ws, Hs))
-            gt_depth = depth_cached[idx].to(self.device) if (use_depth and depth_cached[idx] is not None) else None
+                if use_depth and depth_cached[idx] is None:
+                    depth_cached[idx] = _load_depth_for_frame(depth_dir, frame_paths[idx], (Ws, Hs))
+                gt_depth = depth_cached[idx].to(self.device) if (use_depth and depth_cached[idx] is not None) else None
 
-            if use_mask and mask_cached[idx] is None:
-                mask_cached[idx] = _load_mask_for_frame(mask_dir, frame_paths[idx], (Ws, Hs))
-            frame_mask = mask_cached[idx].to(self.device) if (use_mask and mask_cached[idx] is not None) else None
+                if use_mask and mask_cached[idx] is None:
+                    mask_cached[idx] = _load_mask_for_frame(mask_dir, frame_paths[idx], (Ws, Hs))
+                frame_mask = mask_cached[idx].to(self.device) if (use_mask and mask_cached[idx] is not None) else None
+
+                K_active = K_scaled
+                w2c_active = w2c_list[idx]
 
             # --- Deformation + render ---
-            d_means, d_quats, d_scales = self._apply_deformation(t_norm)
+            # v5.0: Static phase'de deformation tamamen bypass — MLP init
+            # weights nonzero olabilir, sadece lr=0 yapmak yetersiz, forward
+            # pass'i da kapatmak gerek. Statik gaussian'lar direkt render edilir.
+            if it <= getattr(self, "_static_phase_iters", 0):
+                d_means = self.gs.means
+                d_quats = F.normalize(self.gs.quats, dim=-1)
+                d_scales = self.gs.get_scales
+            else:
+                d_means, d_quats, d_scales = self._apply_deformation(t_norm)
 
             render_out, _alpha, _info = render_view(
                 means=d_means, quats=d_quats, scales=d_scales,
                 opacities=self.gs.get_opacities, colors=self.gs.get_colors,
-                K=K_scaled, w2c=w2c_list[idx],
+                K=K_active, w2c=w2c_active,
                 width=Ws, height=Hs,
                 sh_degree=self.gs.sh_degree,
-                with_depth=use_depth,
+                with_depth=(use_depth and not is_multiview),
             )
             if use_depth:
                 rgb = render_out[..., :3]
@@ -676,22 +758,31 @@ class Trainer4DGS:
                 comp["aniso"] = aniso_reg.item()
 
             # --- Fourier trajectory regularizer (v3.6 / Yol C) ---
-            # High-freq katsayıları bastır — noise/overfitting önle.
-            # Frekansa göre ağırlıklı L2: yüksek k → büyük ceza (low-pass prior).
+            # v5.0 (Adim 2): L2 → L1 sparsity. Lasso effect — kucuk coefficient'lari
+            # TAM sifira ceker, sadece gercekten motion isteyen gaussian'lar
+            # nonzero kalir. Bu implicit static-dynamic separation:
+            #   - fourier_pos_coeffs ≈ 0 → gaussian static (motion yok)
+            #   - fourier_pos_coeffs > 0 → gaussian dynamic (motion var)
+            # Multi-view'da kritik: 100k+ gaussian × 8 K = 800k+ DOF, hepsi
+            # birden hareket etmesin diye L1 baskisi gerekli.
+            # Frekans agirligi k^2 → k (L1 zaten daha guclu, k^2 fazla agir).
             if (self.lambda_fourier_reg > 0 and
                     self.gs.fourier_pos_coeffs is not None and
                     self.deform_pos_mode != "mlp"):
                 K = self.gs.fourier_K
-                # Frekans ağırlığı: k² (k=1,2,...,K). Yüksek k'lar daha çok cezalandırılır.
+                # Frekans ağırlığı: k (lineer). Yüksek k'lar biraz daha cezalı.
                 freq_weights = torch.arange(1, K + 1, device=self.gs.fourier_pos_coeffs.device,
                                             dtype=self.gs.fourier_pos_coeffs.dtype)
-                freq_weights = freq_weights ** 2  # (K,)
-                # coeffs: (N, K, 2, 3) → per-coeff squared magnitude × freq weight
-                sq = self.gs.fourier_pos_coeffs.pow(2)  # (N, K, 2, 3)
+                # L1 magnitude: |coeff|
+                mag = self.gs.fourier_pos_coeffs.abs()  # (N, K, 2, 3)
                 # Sum over sin/cos + xyz, mean over N, weighted sum over K
-                per_freq_energy = sq.sum(dim=(0, 2, 3)) / max(self.gs.num_points, 1)  # (K,)
-                fourier_reg = (per_freq_energy * freq_weights).sum()
-                loss = loss + self.lambda_fourier_reg * fourier_reg
+                per_freq_l1 = mag.sum(dim=(0, 2, 3)) / max(self.gs.num_points, 1)  # (K,)
+                fourier_reg = (per_freq_l1 * freq_weights).sum()
+                # L1 magnitude fark farkli L2'den. Initial (Adim 2) 5× idi —
+                # cok agresif, dynamic motion'i da bastirdi. v5.0.1: 2× multiplier
+                # ile recon ve sparsity arasinda denge. Static gaussian'lar
+                # cogunlukla sifir, dynamic gaussian'lar yeterli motion freedom.
+                loss = loss + self.lambda_fourier_reg * 2.0 * fourier_reg
                 comp["fourier"] = fourier_reg.item()
 
             # --- Fourier SPATIAL smoothness (v3.6.2) ---
@@ -699,7 +790,14 @@ class Trainer4DGS:
             # Aksi halde sadece track anchor'larına yakın gaussian hareket ediyor,
             # geri kalan statik — chickchicken'da %92 gaussian durgundu.
             # Her iter random K=128 gaussian sample + 1-NN üzerinden smoothness.
-            if (self.lambda_fourier_reg > 0 and
+            #
+            # v5.0 (Adim 2): Multi-view'da BU ISTENMEZ. L1 sparsity ile statik
+            # gaussian'lar tam sifir kalsin; spatial smoothness motion bulasimi
+            # yaratir, statik bolgeler dynamic'e dogru kayar. Multi-view tespiti
+            # icin: train()'e is_multiview parametresi tasimak yerine, daha
+            # genel bir flag kullanilsa daha iyi olur. Su an kapali tutuyoruz.
+            if (False and  # v5.0: spatial smoothness disabled for multi-view static preservation
+                    self.lambda_fourier_reg > 0 and
                     self.gs.fourier_pos_coeffs is not None and
                     self.deform_pos_mode != "mlp" and
                     self.gs.num_points > 16):

@@ -110,6 +110,11 @@ def run_colmap(
     sequential: bool = True,
     colmap_exe: str | Path | None = None,
     on_progress: ColmapProgressCallback | None = None,
+    single_camera: str = "yes",                    # "yes" | "no" | "per_folder"
+    extra_feat_args: list[str] | None = None,      # SIFT/ImageReader extra
+    extra_match_args: list[str] | None = None,     # matcher extra
+    extra_mapper_args: list[str] | None = None,    # mapper/BA extra
+    glob_pattern: str = "*.png",                   # multi-folder icin "**/*.png"
 ) -> Path:
     """
     COLMAP pipeline:
@@ -117,14 +122,19 @@ def run_colmap(
       2) sequential_matcher   (0.15 – 0.40)
       3) mapper               (0.40 – 0.95)
       4) model_converter TXT  (0.95 – 1.00)
+
+    v5.0.1: Premium multi-view destegi:
+      - single_camera="per_folder" → her cam folder'inin kendi K'si
+      - extra_feat_args ile max_num_features, distortion params
+      - extra_mapper_args ile BA refinement secenekleri
     """
     colmap = _resolve_colmap_exe(colmap_exe)
     print(f"→ COLMAP: {colmap}")
 
     frames_dir = Path(frames_dir)
-    frames = sorted(frames_dir.glob("*.png"))
+    frames = sorted(frames_dir.glob(glob_pattern))
     if not frames:
-        raise FileNotFoundError(f"{frames_dir} altında PNG bulunamadı")
+        raise FileNotFoundError(f"{frames_dir} altında pattern '{glob_pattern}' icin dosya yok")
     n_frames = len(frames)
     print(f"  {n_frames} frame bulundu")
 
@@ -134,11 +144,21 @@ def run_colmap(
     sparse = out / "sparse"
     sparse.mkdir(exist_ok=True)
 
-    extra_feat: list[str] = []
-    extra_match: list[str] = []
+    extra_feat: list[str] = list(extra_feat_args or [])
+    extra_match: list[str] = list(extra_match_args or [])
+    extra_mapper: list[str] = list(extra_mapper_args or [])
     if not use_gpu:
         extra_feat += ["--SiftExtraction.gpu_index", "-1"]
         extra_match += ["--SiftMatching.gpu_index", "-1"]
+
+    # single_camera modu: "yes" → tek K (default), "no" → her image kendi K'si,
+    # "per_folder" → her subfolder kendi K'si (multi-cam ideal)
+    if single_camera == "per_folder":
+        cam_args = ["--ImageReader.single_camera_per_folder", "1"]
+    elif single_camera == "no":
+        cam_args = ["--ImageReader.single_camera", "0"]
+    else:
+        cam_args = ["--ImageReader.single_camera", "1"]
 
     # ---------------- 1) Feature extraction (0.00 → 0.15) ----------------
     print("→ COLMAP: feature_extractor")
@@ -157,7 +177,7 @@ def run_colmap(
          "--database_path", str(db),
          "--image_path", str(frames_dir),
          "--ImageReader.camera_model", camera_model,
-         "--ImageReader.single_camera", "1",
+         *cam_args,
          *extra_feat],
         _feat_parser, on_progress, 0.0, 0.15, "feature_extractor",
     )
@@ -204,7 +224,8 @@ def run_colmap(
         [colmap, "mapper",
          "--database_path", str(db),
          "--image_path", str(frames_dir),
-         "--output_path", str(sparse)],
+         "--output_path", str(sparse),
+         *extra_mapper],
         _map_parser, on_progress, 0.40, 0.95, "mapper",
     )
 
@@ -245,6 +266,82 @@ def run_colmap(
 
     print(f"✓ COLMAP tamamlandı → {sparse_0}")
     return sparse_0
+
+
+def run_mvs_dense_reconstruction(
+    image_dir: str | Path,
+    sparse_dir: str | Path,  # sparse/0/
+    dense_dir: str | Path,
+    colmap_exe: str | Path | None = None,
+    on_progress: ColmapProgressCallback | None = None,
+    geom_consistency: bool = True,
+    max_image_size: int = 2000,  # downsample large images for MVS speed
+) -> Path:
+    """COLMAP MVS Dense Reconstruction — sparse → dense point cloud.
+
+    Pipeline:
+      1) image_undistorter   — undistort images, prepare for MVS
+      2) patch_match_stereo  — per-image dense depth maps via PatchMatchMVS
+      3) stereo_fusion       — fuse depth maps to dense point cloud
+
+    Output: dense_dir/fused.ply with potentially 500k-2M+ dense points.
+    Ideal for 4DGS init — orders of magnitude better than sparse SfM.
+
+    Time cost: 30-90 min for ~500 images on RTX 3060 Ti.
+    """
+    colmap = _resolve_colmap_exe(colmap_exe)
+    image_dir = Path(image_dir)
+    sparse_dir = Path(sparse_dir)
+    dense_dir = Path(dense_dir)
+    dense_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1) image_undistorter (0.0 → 0.10)
+    print(f"→ COLMAP MVS: image_undistorter")
+    if on_progress:
+        on_progress(0.0, "MVS image_undistorter")
+    subprocess.run([
+        colmap, "image_undistorter",
+        "--image_path", str(image_dir),
+        "--input_path", str(sparse_dir),
+        "--output_path", str(dense_dir),
+        "--output_type", "COLMAP",
+        "--max_image_size", str(max_image_size),
+    ], check=True)
+    if on_progress:
+        on_progress(0.10, "MVS undistort done")
+
+    # 2) patch_match_stereo (0.10 → 0.85) — per-image dense depth
+    print(f"→ COLMAP MVS: patch_match_stereo (geom_consistency={geom_consistency})")
+    if on_progress:
+        on_progress(0.10, "MVS patch_match_stereo")
+    pms_args = [
+        colmap, "patch_match_stereo",
+        "--workspace_path", str(dense_dir),
+        "--workspace_format", "COLMAP",
+        "--PatchMatchStereo.geom_consistency",
+        "true" if geom_consistency else "false",
+    ]
+    subprocess.run(pms_args, check=True)
+    if on_progress:
+        on_progress(0.85, "MVS depth maps done")
+
+    # 3) stereo_fusion (0.85 → 1.0) — fuse depth maps to point cloud
+    print(f"→ COLMAP MVS: stereo_fusion")
+    if on_progress:
+        on_progress(0.85, "MVS stereo_fusion")
+    fused_path = dense_dir / "fused.ply"
+    subprocess.run([
+        colmap, "stereo_fusion",
+        "--workspace_path", str(dense_dir),
+        "--workspace_format", "COLMAP",
+        "--input_type", "geometric" if geom_consistency else "photometric",
+        "--output_path", str(fused_path),
+    ], check=True)
+    if on_progress:
+        on_progress(1.0, f"MVS done: {fused_path.name}")
+
+    print(f"✓ MVS dense reconstruction tamamlandı → {fused_path}")
+    return fused_path
 
 
 if __name__ == "__main__":

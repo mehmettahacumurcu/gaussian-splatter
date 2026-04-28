@@ -15,11 +15,14 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+import numpy as np
 import torch
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import default_config, cloud_config, scene_paths, Config
+from .config import default_config, cloud_config, scene_paths, Config, is_multiview_scene
+# v5.0 — multi-view orchestration
+from .preprocess.multiview_pipeline import prepare_multiview_scene
 from .preprocess.extract_frames import extract_frames
 from .preprocess.run_colmap     import run_colmap
 from .preprocess.parse_colmap   import parse_cameras, load_points3d, scene_extent as compute_scene_extent
@@ -85,27 +88,54 @@ def run_pipeline(
     except Exception:
         pass
 
-    # -------- Faz 2a: Frame çıkarma --------
-    print("\n[Faz 2a] Frame çıkarma")
-    cb("frames", 0.0, "Video karelere ayrılıyor", {})
-    extract_frames(
-        video_path, paths["frames"],
-        fps=cfg.preprocess.fps,
-        resize_long_edge=cfg.preprocess.resize_long_edge,
-    )
-    status["frames"] = "ok"
-    cb("frames", 1.0, "Kareler hazır", {})
+    # -------- v5.0: Multi-view scene detection --------
+    is_mv = is_multiview_scene(scene_name)
+    mv_ctx = None
+    if is_mv:
+        print(f"\n[v5.0] Multi-view scene: {scene_name}")
+        run_logger.log_event("scene:multiview_detected", scene=scene_name)
+        try:
+            mv_ctx = prepare_multiview_scene(paths, cfg, on_progress=cb)
+            print(f"  ✓ {mv_ctx['n_cameras']} cam, {len(mv_ctx['train_cams'])} train, "
+                  f"primary={mv_ctx['primary_cam']}, test={mv_ctx['test_cam']}")
+            status["frames"] = f"multi-view ok ({mv_ctx['n_cameras']} cams)"
+            status["colmap"] = f"N3V calibration ({mv_ctx['n_cameras']} cams)"
+        except Exception as e:
+            print(f"  ✗ Multi-view prep failed: {e}, falling back to single-view")
+            run_logger.log_event("scene:multiview_failed", error=str(e)[:200])
+            is_mv = False
+            mv_ctx = None
+
+    # -------- Faz 2a: Frame çıkarma (single-view only) --------
+    if not is_mv:
+        print("\n[Faz 2a] Frame çıkarma")
+        cb("frames", 0.0, "Video karelere ayrılıyor", {})
+        extract_frames(
+            video_path, paths["frames"],
+            fps=cfg.preprocess.fps,
+            resize_long_edge=cfg.preprocess.resize_long_edge,
+        )
+        status["frames"] = "ok"
+        cb("frames", 1.0, "Kareler hazır", {})
 
     # -------- Faz 2b-c: COLMAP (cache'li + progress hook) --------
-    print("\n[Faz 2b] COLMAP SfM")
-    cb("colmap", 0.0, "COLMAP başlıyor", {})
-    # Cache check — eğer sparse zaten hazırsa tekrar koşma
-    try:
+    if is_mv:
+        # v5.0: Multi-view'da COLMAP atlanır, calibration N3V'den gelir
+        print("\n[Faz 2b] COLMAP atlandı — multi-view N3V calibration kullanılıyor")
+        cams = {}  # multi-view'de mv_ctx kullanılacak, single-view dict format gerekmez
+        xyz = mv_ctx["init_xyz"]
+        rgb = mv_ctx["init_rgb"]
+        cb("colmap", 1.0, f"N3V calibration: {mv_ctx['n_cameras']} cams", {"multi_view": True})
+    else:
+      print("\n[Faz 2b] COLMAP SfM")
+      cb("colmap", 0.0, "COLMAP başlıyor", {})
+      # Cache check — eğer sparse zaten hazırsa tekrar koşma
+      try:
         cams = parse_cameras(paths["colmap"])
         xyz, rgb = load_points3d(paths["colmap"])
         print(f"✓ COLMAP cache hit: {len(cams)} kamera, {len(xyz)} nokta (rerun atlandı)")
         cb("colmap", 1.0, f"cache hit: {len(cams)} kamera", {"cache": True})
-    except (FileNotFoundError, RuntimeError):
+      except (FileNotFoundError, RuntimeError):
         # COLMAP stream progress → pipeline callback'e relay
         def _colmap_on_progress(frac: float, msg: str) -> None:
             cb("colmap", frac, msg, {"colmap_fraction": frac})
@@ -123,13 +153,14 @@ def run_pipeline(
         )
         cams = parse_cameras(paths["colmap"])
         xyz, rgb = load_points3d(paths["colmap"])
-    status["colmap"] = f"{len(cams)} kamera, {len(xyz)} nokta"
-    cb("colmap", 1.0, f"{len(cams)} kamera, {len(xyz)} 3B nokta",
-       {"cameras": len(cams), "points": len(xyz)})
+    if not is_mv:
+        status["colmap"] = f"{len(cams)} kamera, {len(xyz)} nokta"
+        cb("colmap", 1.0, f"{len(cams)} kamera, {len(xyz)} 3B nokta",
+           {"cameras": len(cams), "points": len(xyz)})
 
     # -------- Faz 3: Foundation modeller (opsiyonel, resilient) --------
-    # Her fazın hatası diğerlerini etkilemesin — biri patlasa bile pipeline devam eder.
-    if not skip_foundation:
+    # Multi-view'da depth/track/mask atlanır (sonraki sprint per-cam destek).
+    if not skip_foundation and not is_mv:
         foundation_status = {"depth": "pending", "tracks": "pending", "masks": "pending"}
 
         # 3a — Depth
@@ -254,15 +285,23 @@ def run_pipeline(
 
     print("\n[Faz 4] Gaussian model + DeformationField")
     cb("init", 0.0, "Model başlatılıyor", {})
-    init_pts = torch.from_numpy(xyz)
-    init_rgb = torch.from_numpy(rgb).float() / 255.0
+    if is_mv:
+        # v5.0: Multi-view'da init points zaten mv_ctx'ten gelir (random in bbox).
+        # .float() = float32, gsplat zorunlu (float64 → "expected Float but found Double").
+        init_pts = torch.from_numpy(xyz).float()
+        init_rgb = torch.from_numpy(rgb).float() / 255.0  # zaten 0-255 değil 0-1 ama uyumluluk için
+        if init_rgb.max() > 1.5:
+            init_rgb = init_rgb / 255.0
+    else:
+        init_pts = torch.from_numpy(xyz).float()
+        init_rgb = torch.from_numpy(rgb).float() / 255.0
 
     # v3.7.3 -> v3.9: Initial point subsample.
     # Mode:
     #   - "random" (default): cap'in %70'ine random downsample (eski davranis)
     #   - "confidence": COLMAP track length / (1 + reproj_error) skoruyla
     #     top-K se?, outlier'lari at. Static quality icin onerilen.
-    if cfg.train.max_gaussians > 0:
+    if cfg.train.max_gaussians > 0 and not is_mv:
         target_init = int(cfg.train.max_gaussians * 0.7)
         if init_pts.shape[0] > target_init:
             mode = getattr(cfg.preprocess, "init_subsample_mode", "random")
@@ -270,7 +309,6 @@ def run_pipeline(
                   f"({target_init:,}) — mode={mode}")
             if mode == "confidence":
                 try:
-                    import numpy as np
                     from .preprocess.parse_colmap import load_points3d_with_confidence
                     _xyz, _rgb, track_len, reproj_err = load_points3d_with_confidence(paths["colmap"])
                     if track_len.shape[0] != init_pts.shape[0]:
@@ -306,26 +344,37 @@ def run_pipeline(
         mlp_depth=cfg.model.mlp_depth,
         num_time_freqs=cfg.model.num_time_freqs,
     )
-    extent = compute_scene_extent(xyz)
+    if is_mv:
+        extent = float(mv_ctx["scene_extent"])
+    else:
+        extent = compute_scene_extent(xyz)
     print(f"  Sahne kapsamı: {extent:.3f}, başlangıç Gaussian: {gs.num_points:,}")
     cb("init", 1.0, f"Başlangıç Gaussian: {gs.num_points:,}",
        {"num_points": gs.num_points, "scene_extent": float(extent)})
 
-    # Frame yolları + kamera pozları (COLMAP'in kullandığı isim sırasına göre)
-    frame_paths, w2c_list, K_first = [], [], None
-    for name in sorted(cams.keys()):
-        cam = cams[name]
-        fp = Path(paths["frames"]) / name
-        if not fp.exists():
-            continue
-        frame_paths.append(fp)
-        w2c_list.append(torch.from_numpy(cam["w2c"]).float())
-        if K_first is None:
-            K_first = torch.from_numpy(cam["K"]).float()
-
-    if not frame_paths:
-        raise RuntimeError("COLMAP kameraları ile frame dosyaları eşleşmedi")
-    print(f"  Eğitim için {len(frame_paths)} frame eşleşti")
+    # Frame yolları + kamera pozları
+    if is_mv:
+        # v5.0: Multi-view — primary cam frame_paths fallback (single-view path için)
+        # Ama trainer'a aslında mv_* args geçeceğiz
+        frame_paths = mv_ctx["primary_frame_paths"]
+        K_first = mv_ctx["primary_K"]
+        w2c_list = mv_ctx["primary_w2c_per_frame"]
+        print(f"  Multi-view: {len(mv_ctx['train_cams'])} train cam x {len(frame_paths)} frame")
+    else:
+        # COLMAP'in kullandığı isim sırasına göre
+        frame_paths, w2c_list, K_first = [], [], None
+        for name in sorted(cams.keys()):
+            cam = cams[name]
+            fp = Path(paths["frames"]) / name
+            if not fp.exists():
+                continue
+            frame_paths.append(fp)
+            w2c_list.append(torch.from_numpy(cam["w2c"]).float())
+            if K_first is None:
+                K_first = torch.from_numpy(cam["K"]).float()
+        if not frame_paths:
+            raise RuntimeError("COLMAP kameraları ile frame dosyaları eşleşmedi")
+        print(f"  Eğitim için {len(frame_paths)} frame eşleşti")
 
     print("\n[Faz 5] Training loop")
     trainer = Trainer4DGS(
@@ -388,6 +437,21 @@ def run_pipeline(
 
     cb("training", 0.0, "Training başlıyor", {"total_iters": cfg.train.n_iters})
     run_logger.phase_start("training")
+    # v5.0: Multi-view args hazirla
+    mv_frame_paths_arg = None
+    mv_cam_K_arg = None
+    mv_w2c_arg = None
+    mv_test_camera_arg = None
+    if is_mv and mv_ctx is not None:
+        mv_frame_paths_arg = mv_ctx["frame_paths_per_cam"]
+        mv_cam_K_arg = {c: torch.from_numpy(np.array(mv_ctx["calibration"][c]["K"])).float()
+                        for c in mv_ctx["calibration"]}
+        mv_w2c_arg = {c: torch.from_numpy(np.array(mv_ctx["calibration"][c]["w2c"])).float()
+                      for c in mv_ctx["calibration"]}
+        mv_test_camera_arg = mv_ctx["test_cam"]
+        print(f"[pipeline.mv] Trainer multi-view args: "
+              f"{len(mv_frame_paths_arg)} cams, test={mv_test_camera_arg}")
+
     history = trainer.train(
         frame_paths, K_first, w2c_list,
         n_iters=cfg.train.n_iters,
@@ -400,6 +464,10 @@ def run_pipeline(
         mask_dir=mask_dir_arg,
         tracks_path=tracks_path_arg,
         run_logger=run_logger,
+        mv_frame_paths=mv_frame_paths_arg,
+        mv_cam_K=mv_cam_K_arg,
+        mv_w2c=mv_w2c_arg,
+        mv_test_camera=mv_test_camera_arg,
     )
     run_logger.phase_end(
         "training",

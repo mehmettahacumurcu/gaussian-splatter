@@ -56,7 +56,9 @@ def is_multiview_scene(scene_name: str) -> bool:
     videos_mv = paths["videos_mv"]
     if not videos_mv.exists() or not videos_mv.is_dir():
         return False
-    video_files = list(videos_mv.glob("cam*.mp4")) + list(videos_mv.glob("cam*.MP4"))
+    # Windows NTFS case-insensitive: glob("*.mp4") ve glob("*.MP4") ayni dosyalari
+    # iki kez yakalayabilir → set ile dedupe.
+    video_files = set(videos_mv.glob("cam*.mp4")) | set(videos_mv.glob("cam*.MP4"))
     return len(video_files) >= 2
 
 
@@ -71,12 +73,9 @@ def list_multiview_cameras(scene_name: str) -> list[str]:
     videos_mv = paths["videos_mv"]
     if not videos_mv.exists():
         return []
-    cams = sorted([
-        p.stem for p in videos_mv.glob("cam*.mp4")
-    ] + [
-        p.stem for p in videos_mv.glob("cam*.MP4")
-    ])
-    return cams
+    # Windows NTFS case-insensitive dedupe (path -> stem set).
+    files = set(videos_mv.glob("cam*.mp4")) | set(videos_mv.glob("cam*.MP4"))
+    return sorted({p.stem for p in files})
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +110,16 @@ class PreprocessConfig:
     multiview_test_camera: str | None = "cam00"
     # Per-camera frame extraction: hepsini paralel mi yap, sirayla mi?
     multiview_parallel_extract: bool = True
+    # Multi-view bootstrap COLMAP: kac timestep kullan (her cam'den).
+    # 1 = tek timestep (en hizli, ~2.7k point) — chickchicken kalitesi disinda
+    # 5 = standart (5x feature, 25x matching, ~20-40k point) ← ONERILEN
+    # 10 = derin (10x feature, ~50k point, ~10-15dk preprocess)
+    # 25 = premium overnight (25x feature, 137k matching pair, ~80-150k sparse, ~45-90 dk)
+    colmap_mv_timestamps: int = 5
+    # Multi-view bootstrap: MVS dense reconstruction (premium, +30-90 dk).
+    # Sparse SfM 50-150k point → dense 500k-2M point. 4DGS init kalitesi
+    # dramatik artar (chickchicken seviyesi guarantee).
+    colmap_mv_dense_mvs: bool = False
 
 
 # ---------------------------------------------------------------------------

@@ -157,6 +157,9 @@ async def process_video(
     resize_long_edge: int | None = Form(None, description="Frame extract long edge px (default 960)"),
     colmap_matching: str | None = Form(None, description="sequential | exhaustive (default sequential)"),
     init_subsample_mode: str | None = Form(None, description="random | confidence (default random)"),
+    # v5.0 — Multi-view bootstrap COLMAP
+    colmap_mv_timestamps: int | None = Form(None, description="Multi-view bootstrap COLMAP: kac timestep (1, 5, 10, 25). Default 5."),
+    colmap_mv_dense_mvs: bool | None = Form(None, description="Multi-view: MVS dense reconstruction (premium, +30-90 dk, 500k-2M dense point)"),
 ) -> ProcessResponse:
     """
     Video'yu upload et ve pipeline'ı kuyruğa al.
@@ -502,6 +505,12 @@ async def process_video(
             if init_subsample_mode not in ("random", "confidence"):
                 raise HTTPException(400, f"init_subsample_mode: random | confidence ({init_subsample_mode})")
             cfg.preprocess.init_subsample_mode = init_subsample_mode
+        if colmap_mv_timestamps is not None:
+            if colmap_mv_timestamps < 1 or colmap_mv_timestamps > 50:
+                raise HTTPException(400, f"colmap_mv_timestamps: 1-50 ({colmap_mv_timestamps})")
+            cfg.preprocess.colmap_mv_timestamps = int(colmap_mv_timestamps)
+        if colmap_mv_dense_mvs is not None:
+            cfg.preprocess.colmap_mv_dense_mvs = bool(colmap_mv_dense_mvs)
 
         return run_pipeline(
             str(video_path),
