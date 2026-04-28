@@ -43,6 +43,7 @@ def _bootstrap_colmap_init(
     frames_dict: Dict[str, List[Path]],
     cfg,
     on_progress=None,
+    force_preprocess: bool = False,
 ) -> Tuple[Dict, np.ndarray, np.ndarray]:
     """v5.0 ARCHITECTURAL FIX — Multi-cam SfM bootstrap.
 
@@ -72,6 +73,10 @@ def _bootstrap_colmap_init(
     # Lazy import (run_colmap eski single-view yolunda)
     from .run_colmap import run_colmap, run_mvs_dense_reconstruction
     from .parse_colmap import parse_cameras, load_points3d, _find_sparse_dir
+    from .cache_utils import (
+        is_step_cached, log_cache, write_cache_marker,
+        compute_settings_hash, read_cache_marker,
+    )
 
     colmap_dir = paths.get("colmap_mv", paths["base"] / "colmap_multiview")
     colmap_dir.mkdir(parents=True, exist_ok=True)
@@ -124,42 +129,78 @@ def _bootstrap_colmap_init(
     print(f"[bootstrap-colmap] {n_imgs} images organized "
           f"({len(frames_dict)} cams × {n_timestamps} timestamps, per-cam subfolders)")
 
-    # 2) COLMAP CACHE CHECK — eger sparse reconstruction zaten varsa skip
+    # 2) COLMAP CACHE CHECK — eger sparse reconstruction zaten varsa skip.
+    # Phase 1.1: force_preprocess=True ile cache bypass.
+    # Phase 1.3: settings hash check — colmap_mv_timestamps / colmap_matching /
+    # colmap_mv_dense_mvs degisirse cache invalid.
     cache_valid = False
-    try:
-        if (colmap_dir / "sparse").exists():
-            cached_sparse = _find_sparse_dir(colmap_dir)
-            if (cached_sparse / "cameras.txt").exists() and (cached_sparse / "points3D.txt").exists():
-                cache_valid = True
-                print(f"[bootstrap-colmap] ✓ COLMAP cache found at {cached_sparse}, skipping SfM")
-    except Exception:
-        cache_valid = False
+    if not force_preprocess:
+        try:
+            if (colmap_dir / "sparse").exists():
+                cached_sparse = _find_sparse_dir(colmap_dir)
+                files_ok = (cached_sparse / "cameras.txt").exists() and (cached_sparse / "points3D.txt").exists()
+                if files_ok:
+                    # Phase 1.3 hash karsilastirmasi
+                    marker = read_cache_marker(paths["base"], "colmap_mv")
+                    if marker is None:
+                        # Eski cache (marker yok) — conservative: invalidate, hash yaz
+                        print(f"[bootstrap-colmap] ⚠ legacy cache (marker yok), settings hash bilinmiyor → cache miss")
+                        cache_valid = False
+                    else:
+                        cur_hash = compute_settings_hash(cfg, "colmap_mv")
+                        if marker.get("settings_hash") == cur_hash:
+                            cache_valid = True
+                            print(f"[bootstrap-colmap] ✓ COLMAP cache HIT @ {cached_sparse} "
+                                  f"(settings_hash={cur_hash})")
+                        else:
+                            print(f"[bootstrap-colmap] ⚠ settings degisti "
+                                  f"(cache={marker.get('settings_hash')} vs current={cur_hash}) → cache miss")
+                            cache_valid = False
+        except Exception as _e:
+            print(f"[bootstrap-colmap] cache check failed: {_e}")
+            cache_valid = False
+    else:
+        print(f"[bootstrap-colmap] force_preprocess=True → cache bypass, COLMAP yeniden kosacak")
 
     if not cache_valid:
+        # FIX (Phase 1.3 patch): Cache miss durumunda eski COLMAP artifact'larini sil.
+        # database.db, sparse/, dense/ folder'lari onceki run'dan kalmis olabilir;
+        # COLMAP eski database'i kullanip "image not found" warning'leri uretiyor
+        # ve BA conditioning bozuluyor (CHOLMOD failures). Temiz state olusturalim.
+        for stale in ["database.db", "database.db-journal", "database.db-wal", "database.db-shm"]:
+            stale_path = colmap_dir / stale
+            if stale_path.exists():
+                try:
+                    stale_path.unlink()
+                    print(f"[bootstrap-colmap] cache reset: deleted {stale}")
+                except OSError as _e:
+                    print(f"[bootstrap-colmap] ⚠ {stale} silinemedi: {_e}")
+        for stale_dir in ["sparse", "dense"]:
+            d = colmap_dir / stale_dir
+            if d.exists():
+                try:
+                    shutil.rmtree(d)
+                    print(f"[bootstrap-colmap] cache reset: deleted {stale_dir}/")
+                except OSError as _e:
+                    print(f"[bootstrap-colmap] ⚠ {stale_dir}/ silinemedi: {_e}")
+
         # PREMIUM COLMAP — OPENCV camera model + per-cam K + max features
         print(f"[bootstrap-colmap] Running PREMIUM COLMAP on {n_imgs} images...")
         print(f"[bootstrap-colmap] Settings: OPENCV camera model + per-cam K + 8192 SIFT + BA refinement")
-    if on_progress:
-        on_progress("colmap_bootstrap", 0.0, "Multi-cam SfM bootstrap", {})
-
-    def _cb(frac, msg):
         if on_progress:
-            on_progress("colmap_bootstrap", frac, msg, {})
+            on_progress("colmap_bootstrap", 0.0, "Multi-cam SfM bootstrap", {})
 
-    # PREMIUM CONFIGURATION:
-    #  - camera_model="OPENCV" → distortion (k1, k2, p1, p2) modeling
-    #  - single_camera="per_folder" → her cam folder'i icin distinct K
-    #  - max_num_features=8192 → SIFT density 4× artir (default ~2000)
-    #  - num_threads=8 → CPU paralelizm
-    #  - estimate_affine_shape=1 + domain_size_pooling=1 → SIFT robustness
-    #  - ba_refine_focal_length, ba_refine_principal_point → optimizasyonda
-    #    intrinsic'leri de fine-tune et (focal/cx/cy initial estimate'lerden iyi)
-    #  - ba_refine_extra_params → distortion (k1, k2, p1, p2) BA'da refine
-    #  - ba_local_max_num_iterations 50 → daha çok BA iter (default 25)
-    # NOT: COLMAP versiyonlari arg desteginde tutarsiz. Sadece WIDELY supported
-    # extras kalir. SIFT options zaten dogrulandi (525 image extract isi yapti).
-    # Matcher/Mapper extras kaldi — varsayilan ayarlar yeterince iyi (BA otomatik
-    # focal/principal refine yapar zaten 3.6+'da).
+        def _cb(frac, msg):
+            if on_progress:
+                on_progress("colmap_bootstrap", frac, msg, {})
+
+        # PREMIUM CONFIGURATION:
+        #  - camera_model="OPENCV" -> distortion (k1, k2, p1, p2) modeling
+        #  - single_camera="per_folder" -> her cam folder'i icin distinct K
+        #  - max_num_features=8192 -> SIFT density 4x artir (default ~2000)
+        #  - estimate_affine_shape=1 + domain_size_pooling=1 -> SIFT robustness
+        # NOT: COLMAP versiyonlari arg desteginde tutarsiz. Matcher/Mapper extras
+        # kaldi - default ayarlar zaten BA otomatik focal/principal refine yapar.
         extra_feat = [
             "--SiftExtraction.max_num_features", "8192",       # 4x default density
             "--SiftExtraction.estimate_affine_shape", "1",     # robust descriptors
@@ -181,6 +222,22 @@ def _bootstrap_colmap_init(
             extra_mapper_args=extra_mapper,
             glob_pattern="**/*.png",  # subfolder'lardan oku
         )
+        # Phase 1.3: settings hash + metadata marker yaz, bir sonraki run cache hit alabilsin.
+        try:
+            best = _find_sparse_dir(colmap_dir)
+            n_pts_line = (best / "points3D.txt")
+            n_lines = sum(1 for _ in n_pts_line.open()) if n_pts_line.exists() else 0
+            write_cache_marker(paths["base"], "colmap_mv", {
+                "n_images": n_imgs,
+                "n_timestamps": n_timestamps,
+                "matching": "exhaustive",
+                "camera_model": "OPENCV",
+                "sparse_dir": best.name,
+                "approx_points": max(0, n_lines - 3),
+            }, cfg=cfg)
+            print(f"[bootstrap-colmap] cache marker yazildi (settings_hash={compute_settings_hash(cfg, 'colmap_mv')})")
+        except Exception as _e:
+            print(f"[bootstrap-colmap] ⚠ cache marker yazilirken hata (kritik degil): {_e}")
 
     # 3) Parse output — multi-time'da her cam birden cok kez registered olur
     # (her timestep ayri image). Static cam'lar icin tum poses ayni olmalidir
@@ -234,6 +291,15 @@ def _bootstrap_colmap_init(
                 dense_rgb = np.full((len(dense_xyz), 3), 128, dtype=np.uint8)
             print(f"[bootstrap-colmap] ✓ MVS dense cloud: {len(dense_xyz):,} points "
                   f"(sparse {len(sparse_xyz):,} → dense {len(dense_xyz):,})")
+            # Phase 1.3: MVS dense marker
+            try:
+                write_cache_marker(paths["base"], "mvs_dense", {
+                    "n_dense_points": int(len(dense_xyz)),
+                    "n_sparse_points": int(len(sparse_xyz)),
+                    "geom_consistency": True,
+                }, cfg=cfg)
+            except Exception as _e:
+                print(f"[bootstrap-colmap] ⚠ mvs_dense marker hata: {_e}")
             # Kullan: dense cloud daha kaliteli init
             xyz, rgb = dense_xyz, dense_rgb
         except Exception as e:
@@ -296,6 +362,7 @@ def prepare_multiview_scene(
     paths: dict,
     cfg,
     on_progress=None,
+    force_preprocess: bool = False,
 ) -> Dict:
     """Multi-view sahne hazirlama. Returns context dict.
 
@@ -322,14 +389,48 @@ def prepare_multiview_scene(
     print(f"  Has calibration: {info['has_calibration']}")
 
     # 1) Frame extraction (paralel)
+    # Phase 1.3: settings hash check — fps/resize_long_edge degisirse overwrite=True
+    from .cache_utils import (
+        compute_settings_hash, read_cache_marker, write_cache_marker,
+    )
     if on_progress:
         on_progress("frames_mv", 0.0, "Multi-cam frame extraction", {})
+    overwrite_frames = bool(force_preprocess)
+    if not overwrite_frames:
+        try:
+            marker = read_cache_marker(paths["base"], "frames_mv")
+            cur_hash = compute_settings_hash(cfg, "frames_mv")
+            if marker is None:
+                # Marker yok ama frames_mv klasorunde dosya varsa: ilk kez,
+                # overwrite gerekli degil (extract_frames_multiview kendi cache'liyor),
+                # marker'i sonra yazacagiz.
+                pass
+            elif marker.get("settings_hash") != cur_hash:
+                print(f"[multiview] frames_mv settings degisti "
+                      f"(cache={marker.get('settings_hash')} vs current={cur_hash}) "
+                      f"→ frames yeniden extract edilecek")
+                overwrite_frames = True
+        except Exception as _e:
+            print(f"[multiview] frames_mv cache check hata: {_e}")
     frames_dict = extract_frames_multiview(
         paths["videos_mv"],
         paths["frames_mv"],
         fps=cfg.preprocess.fps,
         resize_long_edge=cfg.preprocess.resize_long_edge,
+        overwrite=overwrite_frames,
     )
+    # Phase 1.3: marker yaz (settings_hash + cam/frame counts)
+    try:
+        write_cache_marker(paths["base"], "frames_mv", {
+            "n_cams": len(frames_dict),
+            "n_frames_per_cam": (
+                len(next(iter(frames_dict.values()))) if frames_dict else 0
+            ),
+            "fps": cfg.preprocess.fps,
+            "resize_long_edge": cfg.preprocess.resize_long_edge,
+        }, cfg=cfg)
+    except Exception as _e:
+        print(f"[multiview] ⚠ frames_mv marker yazilirken hata: {_e}")
     if on_progress:
         on_progress("frames_mv", 1.0,
                     f"{len(frames_dict)} cam frames ready", {})
@@ -405,6 +506,7 @@ def prepare_multiview_scene(
     try:
         colmap_cams, init_xyz_colmap, init_rgb_colmap = _bootstrap_colmap_init(
             paths, frames_dict, cfg, on_progress=on_progress,
+            force_preprocess=force_preprocess,
         )
         # STRICT VALIDATION: tum cam'lar COLMAP'ta register olmali, ve
         # yeterli sparse cloud uretilmeli. Aksi halde world-mixing bug

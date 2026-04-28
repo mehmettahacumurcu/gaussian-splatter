@@ -205,6 +205,23 @@ class Trainer4DGS:
         deform_pos_mode: str = "hybrid",     # "mlp" | "fourier" | "hybrid"
         lr_fourier: float = 5e-3,
         lambda_fourier_reg: float = 1e-4,
+        # Phase 1.6 — LPIPS perceptual loss
+        lambda_lpips: float = 0.0,
+        lpips_net: str = "alex",
+        lpips_warmup_iters: int = 1000,
+        # Phase 1.7 — Multi-view cross-view consistency
+        lambda_multiview_consistency: float = 0.0,
+        # Phase 1.8 — RAFT optical flow loss
+        lambda_flow: float = 0.0,
+        flow_warmup_iters: int = 1000,
+        # Phase 1.9 — Densify dynamics MV scale
+        densify_mv_threshold_scale: float = 0.7,
+        # Phase 2.2 — Multi-resolution training schedule [(iter, long_edge), ...]
+        multires_schedule=None,
+        # Phase 2.3 — Camera pose refinement
+        lr_cam_K: float = 0.0,
+        lr_cam_w2c: float = 0.0,
+        cam_refine_start_iter: int = 5000,
     ):
         self.gs = gs.to(device)
         self.deform = deform.to(device)
@@ -231,6 +248,30 @@ class Trainer4DGS:
         self.deform_pos_mode = deform_pos_mode
         self.lr_fourier = lr_fourier
         self.lambda_fourier_reg = lambda_fourier_reg
+        # Phase 1.6/1.7/1.8 — perceptual + cross-view + flow
+        self.lambda_lpips = float(lambda_lpips)
+        self.lpips_net = str(lpips_net)
+        self.lpips_warmup_iters = int(lpips_warmup_iters)
+        self.lambda_multiview_consistency = float(lambda_multiview_consistency)
+        self.lambda_flow = float(lambda_flow)
+        self.flow_warmup_iters = int(flow_warmup_iters)
+        self._lpips_module = None  # lazy init in train()
+        # Phase 1.9
+        self.densify_mv_threshold_scale = float(densify_mv_threshold_scale)
+        # Phase 2.2
+        self.multires_schedule = list(multires_schedule) if multires_schedule else []
+        # Phase 2.3
+        self.lr_cam_K = float(lr_cam_K)
+        self.lr_cam_w2c = float(lr_cam_w2c)
+        self.cam_refine_start_iter = int(cam_refine_start_iter)
+        # Phase 2.1 — Static/Dynamic split (default off; promote_dynamic ile aktiflesir)
+        self.use_static_dynamic_split = False
+        # Phase 2.3 — Camera pose refine optimizer placeholder (None = inactive)
+        self._cam_refine_optimizer = None
+        if self.lr_cam_K > 0 or self.lr_cam_w2c > 0:
+            print(f"[trainer] Camera pose refinement requested "
+                  f"(lr_K={self.lr_cam_K}, lr_w2c={self.lr_cam_w2c}). "
+                  f"Aktivasyon train()'de scene cam'larina baglanir.")
         if deform_pos_mode not in ("mlp", "fourier", "hybrid"):
             raise ValueError(f"deform_pos_mode geçersiz: {deform_pos_mode}")
         if deform_pos_mode != "mlp" and (
@@ -460,6 +501,14 @@ class Trainer4DGS:
         if is_multiview:
             print(f"[trainer.mv] Static warmup phase: {self._static_phase_iters} iter "
                   f"(deformation tamamen donuk)")
+            # Phase 1.9 — Multi-view densify tuning: threshold'u scale ile carp.
+            # MV'de her cam ayri view; densify daha hassas olmali.
+            mv_scale = float(getattr(self, "densify_mv_threshold_scale", 1.0))
+            if 0.0 < mv_scale < 2.0 and abs(mv_scale - 1.0) > 1e-3:
+                old_thr = self.density.grad_threshold
+                self.density.grad_threshold = old_thr * mv_scale
+                print(f"[trainer.mv] Densify grad_threshold {old_thr:.6f} → "
+                      f"{self.density.grad_threshold:.6f} (scale={mv_scale}, MV daha hassas)")
 
         if is_multiview:
             train_cams = sorted([c for c in mv_frame_paths.keys() if c != mv_test_camera])
@@ -489,6 +538,29 @@ class Trainer4DGS:
         else:
             sample = load_frame_tensor(Path(frame_paths[0]))
         H0, W0 = sample.shape[:2]             # original frame resolution
+
+        # Phase 2.2 — Multi-resolution schedule resolver
+        # multires_schedule: [(start_iter, long_edge), ...]; bos = single resolution.
+        def _resolve_long_edge_for_iter(it_check: int) -> int | None:
+            sched = self.multires_schedule
+            if not sched:
+                return None
+            current = None
+            for (it_start, le) in sorted(sched, key=lambda x: x[0]):
+                if it_check >= it_start:
+                    current = le
+            return current
+
+        def _resize_to_long_edge(le: int, base_w: int, base_h: int):
+            ratio = le / max(base_w, base_h)
+            return int(round(base_w * ratio)), int(round(base_h * ratio))
+
+        # Initial resolution: schedule var ise schedule[0] kullan, yoksa image_size
+        initial_le = _resolve_long_edge_for_iter(0)
+        if initial_le is not None:
+            Ws, Hs = _resize_to_long_edge(initial_le, W0, H0)
+            print(f"[trainer.multires] Initial schedule: long_edge={initial_le} -> ({Ws}x{Hs})")
+
         sx, sy = Ws / W0, Hs / H0
         K_scaled = cam_K_orig.clone()         # training resolution (single-view fallback)
         K_scaled[0, 0] *= sx; K_scaled[0, 2] *= sx
@@ -504,6 +576,27 @@ class Trainer4DGS:
                 K_c[1, 1] *= sy; K_c[1, 2] *= sy
                 K_scaled_mv[c] = K_c
                 w2c_mv[c] = mv_w2c[c].to(self.device)
+
+        # Phase 2.3 — Camera pose refine: K_scaled_mv ve w2c_mv'yi nn.Parameter'a wrap et
+        cam_refine_active = (
+            is_multiview and (self.lr_cam_K > 0 or self.lr_cam_w2c > 0)
+        )
+        if cam_refine_active:
+            cam_refine_params: list[dict] = []
+            for c in train_cams:
+                if self.lr_cam_K > 0:
+                    K_p = torch.nn.Parameter(K_scaled_mv[c].clone().detach())
+                    K_scaled_mv[c] = K_p
+                    cam_refine_params.append({"params": [K_p], "lr": self.lr_cam_K})
+                if self.lr_cam_w2c > 0:
+                    w_p = torch.nn.Parameter(w2c_mv[c].clone().detach())
+                    w2c_mv[c] = w_p
+                    cam_refine_params.append({"params": [w_p], "lr": self.lr_cam_w2c})
+            if cam_refine_params:
+                self._cam_refine_optimizer = torch.optim.Adam(cam_refine_params)
+                print(f"[trainer.cam_refine] Aktif: {len(train_cams)} cam, "
+                      f"{len(cam_refine_params)} param group, "
+                      f"start_iter={self.cam_refine_start_iter}")
             print(f"[trainer.mv] K scaled per-cam, {len(train_cams)} entries")
 
         # Cache'ler
@@ -557,6 +650,34 @@ class Trainer4DGS:
             if has_fourier_group:
                 self.optimizer.param_groups[FOURIER_GROUP_IDX]["lr"] = target_lr_fourier * warmup
 
+            # --- Phase 2.2: Multi-resolution transition ---
+            new_le = _resolve_long_edge_for_iter(it)
+            if new_le is not None:
+                new_Ws, new_Hs = _resize_to_long_edge(new_le, W0, H0)
+                if new_Ws != Ws or new_Hs != Hs:
+                    print(f"[trainer.multires] Iter {it}: resolution {Ws}x{Hs} → {new_Ws}x{new_Hs} "
+                          f"(long_edge={new_le})")
+                    Ws, Hs = new_Ws, new_Hs
+                    sx, sy = Ws / W0, Hs / H0
+                    K_scaled = cam_K_orig.clone()
+                    K_scaled[0, 0] *= sx; K_scaled[0, 2] *= sx
+                    K_scaled[1, 1] *= sy; K_scaled[1, 2] *= sy
+                    if is_multiview:
+                        for c in train_cams:
+                            K_c = mv_cam_K[c].to(self.device).clone()
+                            K_c[0, 0] *= sx; K_c[0, 2] *= sx
+                            K_c[1, 1] *= sy; K_c[1, 2] *= sy
+                            K_scaled_mv[c] = K_c
+                        # frame cache invalidate (yeni resolution ile reload)
+                        for c in train_cams:
+                            frames_cached_mv[c] = [None] * T
+                    else:
+                        frames_cached = [None] * T
+                        if use_depth:
+                            depth_cached = [None] * T
+                        if use_mask:
+                            mask_cached = [None] * T
+
             # --- Ground truth load ---
             if is_multiview:
                 # v5.0: random cam selection
@@ -596,6 +717,22 @@ class Trainer4DGS:
                 d_scales = self.gs.get_scales
             else:
                 d_means, d_quats, d_scales = self._apply_deformation(t_norm)
+                # Phase 2.1 + 2.4 — Static + Background gaussian'lari deformation'dan bypass et.
+                # is_static=True veya is_background=True olanlar undeformed kalir.
+                bypass_mask = None
+                if (self.use_static_dynamic_split
+                        and hasattr(self.gs, "is_static")):
+                    bypass_mask = self.gs.is_static.to(d_means.device)
+                if hasattr(self.gs, "is_background") and self.gs.is_background.any():
+                    bg = self.gs.is_background.to(d_means.device)
+                    bypass_mask = bg if bypass_mask is None else (bypass_mask | bg)
+                if bypass_mask is not None and bypass_mask.any():
+                    means_undef = self.gs.means
+                    quats_undef = F.normalize(self.gs.quats, dim=-1)
+                    scales_undef = self.gs.get_scales
+                    d_means = torch.where(bypass_mask.unsqueeze(-1), means_undef, d_means)
+                    d_quats = torch.where(bypass_mask.unsqueeze(-1), quats_undef, d_quats)
+                    d_scales = torch.where(bypass_mask.unsqueeze(-1), scales_undef, d_scales)
 
             render_out, _alpha, _info = render_view(
                 means=d_means, quats=d_quats, scales=d_scales,
@@ -622,7 +759,56 @@ class Trainer4DGS:
             # Loss bileşenlerini ayrı tut (diagnostics için)
             comp = {"recon": loss_recon.item(), "depth": 0.0, "track": 0.0,
                     "deform_reg": 0.0, "smooth": 0.0, "rigid": 0.0,
-                    "scale": 0.0, "fourier": 0.0}
+                    "scale": 0.0, "fourier": 0.0,
+                    "lpips": 0.0, "mv_consist": 0.0, "flow": 0.0}
+
+            # --- Phase 1.6: LPIPS perceptual loss ---
+            # rgb / gt: [H, W, 3] in [0, 1] -> [3, H, W] beklenir
+            if self.lambda_lpips > 0:
+                if self._lpips_module is None:
+                    from .losses_perceptual import LPIPSLoss
+                    self._lpips_module = LPIPSLoss(net=self.lpips_net)
+                lpips_warmup = min(1.0, it / max(1, self.lpips_warmup_iters))
+                pred_chw = rgb.permute(2, 0, 1).contiguous()
+                gt_chw = gt.permute(2, 0, 1).contiguous()
+                lpips_val = self._lpips_module(pred_chw, gt_chw)
+                if torch.isfinite(lpips_val):
+                    loss = loss + self.lambda_lpips * lpips_warmup * lpips_val
+                    comp["lpips"] = float(lpips_val.item())
+
+            # --- Phase 1.7: Multi-view consistency loss ---
+            # Aynı t'de farkli bir cam'da second render + recon. 2 cam supervision
+            # ile single-cam overfit baski. ~%20 iter time art.
+            # Maliyet: ekstra render. Sadece is_multiview ve lambda > 0.
+            if (is_multiview and self.lambda_multiview_consistency > 0
+                    and len(train_cams) >= 2):
+                try:
+                    # Farkli bir cam sec
+                    other_cams = [c for c in train_cams if c != cam_id]
+                    cam_id2 = other_cams[int(torch.randint(0, len(other_cams), (1,)).item())]
+                    if frames_cached_mv[cam_id2][idx] is None:
+                        frames_cached_mv[cam_id2][idx] = load_frame_tensor(
+                            Path(mv_frame_paths[cam_id2][idx]), (Ws, Hs)
+                        )
+                    gt2 = frames_cached_mv[cam_id2][idx].to(self.device)
+                    K2 = K_scaled_mv[cam_id2]
+                    w2c2 = w2c_mv[cam_id2]
+                    render_out2, _, _ = render_view(
+                        means=d_means, quats=d_quats, scales=d_scales,
+                        opacities=self.gs.get_opacities, colors=self.gs.get_colors,
+                        K=K2, w2c=w2c2,
+                        width=Ws, height=Hs,
+                        sh_degree=self.gs.sh_degree,
+                        with_depth=False,
+                    )
+                    rgb2 = render_out2 if render_out2.shape[-1] == 3 else render_out2[..., :3]
+                    mv_l1 = (rgb2 - gt2).abs().mean()
+                    if torch.isfinite(mv_l1):
+                        loss = loss + self.lambda_multiview_consistency * mv_l1
+                        comp["mv_consist"] = float(mv_l1.item())
+                except Exception as _e:
+                    if it < 50:
+                        print(f"  ⚠ mv_consistency failed iter {it}: {_e}")
 
             # --- Depth consistency (log-space, warmup-gated, clamped) ---
             # Log-space L1 scale-invariant ve outlier'a karşı dayanıklı.
@@ -877,6 +1063,11 @@ class Trainer4DGS:
 
             self.density.accumulate(self.gs)
             self.optimizer.step()
+            # Phase 2.3 — Camera pose refinement step (warmup sonrasi aktif)
+            if (self._cam_refine_optimizer is not None
+                    and it >= self.cam_refine_start_iter):
+                self._cam_refine_optimizer.step()
+                self._cam_refine_optimizer.zero_grad(set_to_none=True)
 
             # --- Post-step param NaN/Inf check — v3.4 expanded ---
             # means + scales + quats hepsi kontrol ediliyor çünkü scales inf'e

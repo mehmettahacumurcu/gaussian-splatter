@@ -26,6 +26,11 @@ from .preprocess.multiview_pipeline import prepare_multiview_scene
 from .preprocess.extract_frames import extract_frames
 from .preprocess.run_colmap     import run_colmap
 from .preprocess.parse_colmap   import parse_cameras, load_points3d, scene_extent as compute_scene_extent
+# Phase 1.1 + 1.3: heavy preprocessing cache utilities
+from .preprocess.cache_utils    import (
+    is_step_cached, log_cache, write_cache_marker,
+    compute_settings_hash, read_cache_marker,
+)
 from .model.gaussian_model      import GaussianModel
 from .model.deformation         import DeformationField
 from .model.trainer             import Trainer4DGS
@@ -52,6 +57,7 @@ def run_pipeline(
     skip_training: bool = False,
     skip_export: bool = False,
     progress_callback: ProgressCallback | None = None,
+    force_preprocess: bool = False,
 ) -> dict:
     """
     Returns: { phase: durum }
@@ -60,6 +66,10 @@ def run_pipeline(
         progress_callback: (phase, progress_0_1, message, details) → None
             Her faz başlangıcında ve bitişinde, ayrıca training sırasında
             periyodik olarak çağrılır. None ise hiçbir şey yapmaz.
+        force_preprocess: True ise tum cache'leri yoksay, butun preprocessing
+            adimlari (frame extract, COLMAP, depth, tracks, masks, MVS) sifirdan
+            kosulur. Default False — cache hit'lerde skip eder, training'e
+            hizli baslar (Phase 1.1: heavy preprocess once, train many times).
     """
     if cfg is None:
         cfg = default_config()
@@ -95,7 +105,8 @@ def run_pipeline(
         print(f"\n[v5.0] Multi-view scene: {scene_name}")
         run_logger.log_event("scene:multiview_detected", scene=scene_name)
         try:
-            mv_ctx = prepare_multiview_scene(paths, cfg, on_progress=cb)
+            mv_ctx = prepare_multiview_scene(paths, cfg, on_progress=cb,
+                                              force_preprocess=force_preprocess)
             print(f"  ✓ {mv_ctx['n_cameras']} cam, {len(mv_ctx['train_cams'])} train, "
                   f"primary={mv_ctx['primary_cam']}, test={mv_ctx['test_cam']}")
             status["frames"] = f"multi-view ok ({mv_ctx['n_cameras']} cams)"
@@ -110,12 +121,38 @@ def run_pipeline(
     if not is_mv:
         print("\n[Faz 2a] Frame çıkarma")
         cb("frames", 0.0, "Video karelere ayrılıyor", {})
-        extract_frames(
-            video_path, paths["frames"],
-            fps=cfg.preprocess.fps,
-            resize_long_edge=cfg.preprocess.resize_long_edge,
+        # Phase 1.3: settings hash karsilastirmasi — fps/resize_long_edge degisirse re-extract
+        # (compute_settings_hash/read_cache_marker/write_cache_marker module-level import edildi)
+        frames_marker = read_cache_marker(paths["base"], "frames")
+        cur_frames_hash = compute_settings_hash(cfg, "frames")
+        existing_frames = (
+            paths["frames"].exists()
+            and any(paths["frames"].glob("frame_*.png"))
         )
-        status["frames"] = "ok"
+        frames_settings_match = (
+            frames_marker is not None
+            and frames_marker.get("settings_hash") == cur_frames_hash
+        )
+        if (not force_preprocess) and existing_frames and frames_settings_match:
+            n_frames_existing = len(list(paths["frames"].glob("frame_*.png")))
+            log_cache("frames", paths["frames"], hit=True, count=n_frames_existing)
+            status["frames"] = f"ok (cache hit, {n_frames_existing} frames)"
+        else:
+            if existing_frames and not frames_settings_match and frames_marker is not None:
+                log_cache("frames", paths["frames"], hit=False,
+                          reason=f"settings_hash mismatch ({frames_marker.get('settings_hash')} → {cur_frames_hash})")
+            extract_frames(
+                video_path, paths["frames"],
+                fps=cfg.preprocess.fps,
+                resize_long_edge=cfg.preprocess.resize_long_edge,
+            )
+            n_frames_done = len(list(paths["frames"].glob("frame_*.png")))
+            write_cache_marker(paths["base"], "frames", {
+                "n_frames": n_frames_done,
+                "fps": cfg.preprocess.fps,
+                "resize_long_edge": cfg.preprocess.resize_long_edge,
+            }, cfg=cfg)
+            status["frames"] = "ok"
         cb("frames", 1.0, "Kareler hazır", {})
 
     # -------- Faz 2b-c: COLMAP (cache'li + progress hook) --------
@@ -129,8 +166,23 @@ def run_pipeline(
     else:
       print("\n[Faz 2b] COLMAP SfM")
       cb("colmap", 0.0, "COLMAP başlıyor", {})
-      # Cache check — eğer sparse zaten hazırsa tekrar koşma
+      # Cache check — eğer sparse zaten hazırsa tekrar koşma.
+      # Phase 1.3: settings hash check — colmap_matching/init_subsample_mode degisirse rerun.
+      # (cache_utils helpers module-level import edildi, lokal binding yok)
+      colmap_marker = read_cache_marker(paths["base"], "colmap")
+      cur_colmap_hash = compute_settings_hash(cfg, "colmap")
+      colmap_settings_match = (
+          colmap_marker is not None
+          and colmap_marker.get("settings_hash") == cur_colmap_hash
+      )
       try:
+        if force_preprocess or not colmap_settings_match:
+            # Cache invalidate — eski parse fail-fast yerine direk RuntimeError trigger
+            if colmap_marker is not None and not colmap_settings_match:
+                print(f"[pipeline] COLMAP settings degisti "
+                      f"(cache={colmap_marker.get('settings_hash')} vs current={cur_colmap_hash}) "
+                      f"→ rerun")
+            raise RuntimeError("force/settings invalidation")
         cams = parse_cameras(paths["colmap"])
         xyz, rgb = load_points3d(paths["colmap"])
         print(f"✓ COLMAP cache hit: {len(cams)} kamera, {len(xyz)} nokta (rerun atlandı)")
@@ -153,34 +205,212 @@ def run_pipeline(
         )
         cams = parse_cameras(paths["colmap"])
         xyz, rgb = load_points3d(paths["colmap"])
+        # Phase 1.3: settings_hash marker yaz, bir sonraki run cache hit alabilsin
+        try:
+            write_cache_marker(paths["base"], "colmap", {
+                "n_cameras": len(cams),
+                "n_points": int(len(xyz)),
+                "matching": "sequential" if is_sequential else "exhaustive",
+                "camera_model": cfg.preprocess.colmap_camera_model,
+            }, cfg=cfg)
+        except Exception as _e:
+            print(f"[pipeline] ⚠ COLMAP cache marker yazilirken hata: {_e}")
     if not is_mv:
         status["colmap"] = f"{len(cams)} kamera, {len(xyz)} nokta"
         cb("colmap", 1.0, f"{len(cams)} kamera, {len(xyz)} 3B nokta",
            {"cameras": len(cams), "points": len(xyz)})
 
     # -------- Faz 3: Foundation modeller (opsiyonel, resilient) --------
-    # Multi-view'da depth/track/mask atlanır (sonraki sprint per-cam destek).
+    # Phase 1.4: Multi-view'da per-cam depth (Metric3D/MiDaS) calisiyor.
+    # Tracks/masks per-cam Phase 1.5'te aktif olacak (su an MV'de sadece depth).
+    if not skip_foundation and is_mv:
+        foundation_status_mv = {"depth_mv": "pending", "masks_mv": "pending", "flow_mv": "skip"}
+        print("\n[Faz 3-MV] Multi-view per-cam foundation (depth + masks + flow)")
+        cb("foundation", 0.0, "Per-cam depth (multi-view)", {})
+
+        # 3a-MV — Depth per cam
+        # Beklenen min count: cam basina (frames - 5) tolerans
+        try:
+            sample_cam = next(iter(mv_ctx["frame_paths_per_cam"].values()))
+            n_frames_per_cam = len(sample_cam)
+        except Exception:
+            n_frames_per_cam = 0
+        n_cams_mv = len(mv_ctx.get("frame_paths_per_cam", {}))
+        # Multi-view glob: "cam*/*_depth.npy" — toplam asgari count
+        min_total = max(1, n_cams_mv * (n_frames_per_cam - 5))
+        depth_mv_cached = (
+            not force_preprocess
+            and is_step_cached(paths, "depth_mv", min_count=min_total,
+                               cfg=cfg, scene_dir=paths["base"])
+        )
+        if depth_mv_cached:
+            n_depth_total = len(list(paths["depth_mv"].glob("cam*/*_depth.npy")))
+            log_cache("depth_mv", paths["depth_mv"], hit=True, count=n_depth_total)
+            foundation_status_mv["depth_mv"] = f"ok (cache hit, {n_depth_total} files)"
+            run_logger.log_event("depth_mv:cache_hit", n_files=n_depth_total)
+        else:
+            log_cache("depth_mv", paths["depth_mv"], hit=False)
+            try:
+                from .preprocess.depth_multiview import estimate_depth_multiview
+                def _depth_mv_cb(frac, msg):
+                    cb("foundation", 0.0 + 0.5 * frac, msg, {"depth_mv_frac": frac})
+                estimate_depth_multiview(
+                    paths["frames_mv"],
+                    paths["depth_mv"],
+                    model_name=cfg.foundation.metric3d_model,
+                    device="cuda" if torch.cuda.is_available() else "cpu",
+                    overwrite=False,
+                    on_progress=_depth_mv_cb,
+                )
+                n_depth_total = len(list(paths["depth_mv"].glob("cam*/*_depth.npy")))
+                foundation_status_mv["depth_mv"] = f"ok ({n_depth_total} files)"
+                write_cache_marker(paths["base"], "depth_mv", {
+                    "model": cfg.foundation.metric3d_model,
+                    "n_cams": n_cams_mv,
+                    "n_frames_per_cam": n_frames_per_cam,
+                    "n_depth_total": n_depth_total,
+                }, cfg=cfg)
+                # VRAM cleanup — sonraki phase'lerde tracks/masks gelecek
+                try:
+                    from .preprocess.depth_estimate import release_models as _rd
+                    _rd()
+                except Exception:
+                    pass
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"⚠ Multi-view depth basarisiz, atlanir: {e}")
+                foundation_status_mv["depth_mv"] = f"failed: {e}"
+
+        # 3b-MV — Masks per cam (Phase 1.5)
+        masks_mv_cached = (
+            not force_preprocess
+            and is_step_cached(paths, "masks_mv",
+                               min_count=max(1, n_cams_mv * (n_frames_per_cam - 5)),
+                               cfg=cfg, scene_dir=paths["base"])
+        )
+        if masks_mv_cached:
+            n_masks_total = len(list(paths["masks_mv"].glob("cam*/mask_*.png")))
+            log_cache("masks_mv", paths["masks_mv"], hit=True, count=n_masks_total)
+            foundation_status_mv["masks_mv"] = f"ok (cache hit, {n_masks_total} files)"
+            run_logger.log_event("masks_mv:cache_hit", n_files=n_masks_total)
+        else:
+            log_cache("masks_mv", paths["masks_mv"], hit=False)
+            try:
+                from .preprocess.dynamic_mask_multiview import compute_dynamic_masks_multiview
+                def _masks_mv_cb(frac, msg):
+                    cb("foundation", 0.5 + 0.5 * frac, msg, {"masks_mv_frac": frac})
+                compute_dynamic_masks_multiview(
+                    paths["frames_mv"], paths["masks_mv"],
+                    overwrite=False, on_progress=_masks_mv_cb,
+                )
+                n_masks_total = len(list(paths["masks_mv"].glob("cam*/mask_*.png")))
+                foundation_status_mv["masks_mv"] = f"ok ({n_masks_total} files)"
+                write_cache_marker(paths["base"], "masks_mv", {
+                    "n_cams": n_cams_mv,
+                    "n_frames_per_cam": n_frames_per_cam,
+                    "n_masks_total": n_masks_total,
+                }, cfg=cfg)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"⚠ Multi-view mask basarisiz, atlanir: {e}")
+                foundation_status_mv["masks_mv"] = f"failed: {e}"
+
+        # 3c-MV — Optical flow (Phase 1.8). Sadece training trainer.lambda_flow > 0
+        # ise gerekli. Cache'lenir, training tarafi opsiyonel consume eder.
+        if getattr(cfg.train, "lambda_flow", 0.0) > 0:
+            flow_mv_cached = (
+                not force_preprocess
+                and is_step_cached(paths, "flow_mv",
+                                   min_count=max(1, n_cams_mv * (n_frames_per_cam - 6)),
+                                   cfg=cfg, scene_dir=paths["base"])
+            )
+            if flow_mv_cached:
+                n_flow_total = len(list(paths["flow_mv"].glob("cam*/forward_*.pt")))
+                log_cache("flow_mv", paths["flow_mv"], hit=True, count=n_flow_total)
+                foundation_status_mv["flow_mv"] = f"ok (cache hit, {n_flow_total})"
+            else:
+                log_cache("flow_mv", paths["flow_mv"], hit=False)
+                try:
+                    from .preprocess.optical_flow import (
+                        estimate_flow_multiview, release_models as _rf,
+                    )
+                    estimate_flow_multiview(
+                        paths["frames_mv"], paths["flow_mv"],
+                        device="cuda" if torch.cuda.is_available() else "cpu",
+                        overwrite=False,
+                    )
+                    n_flow_total = len(list(paths["flow_mv"].glob("cam*/forward_*.pt")))
+                    foundation_status_mv["flow_mv"] = f"ok ({n_flow_total} files)"
+                    write_cache_marker(paths["base"], "flow_mv", {
+                        "n_cams": n_cams_mv,
+                        "n_frames_per_cam": n_frames_per_cam,
+                        "n_flow_total": n_flow_total,
+                    }, cfg=cfg)
+                    _rf()
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    print(f"⚠ Multi-view flow basarisiz, atlanir: {e}")
+                    foundation_status_mv["flow_mv"] = f"failed: {e}"
+        else:
+            foundation_status_mv["flow_mv"] = "skip (lambda_flow=0)"
+
+        status["foundation_mv"] = ", ".join(f"{k}={v}" for k, v in foundation_status_mv.items())
+        cb("foundation", 1.0, f"MV foundation: {status['foundation_mv']}", foundation_status_mv)
+
     if not skip_foundation and not is_mv:
         foundation_status = {"depth": "pending", "tracks": "pending", "masks": "pending"}
 
-        # 3a — Depth
+        # 3a — Depth (Phase 1.1: cache check — sahnede yeterli depth varsa skip)
         print("\n[Faz 3a] MiDaS derinlik tahmini")
         cb("foundation", 0.0, "Derinlik tahmini", {})
-        try:
-            from .preprocess.depth_estimate import estimate_depth
-            estimate_depth(paths["frames"], paths["depth"],
-                           model_name=cfg.foundation.metric3d_model)
-            foundation_status["depth"] = "ok"
-        except Exception as e:
-            print(f"⚠ Derinlik tahmini başarısız, atlanıyor: {e}")
-            foundation_status["depth"] = f"failed: {e}"
+        # Beklenen depth count = frame count (her PNG icin bir depth)
+        n_frames = len(list(paths["frames"].glob("frame_*.png"))) if paths["frames"].exists() else 0
+        depth_cached = (
+            not force_preprocess
+            and is_step_cached(paths, "depth", min_count=max(1, n_frames - 5),
+                               cfg=cfg, scene_dir=paths["base"])
+        )
+        if depth_cached:
+            n_depth = len(list(paths["depth"].glob("*_depth.npy")))
+            log_cache("depth", paths["depth"], hit=True, count=n_depth)
+            foundation_status["depth"] = f"ok (cache hit, {n_depth} files)"
+            run_logger.log_event("depth:cache_hit", n_files=n_depth)
+        else:
+            log_cache("depth", paths["depth"], hit=False)
+            try:
+                from .preprocess.depth_estimate import estimate_depth
+                estimate_depth(paths["frames"], paths["depth"],
+                               model_name=cfg.foundation.metric3d_model)
+                foundation_status["depth"] = "ok"
+                write_cache_marker(paths["base"], "depth", {
+                    "model": cfg.foundation.metric3d_model,
+                    "n_frames": n_frames,
+                }, cfg=cfg)
+            except Exception as e:
+                print(f"⚠ Derinlik tahmini başarısız, atlanıyor: {e}")
+                foundation_status["depth"] = f"failed: {e}"
 
         # 3a.5 — MiDaS → COLMAP scale alignment (v3.7 / Option B)
         # MiDaS relative depth üretiyor, COLMAP world scale ile uyumsuz.
         # Anchor unprojection doğru 3D koordinat üretebilsin diye align ediyoruz.
         # Track loss'un 0.15'te takılmasının ana sebebi bu uyumsuzluktu.
+        # Phase 1.1: depth_align cache check — marker varsa skip.
         run_logger.log_event("phase:start", phase="depth_align")
-        if foundation_status["depth"] == "ok":
+        align_cached = (
+            not force_preprocess
+            and (paths["base"] / ".cache_markers" / "depth_align.json").exists()
+        )
+        if align_cached:
+            log_cache("depth_align", paths["depth"], hit=True)
+            run_logger.log_event("depth_align:cache_hit")
+            foundation_status["depth"] = (foundation_status.get("depth") or "ok") + " (aligned, cached)"
+        elif foundation_status["depth"].startswith("ok"):
             try:
                 print("\n[Faz 3a.5] Depth → COLMAP scale alignment")
                 from .preprocess.align_depth import align_depth_to_colmap
@@ -216,6 +446,10 @@ def run_pipeline(
                     n_skipped=align_stats["n_frames_skipped"],
                     global_scale=align_stats["global_scale_median"],
                 )
+                write_cache_marker(paths["base"], "depth_align", {
+                    "n_aligned": align_stats["n_frames_aligned"],
+                    "global_scale": align_stats["global_scale_median"],
+                })
             except Exception as e:
                 import traceback
                 tb = traceback.format_exc()
@@ -229,42 +463,77 @@ def run_pipeline(
 
         cb("foundation", 0.33, "Depth done, CoTracker başlıyor", {})
 
-        # 3b — Tracks
+        # 3b — Tracks (Phase 1.1: cache check — tracks.pt varsa skip)
         # v3.7.5: MiDaS modelini eksplisit release et — module-level cache'te
         # 700MB-1.4GB tutuyordu. empty_cache() bunu temizlemiyor.
         # Sonra CoTracker yer bulamadığı için OOM oluyordu.
         print("\n[Faz 3b] CoTracker piksel takibi")
-        try:
-            from .preprocess.depth_estimate import release_models as release_depth_models
-            release_depth_models()
-        except Exception as _e:
-            print(f"  ⚠ depth model release: {_e}")
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        try:
-            from .preprocess.point_tracking import track_points
-            track_points(paths["frames"], paths["tracks"] / "tracks.pt",
-                         grid_size=cfg.foundation.cotracker_grid_size)
-            foundation_status["tracks"] = "ok"
-        except Exception as e:
-            print(f"⚠ Tracking başarısız, atlanıyor: {e}")
-            foundation_status["tracks"] = f"failed: {e}"
+        tracks_path = paths["tracks"] / "tracks.pt"
+        # Phase 1.3: settings hash da kontrol et (cotracker_grid_size degisirse miss)
+        tracks_cached = (
+            not force_preprocess
+            and tracks_path.exists()
+            and tracks_path.stat().st_size > 1000  # not corrupt
+            and is_step_cached(paths, "tracks", cfg=cfg, scene_dir=paths["base"])
+        )
+        if tracks_cached:
+            log_cache("tracks", tracks_path, hit=True)
+            foundation_status["tracks"] = f"ok (cache hit, {tracks_path.stat().st_size // 1024} KB)"
+            run_logger.log_event("tracks:cache_hit",
+                                 size_bytes=tracks_path.stat().st_size)
+        else:
+            log_cache("tracks", tracks_path, hit=False)
+            try:
+                from .preprocess.depth_estimate import release_models as release_depth_models
+                release_depth_models()
+            except Exception as _e:
+                print(f"  ⚠ depth model release: {_e}")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            try:
+                from .preprocess.point_tracking import track_points
+                track_points(paths["frames"], tracks_path,
+                             grid_size=cfg.foundation.cotracker_grid_size)
+                foundation_status["tracks"] = "ok"
+                write_cache_marker(paths["base"], "tracks", {
+                    "grid_size": cfg.foundation.cotracker_grid_size,
+                    "size_bytes": tracks_path.stat().st_size if tracks_path.exists() else 0,
+                }, cfg=cfg)
+            except Exception as e:
+                print(f"⚠ Tracking başarısız, atlanıyor: {e}")
+                foundation_status["tracks"] = f"failed: {e}"
         # Cleanup after CoTracker too
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
         cb("foundation", 0.66, "Tracks done, dinamik maske başlıyor", {})
 
-        # 3c — Dynamic mask
+        # 3c — Dynamic mask (Phase 1.1: cache check)
         print("\n[Faz 3c] Dinamik maske")
-        try:
-            from .preprocess.dynamic_mask import compute_dynamic_masks
-            compute_dynamic_masks(paths["frames"], paths["masks"])
-            foundation_status["masks"] = "ok"
-        except Exception as e:
-            print(f"⚠ Maske başarısız, atlanıyor: {e}")
-            foundation_status["masks"] = f"failed: {e}"
+        n_frames_for_mask = len(list(paths["frames"].glob("frame_*.png"))) if paths["frames"].exists() else 0
+        masks_cached = (
+            not force_preprocess
+            and is_step_cached(paths, "masks", min_count=max(1, n_frames_for_mask - 5),
+                               cfg=cfg, scene_dir=paths["base"])
+        )
+        if masks_cached:
+            n_masks = len(list(paths["masks"].glob("*.png")))
+            log_cache("masks", paths["masks"], hit=True, count=n_masks)
+            foundation_status["masks"] = f"ok (cache hit, {n_masks} files)"
+            run_logger.log_event("masks:cache_hit", n_files=n_masks)
+        else:
+            log_cache("masks", paths["masks"], hit=False)
+            try:
+                from .preprocess.dynamic_mask import compute_dynamic_masks
+                compute_dynamic_masks(paths["frames"], paths["masks"])
+                foundation_status["masks"] = "ok"
+                write_cache_marker(paths["base"], "masks", {
+                    "n_frames": n_frames_for_mask,
+                }, cfg=cfg)
+            except Exception as e:
+                print(f"⚠ Maske başarısız, atlanıyor: {e}")
+                foundation_status["masks"] = f"failed: {e}"
 
         status["foundation"] = ", ".join(f"{k}={v}" for k, v in foundation_status.items())
         cb("foundation", 1.0, f"Foundation bitti: {status['foundation']}", foundation_status)
@@ -343,6 +612,9 @@ def run_pipeline(
         mlp_width=cfg.model.mlp_width,
         mlp_depth=cfg.model.mlp_depth,
         num_time_freqs=cfg.model.num_time_freqs,
+        # Phase 2.5 — opt-in multi-res HexPlane
+        multires_resolutions=getattr(cfg.model, "multires_resolutions", None) or None,
+        multires_feat_dim=getattr(cfg.model, "multires_feat_dim", None),
     )
     if is_mv:
         extent = float(mv_ctx["scene_extent"])
@@ -415,6 +687,20 @@ def run_pipeline(
         lambda_fourier_reg=cfg.train.lambda_fourier_reg,
         # v3.7.2 — N hard cap
         max_gaussians=cfg.train.max_gaussians,
+        # Phase 1.6/1.7/1.8/1.9 — perceptual + MV consistency + flow + densify scale
+        lambda_lpips=getattr(cfg.train, "lambda_lpips", 0.0),
+        lpips_net=getattr(cfg.train, "lpips_net", "alex"),
+        lpips_warmup_iters=getattr(cfg.train, "lpips_warmup_iters", 1000),
+        lambda_multiview_consistency=getattr(cfg.train, "lambda_multiview_consistency", 0.0),
+        lambda_flow=getattr(cfg.train, "lambda_flow", 0.0),
+        flow_warmup_iters=getattr(cfg.train, "flow_warmup_iters", 1000),
+        densify_mv_threshold_scale=getattr(cfg.train, "densify_mv_threshold_scale", 0.7),
+        # Phase 2.2 — Multi-resolution schedule
+        multires_schedule=getattr(cfg.train, "multires_schedule", None),
+        # Phase 2.3 — Camera pose refinement
+        lr_cam_K=getattr(cfg.train, "lr_cam_K", 0.0),
+        lr_cam_w2c=getattr(cfg.train, "lr_cam_w2c", 0.0),
+        cam_refine_start_iter=getattr(cfg.train, "cam_refine_start_iter", 5000),
     )
     # Foundation çıktıları varsa trainer'a ver (stage 2 loss'lar için)
     depth_dir_arg = paths["depth"] if (not skip_foundation and paths["depth"].exists()) else None
@@ -549,6 +835,10 @@ def main():
                         "Alternatif: COLMAP_EXE ortam değişkeni.")
     p.add_argument("--smoke-test", action="store_true",
                    help="Hızlı uçtan uca test: 500 iter, 480x270, 10 timestamp (~1-2 dk)")
+    p.add_argument("--force-preprocess", action="store_true",
+                   help="Phase 1.1: tum cache'leri yoksay, preprocessing baştan kossun "
+                        "(frames/COLMAP/depth/tracks/masks/MVS). "
+                        "Default: cache hit'lerde skip (heavy preprocess once, train many times).")
     args = p.parse_args()
 
     cfg = cloud_config() if args.cloud else default_config()
@@ -576,6 +866,7 @@ def main():
         skip_foundation=skip_found,
         skip_training=args.skip_training,
         skip_export=args.skip_export,
+        force_preprocess=args.force_preprocess,
     )
     print(f"\n=== Pipeline tamamlandi ({time.time()-t0:.1f}s) ===")
     for k, v in status.items():

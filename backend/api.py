@@ -160,6 +160,8 @@ async def process_video(
     # v5.0 — Multi-view bootstrap COLMAP
     colmap_mv_timestamps: int | None = Form(None, description="Multi-view bootstrap COLMAP: kac timestep (1, 5, 10, 25). Default 5."),
     colmap_mv_dense_mvs: bool | None = Form(None, description="Multi-view: MVS dense reconstruction (premium, +30-90 dk, 500k-2M dense point)"),
+    # Phase 1.1 — Cache infrastructure
+    force_preprocess: bool = Form(False, description="True: tum cache'leri yoksay, preprocessing baştan kosulsun (frames/COLMAP/depth/tracks/masks). Default False — heavy preprocess once, train many times."),
 ) -> ProcessResponse:
     """
     Video'yu upload et ve pipeline'ı kuyruğa al.
@@ -518,6 +520,7 @@ async def process_video(
             cfg,
             skip_foundation=effective_skip_foundation,
             progress_callback=on_progress,
+            force_preprocess=force_preprocess,
         )
 
     manager.submit(job.id, _runner)

@@ -41,6 +41,8 @@ def scene_paths(scene_name: str) -> dict[str, Path]:
         "colmap_mv":           base / "colmap_multiview",  # multi-cam reconstruction
         "depth_mv":            base / "depth_multiview",   # depth_multiview/cam00/...
         "masks_mv":            base / "masks_multiview",
+        "flow":                base / "flow",              # Phase 1.8 — single-view forward flow
+        "flow_mv":             base / "flow_multiview",    # Phase 1.8 — per-cam forward flow
         "poses_bounds":        base / "poses_bounds.npy",  # N3V format (opsiyonel)
         "calibration":         base / "calibration.json",  # custom multi-cam intrinsics (opsiyonel)
     }
@@ -154,6 +156,10 @@ class ModelConfig:
     # "hybrid"  -> her ikisi (MLP global bias + per-gaussian ozgun trajectory)
     deform_pos_mode: str = "hybrid"
     fourier_K: int = 8               # Frekans sayisi: 48 param/gaussian (K x 2 x 3)
+    # Phase 2.5 — Multi-resolution HexPlane. Bos = single-res (mevcut).
+    # Onerilen: [24, 48, 96] (3 scale, total feat 6*24*3 = 432).
+    multires_resolutions: list = field(default_factory=list)
+    multires_feat_dim: int = 24
 
 
 @dataclass
@@ -204,8 +210,28 @@ class TrainConfig:
     # Higher -> daha tutarli multi-view supervision, daha yavas iter.
     multiview_cams_per_iter: int = 1
     # Multi-view consistency loss: ayni 3D point farkli cam'lardan benzer renk vermeli.
-    # 0 = kapali (default), >0 = aktif (Sprint 4 implementation).
+    # 0 = kapali (default), >0 = aktif (Phase 1.7 implementation).
     lambda_multiview_consistency: float = 0.0
+    # Phase 1.6 — LPIPS perceptual loss (AlexNet/VGG). 0 = off.
+    # 0.05-0.1 onerilen. Ek ~10-15% iter time, 0.5-1.0 dB PSNR yukselir.
+    lambda_lpips: float = 0.0
+    lpips_net: str = "alex"  # "alex" (hizli) | "vgg" (kaliteli) | "squeeze"
+    lpips_warmup_iters: int = 1000  # ilk N iter'de scale lineer artar
+    # Phase 1.8 — RAFT optical flow loss. 0 = off.
+    lambda_flow: float = 0.0
+    flow_warmup_iters: int = 1000
+    # Phase 1.9 — Densify dynamics tuning (multi-view spesifik defaults)
+    # Multi-view'da daha aggresif densify gerekir (her cam ayri view).
+    densify_mv_threshold_scale: float = 0.7  # 1.0 = single-view ile ayni, 0.7 = %30 daha hassas
+    # Phase 2.2 — Multi-resolution training schedule (multi-stage)
+    # Liste: [(iter, long_edge), ...]. Bos = single-resolution.
+    # Orn: [(0, 480), (10000, 720), (25000, 1080)]
+    multires_schedule: list = field(default_factory=list)
+    # Phase 2.3 — Camera pose refinement (Joint BA)
+    # 0.0 = kapali, lr_cam_K=1e-7, lr_cam_w2c=1e-7 onerilen.
+    lr_cam_K: float = 0.0
+    lr_cam_w2c: float = 0.0
+    cam_refine_start_iter: int = 5000  # warmup sonrasi cam refine basla
 
 
 @dataclass

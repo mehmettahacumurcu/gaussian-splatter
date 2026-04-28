@@ -117,6 +117,10 @@ export function JobSubmitPanel({ onJobSubmitted }: Props) {
       {/* Preset */}
       <div className="submit-section">
         <label className="submit-label">Preset</label>
+        <div style={{ marginBottom: 8, padding: 8, background: "var(--bg-1)", border: "1px solid var(--border-1)", borderRadius: 4, fontSize: 11, color: "var(--text-muted)" }}>
+          <strong style={{ color: "var(--text-primary)" }}>Pipeline Mode:</strong>{" "}
+          <span>Auto-detect — eğer <code>data/&lt;sahne&gt;/videos/cam*.mp4</code> varsa <strong>multi-view</strong> aktif (N3V/Neural 3D Video format). Aksi halde <strong>single-view</strong>. Multi-view scene için video upload zorunlu değil ama sahne adı önceden hazır olmalı (scripts/load_n3v.py ile import).</span>
+        </div>
         <div className="preset-row">
           <label className={`preset-chip ${preset === "micro" ? "active" : ""}`}>
             <input

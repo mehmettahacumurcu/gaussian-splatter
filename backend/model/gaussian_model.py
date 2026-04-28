@@ -86,6 +86,19 @@ class GaussianModel(nn.Module):
             # Dummy placeholder — kapalı mod için (backward compat)
             self.register_parameter("fourier_pos_coeffs", None)
 
+        # ----- Phase 2.1 — Static/Dynamic explicit split -----
+        # is_static=True olan Gaussian'lar deformation BYPASS edilir
+        # (renderda d_means=means, d_quats=quats, d_scales=get_scales).
+        # Init: hepsi static (mask-based selection sonra promote eder).
+        # register_buffer: nn.Module persistent ama gradient yok.
+        self.register_buffer("is_static", torch.ones(N, dtype=torch.bool))
+
+        # ----- Phase 2.4 — Background flag (distance-based split) -----
+        # is_background=True olan Gaussian'lar uzakta sayilir; deformation kapali,
+        # densify pruning farkli (more permissive). flag_background_by_distance()
+        # ile init sonrasi set edilir. Default: hepsi foreground (False).
+        self.register_buffer("is_background", torch.zeros(N, dtype=torch.bool))
+
     # ------------------------------------------------------------------
     # Yardımcı: başlangıç scale'ini KNN ile tahmin et
     # ------------------------------------------------------------------
@@ -133,6 +146,65 @@ class GaussianModel(nn.Module):
         return int(self.means.shape[0])
 
     # ------------------------------------------------------------------
+    # Phase 2.1 — Static/Dynamic API
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def promote_dynamic(self, dynamic_mask: torch.Tensor) -> int:
+        """Verilen bool mask'i (N,) True olan Gaussian'lari dynamic flag'le.
+
+        Returns:
+            promoted: dynamic'e gecirilen Gaussian sayisi
+        """
+        if not hasattr(self, "is_static"):
+            return 0
+        if dynamic_mask.shape[0] != self.num_points:
+            raise ValueError(
+                f"dynamic_mask boyutu ({dynamic_mask.shape[0]}) num_points ({self.num_points}) ile uyumsuz"
+            )
+        prev_static = self.is_static.clone()
+        self.is_static = self.is_static & ~dynamic_mask.to(self.is_static.device)
+        promoted = int((prev_static & ~self.is_static).sum().item())
+        return promoted
+
+    @property
+    def num_static(self) -> int:
+        return int(self.is_static.sum().item()) if hasattr(self, "is_static") else self.num_points
+
+    @property
+    def num_dynamic(self) -> int:
+        return self.num_points - self.num_static
+
+    # ------------------------------------------------------------------
+    # Phase 2.4 — Background API
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def flag_background_by_distance(
+        self, scene_center: torch.Tensor, scene_extent: float, ratio: float = 2.0
+    ) -> int:
+        """Scene merkezinden 'ratio * scene_extent' uzakta olanlari background flag'le.
+
+        Args:
+            scene_center: (3,) world-space scene center
+            scene_extent: scene scale (look-points'ten tahmin)
+            ratio:        threshold = ratio * scene_extent (default 2.0)
+
+        Returns:
+            n_bg: background olarak isaretlenen Gaussian sayisi
+        """
+        if not hasattr(self, "is_background"):
+            return 0
+        sc = scene_center.to(self.means.device).reshape(1, 3)
+        d = (self.means.detach() - sc).norm(dim=-1)  # (N,)
+        threshold = ratio * scene_extent
+        bg_mask = d > threshold
+        self.is_background = bg_mask.to(self.is_background.device)
+        return int(bg_mask.sum().item())
+
+    @property
+    def num_background(self) -> int:
+        return int(self.is_background.sum().item()) if hasattr(self, "is_background") else 0
+
+    # ------------------------------------------------------------------
     # Density control: prune
     # ------------------------------------------------------------------
     @torch.no_grad()
@@ -161,6 +233,12 @@ class GaussianModel(nn.Module):
             self.fourier_pos_coeffs = nn.Parameter(
                 self.fourier_pos_coeffs[mask].contiguous()
             )
+        # Phase 2.1 — is_static buffer senkronu (prune)
+        if hasattr(self, "is_static"):
+            self.is_static = self.is_static[mask].contiguous()
+        # Phase 2.4 — is_background buffer senkronu
+        if hasattr(self, "is_background"):
+            self.is_background = self.is_background[mask].contiguous()
 
     @torch.no_grad()
     def append_gaussians(
@@ -193,6 +271,17 @@ class GaussianModel(nn.Module):
             self.fourier_pos_coeffs = nn.Parameter(
                 cat(self.fourier_pos_coeffs, new_fourier_coeffs)
             )
+        # Phase 2.1 — is_static senkronu (split/clone yeni Gaussian'lar parent'tan inherit)
+        if hasattr(self, "is_static"):
+            n_new = new_means.shape[0]
+            # Default: yeni Gaussian static (caller motion mask'ten promote etmeli)
+            new_static = torch.ones(n_new, dtype=torch.bool, device=device)
+            self.is_static = torch.cat([self.is_static, new_static], dim=0).contiguous()
+        # Phase 2.4 — is_background senkronu (yeni gauss default foreground)
+        if hasattr(self, "is_background"):
+            n_new = new_means.shape[0]
+            new_bg = torch.zeros(n_new, dtype=torch.bool, device=device)
+            self.is_background = torch.cat([self.is_background, new_bg], dim=0).contiguous()
 
     # ------------------------------------------------------------------
     # I/O

@@ -41,6 +41,9 @@ adam_error.txt
 runs/
 wandb/
 
+# Runtime state (job manager — paylaşılmaz)
+jobs.json
+
 # Derleyici / ninja cache
 torch_extensions/
 *.cuda.o
