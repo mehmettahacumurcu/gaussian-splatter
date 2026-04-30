@@ -80,18 +80,16 @@ def run_pipeline(
     cb: ProgressCallback = progress_callback or _noop_cb
     status = {}
 
-    # Static 3DGS Faz 1 — static_mode aktifse foundation modelleri (depth/tracks/
-    # masks/flow) gerekmez. 4D dynamic loss'lar zaten kapali, sadece RGB+SSIM+LPIPS.
-    # NOT: Lambda'lar otomatik 0'lanir (lambda_depth, lambda_flow vs.) ki cache
-    # yokken trainer crash etmesin.
+    # Static 3DGS Faz 1 — static_mode aktifse 4D dynamic loss'lari + motion regs
+    # otomatik 0'lanir. Foundation modellerden DEPTH ise hala calisir (geometric
+    # prior + sparse-view yardimcisi); tracks/masks/flow ise statik sahnede anlamsiz.
+    # Bu nedenle skip_foundation FALSE birakilir (depth icin), trainer track/mask/flow
+    # lambda'lari 0 oldugu icin onlari kullanmaz.
     static_mode_active = bool(getattr(cfg.train, "static_mode", False))
     if static_mode_active:
-        if not skip_foundation:
-            print("[Static 3DGS] static_mode=True → foundation modeller atlandi "
-                  "(depth/tracks/masks/flow)")
-            skip_foundation = True
-        # 4D-only loss'larin lambda'larini sifirla — preprocess yok ise crash riski.
-        for _attr in ("lambda_depth", "lambda_mask_motion", "lambda_track",
+        # 4D-only loss'larin lambda'larini sifirla. NOT: lambda_depth listede DEGIL —
+        # static modda da geometric supervision olarak kullanilir.
+        for _attr in ("lambda_mask_motion", "lambda_track",
                       "lambda_flow", "lambda_smoothness", "lambda_rigidity",
                       "lambda_deform_reg", "lambda_fourier_reg",
                       "lambda_multiview_consistency"):
@@ -100,11 +98,23 @@ def run_pipeline(
                     setattr(cfg.train, _attr, 0.0)
             except Exception:
                 pass
-        # Phase 2.1 auto-promote da gereksiz — statik sahnede dynamic ayrimi yok.
+        # Phase 2.1 auto-promote gereksiz — statik sahnede dynamic ayrimi yok.
         try:
             cfg.train.auto_static_dynamic = False
         except Exception:
             pass
+        # lambda_depth > 0 ise foundation depth gerekli — skip_foundation'i KAPATMA.
+        # Eger user explicit skip_foundation=True dediyse, lambda_depth da 0'la
+        # (depth dosyasi yok, trainer crash etmesin).
+        wants_depth = float(getattr(cfg.train, "lambda_depth", 0.0)) > 0
+        if skip_foundation and wants_depth:
+            print("[Static 3DGS] skip_foundation=True ama lambda_depth>0 → "
+                  "lambda_depth=0 zorlandi (depth dosyasi yok)")
+            cfg.train.lambda_depth = 0.0
+        elif wants_depth:
+            print(f"[Static 3DGS] depth supervision aktif (lambda_depth="
+                  f"{cfg.train.lambda_depth}) — foundation depth phase calisacak, "
+                  f"tracks/masks/flow ise pipeline tarafinda atlanacak")
 
     # Run logger — tüm pipeline'ı takip eder, metrics/events/summary yazar
     run_logger = RunLogger(paths["output"] / "logs", scene=scene_name)
@@ -146,40 +156,124 @@ def run_pipeline(
 
     # -------- Faz 2a: Frame çıkarma (single-view only) --------
     if not is_mv:
+        images_dir = paths["base"] / "images"
+        frames_dir = paths["frames"]
+        has_photo_set = images_dir.exists() and any(
+            list(images_dir.glob("*.jpg")) + list(images_dir.glob("*.JPG"))
+            + list(images_dir.glob("*.png")) + list(images_dir.glob("*.PNG"))
+            + list(images_dir.glob("*.jpeg")) + list(images_dir.glob("*.JPEG"))
+        )
+
         print("\n[Faz 2a] Frame çıkarma")
         cb("frames", 0.0, "Video karelere ayrılıyor", {})
         # Phase 1.3: settings hash karsilastirmasi — fps/resize_long_edge degisirse re-extract
-        # (compute_settings_hash/read_cache_marker/write_cache_marker module-level import edildi)
         frames_marker = read_cache_marker(paths["base"], "frames")
         cur_frames_hash = compute_settings_hash(cfg, "frames")
         existing_frames = (
-            paths["frames"].exists()
-            and any(paths["frames"].glob("frame_*.png"))
+            frames_dir.exists() and any(frames_dir.glob("frame_*.png"))
         )
         frames_settings_match = (
             frames_marker is not None
             and frames_marker.get("settings_hash") == cur_frames_hash
         )
-        if (not force_preprocess) and existing_frames and frames_settings_match:
-            n_frames_existing = len(list(paths["frames"].glob("frame_*.png")))
-            log_cache("frames", paths["frames"], hit=True, count=n_frames_existing)
+
+        def _photo_set_to_frames():
+            """images/ -> frames/ kopyala, resize_long_edge uygula, cache marker yaz."""
+            print(f"  [Photo set adapter] images/ -> frames/ kopyalaniyor")
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            # Eski frame'leri temizle (settings degistiyse stale olur)
+            for old in frames_dir.glob("frame_*.png"):
+                try: old.unlink()
+                except Exception: pass
+            from PIL import Image
+            all_imgs = []
+            for ext in ("*.jpg", "*.JPG", "*.png", "*.PNG", "*.jpeg", "*.JPEG"):
+                all_imgs.extend(images_dir.glob(ext))
+            all_imgs = sorted(set(all_imgs))
+            resize_le = int(cfg.preprocess.resize_long_edge or 0)
+            for i, img_path in enumerate(all_imgs):
+                try:
+                    img = Image.open(img_path).convert("RGB")
+                    if resize_le > 0:
+                        w, h = img.size
+                        if max(w, h) > resize_le:
+                            if w >= h:
+                                new_w, new_h = resize_le, int(h * resize_le / w)
+                            else:
+                                new_h, new_w = resize_le, int(w * resize_le / h)
+                            img = img.resize((new_w, new_h), Image.LANCZOS)
+                    img.save(frames_dir / f"frame_{i:06d}.png")
+                except Exception as _e:
+                    print(f"    ! {img_path.name} skip: {_e}")
+            n_done = len(list(frames_dir.glob("frame_*.png")))
+            print(f"  ok: {n_done} frame yazildi (resize_long_edge={resize_le})")
+            write_cache_marker(paths["base"], "frames", {
+                "n_frames": n_done,
+                "fps": cfg.preprocess.fps,
+                "resize_long_edge": resize_le,
+                "source": "photo_set",
+            }, cfg=cfg)
+            return n_done
+
+        if has_photo_set:
+            # Photo set source-of-truth: video gerekli degil, settings degisiminde
+            # adapter re-copy yapar.
+            if (not force_preprocess) and existing_frames and frames_settings_match:
+                n_frames_existing = len(list(frames_dir.glob("frame_*.png")))
+                log_cache("frames", frames_dir, hit=True, count=n_frames_existing)
+                status["frames"] = f"ok (cache hit, photo-set, {n_frames_existing} frames)"
+            else:
+                if existing_frames and not frames_settings_match and frames_marker is not None:
+                    log_cache("frames", frames_dir, hit=False,
+                              reason=f"settings_hash mismatch ({frames_marker.get('settings_hash')} → {cur_frames_hash})")
+                try:
+                    n_done = _photo_set_to_frames()
+                    status["frames"] = f"photo_set ok ({n_done} frame)"
+                except ImportError:
+                    raise RuntimeError(
+                        "Photo set adapter PIL gerektirir. pip install pillow"
+                    )
+        elif (not force_preprocess) and existing_frames and frames_settings_match:
+            n_frames_existing = len(list(frames_dir.glob("frame_*.png")))
+            log_cache("frames", frames_dir, hit=True, count=n_frames_existing)
             status["frames"] = f"ok (cache hit, {n_frames_existing} frames)"
         else:
+            # Standart video extract — DEFENSIVE: video yoksa ve images/ varsa
+            # photo-set adapter'a duser (sadece has_photo_set True iken yukarida
+            # yakalanmali ama uvicorn reload'unda kod sirasi kacirilirsa burda
+            # son savunma.)
             if existing_frames and not frames_settings_match and frames_marker is not None:
-                log_cache("frames", paths["frames"], hit=False,
+                log_cache("frames", frames_dir, hit=False,
                           reason=f"settings_hash mismatch ({frames_marker.get('settings_hash')} → {cur_frames_hash})")
-            extract_frames(
-                video_path, paths["frames"],
-                fps=cfg.preprocess.fps,
-                resize_long_edge=cfg.preprocess.resize_long_edge,
-            )
-            n_frames_done = len(list(paths["frames"].glob("frame_*.png")))
-            write_cache_marker(paths["base"], "frames", {
-                "n_frames": n_frames_done,
-                "fps": cfg.preprocess.fps,
-                "resize_long_edge": cfg.preprocess.resize_long_edge,
-            }, cfg=cfg)
-            status["frames"] = "ok"
+            video_path_p = Path(video_path)
+            if not video_path_p.exists():
+                if has_photo_set:
+                    print(f"  [Defensive] video yok ama images/ var → photo-set adapter")
+                    try:
+                        n_done = _photo_set_to_frames()
+                        status["frames"] = f"photo_set defensive ok ({n_done} frame)"
+                    except ImportError:
+                        raise RuntimeError("Photo set adapter PIL gerektirir. pip install pillow")
+                else:
+                    raise FileNotFoundError(
+                        f"Ne video.mp4 ne images/ klasoru bulundu:\n"
+                        f"  video: {video_path}\n"
+                        f"  images: {images_dir}\n"
+                        f"Coz: data/{scene_name}/images/IMG_*.jpg KOY veya video.mp4 ekle."
+                    )
+            else:
+                extract_frames(
+                    video_path, frames_dir,
+                    fps=cfg.preprocess.fps,
+                    resize_long_edge=cfg.preprocess.resize_long_edge,
+                )
+                n_frames_done = len(list(frames_dir.glob("frame_*.png")))
+                write_cache_marker(paths["base"], "frames", {
+                    "n_frames": n_frames_done,
+                    "fps": cfg.preprocess.fps,
+                    "resize_long_edge": cfg.preprocess.resize_long_edge,
+                }, cfg=cfg)
+                status["frames"] = "ok"
         cb("frames", 1.0, "Kareler hazır", {})
 
     # -------- Faz 2b-c: COLMAP (cache'li + progress hook) --------
@@ -202,7 +296,51 @@ def run_pipeline(
           colmap_marker is not None
           and colmap_marker.get("settings_hash") == cur_colmap_hash
       )
-      try:
+      # 4D Quality v6.1 — Madde 3: DUSt3R sparse-view init opt-in
+      init_method = getattr(cfg.preprocess, "init_method", "colmap")
+      sparse_threshold = int(getattr(cfg.preprocess, "sparse_view_threshold_frames", 20))
+      n_frames_for_init = len(list(paths["frames"].glob("frame_*.png"))) if paths["frames"].exists() else 0
+      want_dust3r = (
+          init_method == "dust3r"
+          or (init_method == "auto" and 0 < n_frames_for_init < sparse_threshold)
+      )
+      dust3r_done = False
+      if want_dust3r:
+          try:
+              from .preprocess.dust3r_init import (
+                  estimate_sparse_init, is_dust3r_available, install_hint,
+              )
+              if not is_dust3r_available():
+                  print(f"[pipeline] DUSt3R yok, COLMAP'a duser:\n  {install_hint()}")
+              else:
+                  frame_paths_init = sorted(paths["frames"].glob("frame_*.png"))
+                  print(f"[pipeline] DUSt3R sparse init ({n_frames_for_init} frame, "
+                        f"method={init_method})")
+                  d3r = estimate_sparse_init(
+                      frame_paths_init, paths["base"] / "dust3r_init",
+                      device="cuda" if torch.cuda.is_available() else "cpu",
+                  )
+                  cams = d3r["cameras"]
+                  for name in cams:
+                      if "width" not in cams[name]:
+                          cams[name]["width"] = int(cfg.preprocess.resize_long_edge or 960)
+                          cams[name]["height"] = int(cams[name]["width"] * 9 / 16)
+                  xyz = d3r["xyz"]
+                  rgb = d3r["rgb"]
+                  print(f"  ✓ DUSt3R: {len(cams)} cam, {len(xyz)} point")
+                  cb("colmap", 1.0, f"DUSt3R init: {len(cams)} cam", {"dust3r": True})
+                  status["colmap"] = f"DUSt3R: {len(cams)} cam, {len(xyz)} point"
+                  dust3r_done = True
+          except Exception as e:
+              import traceback
+              traceback.print_exc()
+              print(f"[pipeline] DUSt3R basarisiz, COLMAP'a duser: {e}")
+
+      if dust3r_done:
+        # COLMAP fazini atla — cams/xyz/rgb DUSt3R'dan dolduruldu
+        pass
+      else:
+       try:
         if force_preprocess or not colmap_settings_match:
             # Cache invalidate — eski parse fail-fast yerine direk RuntimeError trigger
             if colmap_marker is not None and not colmap_settings_match:
@@ -214,7 +352,7 @@ def run_pipeline(
         xyz, rgb = load_points3d(paths["colmap"])
         print(f"✓ COLMAP cache hit: {len(cams)} kamera, {len(xyz)} nokta (rerun atlandı)")
         cb("colmap", 1.0, f"cache hit: {len(cams)} kamera", {"cache": True})
-      except (FileNotFoundError, RuntimeError):
+       except (FileNotFoundError, RuntimeError):
         # COLMAP stream progress → pipeline callback'e relay
         def _colmap_on_progress(frac: float, msg: str) -> None:
             cb("colmap", frac, msg, {"colmap_fraction": frac})
@@ -490,80 +628,96 @@ def run_pipeline(
 
         cb("foundation", 0.33, "Depth done, CoTracker başlıyor", {})
 
-        # 3b — Tracks (Phase 1.1: cache check — tracks.pt varsa skip)
-        # v3.7.5: MiDaS modelini eksplisit release et — module-level cache'te
-        # 700MB-1.4GB tutuyordu. empty_cache() bunu temizlemiyor.
-        # Sonra CoTracker yer bulamadığı için OOM oluyordu.
-        print("\n[Faz 3b] CoTracker piksel takibi")
-        tracks_path = paths["tracks"] / "tracks.pt"
-        # Phase 1.3: settings hash da kontrol et (cotracker_grid_size degisirse miss)
-        tracks_cached = (
-            not force_preprocess
-            and tracks_path.exists()
-            and tracks_path.stat().st_size > 1000  # not corrupt
-            and is_step_cached(paths, "tracks", cfg=cfg, scene_dir=paths["base"])
-        )
-        if tracks_cached:
-            log_cache("tracks", tracks_path, hit=True)
-            foundation_status["tracks"] = f"ok (cache hit, {tracks_path.stat().st_size // 1024} KB)"
-            run_logger.log_event("tracks:cache_hit",
-                                 size_bytes=tracks_path.stat().st_size)
-        else:
-            log_cache("tracks", tracks_path, hit=False)
+        # Static 3DGS Faz 1 — tracks/masks/flow statik sahnede anlamsiz.
+        # Sadece depth (yukarida) hesaplandi, gerisi atlanir.
+        if static_mode_active:
+            foundation_status["tracks"] = "skip (static_mode)"
+            foundation_status["masks"]  = "skip (static_mode)"
+            foundation_status["flow"]   = "skip (static_mode)"
+            n_frames_for_mask = len(list(paths["frames"].glob("frame_*.png"))) if paths["frames"].exists() else 0
+            tracks_path = paths["tracks"] / "tracks.pt"
             try:
-                from .preprocess.depth_estimate import release_models as release_depth_models
-                release_depth_models()
-            except Exception as _e:
-                print(f"  ⚠ depth model release: {_e}")
+                from .preprocess.depth_estimate import release_models as _rd
+                _rd()
+            except Exception:
+                pass
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-            try:
-                from .preprocess.point_tracking import track_points
-                track_points(paths["frames"], tracks_path,
-                             grid_size=cfg.foundation.cotracker_grid_size)
-                foundation_status["tracks"] = "ok"
-                write_cache_marker(paths["base"], "tracks", {
-                    "grid_size": cfg.foundation.cotracker_grid_size,
-                    "size_bytes": tracks_path.stat().st_size if tracks_path.exists() else 0,
-                }, cfg=cfg)
-            except Exception as e:
-                print(f"⚠ Tracking başarısız, atlanıyor: {e}")
-                foundation_status["tracks"] = f"failed: {e}"
-        # Cleanup after CoTracker too
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-        cb("foundation", 0.66, "Tracks done, dinamik maske başlıyor", {})
-
-        # 3c — Dynamic mask (Phase 1.1: cache check)
-        print("\n[Faz 3c] Dinamik maske")
-        n_frames_for_mask = len(list(paths["frames"].glob("frame_*.png"))) if paths["frames"].exists() else 0
-        masks_cached = (
-            not force_preprocess
-            and is_step_cached(paths, "masks", min_count=max(1, n_frames_for_mask - 5),
-                               cfg=cfg, scene_dir=paths["base"])
-        )
-        if masks_cached:
-            n_masks = len(list(paths["masks"].glob("*.png")))
-            log_cache("masks", paths["masks"], hit=True, count=n_masks)
-            foundation_status["masks"] = f"ok (cache hit, {n_masks} files)"
-            run_logger.log_event("masks:cache_hit", n_files=n_masks)
+            cb("foundation", 0.66, "Tracks/Masks atlandi (static_mode)", {"static": True})
+            print("[Faz 3] Static modda tracks/masks/flow atlandi, depth aktif")
         else:
-            log_cache("masks", paths["masks"], hit=False)
-            try:
-                from .preprocess.dynamic_mask import compute_dynamic_masks
-                compute_dynamic_masks(paths["frames"], paths["masks"])
-                foundation_status["masks"] = "ok"
-                write_cache_marker(paths["base"], "masks", {
-                    "n_frames": n_frames_for_mask,
-                }, cfg=cfg)
-            except Exception as e:
-                print(f"⚠ Maske başarısız, atlanıyor: {e}")
-                foundation_status["masks"] = f"failed: {e}"
+            print("\n[Faz 3b] CoTracker piksel takibi")
+            tracks_path = paths["tracks"] / "tracks.pt"
+            # Phase 1.3: settings hash da kontrol et (cotracker_grid_size degisirse miss)
+            tracks_cached = (
+                not force_preprocess
+                and tracks_path.exists()
+                and tracks_path.stat().st_size > 1000  # not corrupt
+                and is_step_cached(paths, "tracks", cfg=cfg, scene_dir=paths["base"])
+            )
+            if tracks_cached:
+                log_cache("tracks", tracks_path, hit=True)
+                foundation_status["tracks"] = f"ok (cache hit, {tracks_path.stat().st_size // 1024} KB)"
+                run_logger.log_event("tracks:cache_hit",
+                                     size_bytes=tracks_path.stat().st_size)
+            else:
+                log_cache("tracks", tracks_path, hit=False)
+                try:
+                    from .preprocess.depth_estimate import release_models as release_depth_models
+                    release_depth_models()
+                except Exception as _e:
+                    print(f"  ⚠ depth model release: {_e}")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                try:
+                    from .preprocess.point_tracking import track_points
+                    track_points(paths["frames"], tracks_path,
+                                 grid_size=cfg.foundation.cotracker_grid_size)
+                    foundation_status["tracks"] = "ok"
+                    write_cache_marker(paths["base"], "tracks", {
+                        "grid_size": cfg.foundation.cotracker_grid_size,
+                        "size_bytes": tracks_path.stat().st_size if tracks_path.exists() else 0,
+                    }, cfg=cfg)
+                except Exception as e:
+                    print(f"⚠ Tracking başarısız, atlanıyor: {e}")
+                    foundation_status["tracks"] = f"failed: {e}"
+            # Cleanup after CoTracker too
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            cb("foundation", 0.66, "Tracks done, dinamik maske başlıyor", {})
+
+            # 3c — Dynamic mask (Phase 1.1: cache check)
+            print("\n[Faz 3c] Dinamik maske")
+            n_frames_for_mask = len(list(paths["frames"].glob("frame_*.png"))) if paths["frames"].exists() else 0
+            masks_cached = (
+                not force_preprocess
+                and is_step_cached(paths, "masks", min_count=max(1, n_frames_for_mask - 5),
+                                   cfg=cfg, scene_dir=paths["base"])
+            )
+            if masks_cached:
+                n_masks = len(list(paths["masks"].glob("*.png")))
+                log_cache("masks", paths["masks"], hit=True, count=n_masks)
+                foundation_status["masks"] = f"ok (cache hit, {n_masks} files)"
+                run_logger.log_event("masks:cache_hit", n_files=n_masks)
+            else:
+                log_cache("masks", paths["masks"], hit=False)
+                try:
+                    from .preprocess.dynamic_mask import compute_dynamic_masks
+                    compute_dynamic_masks(paths["frames"], paths["masks"])
+                    foundation_status["masks"] = "ok"
+                    write_cache_marker(paths["base"], "masks", {
+                        "n_frames": n_frames_for_mask,
+                    }, cfg=cfg)
+                except Exception as e:
+                    print(f"⚠ Maske başarısız, atlanıyor: {e}")
+                    foundation_status["masks"] = f"failed: {e}"
 
         # 3d — Phase 1.8 SV: RAFT optical flow (lambda_flow>0 ise preprocess)
-        if getattr(cfg.train, "lambda_flow", 0.0) > 0:
+        # Static modda zaten lambda_flow=0 zorlandi, yine de explicit guard ekle.
+        if not static_mode_active and getattr(cfg.train, "lambda_flow", 0.0) > 0:
             flow_cached_sv = (
                 not force_preprocess
                 and is_step_cached(paths, "flow",
@@ -889,6 +1043,12 @@ def run_pipeline(
         static_dynamic_threshold=getattr(cfg.train, "static_dynamic_threshold", 0.10),
         # Static 3DGS Faz 1 — 4D bypass
         static_mode=getattr(cfg.train, "static_mode", False),
+        # 4D Quality v6.1 — runtime knobs
+        sh_progressive_schedule=getattr(cfg.train, "sh_progressive_schedule", False),
+        lambda_accel=getattr(cfg.train, "lambda_accel", 0.0),
+        cam_grad_clip_norm=getattr(cfg.train, "cam_grad_clip_norm", 0.0),
+        mip_scale_floor_frac=getattr(cfg.train, "mip_scale_floor_frac", 0.0),
+        dynamic_densify_scale=getattr(cfg.train, "dynamic_densify_scale", 1.0),
     )
     run_logger.phase_end(
         "training",
@@ -931,6 +1091,105 @@ def run_pipeline(
     cb("export", 1.0, f"{cfg.export.num_timestamps} .ply yazıldı",
        {"num_timestamps": cfg.export.num_timestamps,
         "ply_dir": str(paths["output"] / "ply")})
+
+    # -------- Faz 7: NVS Evaluation (4D Quality v6.1 — Madde 1+8) --------
+    if getattr(cfg.train, "nvs_eval_enabled", False):
+        print("\n[Faz 7] NVS Evaluation — held-out cam metrics + orbit render")
+        cb("eval", 0.0, "NVS evaluation basliyor", {})
+        try:
+            from .eval.nvs_eval import (
+                eval_held_out_camera, eval_temporal_holdout, save_eval_report,
+            )
+            from .eval.orbit_render import render_orbit_video
+            eval_dir = paths["output"] / "eval"
+            eval_dir.mkdir(parents=True, exist_ok=True)
+            report = {"scene": scene_name, "type": "mv" if is_mv else "sv"}
+
+            if is_mv and mv_ctx is not None and mv_ctx.get("test_cam"):
+                # Held-out test cam (N3V cam00 default)
+                test_cam = mv_ctx["test_cam"]
+                test_K = torch.from_numpy(np.array(mv_ctx["calibration"][test_cam]["K"])).float()
+                test_w2c = torch.from_numpy(np.array(mv_ctx["calibration"][test_cam]["w2c"])).float()
+                test_frame_paths = mv_ctx["frame_paths_per_cam"].get(test_cam, [])
+                if test_frame_paths:
+                    cb("eval", 0.2, f"Held-out cam {test_cam} render", {})
+                    held_out = eval_held_out_camera(
+                        gs=trainer.gs, deform=trainer.deform,
+                        cam_K=test_K, cam_w2c=test_w2c,
+                        frame_paths=test_frame_paths,
+                        width=cfg.train.image_resolution[0],
+                        height=cfg.train.image_resolution[1],
+                        static_mode=getattr(cfg.train, "static_mode", False),
+                        scene_extent=extent, device=device,
+                    )
+                    report["held_out_cam"] = test_cam
+                    report["held_out_metrics"] = {
+                        "psnr": held_out["psnr_mean"],
+                        "ssim": held_out["ssim_mean"],
+                        "lpips": held_out["lpips_mean"],
+                        "n_frames": held_out["n_frames"],
+                    }
+                    print(f"  Held-out [{test_cam}]: PSNR={held_out['psnr_mean']:.2f} "
+                          f"SSIM={held_out['ssim_mean']:.4f} LPIPS={held_out['lpips_mean']:.4f}")
+            elif not is_mv and len(frame_paths) > 5:
+                # Single-view temporal hold-out: son %10'unu test ayır
+                T = len(frame_paths)
+                holdout = list(range(max(0, T - max(1, T // 10)), T))
+                cb("eval", 0.2, f"Temporal hold-out ({len(holdout)} frame)", {})
+                t_metrics = eval_temporal_holdout(
+                    gs=trainer.gs, deform=trainer.deform,
+                    cam_K=K_first, cam_w2c_per_frame=w2c_list,
+                    frame_paths=frame_paths, holdout_indices=holdout,
+                    width=cfg.train.image_resolution[0],
+                    height=cfg.train.image_resolution[1],
+                    static_mode=getattr(cfg.train, "static_mode", False),
+                    scene_extent=extent, device=device,
+                )
+                report["temporal_holdout"] = {
+                    "psnr": t_metrics["psnr_mean"],
+                    "ssim": t_metrics["ssim_mean"],
+                    "lpips": t_metrics["lpips_mean"],
+                    "n_frames": t_metrics["n_frames"],
+                }
+                print(f"  Temporal hold-out: PSNR={t_metrics['psnr_mean']:.2f} "
+                      f"SSIM={t_metrics['ssim_mean']:.4f} LPIPS={t_metrics['lpips_mean']:.4f}")
+
+            # Smooth orbit video
+            cb("eval", 0.6, "Orbit render", {})
+            n_orbit = int(getattr(cfg.train, "nvs_eval_orbit_frames", 60))
+            fps_orbit = int(getattr(cfg.train, "nvs_eval_orbit_fps", 30))
+            orbit_path = eval_dir / "orbit.mp4"
+            train_w2c_for_orbit = list(w2c_list) if not is_mv else [
+                torch.from_numpy(np.array(mv_ctx["calibration"][c]["w2c"])).float()
+                for c in mv_ctx["train_cams"]
+            ]
+            K_for_orbit = K_first if not is_mv else torch.from_numpy(
+                np.array(mv_ctx["calibration"][mv_ctx["train_cams"][0]]["K"])
+            ).float()
+            orbit_result = render_orbit_video(
+                gs=trainer.gs, deform=trainer.deform,
+                K=K_for_orbit, train_w2c=train_w2c_for_orbit,
+                out_path=orbit_path,
+                width=cfg.train.image_resolution[0],
+                height=cfg.train.image_resolution[1],
+                num_frames=n_orbit, fps=fps_orbit,
+                static_mode=getattr(cfg.train, "static_mode", False),
+                scene_extent=extent, device=device,
+            )
+            report["orbit"] = orbit_result
+
+            # JSON report yaz
+            save_eval_report(report, eval_dir)
+            status["eval"] = (
+                f"PSNR={report.get('held_out_metrics', report.get('temporal_holdout', {})).get('psnr', 'n/a')}, "
+                f"orbit={'ok' if orbit_result.get('success') else 'fail'}"
+            )
+            cb("eval", 1.0, f"NVS eval bitti: {status['eval']}", report)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"⚠ NVS eval failed (non-critical): {e}")
+            status["eval"] = f"failed: {e}"
 
     # Run summary — final metrics, config, PLY stats, phase durations
     try:

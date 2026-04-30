@@ -1,8 +1,10 @@
 """Faz 5 — gsplat rasterizer wrapper.
 
-gsplat 1.x API'si. with_depth=True ise iki ayrı render call yapar
-(RGB + D) çünkü "RGB+D" mode bg channel shape konusunda version-specific
-quirk'lere sahip. İki call biraz daha yavaş ama bulletproof.
+gsplat 1.x API'si. with_depth=True ise tek call'la RGB+ED (expected depth)
+render eder — gsplat internal olarak RGB ve depth'i ayni geometric pass'te
+hesaplar; backgrounds tensor'unu da otomatik genisletir (rendering.py:614-623).
+Iki ayri call yapan eski yol depth ON'unu render maliyetini neredeyse iki
+katina cikariyordu.
 """
 from __future__ import annotations
 import torch
@@ -40,12 +42,13 @@ def render_view(
     if opacities.dim() == 2:
         opacities = opacities.squeeze(-1)
 
-    viewmat = w2c.unsqueeze(0).to(device)        # (1, 4, 4)
-    Ks = K.unsqueeze(0).to(device)               # (1, 3, 3)
+    viewmat = w2c.unsqueeze(0)                              # (1, 4, 4) — assume already on device
+    Ks = K.unsqueeze(0)                                     # (1, 3, 3) — assume already on device
     bg = torch.tensor(bg_color, device=device).unsqueeze(0)  # (1, 3)
 
-    # 1) RGB render
-    rgb, alpha, info = rasterization(
+    mode = "RGB+ED" if with_depth else "RGB"
+
+    out, alpha, info = rasterization(
         means=means,
         quats=quats,
         scales=scales,
@@ -56,37 +59,12 @@ def render_view(
         width=width,
         height=height,
         sh_degree=sh_degree if colors.dim() == 3 else None,
-        backgrounds=bg,
-        render_mode="RGB",
+        backgrounds=bg,                # gsplat extends with 0 for depth chan internally
+        render_mode=mode,
         packed=False,
     )
-    # rgb: (1, H, W, 3), alpha: (1, H, W, 1)
-
-    if not with_depth:
-        return rgb[0], alpha[0], info
-
-    # 2) Depth render (ayrı call, render_mode="ED" = expected depth, 1 kanal)
-    bg_d = torch.zeros(1, 1, device=device)  # 1-kanal bg
-    depth, _, _ = rasterization(
-        means=means,
-        quats=quats,
-        scales=scales,
-        opacities=opacities,
-        colors=colors,
-        viewmats=viewmat,
-        Ks=Ks,
-        width=width,
-        height=height,
-        sh_degree=sh_degree if colors.dim() == 3 else None,
-        backgrounds=bg_d,
-        render_mode="ED",
-        packed=False,
-    )
-    # depth: (1, H, W, 1)
-
-    # Concat RGB + depth → (H, W, 4)
-    combined = torch.cat([rgb[0], depth[0]], dim=-1)
-    return combined, alpha[0], info
+    # out: (1, H, W, 3) for RGB, (1, H, W, 4) for RGB+ED. alpha: (1, H, W, 1)
+    return out[0], alpha[0], info
 
 
 def render_image_uint8(*args, **kwargs) -> np.ndarray:

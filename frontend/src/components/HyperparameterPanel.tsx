@@ -11,7 +11,7 @@
  * Her field "optional override": boş bırakılırsa backend default'u kullanır.
  * Preset (smoke/cloud) seçili ise preset'in yazdığı değer üzerine uygulanır.
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { HyperParams, JobMode } from "../api";
 
 interface Props {
@@ -60,6 +60,7 @@ const GROUPS: GroupSpec[] = [
     fields: [
       { key: "lambda_ssim", label: "λ SSIM", placeholder: "0.2", kind: "number", step: 0.05, help: "0=L1 only, 1=SSIM only" },
       { key: "lambda_scale", label: "λ scale reg", placeholder: "0.005", kind: "number", step: 0.001, help: "ASIMETRIK hinge: sadece scale > 5% × scene_extent olanları cezalandır (outlier-only). Static + Dynamic." },
+      { key: "lambda_depth", label: "λ depth (Metric3D)", placeholder: "0.1", kind: "number", step: 0.05, help: "Scale-invariant L1 between rendered & Metric3D depth. Static modda da kullanilabilir (geometric prior). 0 = depth supervision off." },
     ],
   },
   {
@@ -70,7 +71,6 @@ const GROUPS: GroupSpec[] = [
       { key: "lambda_deform_reg", label: "λ deform L2", placeholder: "0.0003", kind: "number", step: 0.0001, help: "Δpos/Δquat/Δscale mag regularizer." },
       { key: "lambda_smoothness", label: "λ temporal smoothness", placeholder: "0.002", kind: "number", step: 0.001, help: "D(t) vs D(t+dt)." },
       { key: "lambda_rigidity", label: "λ isometric rigidity", placeholder: "0.002", kind: "number", step: 0.001, help: "Local geometry koruma." },
-      { key: "lambda_depth", label: "λ depth (Metric3D)", placeholder: "0.1", kind: "number", step: 0.05, help: "Scale-invariant L1 between rendered & Metric3D depth." },
       { key: "lambda_mask_motion", label: "λ mask-weighted recon", placeholder: "1.0", kind: "number", step: 0.1, help: "Dynamic mask'li bölgelerde reconstruction weight boost." },
       { key: "lambda_track", label: "λ track (CoTracker)", placeholder: "0.1", kind: "number", step: 0.01, help: "CoTracker 3D-anchored track L1." },
       { key: "track_sample_k", label: "Track sample K", placeholder: "256", kind: "number", min: 16, step: 32, help: "Her iter kaç track örneklenir." },
@@ -102,6 +102,7 @@ const GROUPS: GroupSpec[] = [
       { key: "densify_grad_threshold", label: "Densify grad threshold", placeholder: "0.0002", kind: "number", step: 0.0001 },
       { key: "prune_min_opacity", label: "Prune min opacity", placeholder: "0.005", kind: "number", step: 0.001 },
       { key: "prune_max_scale", label: "Prune max scale (fraction)", placeholder: "0.02", kind: "number", step: 0.005, help: "v3.2: scene_extent'in FRACTION'u. Örn scene=70 → 0.02×70=1.4 units cap. Önceden absolute idi, bug'tı" },
+      { key: "max_gaussians", label: "Max gauss (N hard cap)", placeholder: "0 (unlimited)", kind: "number", min: 0, step: 10000, help: "v3.7.2: bu sayıya ulaşınca split+clone DURDURULUR, sadece prune devam. 0 = sınırsız (preset'in kendi cap'i). 200000 onerilir 1080p 8GB için." },
       { key: "opacity_reset_interval", label: "Opacity reset aralığı", placeholder: "0 (kapalı)", kind: "number", min: 0, step: 500, help: "v3.1 default: 0 (KAPALI, density control zaten yapıyor). >0 koyarsan her N iter reset yapar" },
     ],
   },
@@ -148,6 +149,25 @@ const GROUPS: GroupSpec[] = [
     ],
   },
   {
+    title: "v6.1 Quality (mode-shared)",
+    icon: "✨",
+    fields: [
+      { key: "mip_scale_floor_frac", label: "Mip-Splatting scale floor frac", placeholder: "0", kind: "number", step: 0.0005, min: 0, max: 0.01, help: "v6.1 Madde 2-B: 3D scale floor = frac × distance_to_nearest_cam. Anti-aliasing approx. 0.001-0.005 onerilen, 0=off (default). Yakın gauss'larin tek-piksel bozulmasini engeller." },
+      { key: "sh_progressive_schedule", label: "SH progressive schedule (0/1)", placeholder: "1", kind: "number", min: 0, max: 1, step: 1, help: "v6.1 Madde 11: SH degree iter'a gore 0→3 progresif. 1=ON (default), 0=OFF (sabit max degree). PSNR +0.3-0.5 dB." },
+      { key: "init_method", label: "Init method", placeholder: "colmap", kind: "string", help: "v6.1 Madde 3: colmap (default) | dust3r (sparse-view, ~500MB model) | auto (frame<20 ise dust3r)" },
+    ],
+  },
+  {
+    title: "v6.1 Quality (4D only)",
+    icon: "✨",
+    dynamicOnly: true,
+    fields: [
+      { key: "lambda_accel", label: "λ accel (2nd-order smoothness)", placeholder: "0", kind: "number", step: 0.0001, min: 0, max: 0.01, help: "v6.1 Madde 6: D(t-1)-2D(t)+D(t+1) ceza. Slow-motion render titremesini azalt. 1e-4 to 5e-4 onerilen, 0=off." },
+      { key: "cam_grad_clip_norm", label: "Cam refine grad clip", placeholder: "1.0", kind: "number", step: 0.1, min: 0, help: "v6.1 Madde 12: cam_K + cam_w2c grad norm budget. Default 1.0. 0=off. Large-scale scene cam drift'i azalt." },
+      { key: "dynamic_densify_scale", label: "Dynamic densify scale", placeholder: "0.5", kind: "number", step: 0.1, min: 0, max: 2, help: "v6.1 Madde 7: dynamic gauss icin densify_grad_threshold * scale. 0.5 = 2× hassas. 1.0 = no-op. Phase 2.1 split'le birlikte calisir." },
+    ],
+  },
+  {
     title: "Anti-streak (4D only)",
     icon: "★",
     dynamicOnly: true,
@@ -175,19 +195,6 @@ export function HyperparameterPanel({ value, onChange, mode = "dynamic", preset 
       else next.add(title);
       return next;
     });
-  };
-
-  const updateField = (key: keyof HyperParams, raw: string, kind: "number" | "string") => {
-    const next = { ...value };
-    if (raw === "") {
-      next[key] = null;
-    } else if (kind === "number") {
-      const n = parseFloat(raw);
-      next[key] = Number.isFinite(n) ? (n as any) : null;
-    } else {
-      next[key] = raw as any;
-    }
-    onChange(next);
   };
 
   const overrideCount = Object.values(value).filter(
@@ -230,30 +237,89 @@ export function HyperparameterPanel({ value, onChange, mode = "dynamic", preset 
             </button>
             {isOpen && (
               <div className="hparam-fields">
-                {g.fields.map((f) => {
-                  const v = value[f.key];
-                  return (
-                    <label key={f.key} className="hparam-field">
-                      <span className="hparam-label" title={f.help}>
-                        {f.label}
-                      </span>
-                      <input
-                        type={f.kind === "number" ? "number" : "text"}
-                        placeholder={f.placeholder}
-                        value={v === null || v === undefined ? "" : String(v)}
-                        min={f.min}
-                        max={f.max}
-                        step={f.step}
-                        onChange={(e) => updateField(f.key, e.target.value, f.kind)}
-                      />
-                    </label>
-                  );
-                })}
+                {g.fields.map((f) => (
+                  <NumberOrTextField
+                    key={f.key}
+                    spec={f}
+                    value={value[f.key] as any}
+                    onChange={(val) => onChange({ ...value, [f.key]: val })}
+                  />
+                ))}
               </div>
             )}
           </div>
         );
       })}
     </div>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// NumberOrTextField — locale-safe input (text + decimal mode)
+// HTML5 number input Turkce Windows'ta nokta-decimal'i ("0.001") reddediyor.
+// Local raw text buffer ile yarim sayilarin (0., 0.0, 0.00) korunmasini saglar.
+// ---------------------------------------------------------------------------
+function NumberOrTextField({
+  spec,
+  value,
+  onChange,
+}: {
+  spec: FieldSpec;
+  value: number | string | null | undefined;
+  onChange: (val: number | string | null) => void;
+}) {
+  const isNum = spec.kind === "number";
+  // Local raw text buffer — controlled input ama yarim sayilar kayboldurmasin
+  const [raw, setRaw] = useState<string>(
+    value === null || value === undefined ? "" : String(value),
+  );
+  // Dis prop value degistiginde raw'i senkronize et (preset secimi vs.)
+  useEffect(() => {
+    const ext = value === null || value === undefined ? "" : String(value);
+    // Sadece kullanici-girisi olmayan dis degisikliklerde set et:
+    // raw'in parse'i value ile eslesiyorsa zaten senkron; aksi halde override.
+    const parsed = isNum ? parseFloat(raw.replace(",", ".")) : NaN;
+    const sameAsValue =
+      (raw === "" && (value === null || value === undefined)) ||
+      (isNum && Number.isFinite(parsed) && parsed === value) ||
+      (!isNum && raw === value);
+    if (!sameAsValue) setRaw(ext);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value]);
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const r = e.target.value;
+    setRaw(r);  // Her zaman ham metni koru
+    if (r === "") {
+      onChange(null);
+      return;
+    }
+    if (isNum) {
+      const normalized = r.replace(",", ".").trim();
+      if (normalized === "-" || normalized === "." || normalized === "-.") {
+        // Yarim sayi — parent value degistirme, kullanici devam ediyor
+        return;
+      }
+      const n = parseFloat(normalized);
+      if (Number.isFinite(n)) onChange(n);
+    } else {
+      onChange(r);
+    }
+  };
+
+  return (
+    <label className="hparam-field">
+      <span className="hparam-label" title={spec.help}>
+        {spec.label}
+      </span>
+      <input
+        type="text"
+        inputMode={isNum ? "decimal" : "text"}
+        placeholder={spec.placeholder}
+        value={raw}
+        onChange={handleChange}
+      />
+    </label>
   );
 }

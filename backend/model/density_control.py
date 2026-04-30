@@ -56,8 +56,26 @@ class DensityController:
         self._n_obs += (grad_norm > 1e-12).float()
 
     @torch.no_grad()
-    def step(self, gs: GaussianModel) -> dict:
-        """Clone + split + prune. İstatistikleri döner."""
+    def step(
+        self,
+        gs: GaussianModel,
+        optimizer=None,
+        dynamic_densify_scale: float = 1.0,
+    ) -> dict:
+        """Clone + split + prune. İstatistikleri döner.
+
+        Args:
+          gs: GaussianModel
+          optimizer: torch.optim.Adam (or compatible). T4 perf fix — optimizer
+            geçirilirse Adam exp_avg / exp_avg_sq state'i parametre mutation'ı
+            ile lockstep gunceleneceği için her density step'te momentum
+            kaybolmaz. Geriye dönük uyum: None geçilirse legacy code path
+            (her gauss param'i fresh nn.Parameter, optimizer state baska yerde
+            yeniden kurulmali — eski trainer._build_optimizer() davranisi).
+          dynamic_densify_scale: 4D Quality v6.1 Madde 7 — dynamic flag'i set
+            olan gauss'lar icin grad_threshold * scale (genelde 0.5 = 2x hassas).
+            1.0 = no-op. gs.is_dynamic buffer'i Phase 2.1 ile set edilir.
+        """
         stats = {"cloned": 0, "split": 0, "pruned": 0, "before": gs.num_points}
 
         if self._grad_accum is not None and self._n_obs is not None:
@@ -69,7 +87,24 @@ class DensityController:
             min_obs = 3.0
             seen_enough = self._n_obs >= min_obs
 
-            high_grad = (avg_grad > self.grad_threshold) & seen_enough
+            # 4D Quality v6.1 — Madde 7: Adaptive densify dynamic regions
+            # Dynamic gauss'lar icin grad_threshold * dynamic_densify_scale.
+            # 0.5 = %50 hassas (2x daha kolay densify) → motion-rich bolgelere
+            # daha cok detail. Static gauss'lar default threshold.
+            grad_thr_per_gauss = torch.full_like(avg_grad, self.grad_threshold)
+            if (dynamic_densify_scale != 1.0
+                    and hasattr(gs, "is_dynamic")
+                    and gs.is_dynamic is not None
+                    and gs.is_dynamic.numel() == avg_grad.numel()):
+                dyn_mask = gs.is_dynamic.to(avg_grad.device)
+                grad_thr_per_gauss = torch.where(
+                    dyn_mask,
+                    torch.full_like(grad_thr_per_gauss,
+                                    self.grad_threshold * dynamic_densify_scale),
+                    grad_thr_per_gauss,
+                )
+
+            high_grad = (avg_grad > grad_thr_per_gauss) & seen_enough
             scale_max = gs.get_scales.max(dim=-1).values
             small = scale_max <= self.scale_split_threshold
             large = scale_max > self.scale_split_threshold
@@ -86,7 +121,7 @@ class DensityController:
             # Clone: aynı parametrelerle kopyala
             n_cloned = int(clone_mask.sum().item())
             if n_cloned > 0:
-                gs.append_gaussians(
+                clone_kwargs = dict(
                     new_means     = gs.means[clone_mask].clone(),
                     new_scales    = gs.scales[clone_mask].clone(),
                     new_quats     = gs.quats[clone_mask].clone(),
@@ -94,6 +129,10 @@ class DensityController:
                     new_sh_dc     = gs.sh_dc[clone_mask].clone(),
                     new_sh_rest   = gs.sh_rest[clone_mask].clone(),
                 )
+                if optimizer is not None:
+                    gs._append_keep_optimizer(optimizer, **clone_kwargs)
+                else:
+                    gs.append_gaussians(**clone_kwargs)
                 stats["cloned"] = n_cloned
 
             # Split: aynı bölgede biraz kaymış 2 yeni Gaussian, scale küçült
@@ -120,13 +159,28 @@ class DensityController:
                 current_n = gs.num_points
                 keep = torch.ones(current_n, dtype=torch.bool, device=gs.means.device)
                 keep[idx] = False
-                gs._apply_mask(keep)
-                gs.append_gaussians(new_means, new_scales, new_quats,
-                                    new_opacities, new_sh_dc, new_sh_rest)
+                if optimizer is not None:
+                    gs._apply_mask_keep_optimizer(keep, optimizer)
+                    gs._append_keep_optimizer(
+                        optimizer,
+                        new_means, new_scales, new_quats,
+                        new_opacities, new_sh_dc, new_sh_rest,
+                    )
+                else:
+                    gs._apply_mask(keep)
+                    gs.append_gaussians(
+                        new_means, new_scales, new_quats,
+                        new_opacities, new_sh_dc, new_sh_rest,
+                    )
                 stats["split"] = n_split
 
         # Prune
-        n_pruned = gs.prune_gaussians(self.min_opacity, self.max_scale)
+        if optimizer is not None:
+            n_pruned = gs.prune_gaussians_keep_optimizer(
+                optimizer, self.min_opacity, self.max_scale,
+            )
+        else:
+            n_pruned = gs.prune_gaussians(self.min_opacity, self.max_scale)
         stats["pruned"] = n_pruned
         stats["after"] = gs.num_points
 

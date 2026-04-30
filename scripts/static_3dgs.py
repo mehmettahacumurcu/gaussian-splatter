@@ -65,6 +65,9 @@ PRESETS: dict[str, dict] = {
         "opacity_reset_interval": 0,
         "lambda_ssim": 0.2,
         "lambda_lpips": 0.0,
+        # Static depth supervision — Metric3D-aligned mono depth
+        "lambda_depth": 0.05,
+        "metric3d_model": "metric3d_vit_small",
         "lambda_aniso": 5e-3,
         "aniso_threshold": 5.0,
         "fps": 10,
@@ -90,6 +93,8 @@ PRESETS: dict[str, dict] = {
         "lambda_lpips": 0.05,
         "lpips_net": "vgg",
         "lpips_warmup_iters": 1_000,
+        "lambda_depth": 0.10,
+        "metric3d_model": "metric3d_vit_small",
         "lambda_aniso": 5e-3,
         "aniso_threshold": 5.0,
         "fps": 15,
@@ -115,6 +120,8 @@ PRESETS: dict[str, dict] = {
         "lambda_lpips": 0.10,
         "lpips_net": "vgg",
         "lpips_warmup_iters": 2_000,
+        "lambda_depth": 0.10,
+        "metric3d_model": "metric3d_vit_large",
         "lambda_aniso": 1e-2,
         "aniso_threshold": 4.0,
         "fps": 20,
@@ -140,6 +147,8 @@ PRESETS: dict[str, dict] = {
         "lambda_lpips": 0.15,
         "lpips_net": "vgg",
         "lpips_warmup_iters": 3_000,
+        "lambda_depth": 0.15,
+        "metric3d_model": "metric3d_vit_large",
         "lambda_aniso": 1e-2,
         "aniso_threshold": 3.5,
         "fps": 30,
@@ -182,8 +191,12 @@ def _apply_preset(cfg, preset_name: str) -> None:
     cfg.train.lambda_aniso = p["lambda_aniso"]
     cfg.train.aniso_threshold = p["aniso_threshold"]
 
-    # Static modda 4D-only loss'lar 0'lanmali
-    cfg.train.lambda_depth = 0.0
+    # Static depth supervision (Metric3D + COLMAP scale alignment)
+    cfg.train.lambda_depth = p.get("lambda_depth", 0.0)
+    if "metric3d_model" in p:
+        cfg.foundation.metric3d_model = p["metric3d_model"]
+
+    # 4D-only loss'lar 0'lanmali (motion regs / track / mask / flow)
     cfg.train.lambda_mask_motion = 0.0
     cfg.train.lambda_track = 0.0
     cfg.train.lambda_flow = 0.0

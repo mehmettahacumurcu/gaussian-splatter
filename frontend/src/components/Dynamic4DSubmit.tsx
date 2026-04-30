@@ -88,6 +88,8 @@ export function Dynamic4DSubmit({ onJobSubmitted }: Props) {
   const [scene, setScene] = useState("");
   const [preset, setPreset] = useState<DynamicPreset>("smoke");
   const [skipFoundation, setSkipFoundation] = useState(false);
+  // v6.1 — NVS evaluation
+  const [nvsEval, setNvsEval] = useState(true);
   const [hyperparams, setHyperparams] = useState<HyperParams>({});
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -121,6 +123,7 @@ export function Dynamic4DSubmit({ onJobSubmitted }: Props) {
         mode: "dynamic",
         preset,
         skip_foundation: skipFoundation,
+        nvs_eval: nvsEval,
         hyperparams,
       });
       onJobSubmitted(res, scene.trim());
@@ -216,6 +219,17 @@ export function Dynamic4DSubmit({ onJobSubmitted }: Props) {
           Foundation modelleri atla (Metric3D / CoTracker / Farneback / RAFT)
           <span className="submit-hint-inline">
             — micro/smoke preset'leri icin onerilir
+          </span>
+        </label>
+        <label className="submit-checkbox" style={{ marginTop: 6 }}>
+          <input
+            type="checkbox"
+            checked={nvsEval}
+            onChange={(e) => setNvsEval(e.target.checked)}
+          />
+          NVS Evaluation — onerilir
+          <span className="submit-hint-inline">
+            — training sonrasi held-out PSNR/SSIM/LPIPS + orbit mp4. Eval tab'da gorulur.
           </span>
         </label>
       </div>
