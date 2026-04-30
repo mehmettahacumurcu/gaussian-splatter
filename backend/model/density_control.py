@@ -36,7 +36,15 @@ class DensityController:
         self._n_obs = torch.zeros(num_points, device=device)
 
     def accumulate(self, gs: GaussianModel) -> None:
-        """Bir backward'dan sonra çağır — pozisyon gradyanını biriktir."""
+        """Bir backward'dan sonra çağır — pozisyon gradyanını biriktir.
+
+        v5.0 FIX (multi-view bug): n_obs'u SADECE gradient ALAN gaussian'lar
+        icin artir. Eskiden her iter +1 ekliyordu, ama multi-view'da her iter
+        sadece 1 kamera goruluyor → ~%95 gaussian o iter gradient ALMIYOR.
+        Bu yuzden avg_grad = sum_grad / total_iter → 20x kucuk → clone hic
+        tetiklenmiyor → N surekli azaliyor. Single-view'da grad_norm her
+        gaussian icin > 0 (hepsi her iter goruluyor) → davranis ayni kalir.
+        """
         if gs.means.grad is None:
             return
         if self._grad_accum is None or len(self._grad_accum) != gs.num_points:
@@ -44,7 +52,8 @@ class DensityController:
 
         grad_norm = gs.means.grad.norm(dim=-1)
         self._grad_accum += grad_norm
-        self._n_obs += 1
+        # Visibility-aware obs count: gradient gelmediyse n_obs artmaz.
+        self._n_obs += (grad_norm > 1e-12).float()
 
     @torch.no_grad()
     def step(self, gs: GaussianModel) -> dict:
@@ -55,7 +64,12 @@ class DensityController:
             obs = self._n_obs.clamp(min=1)
             avg_grad = self._grad_accum / obs
 
-            high_grad = avg_grad > self.grad_threshold
+            # v5.0: Multi-view'da bir gaussian 1-2 kez gorunup buyuk gradient
+            # alabilir → spurious clone'u onlemek icin min_obs gate.
+            min_obs = 3.0
+            seen_enough = self._n_obs >= min_obs
+
+            high_grad = (avg_grad > self.grad_threshold) & seen_enough
             scale_max = gs.get_scales.max(dim=-1).values
             small = scale_max <= self.scale_split_threshold
             large = scale_max > self.scale_split_threshold

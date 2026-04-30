@@ -42,5 +42,8 @@ einops>=0.7.0
 timm>=0.9.0
 huggingface-hub>=0.22.0
 
+# Phase 1.6 — LPIPS perceptual loss (~24-110 MB pretrained AlexNet/VGG download)
+lpips>=0.1.4
+
 # Geliştirme
 pyyaml>=6.0.1

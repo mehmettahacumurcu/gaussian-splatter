@@ -95,15 +95,19 @@ def health() -> HealthResponse:
 # ---------------------------------------------------------------------------
 @app.post("/process", response_model=ProcessResponse, status_code=202, tags=["jobs"])
 async def process_video(
-    video: UploadFile = File(..., description="Girdi video dosyası (mp4/mov)"),
+    video: UploadFile | None = File(None, description="Girdi video dosyası (mp4/mov). Static modda OPSIYONEL — sahne klasoründe images/ varsa video gerekmez."),
     scene: str = Form("unnamed_scene", description="Sahne ismi — data/<scene>/ altında çalışılır"),
-    smoke_test: bool = Form(False, description="True: hızlı preset (500 iter, 480x270, 10 ts)"),
-    micro_test: bool = Form(False, description="True: ULTRA hızlı preset (200 iter, 320x180, 5 ts, fps=2, no foundation) — dev iteration için, cache'li scene'de ~30 sn"),
-    cloud: bool = Form(False, description="True: cloud_config (1920x1080, 60k iter)"),
-    high_test: bool = Form(False, description="True: 3-4 saat HIGH preset (50k iter, 640x360, HexPlane 96/48, MLP 512/4, Fourier K=10, density_end=35k, 90 ts, N cap 60k)"),
-    ultra_test: bool = Form(False, description="True: 6-9 saat ULTRA preset (80k iter, 720x405, HexPlane 112/56, MLP 640/4, Fourier K=12, density_end=50k, 90 ts, N cap 80k)"),
-    ultra_clean: bool = Form(False, description="True: 7-9 saat ULTRA CLEAN preset (v3.8 anti-streak: aniso reg + sıkı dpos clamp + rigid 5× + fourier_reg 10× + density_end 30k + sh_degree 2). Banana_demo bulanıklık fix'i."),
-    static_max: bool = Form(False, description="True: STATIC MAX preset (v3.9). Tum preprocessing iyilestirmeleri: fps=20, metric3d_vit_large, COLMAP exhaustive, confidence init subsample, resolution=720x405, sh_degree=3. Ultra Clean fix'leri + max input quality."),
+    # v6.0 — Mode + preset (single source of truth)
+    mode: str = Form("dynamic", description="'static' (Static 3DGS) | 'dynamic' (4D, default)"),
+    preset: str | None = Form(None, description="Mode'a göre preset adı. Static: fast/balanced/high/premium. Dynamic: micro/smoke/full/high/cloud/ultra/ultra_clean/static_max."),
+    # Legacy boolean preset flag'leri (geriye uyumluluk — yeni clientlar mode+preset gönderir)
+    smoke_test: bool = Form(False, description="[LEGACY] use mode='dynamic' + preset='smoke'"),
+    micro_test: bool = Form(False, description="[LEGACY] use mode='dynamic' + preset='micro'"),
+    cloud: bool = Form(False, description="[LEGACY] use mode='dynamic' + preset='cloud'"),
+    high_test: bool = Form(False, description="[LEGACY] use mode='dynamic' + preset='high'"),
+    ultra_test: bool = Form(False, description="[LEGACY] use mode='dynamic' + preset='ultra'"),
+    ultra_clean: bool = Form(False, description="[LEGACY] use mode='dynamic' + preset='ultra_clean'"),
+    static_max: bool = Form(False, description="[LEGACY] use mode='dynamic' + preset='static_max'"),
     skip_foundation: bool = Form(True, description="Foundation modelleri atla"),
     # --- Override parametreleri (preset üzerine uygulanır) ---
     # Temel training
@@ -157,27 +161,89 @@ async def process_video(
     resize_long_edge: int | None = Form(None, description="Frame extract long edge px (default 960)"),
     colmap_matching: str | None = Form(None, description="sequential | exhaustive (default sequential)"),
     init_subsample_mode: str | None = Form(None, description="random | confidence (default random)"),
+    # v5.0 — Multi-view bootstrap COLMAP
+    colmap_mv_timestamps: int | None = Form(None, description="Multi-view bootstrap COLMAP: kac timestep (1, 5, 10, 25). Default 5."),
+    colmap_mv_dense_mvs: bool | None = Form(None, description="Multi-view: MVS dense reconstruction (premium, +30-90 dk, 500k-2M dense point)"),
+    # Phase 1.1 — Cache infrastructure
+    force_preprocess: bool = Form(False, description="True: tum cache'leri yoksay, preprocessing baştan kosulsun (frames/COLMAP/depth/tracks/masks). Default False — heavy preprocess once, train many times."),
 ) -> ProcessResponse:
     """
     Video'yu upload et ve pipeline'ı kuyruğa al.
 
     Response: 202 Accepted + job_id. İlerleme için /status/{job_id}'yi poll et.
+
+    v6.0: mode + preset alanlari (single source of truth). Eski boolean flag'ler
+    hala desteklenir (legacy clientlar) ama yeni client'lar sadece mode+preset
+    gondermeli.
     """
     # Sahne adı sanitize — path traversal engelle
     safe_scene = _safe_scene_name(scene)
-
-    # Video'yu diske yaz
     paths = scene_paths(safe_scene)
     paths["base"].mkdir(parents=True, exist_ok=True)
-    video_path = paths["base"] / "video.mp4"
 
-    # Chunked write (büyük dosya support)
-    try:
-        with open(video_path, "wb") as f:
-            while chunk := await video.read(1024 * 1024):  # 1 MB
-                f.write(chunk)
-    except Exception as e:
-        raise HTTPException(500, f"Video yazılamadı: {e}")
+    # ---- v6.0 mode + preset → legacy boolean translation ----
+    # Eski boolean flag'leri override eder. Mode='static' verilirse
+    # static_mode_active True yapilir, alt presetlerle birlikte islenir.
+    mode_norm = (mode or "dynamic").strip().lower()
+    if mode_norm not in ("static", "dynamic"):
+        raise HTTPException(400, f"mode '{mode}' invalid — use 'static' or 'dynamic'")
+    static_mode_active = (mode_norm == "static")
+    if preset:
+        preset_lc = preset.strip().lower()
+        if static_mode_active:
+            valid_static = {"fast", "balanced", "high", "premium"}
+            if preset_lc not in valid_static:
+                raise HTTPException(400, f"static preset '{preset}' invalid — use one of {sorted(valid_static)}")
+            # Static preset'leri legacy boolean'a translate ETMIYORUZ;
+            # asagida static-only preset uygulayicisi ile islenir.
+        else:
+            # Dynamic mode — preset string'i legacy boolean'a cevir
+            mapping = {
+                "micro": "micro_test",
+                "smoke": "smoke_test",
+                "full": None,  # default config, ek flag yok
+                "high": "high_test",
+                "cloud": "cloud",
+                "ultra": "ultra_test",
+                "ultra_clean": "ultra_clean",
+                "static_max": "static_max",
+            }
+            if preset_lc not in mapping:
+                raise HTTPException(400, f"dynamic preset '{preset}' invalid — use one of {sorted(mapping.keys())}")
+            target = mapping[preset_lc]
+            # Tum legacy flag'leri False'a cek, sadece target'i True
+            smoke_test = (target == "smoke_test")
+            micro_test = (target == "micro_test")
+            high_test = (target == "high_test")
+            ultra_test = (target == "ultra_test")
+            ultra_clean = (target == "ultra_clean")
+            static_max = (target == "static_max")
+            cloud = (target == "cloud")
+
+    # ---- Video upload ----
+    video_path = paths["base"] / "video.mp4"
+    if video is not None and video.filename:
+        # Chunked write (büyük dosya support)
+        try:
+            with open(video_path, "wb") as f:
+                while chunk := await video.read(1024 * 1024):  # 1 MB
+                    f.write(chunk)
+        except Exception as e:
+            raise HTTPException(500, f"Video yazılamadı: {e}")
+    else:
+        # Static mode + photo set / pre-loaded scene durumu — video gerekmez,
+        # ama sahne klasorunde frames/ veya images/ olmali.
+        if not static_mode_active:
+            raise HTTPException(400, "Dynamic mode'da video upload zorunludur")
+        has_images = (paths["base"] / "images").exists()
+        has_frames = paths["frames"].exists() and any(paths["frames"].glob("frame_*.png"))
+        has_video = video_path.exists()
+        if not (has_images or has_frames or has_video):
+            raise HTTPException(
+                400,
+                f"Static mode'da video yok ve {paths['base']}/ altinda images/, frames/ veya video.mp4 hiçbiri bulunamadı. "
+                f"Photo set kullaniyorsan: data/{safe_scene}/images/IMG_*.jpg klasorunu hazirla."
+            )
 
     # Job kaydını oluştur
     manager: JobManager = app.state.manager
@@ -186,6 +252,73 @@ async def process_video(
     # Runner kapanı — pipeline.run_pipeline'ı callback'le çağırır
     def _runner(on_progress: Any) -> dict:
         cfg = cloud_config() if cloud else default_config()
+
+        # ---- v6.0 Static 3DGS preset uygulayicisi ----
+        # mode='static' verildiyse Static 3DGS preset'leri kosulur, sonra
+        # dynamic preset blok'lari (smoke_test/...) atlanir.
+        if static_mode_active:
+            from scripts.static_3dgs import _apply_preset as _apply_static_preset
+            preset_name = (preset or "balanced").strip().lower()
+            if preset_name not in ("fast", "balanced", "high", "premium"):
+                preset_name = "balanced"
+            _apply_static_preset(cfg, preset_name)
+            print(f"[api.static] preset={preset_name}, static_mode={cfg.train.static_mode}, "
+                  f"n_iters={cfg.train.n_iters}, max_gauss={cfg.train.max_gaussians}")
+            # Static modda foundation otomatik atlanir, ancak skip_foundation flag'i
+            # dogrudan run_pipeline'a gecirilir. Pipeline'da zaten static_mode=True
+            # ise foundation skip + 4D lambda zero-out yapiliyor, double safety.
+            effective_skip_foundation = True
+
+            # Apply user hyperparam overrides on top of static preset
+            # (en azindan training-shared olanlari; preset-specific olanlar
+            # static-friendly olmaya zorlanir).
+            if iters is not None:
+                cfg.train.n_iters = iters
+            if resolution:
+                try:
+                    w_str, h_str = resolution.lower().split("x")
+                    cfg.train.image_resolution = (int(w_str), int(h_str))
+                except ValueError as e:
+                    raise HTTPException(400, f"resolution formati: WxH ({e})")
+            if num_timestamps is not None:
+                cfg.export.num_timestamps = max(1, num_timestamps)
+            if lambda_ssim is not None:
+                cfg.train.lambda_ssim = lambda_ssim
+            if lambda_scale is not None:
+                cfg.train.lambda_scale = lambda_scale
+            if sh_degree is not None:
+                cfg.model.sh_degree = sh_degree
+            if density_start_iter is not None:
+                cfg.train.density_start_iter = density_start_iter
+            if density_end_iter is not None:
+                cfg.train.density_end_iter = density_end_iter
+            if densify_grad_threshold is not None:
+                cfg.train.densify_grad_threshold = densify_grad_threshold
+            if prune_min_opacity is not None:
+                cfg.train.prune_min_opacity = prune_min_opacity
+            if prune_max_scale is not None:
+                cfg.train.prune_max_scale = prune_max_scale
+            if resize_long_edge is not None:
+                cfg.preprocess.resize_long_edge = resize_long_edge
+            if colmap_matching is not None:
+                if colmap_matching not in ("sequential", "exhaustive"):
+                    raise HTTPException(400, f"colmap_matching invalid: {colmap_matching}")
+                cfg.preprocess.colmap_matching = colmap_matching
+            if init_subsample_mode is not None:
+                if init_subsample_mode not in ("random", "confidence"):
+                    raise HTTPException(400, f"init_subsample_mode invalid: {init_subsample_mode}")
+                cfg.preprocess.init_subsample_mode = init_subsample_mode
+
+            return run_pipeline(
+                str(video_path),
+                safe_scene,
+                cfg,
+                skip_foundation=effective_skip_foundation,
+                progress_callback=on_progress,
+                force_preprocess=force_preprocess,
+            )
+
+        # ---- Dynamic mode (legacy path) ----
         if smoke_test:
             cfg.train.n_iters = 500
             cfg.train.image_resolution = (480, 270)
@@ -502,6 +635,12 @@ async def process_video(
             if init_subsample_mode not in ("random", "confidence"):
                 raise HTTPException(400, f"init_subsample_mode: random | confidence ({init_subsample_mode})")
             cfg.preprocess.init_subsample_mode = init_subsample_mode
+        if colmap_mv_timestamps is not None:
+            if colmap_mv_timestamps < 1 or colmap_mv_timestamps > 50:
+                raise HTTPException(400, f"colmap_mv_timestamps: 1-50 ({colmap_mv_timestamps})")
+            cfg.preprocess.colmap_mv_timestamps = int(colmap_mv_timestamps)
+        if colmap_mv_dense_mvs is not None:
+            cfg.preprocess.colmap_mv_dense_mvs = bool(colmap_mv_dense_mvs)
 
         return run_pipeline(
             str(video_path),
@@ -509,6 +648,7 @@ async def process_video(
             cfg,
             skip_foundation=effective_skip_foundation,
             progress_callback=on_progress,
+            force_preprocess=force_preprocess,
         )
 
     manager.submit(job.id, _runner)

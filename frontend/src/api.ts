@@ -116,15 +116,33 @@ export interface HyperParams {
   init_subsample_mode?: string | null;    // "random" | "confidence"
 }
 
+/**
+ * Pipeline mode — Static 3DGS (foto/sparse-view) vs 4D Dynamic (video).
+ * v6.0 frontend cleanup: tek alan, eski boolean preset flag'leri yerine
+ * mode + preset string ile gönderim.
+ */
+export type JobMode = "static" | "dynamic";
+
+/** Static 3DGS preset'leri — scripts/static_3dgs.py PRESETS ile birebir. */
+export type StaticPreset = "fast" | "balanced" | "high" | "premium";
+
+/** 4D Dynamic preset'leri — backend api.py'deki mevcut preset'ler. */
+export type DynamicPreset =
+  | "micro"
+  | "smoke"
+  | "full"
+  | "high"
+  | "cloud"
+  | "ultra"
+  | "ultra_clean"
+  | "static_max"; // legacy 4D static-leaning preset, deprecated → "premium" 3D static öneririz
+
 export interface SubmitJobOptions {
   scene: string;
-  smoke_test?: boolean;
-  micro_test?: boolean;
-  cloud?: boolean;
-  high_test?: boolean;
-  ultra_test?: boolean;
-  ultra_clean?: boolean;
-  static_max?: boolean;
+  /** v6.0: zorunlu — backend bu alana göre static_mode set eder. */
+  mode: JobMode;
+  /** v6.0: mode'a uygun preset string. Backend tanımıyorsa default'a düşer. */
+  preset: string;
   skip_foundation?: boolean;
   hyperparams?: HyperParams;
 }
@@ -221,26 +239,17 @@ export function frameUrl(identifier: string, idx: number): string {
  * Backend FormData bekler (multipart upload).
  */
 export async function submitJob(
-  videoFile: File,
+  videoFile: File | null,
   options: SubmitJobOptions,
 ): Promise<ProcessResponse> {
   const fd = new FormData();
-  fd.append("video", videoFile);
+  // Static modda video opsiyonel (photo set scenario). Backend kendi tarafinda
+  // sahne klasorunde images/ varsa video.mp4 yoksa hata firlatmiyor.
+  if (videoFile) fd.append("video", videoFile);
   fd.append("scene", options.scene);
-  if (options.smoke_test !== undefined)
-    fd.append("smoke_test", String(options.smoke_test));
-  if (options.micro_test !== undefined)
-    fd.append("micro_test", String(options.micro_test));
-  if (options.cloud !== undefined)
-    fd.append("cloud", String(options.cloud));
-  if (options.high_test !== undefined)
-    fd.append("high_test", String(options.high_test));
-  if (options.ultra_test !== undefined)
-    fd.append("ultra_test", String(options.ultra_test));
-  if (options.ultra_clean !== undefined)
-    fd.append("ultra_clean", String(options.ultra_clean));
-  if (options.static_max !== undefined)
-    fd.append("static_max", String(options.static_max));
+  // v6.0: mode + preset (single source of truth)
+  fd.append("mode", options.mode);
+  fd.append("preset", options.preset);
   if (options.skip_foundation !== undefined)
     fd.append("skip_foundation", String(options.skip_foundation));
 

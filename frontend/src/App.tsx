@@ -22,6 +22,7 @@ import {
   listDiskScenes,
   type HealthResponse,
   type Job,
+  type JobMode,
   type SceneListItem,
   type SplatInfo,
 } from "./api";
@@ -56,6 +57,20 @@ function formatTime(ts: number): string {
 
 function App() {
   const [tab, setTab] = useState<Tab>("submit");
+  // v6.0 — Pipeline mode (Static 3D / 4D Dynamic). Submit panel mode'a göre
+  // alt component render eder. localStorage'a hatirlatir, refresh'te kalır.
+  const [mode, setMode] = useState<JobMode>(() => {
+    try {
+      const saved = window.localStorage.getItem("4dgs.mode");
+      return saved === "static" || saved === "dynamic" ? saved : "dynamic";
+    } catch {
+      return "dynamic";
+    }
+  });
+  const handleModeChange = useCallback((m: JobMode) => {
+    setMode(m);
+    try { window.localStorage.setItem("4dgs.mode", m); } catch { /* ignore */ }
+  }, []);
   const [health, setHealth] = useState<HealthResponse | null>(null);
 
   // Viewer state
@@ -209,7 +224,11 @@ function App() {
       {/* İçerik */}
       <main className="app-content">
         {tab === "submit" && (
-          <JobSubmitPanel onJobSubmitted={handleJobSubmitted} />
+          <JobSubmitPanel
+            mode={mode}
+            onModeChange={handleModeChange}
+            onJobSubmitted={handleJobSubmitted}
+          />
         )}
 
         {tab === "jobs" && (

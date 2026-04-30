@@ -18,10 +18,16 @@ DATA_ROOT = PROJECT_ROOT / "data"
 
 
 def scene_paths(scene_name: str) -> dict[str, Path]:
-    """Bir sahne için standart klasör yapısı döndür."""
+    """Bir sahne için standart klasör yapısı döndür.
+
+    v5.0: Multi-view path'leri eklendi (yeni, opsiyonel).
+    Auto-detection: pipeline 'videos/' klasörü varsa multi-view mode kullanır.
+    'video.mp4' tek dosya varsa single-view (eski davranış).
+    """
     base = DATA_ROOT / scene_name
     return {
         "base":    base,
+        # Single-view (mevcut, backward-compat)
         "video":   base / "video.mp4",
         "frames":  base / "frames",
         "colmap":  base / "colmap",
@@ -29,7 +35,87 @@ def scene_paths(scene_name: str) -> dict[str, Path]:
         "tracks":  base / "tracks",
         "masks":   base / "masks",
         "output":  base / "output",
+        # v5.0 — Multi-view (yeni, opsiyonel)
+        "videos_mv":           base / "videos",            # cam00.mp4, cam01.mp4, ...
+        "frames_mv":           base / "frames_multiview",  # frames_multiview/cam00/frame_0000.png
+        "colmap_mv":           base / "colmap_multiview",  # multi-cam reconstruction
+        "depth_mv":            base / "depth_multiview",   # depth_multiview/cam00/...
+        "masks_mv":            base / "masks_multiview",
+        "flow":                base / "flow",              # Phase 1.8 — single-view forward flow
+        "flow_mv":             base / "flow_multiview",    # Phase 1.8 — per-cam forward flow
+        "poses_bounds":        base / "poses_bounds.npy",  # N3V format (opsiyonel)
+        "calibration":         base / "calibration.json",  # custom multi-cam intrinsics (opsiyonel)
     }
+
+
+def is_multiview_scene(scene_name: str) -> bool:
+    """v5.0: Sahnenin multi-view mode'da olup olmadığını tespit et.
+
+    Heuristic: 'videos/' klasörü VAR ve içinde >=2 video dosyası varsa multi-view.
+    Aksi halde single-view (mevcut 'video.mp4' veya 'frames/' kullanır).
+    """
+    paths = scene_paths(scene_name)
+    videos_mv = paths["videos_mv"]
+    if not videos_mv.exists() or not videos_mv.is_dir():
+        return False
+    # Windows NTFS case-insensitive: glob("*.mp4") ve glob("*.MP4") ayni dosyalari
+    # iki kez yakalayabilir → set ile dedupe.
+    video_files = set(videos_mv.glob("cam*.mp4")) | set(videos_mv.glob("cam*.MP4"))
+    return len(video_files) >= 2
+
+
+def is_static_scene(scene_name: str) -> bool:
+    """Static 3DGS — Faz 1: photo-set / sparse-view sahnesini tespit et.
+
+    Heuristic (oncelik sirasi):
+      1. data/<scene>/static.flag → varsa True (manuel override).
+      2. data/<scene>/images/ klasoru var ve >=3 jpg/png/exr varsa True
+         (klasik 3DGS / NeRF Synthetic / Tanks & Temples / Mip-NeRF360 yapisi).
+      3. data/<scene>/video.mp4 yok, frames/ yok ama colmap/ var → True.
+         (kullanici sadece COLMAP klasoru sagladiysa fotograf seti demektir).
+      4. Yukaridakilerin hicbiri yoksa False (4D dynamic veya video pipeline'i).
+
+    Bu helper sadece tespit eder; cfg.train.static_mode'u set ETMEZ. Ust katman
+    (CLI / pipeline / preset script) bu sonuca gore kararini verir.
+    """
+    paths = scene_paths(scene_name)
+    base = paths["base"]
+    if not base.exists():
+        return False
+    # 1) Manuel flag
+    if (base / "static.flag").exists():
+        return True
+    # 2) images/ klasoru (klasik 3DGS yapisi)
+    images_dir = base / "images"
+    if images_dir.exists() and images_dir.is_dir():
+        n_imgs = 0
+        for ext in (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"):
+            n_imgs += len(list(images_dir.glob(f"*{ext}")))
+            if n_imgs >= 3:
+                return True
+    # 3) Sadece colmap/ var, video/frames yok
+    has_video = paths["video"].exists()
+    has_frames = paths["frames"].exists() and any(paths["frames"].glob("frame_*.png"))
+    has_colmap = paths["colmap"].exists() and (paths["colmap"] / "sparse").exists()
+    if has_colmap and not has_video and not has_frames:
+        return True
+    return False
+
+
+def list_multiview_cameras(scene_name: str) -> list[str]:
+    """Multi-view sahnesinin kameralarını listele (cam00, cam01, ...).
+
+    Returns:
+        Sıralı kamera ID listesi (örn ['cam00', 'cam01', 'cam02']).
+        Boş liste = single-view veya kamera yok.
+    """
+    paths = scene_paths(scene_name)
+    videos_mv = paths["videos_mv"]
+    if not videos_mv.exists():
+        return []
+    # Windows NTFS case-insensitive dedupe (path -> stem set).
+    files = set(videos_mv.glob("cam*.mp4")) | set(videos_mv.glob("cam*.MP4"))
+    return sorted({p.stem for p in files})
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +140,26 @@ class PreprocessConfig:
     #   high-confidence noktalari sec, outlier'lari at
     init_subsample_mode: str = "random"
     colmap_exe: str | None = None
+    # v5.0 — Multi-view configuration
+    # multiview_mode: 'auto' (detect from data/), 'single', 'multi'
+    multiview_mode: str = "auto"
+    # Eger poses_bounds.npy varsa (N3V format), COLMAP atlanir mi?
+    use_provided_poses: bool = True
+    # Multi-view'de hangi kamera'yi "test" (held-out) olarak ayir?
+    # N3V convention: cam00 test, kalanlar train. None ise hepsi train.
+    multiview_test_camera: str | None = "cam00"
+    # Per-camera frame extraction: hepsini paralel mi yap, sirayla mi?
+    multiview_parallel_extract: bool = True
+    # Multi-view bootstrap COLMAP: kac timestep kullan (her cam'den).
+    # 1 = tek timestep (en hizli, ~2.7k point) — chickchicken kalitesi disinda
+    # 5 = standart (5x feature, 25x matching, ~20-40k point) ← ONERILEN
+    # 10 = derin (10x feature, ~50k point, ~10-15dk preprocess)
+    # 25 = premium overnight (25x feature, 137k matching pair, ~80-150k sparse, ~45-90 dk)
+    colmap_mv_timestamps: int = 5
+    # Multi-view bootstrap: MVS dense reconstruction (premium, +30-90 dk).
+    # Sparse SfM 50-150k point → dense 500k-2M point. 4DGS init kalitesi
+    # dramatik artar (chickchicken seviyesi guarantee).
+    colmap_mv_dense_mvs: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -76,18 +182,22 @@ class FoundationConfig:
 class ModelConfig:
     init_random_points: int = 0
     sh_degree: int = 3
-    # Deformation field — v2 genişletildi
+    # Deformation field — v2 genisletildi
     hexplane_resolution: int = 96
     hexplane_feat_dim: int = 48
     mlp_width: int = 512
     mlp_depth: int = 4
     num_time_freqs: int = 6
     # v3.6 / Yol C — Per-gaussian Fourier trajectory (4DGS paper SOTA)
-    # "mlp"     → eski global MLP (tüm pozisyon MLP'den)
-    # "fourier" → saf per-gaussian trajectory (MLP dpos kullanılmaz, dquat/dscale için MLP)
-    # "hybrid"  → her ikisi (MLP global bias + per-gaussian özgün trajectory)
+    # "mlp"     -> eski global MLP (tum pozisyon MLP'den)
+    # "fourier" -> saf per-gaussian trajectory (MLP dpos kullanilmaz, dquat/dscale icin MLP)
+    # "hybrid"  -> her ikisi (MLP global bias + per-gaussian ozgun trajectory)
     deform_pos_mode: str = "hybrid"
-    fourier_K: int = 8               # Frekans sayısı: 48 param/gaussian (K × 2 × 3)
+    fourier_K: int = 8               # Frekans sayisi: 48 param/gaussian (K x 2 x 3)
+    # Phase 2.5 — Multi-resolution HexPlane. Bos = single-res (mevcut).
+    # Onerilen: [24, 48, 96] (3 scale, total feat 6*24*3 = 432).
+    multires_resolutions: list = field(default_factory=list)
+    multires_feat_dim: int = 24
 
 
 @dataclass
@@ -103,55 +213,75 @@ class TrainConfig:
     lr_opacities: float = 5e-2
     lr_sh_dc: float = 2.5e-3
     lr_sh_rest: float = 2.5e-3 / 20
-    lr_deform: float = 3e-3             # v3: 1e-3 → 3e-3 — motion'un daha hızlı öğrenilmesi için (ÇALIŞIYOR)
-    lr_fourier: float = 3e-3            # v3.6.1: 5e-3 → 3e-3 (kontrolsüz büyümeyi azalt)
-    # Fourier regularizer — high-freq katsayıları bastır (low-pass prior, overfitting önle)
-    lambda_fourier_reg: float = 1e-3    # v3.6.1: 1e-4 → 1e-3 (10× güçlü, 0.12 → 6.38 explosion engelle)
-    # Density control — v3.1: aggressive prune revert, extended end korundu
+    lr_deform: float = 3e-3             # v3: 1e-3 -> 3e-3 (motion daha hizli ogren)
+    lr_fourier: float = 3e-3            # v3.6.1: 5e-3 -> 3e-3 (kontrolsuz buyume azalt)
+    # Fourier regularizer (low-pass prior)
+    lambda_fourier_reg: float = 1e-3    # v3.6.1: 1e-4 -> 1e-3 (10x guclu)
+    # Density control
     density_start_iter: int = 500
-    density_end_iter: int = 22_000      # v3: 15k → 22k (final prune'lar için)
+    density_end_iter: int = 22_000
     density_interval: int = 100
     densify_grad_threshold: float = 2e-4
     prune_min_opacity: float = 0.005
-    # v3.7.2: Hard cap on N — banana ultra'da 164k oldu, render saatte 1k iter yapamadı.
-    # 0 = sınırsız. Ultra için 80k güvenli sınır.
     max_gaussians: int = 0
-    prune_max_scale: float = 0.02       # v3.2: FRACTION of scene_extent (INRIA original intent)
-                                        # trainer.py içinde: effective = prune_max_scale * scene_extent
-                                        # 0.02 × 70 = 1.4 units → reasonable bloat cap
-    # Opacity reset — v3.1: kapatıldı (density control zaten prune yapıyor,
-    # bu interval aggressive prune ile birleşince %95 gaussian öldü)
-    opacity_reset_interval: int = 0     # v3.1: 3000 → 0 (KAPA)
-    # Motion regularizers (Stage 1) — v3.4: DENGE.
-    # v3.2: reg güçlü → motion yok
-    # v3.3: reg=0 → scales inf, training patladı
-    # v3.4: reg 1/10 of v3.2 — stability için minimum, motion'u killing değil
-    lambda_deform_reg: float = 3e-5     # v3.4: was 3e-4 (v3.2), 0 (v3.3) → 3e-5 (1/10)
-    lambda_smoothness: float = 2e-4     # v3.4: was 2e-3 (v3.2), 0 (v3.3) → 2e-4 (1/10)
-    lambda_rigidity: float = 2e-4       # v3.4: aynı, 1/10 of v3.2
-    # Scale regularizer — v3.1: ASIMETRIK hinge (sadece scene_extent %5 üzerini cezalandır)
-    # v3'te symmetric formul tüm scale'leri 1'e itip homogenization yaratmıştı.
-    # v3.1'de trainer.py içinde threshold-based hinge kullanılıyor (bkz. orada).
-    lambda_scale: float = 5e-3          # v3: 1e-3 → 5e-3 (5× güçlü ama asimetrik, sadece outlier hit)
-    # v3.8: Anisotropy regularizer — STREAK / NEEDLE GAUSSIAN FIX.
-    # banana_demo Ultra'da uzun parlak çizgiler oluştu. Magnitude reg kontrol
-    # etmiyordu çünkü iğne şeklinde gaussian (max=2 küçük min=0.05) magnitude'u
-    # küçük ama ratio 40. Ultra Clean preset 0.02 default açar.
-    lambda_aniso: float = 0.0           # 0 = kapalı (geriye uyumlu); Ultra Clean = 0.02
-    aniso_threshold: float = 5.0        # ratio < 5 serbest, üstü quadratic ceza
-    # v3.8: Total dpos clamp fraction — per-iter motion cap (× scene_extent).
-    # banana_demo Δpos max ortalama 6, peak 13 (cap 21'de). Daha sıkı için 0.05.
-    dpos_total_cap_frac: float = 0.2    # v3.6.2 default; Ultra Clean = 0.05
-    # Foundation model losses (Stage 2) — v3.4 denge
+    prune_max_scale: float = 0.02       # v3.2: FRACTION of scene_extent
+    opacity_reset_interval: int = 0
+    # Motion regularizers (Stage 1) — v3.4 denge
+    lambda_deform_reg: float = 3e-5
+    lambda_smoothness: float = 2e-4
+    lambda_rigidity: float = 2e-4
+    # Scale + anti-streak (v3 / v3.8)
+    lambda_scale: float = 5e-3
+    lambda_aniso: float = 0.0
+    aniso_threshold: float = 5.0
+    dpos_total_cap_frac: float = 0.2
+    # Foundation model losses (Stage 2)
     lambda_depth: float = 0.1
-    lambda_mask_motion: float = 2.0     # v3.4: 1.0 → 2.0 (denge, v3.3'teki 3.0 overshoot)
-    lambda_track: float = 0.5           # v3.6.1: 0.3 → 0.5 (fourier artık track sinyali alıyor, boost)
-    track_sample_k: int = 256           # Her iter kaç track sample'lansın
-    # Warmup (regularizer'lar linear 0 → full over first N iter)
-    warmup_iters: int = 500             # v3: 2000 → 500 (reg'ler erken devreye girsin ama yumuşak)
-    # Checkpoint
+    lambda_mask_motion: float = 2.0
+    lambda_track: float = 0.5
+    track_sample_k: int = 256
+    warmup_iters: int = 500
     ckpt_interval: int = 1000
     log_interval: int = 50
+    # v5.0 — Multi-view training
+    # Multi-view: her iter'de kac kamera sample edilir (>=1).
+    # Higher -> daha tutarli multi-view supervision, daha yavas iter.
+    multiview_cams_per_iter: int = 1
+    # Multi-view consistency loss: ayni 3D point farkli cam'lardan benzer renk vermeli.
+    # 0 = kapali (default), >0 = aktif (Phase 1.7 implementation).
+    lambda_multiview_consistency: float = 0.0
+    # Phase 1.6 — LPIPS perceptual loss. 0 = off.
+    # VGG (kaliteli, edge sharpness) vs alex (hizli ama low-detail).
+    # Production tier: vgg + lambda 0.1+. Mini smoke: alex + 0.05.
+    lambda_lpips: float = 0.0
+    lpips_net: str = "vgg"  # vgg (kaliteli, default) | alex (hizli) | squeeze
+    lpips_warmup_iters: int = 1000
+    # Phase 1.8 — RAFT optical flow loss. 0 = off.
+    lambda_flow: float = 0.0
+    flow_warmup_iters: int = 1000
+    # Phase 1.9 — Densify dynamics tuning (multi-view spesifik defaults)
+    # Multi-view'da daha aggresif densify gerekir (her cam ayri view).
+    densify_mv_threshold_scale: float = 0.7  # 1.0 = single-view ile ayni, 0.7 = %30 daha hassas
+    # Phase 2.2 — Multi-resolution training schedule (multi-stage)
+    # Liste: [(iter, long_edge), ...]. Bos = single-resolution.
+    # Orn: [(0, 480), (10000, 720), (25000, 1080)]
+    multires_schedule: list = field(default_factory=list)
+    # Phase 2.3 — Camera pose refinement (Joint BA)
+    # 0.0 = kapali, lr_cam_K=1e-7, lr_cam_w2c=1e-7 onerilen.
+    lr_cam_K: float = 0.0
+    lr_cam_w2c: float = 0.0
+    cam_refine_start_iter: int = 5000  # warmup sonrasi cam refine basla
+    # Phase 2.4 — Background distance ratio. 0 = kapali, 2.0 = 2x scene_extent ote
+    bg_distance_ratio: float = 2.0
+    # Phase 2.1 — Static/Dynamic auto-promote (multi-view only).
+    # masks_mv'dan motion vote toplayip dinamik gauss seçer.
+    # 0 = kapali (manuel API), >0 = auto-promote threshold (motion-vote frac).
+    auto_static_dynamic: bool = True
+    static_dynamic_threshold: float = 0.10  # gauss %10+ frame motion -> dynamic
+    # Static 3DGS — Faz 1: 4D dynamic features tamamen bypass.
+    # True: deformation MLP + Fourier trajectory yok, sadece statik 3D.
+    # Mevcut 4D kodu olduğu gibi reuse eder, training/inference sade 3DGS.
+    static_mode: bool = False
 
 
 @dataclass
@@ -161,7 +291,7 @@ class ExportConfig:
 
 
 # ---------------------------------------------------------------------------
-# Birleşik
+# Birlesik
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -174,18 +304,20 @@ class Config:
 
 
 def default_config() -> Config:
-    """Varsayılan (RTX 3060 Ti 8GB) konfigürasyon."""
+    """Varsayilan (RTX 3060 Ti 8GB) konfigurasyon."""
     return Config()
 
 
 def cloud_config() -> Config:
-    """Daha ağır iş için cloud GPU (RTX 4090 24GB) konfigürasyonu."""
+    """Daha agir is icin cloud GPU (RTX 4090 24GB) konfigurasyonu."""
     cfg = default_config()
     cfg.preprocess.fps = 24
     cfg.preprocess.resize_long_edge = 1920
     cfg.foundation.metric3d_model = "metric3d_vit_large"
     cfg.foundation.cotracker_num_points = 4096
-    cfg.train.image_resolution = (1920, 1080)
+    cfg.foundation.cotracker_grid_size = 60
     cfg.train.n_iters = 60_000
+    cfg.train.image_resolution = (1920, 1080)
+    cfg.train.batch_size = 4
     cfg.export.num_timestamps = 120
     return cfg

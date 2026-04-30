@@ -48,6 +48,36 @@ class HexPlane(nn.Module):
         return torch.cat(feats, dim=-1)
 
 
+class MultiResHexPlane(nn.Module):
+    """Phase 2.5 — Multi-resolution HexPlane stack (4DGaussians-style).
+
+    Multiple HexPlane scale'lerinde sample edip feature'lari concat eder.
+    Coarse plane düşük frekansli motion'i ogrenir, fine plane yüksek detay.
+
+    Args:
+        resolutions: list of int, orn [12, 24, 48, 96]
+        feat_dim:    her resolution icin feat dim (toplam = sum * 6 plane)
+    """
+
+    def __init__(self, resolutions: list[int] = (24, 48, 96), feat_dim: int = 24):
+        super().__init__()
+        self.resolutions = list(resolutions)
+        self.feat_dim = feat_dim
+        self.planes_list = nn.ModuleList([
+            HexPlane(resolution=r, feat_dim=feat_dim) for r in self.resolutions
+        ])
+
+    @property
+    def total_feat_dim(self) -> int:
+        # Her HexPlane.forward 6 plane'i concat -> feat_dim * 6
+        # Multi-res: ayrica scale sayisi kadar
+        return self.feat_dim * 6 * len(self.resolutions)
+
+    def forward(self, x, y, z, t):
+        feats = [hp(x, y, z, t) for hp in self.planes_list]
+        return torch.cat(feats, dim=-1)
+
+
 def fourier_encode_scalar(value: float, num_freqs: int, device) -> torch.Tensor:
     """
     [t, sin(πt), cos(πt), sin(2πt), cos(2πt), ..., sin(2^(L-1)·πt), cos(...)].
@@ -114,14 +144,29 @@ class DeformationField(nn.Module):
         mlp_width: int = 512,
         mlp_depth: int = 4,         # hidden layer sayısı (önceki: implicit 2)
         num_time_freqs: int = 6,    # Fourier frekans sayısı (0 = kapalı)
+        # Phase 2.5 — Multi-resolution HexPlane (default off, single-res)
+        multires_resolutions: list | None = None,
+        multires_feat_dim: int | None = None,
     ):
         super().__init__()
-        self.hexplane = HexPlane(resolution, feat_dim)
         self.num_time_freqs = num_time_freqs
 
-        # Girdi: HexPlane features (feat_dim*6) + Fourier time (1 + 2*L)
+        # Phase 2.5 — Multi-res toggle
+        if multires_resolutions:
+            mr_feat = multires_feat_dim if multires_feat_dim else feat_dim
+            self.hexplane = MultiResHexPlane(
+                resolutions=list(multires_resolutions), feat_dim=mr_feat,
+            )
+            input_hexplane_dim = self.hexplane.total_feat_dim
+            print(f"[deformation] MultiResHexPlane: resolutions={multires_resolutions} "
+                  f"feat_dim={mr_feat} total={input_hexplane_dim}")
+        else:
+            self.hexplane = HexPlane(resolution, feat_dim)
+            input_hexplane_dim = feat_dim * 6
+
+        # Girdi: HexPlane features + Fourier time (1 + 2*L)
         t_dim = 1 + 2 * num_time_freqs
-        input_dim = feat_dim * 6 + t_dim
+        input_dim = input_hexplane_dim + t_dim
 
         # MLP: input → width → width → ... (mlp_depth katman) → 10
         layers = []
