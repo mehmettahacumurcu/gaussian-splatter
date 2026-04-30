@@ -14,6 +14,7 @@ import { TimelineSlider } from "./components/TimelineSlider";
 import { JobSubmitPanel } from "./components/JobSubmitPanel";
 import { JobsList } from "./components/JobsList";
 import { TrainingAnalytics } from "./components/TrainingAnalytics";
+import { NvsEvalPanel } from "./components/NvsEvalPanel";
 import {
   API_BASE,
   getHealth,
@@ -27,7 +28,7 @@ import {
   type SplatInfo,
 } from "./api";
 
-type Tab = "submit" | "jobs" | "viewer" | "analytics";
+type Tab = "submit" | "jobs" | "viewer" | "analytics" | "eval";
 
 type ViewerState =
   | { kind: "idle" }
@@ -217,6 +218,12 @@ function App() {
           >
             Analiz
           </button>
+          <button
+            className={`tab-btn ${tab === "eval" ? "active" : ""}`}
+            onClick={() => setTab("eval")}
+          >
+            Eval
+          </button>
         </nav>
         <div className="app-status">{backendBadge}</div>
       </header>
@@ -279,6 +286,36 @@ function App() {
                 Sahne adını gir ve Enter — ya da "Aktif/son job" butonuna bas.
               </div>
             )}
+          </div>
+        )}
+
+        {tab === "eval" && (
+          <div className="tab-content">
+            <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "14px 20px 0" }}>
+              <input
+                type="text"
+                value={analyticsScene}
+                placeholder="sahne adı veya job id"
+                onChange={(e) => setAnalyticsScene(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") setAnalyticsScene((v) => v.trim());
+                }}
+                style={{ flex: 1, maxWidth: 500 }}
+              />
+              <button
+                className="btn-secondary"
+                onClick={async () => {
+                  try {
+                    const { jobs } = await listJobs();
+                    const done = jobs.find((j) => j.status === "completed");
+                    if (done) setAnalyticsScene(done.scene);
+                  } catch { /* ignore */ }
+                }}
+              >
+                Son tamamlanmis
+              </button>
+            </div>
+            <NvsEvalPanel scene={analyticsScene} />
           </div>
         )}
 

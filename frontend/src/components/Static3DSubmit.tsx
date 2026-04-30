@@ -64,6 +64,12 @@ export function Static3DSubmit({ onJobSubmitted }: Props) {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [scene, setScene] = useState("");
   const [preset, setPreset] = useState<StaticPreset>("balanced");
+  // Static 3DGS — depth supervision ON varsayilan (geometric prior yardimci).
+  // Tracks/masks/flow zaten static modda otomatik atlanir; bu toggle sadece
+  // depth (Metric3D) calistirilsin mi onu kontrol eder.
+  const [useDepthSupervision, setUseDepthSupervision] = useState(true);
+  // v6.1 — NVS evaluation (held-out cam metrics + orbit mp4)
+  const [nvsEval, setNvsEval] = useState(true);
   const [hyperparams, setHyperparams] = useState<HyperParams>({});
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -96,7 +102,10 @@ export function Static3DSubmit({ onJobSubmitted }: Props) {
         scene: scene.trim(),
         mode: "static",
         preset,
-        skip_foundation: true, // static modda zaten backend skip eder
+        // depth supervision aktif → foundation phase'in depth adimi calisir
+        // (tracks/masks/flow yine de static modda otomatik atlanir).
+        skip_foundation: !useDepthSupervision,
+        nvs_eval: nvsEval,
         hyperparams,
       });
       onJobSubmitted(res, scene.trim());
@@ -181,6 +190,33 @@ export function Static3DSubmit({ onJobSubmitted }: Props) {
             </label>
           ))}
         </div>
+      </div>
+
+      {/* Foundation depth supervision toggle */}
+      <div className="submit-section">
+        <label className="submit-checkbox">
+          <input
+            type="checkbox"
+            checked={useDepthSupervision}
+            onChange={(e) => setUseDepthSupervision(e.target.checked)}
+          />
+          Depth supervision (Metric3D) — onerilir
+          <span className="submit-hint-inline">
+            — geometric prior + sparse-view yardimcisi. Kapatirsan
+            sadece RGB+SSIM+LPIPS supervision.
+          </span>
+        </label>
+        <label className="submit-checkbox" style={{ marginTop: 6 }}>
+          <input
+            type="checkbox"
+            checked={nvsEval}
+            onChange={(e) => setNvsEval(e.target.checked)}
+          />
+          NVS Evaluation — onerilir
+          <span className="submit-hint-inline">
+            — training sonrasi held-out PSNR/SSIM/LPIPS + orbit mp4. Eval tab'da gorulur.
+          </span>
+        </label>
       </div>
 
       {/* Advanced hyperparams (mode='static' filter) */}

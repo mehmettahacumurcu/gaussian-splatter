@@ -140,6 +140,13 @@ class PreprocessConfig:
     #   high-confidence noktalari sec, outlier'lari at
     init_subsample_mode: str = "random"
     colmap_exe: str | None = None
+    # 4D Quality v6.1 — Madde 3: Sparse-view init method.
+    # "colmap" (default), "dust3r" (transformer-based dense pointmap, opt-in),
+    # "auto" (sparse-view detect: <20 frame ise dust3r, aksi colmap).
+    # DUSt3R model weights ilk run'da indirilir (~500 MB).
+    init_method: str = "colmap"
+    # DUSt3R sparse-view threshold — auto modda bu sayidan az frame varsa DUSt3R.
+    sparse_view_threshold_frames: int = 20
     # v5.0 — Multi-view configuration
     # multiview_mode: 'auto' (detect from data/), 'single', 'multi'
     multiview_mode: str = "auto"
@@ -182,11 +189,16 @@ class FoundationConfig:
 class ModelConfig:
     init_random_points: int = 0
     sh_degree: int = 3
-    # Deformation field — v2 genisletildi
-    hexplane_resolution: int = 96
-    hexplane_feat_dim: int = 48
-    mlp_width: int = 512
-    mlp_depth: int = 4
+    # Deformation field — T7 perf fix (3060 Ti 8GB target):
+    # Eski default'lar (96/48/512/4) per iter MLP forward'ı 100k+ gauss icin
+    # ciddi maliyetliydi. 4-5 katini deformation MLP'sine harciyorduk + uzun
+    # training (10+ saat). Cloud config (cloud_config()) bu degerleri tekrar
+    # 96/48/512/4'e itiyor — 24GB GPU + 60k iter butcesi ile capacity
+    # gerekli oldugunda kullanilsin.
+    hexplane_resolution: int = 64
+    hexplane_feat_dim: int = 32
+    mlp_width: int = 384
+    mlp_depth: int = 3
     num_time_freqs: int = 6
     # v3.6 / Yol C — Per-gaussian Fourier trajectory (4DGS paper SOTA)
     # "mlp"     -> eski global MLP (tum pozisyon MLP'den)
@@ -223,7 +235,11 @@ class TrainConfig:
     density_interval: int = 100
     densify_grad_threshold: float = 2e-4
     prune_min_opacity: float = 0.005
-    max_gaussians: int = 0
+    # T9 perf fix: 3060 Ti 8GB icin guvenli hard cap. Eskiden 0 (sinirsiz),
+    # buyuk sahnelerde split sirasinda N=200k+ olup OOM ediyordu. 400k cap
+    # ile training stuck/abort durumu ortadan kalkmali. Cloud config (24GB)
+    # bu degeri 0'a (sinirsiz) ceker.
+    max_gaussians: int = 400_000
     prune_max_scale: float = 0.02       # v3.2: FRACTION of scene_extent
     opacity_reset_interval: int = 0
     # Motion regularizers (Stage 1) — v3.4 denge
@@ -282,6 +298,32 @@ class TrainConfig:
     # True: deformation MLP + Fourier trajectory yok, sadece statik 3D.
     # Mevcut 4D kodu olduğu gibi reuse eder, training/inference sade 3DGS.
     static_mode: bool = False
+    # 4D Quality v6.1 — Madde 11: Adaptive SH degree schedule
+    # True: SH degree iter'a göre 0→1→2→3 artarak progresif öğrenme.
+    # Erken iter'lerde DC + 1st order yeterken late iter'lerde 3rd order detail kazandırır.
+    # Schedule: %25 / %50 / %75 / %100 of n_iters bandlarinda degree 0/1/2/3.
+    sh_progressive_schedule: bool = True
+    # 4D Quality v6.1 — Madde 7: Adaptive densify dynamic regions
+    # Dynamic gauss'lar icin densify_grad_threshold * dynamic_densify_scale.
+    # 0.5 = %50 hassas (dynamic'te 2x daha agresif densify). 1.0 = no-op.
+    dynamic_densify_scale: float = 0.5
+    # 4D Quality v6.1 — Madde 6: 2nd-order temporal smoothness (acceleration ceza)
+    # D(t-1) - 2D(t) + D(t+1) magnitude on dpos. 0 = off.
+    lambda_accel: float = 0.0
+    # 4D Quality v6.1 — Madde 12: Cam refinement gradient norm clipping
+    # cam_K + cam_w2c parametreleri icin ayri grad_norm clip degeri. 0 = off.
+    cam_grad_clip_norm: float = 1.0
+    # 4D Quality v6.1 — Madde 2-B: Mip-Splatting Python-side anti-aliasing
+    # 3D scale floor — her gauss'a min scale = mip_scale_floor_frac × distance_to_nearest_cam.
+    # 0.0 = off. 0.0005-0.002 onerilen. Anti-aliasing approximation; tam Mip-Splatting CUDA
+    # kernel degil, ama ekran-uzayinda yakin gauss'larin "noktalasmasini" engeller.
+    mip_scale_floor_frac: float = 0.0
+    # 4D Quality v6.1 — NVS evaluation
+    # Training sonrasi held-out cam metrics + orbit cam mp4 render.
+    # False default: pipeline'a ek faz eklemeden run. UI/CLI flag ile aktive edilir.
+    nvs_eval_enabled: bool = False
+    nvs_eval_orbit_frames: int = 60  # orbit mp4 frame count
+    nvs_eval_orbit_fps: int = 30
 
 
 @dataclass
@@ -316,8 +358,17 @@ def cloud_config() -> Config:
     cfg.foundation.metric3d_model = "metric3d_vit_large"
     cfg.foundation.cotracker_num_points = 4096
     cfg.foundation.cotracker_grid_size = 60
+    # Cloud GPU'da deformation field'i full kapasiteye geri al — 24GB VRAM
+    # buyuk MLP'i tasiyor + 60k iter butcesi ek capacity'i kullanabiliyor.
+    # Default config bu degerleri 64/32/384/3'e indiriyor (3060 Ti 8GB icin).
+    cfg.model.hexplane_resolution = 96
+    cfg.model.hexplane_feat_dim = 48
+    cfg.model.mlp_width = 512
+    cfg.model.mlp_depth = 4
     cfg.train.n_iters = 60_000
     cfg.train.image_resolution = (1920, 1080)
     cfg.train.batch_size = 4
+    # 24GB VRAM has headroom — lift the 8GB cap.
+    cfg.train.max_gaussians = 0
     cfg.export.num_timestamps = 120
     return cfg

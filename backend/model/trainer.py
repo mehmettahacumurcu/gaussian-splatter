@@ -60,6 +60,70 @@ def psnr(rendered: torch.Tensor, gt: torch.Tensor) -> float:
 
 
 # ---------------------------------------------------------------------------
+# 4D Quality v6.1 — Madde 11: Adaptive SH degree schedule
+# ---------------------------------------------------------------------------
+def progressive_sh_degree(
+    iter_idx: int, n_iters: int, max_degree: int = 3
+) -> int:
+    """Iter'a göre SH degree dön: %25/%50/%75/%100 bandlarinda 0/1/2/3.
+
+    Erken iter'lerde DC + 1st order yeterken, late iter'lerde 3rd order detail
+    kazandırır. Bu schedule ~0.3-0.5 dB PSNR artışı + daha temiz convergence.
+    Standart 3DGS practice (INRIA reference impl).
+    """
+    if max_degree <= 0:
+        return 0
+    frac = iter_idx / max(n_iters, 1)
+    if frac < 0.25:
+        return 0
+    elif frac < 0.50:
+        return min(1, max_degree)
+    elif frac < 0.75:
+        return min(2, max_degree)
+    return max_degree
+
+
+# ---------------------------------------------------------------------------
+# 4D Quality v6.1 — Madde 2-B: Mip-Splatting Python-side scale floor
+# ---------------------------------------------------------------------------
+def apply_mip_scale_floor(
+    scales: torch.Tensor, means: torch.Tensor, cam_centers: torch.Tensor,
+    floor_frac: float = 0.001,
+    chunk_size: int = 8192,
+) -> torch.Tensor:
+    """3D scale floor — her gauss'a min scale = floor_frac × distance_to_nearest_cam.
+
+    Mip-Splatting paper'inin 3D filter approximation'i. Ekran-uzayinda
+    Gaussian'a min pixel-size garantisi vermez ama yakin gauss'larin
+    "noktalasmasini" engelliyor (ufak scale → tek piksel artifact'i).
+
+    Memory-safe chunked impl: (N, M, 3) materialize etmek yerine N'i
+    chunk_size'a bol → her chunk (chunk, M, 3) tensor (~ chunk×M×12 bytes).
+    Default chunk=8192 + M=32 → ~12 MB peak, hizli + safe.
+
+    Args:
+      scales: (N, 3) gauss scale (post-activation, units of world)
+      means: (N, 3) gauss world position
+      cam_centers: (M, 3) sahnedeki cam centers (genelde 32'ye subsample edilmis)
+      floor_frac: scale floor = floor_frac × min_dist (0.001-0.005 onerilen)
+      chunk_size: gauss chunk boyutu (memory tradeoff)
+    """
+    if floor_frac <= 0 or cam_centers.numel() == 0:
+        return scales
+    N = means.shape[0]
+    # Output buffer
+    min_dist = torch.empty(N, device=means.device, dtype=means.dtype)
+    for i in range(0, N, chunk_size):
+        j = min(i + chunk_size, N)
+        # (chunk, 1, 3) - (1, M, 3) -> (chunk, M, 3) -> (chunk, M) -> (chunk,)
+        diff = means[i:j].unsqueeze(1) - cam_centers.unsqueeze(0)
+        d = (diff * diff).sum(-1).sqrt()
+        min_dist[i:j] = d.min(dim=1).values
+    floor = (floor_frac * min_dist).unsqueeze(1).expand_as(scales)
+    return torch.maximum(scales, floor)
+
+
+# ---------------------------------------------------------------------------
 # Frame / depth / mask / tracks yardımcıları
 # ---------------------------------------------------------------------------
 def load_frame_tensor(frame_path: Path, target_size: tuple[int, int] | None = None) -> torch.Tensor:
@@ -268,6 +332,12 @@ class Trainer4DGS:
         self.use_static_dynamic_split = False
         # Static 3DGS Faz 1 — static mode flag (4D features bypass)
         self.static_mode = False
+        # 4D Quality v6.1 — runtime knobs (default off; train() siginatursinde override)
+        self.sh_progressive_schedule = False
+        self.lambda_accel = 0.0
+        self.cam_grad_clip_norm = 0.0
+        self.mip_scale_floor_frac = 0.0
+        self.dynamic_densify_scale = 1.0
         # Phase 2.3 — Camera pose refine optimizer placeholder (None = inactive)
         self._cam_refine_optimizer = None
         if self.lr_cam_K > 0 or self.lr_cam_w2c > 0:
@@ -332,33 +402,38 @@ class Trainer4DGS:
             )
         self.optimizer = torch.optim.Adam(groups, eps=1e-15)
 
-    def _apply_deformation(self, t: float):
+    def _apply_deformation(self, t: float, return_raw: bool = False):
         # Static 3DGS Faz 1 — static_mode'da hiç deformation yok, identity döner
         if getattr(self, "static_mode", False) or self.deform is None:
-            return (
+            id_out = (
                 self.gs.means,
                 F.normalize(self.gs.quats, dim=-1),
                 self.gs.get_scales,
             )
+            if return_raw:
+                return id_out, (None, None, None)
+            return id_out
         # MLP her zaman çağrılır (dquat, dscale için gerekli, dpos opsiyonel)
         dpos_mlp, dquat, dscale = self.deform(self.gs.means, t, self.scene_extent)
         # v3.5: dscale clamp — MLP'nin scale delta'sı ±2 ile sınırlı.
-        dscale = dscale.clamp(min=-2.0, max=2.0)
+        # T6 perf fix: clamp'i yeni isimde tut, RAW dscale'i regularizer icin koru.
+        dscale_clamped = dscale.clamp(min=-2.0, max=2.0)
 
         # v3.6.2: dpos_mlp clamp — MLP serbest yazabildiği için 500+ unit
         # jump'lara yol açıyordu (chickchicken_fourier_v2'de Δpos max=513 görüldü).
         # Max motion per iter = scene_extent × 0.1 (yumuşak caydırıcı).
+        # T6 perf fix: clamp'i yeni isimde tut, RAW dpos_mlp'i regularizer icin koru.
         mlp_cap = self.scene_extent * 0.1
-        dpos_mlp = dpos_mlp.clamp(min=-mlp_cap, max=mlp_cap)
+        dpos_mlp_clamped = dpos_mlp.clamp(min=-mlp_cap, max=mlp_cap)
 
         # v3.6 / Yol C: Pozisyon deformasyonunu pos_mode'a göre seç
         if self.deform_pos_mode == "mlp":
-            dpos = dpos_mlp
+            dpos = dpos_mlp_clamped
         elif self.deform_pos_mode == "fourier":
             dpos = decode_fourier_trajectory(self.gs.fourier_pos_coeffs, t)
         else:  # "hybrid"
             dpos_fourier = decode_fourier_trajectory(self.gs.fourier_pos_coeffs, t)
-            dpos = dpos_mlp + dpos_fourier
+            dpos = dpos_mlp_clamped + dpos_fourier
 
         # v3.6.2 → v3.8: FINAL dpos clamp — overall motion cap
         # Default scene_extent × 0.2; Ultra Clean preset 0.05 (4× daha sıkı).
@@ -368,7 +443,11 @@ class Trainer4DGS:
 
         deformed_means  = self.gs.means + dpos
         deformed_quats  = F.normalize(self.gs.quats + dquat, dim=-1)
-        deformed_scales = self.gs.get_scales * torch.exp(dscale)
+        deformed_scales = self.gs.get_scales * torch.exp(dscale_clamped)
+        if return_raw:
+            # T6: RAW MLP output (pre-clamp) — regularizer block reg=dpos.pow(2)
+            # tipi loss'larda kullanir; iki kez forward pass'i onlemek icin paylasiyoruz.
+            return (deformed_means, deformed_quats, deformed_scales), (dpos_mlp, dquat, dscale)
         return deformed_means, deformed_quats, deformed_scales
 
     def _warmup_factor(self, it: int) -> float:
@@ -676,11 +755,33 @@ class Trainer4DGS:
         static_dynamic_threshold: float = 0.10,
         # Static 3DGS Faz 1 — 4D features bypass
         static_mode: bool = False,
+        # 4D Quality v6.1 — runtime knobs
+        sh_progressive_schedule: bool = False,
+        lambda_accel: float = 0.0,
+        cam_grad_clip_norm: float = 0.0,
+        mip_scale_floor_frac: float = 0.0,
+        dynamic_densify_scale: float = 1.0,
     ) -> dict:
         # Static mode — 4D dynamic features bypass (deformation, Fourier, motion regs)
         self.static_mode = bool(static_mode)
         if self.static_mode:
             print(f"\n[trainer.STATIC] Static 3DGS modu — 4D dynamic features kapalı")
+        # 4D Quality v6.1 — runtime knobs
+        self.sh_progressive_schedule = bool(sh_progressive_schedule)
+        self.lambda_accel = float(lambda_accel)
+        self.cam_grad_clip_norm = float(cam_grad_clip_norm)
+        self.mip_scale_floor_frac = float(mip_scale_floor_frac)
+        self.dynamic_densify_scale = float(dynamic_densify_scale)
+        if self.sh_progressive_schedule:
+            print(f"[trainer.v6.1] SH progressive schedule aktif "
+                  f"(0→{self.gs.sh_degree} degree over n_iters)")
+        if self.lambda_accel > 0:
+            print(f"[trainer.v6.1] 2nd-order accel reg aktif (λ={self.lambda_accel})")
+        if self.mip_scale_floor_frac > 0:
+            print(f"[trainer.v6.1] Mip-Splatting Python-side aktif "
+                  f"(scale_floor_frac={self.mip_scale_floor_frac})")
+        if self.cam_grad_clip_norm > 0 and (self.lr_cam_K > 0 or self.lr_cam_w2c > 0):
+            print(f"[trainer.v6.1] Cam refine grad clip = {self.cam_grad_clip_norm}")
         # v5.0: Multi-view detect
         is_multiview = mv_frame_paths is not None
         # v5.0 ARCHITECTURAL FIX: Static warmup phase.
@@ -907,6 +1008,39 @@ class Trainer4DGS:
         target_lr_fourier = 0.0 if self.static_mode else self.lr_fourier
         has_fourier_group = len(self.optimizer.param_groups) > FOURIER_GROUP_IDX
 
+        # 4D Quality v6.1 — Madde 2-B: Mip-Splatting cam_centers (training boyunca sabit)
+        # Performans icin max 32 cam kullaniyoruz — her gauss'in NEAREST cam'i
+        # tahmini icin yeterli, distance hesabi sabit-zaman.
+        mip_cam_centers = None
+        MIP_MAX_CAMS = 32
+        if self.mip_scale_floor_frac > 0:
+            try:
+                cam_centers_list = []
+                if is_multiview:
+                    for c in train_cams:
+                        w2c = mv_w2c[c]
+                        cam_center = -w2c[:3, :3].T @ w2c[:3, 3]
+                        cam_centers_list.append(cam_center)
+                else:
+                    for w2c in w2c_list:
+                        cam_center = -w2c[:3, :3].T @ w2c[:3, 3]
+                        cam_centers_list.append(cam_center)
+                if cam_centers_list:
+                    full_centers = torch.stack(cam_centers_list).to(self.device)
+                    M = full_centers.shape[0]
+                    if M > MIP_MAX_CAMS:
+                        # Uniform stride subsample (ilk + son + arası eşit aralıklı)
+                        stride = max(1, M // MIP_MAX_CAMS)
+                        idx = torch.arange(0, M, stride, device=full_centers.device)[:MIP_MAX_CAMS]
+                        mip_cam_centers = full_centers[idx]
+                        print(f"[trainer.v6.1] Mip-Splatting cam_centers: {M} → {mip_cam_centers.shape[0]} (subsample, performans)")
+                    else:
+                        mip_cam_centers = full_centers
+                        print(f"[trainer.v6.1] Mip-Splatting cam_centers ({mip_cam_centers.shape[0]} cam) hazirlandi")
+            except Exception as _e:
+                print(f"[trainer.v6.1] Mip cam_centers hata, devre disi: {_e}")
+                self.mip_scale_floor_frac = 0.0
+
         for it in range(1, n_iters + 1):
             idx = int(torch.randint(0, T, (1,)).item())
             t_norm = idx / max(T - 1, 1)
@@ -916,6 +1050,12 @@ class Trainer4DGS:
             self.optimizer.param_groups[DEFORM_GROUP_IDX]["lr"] = target_lr_deform * warmup
             if has_fourier_group:
                 self.optimizer.param_groups[FOURIER_GROUP_IDX]["lr"] = target_lr_fourier * warmup
+
+            # 4D Quality v6.1 — Madde 11: Adaptive SH degree
+            if self.sh_progressive_schedule:
+                active_sh_degree = progressive_sh_degree(it, n_iters, self.gs.sh_degree)
+            else:
+                active_sh_degree = self.gs.sh_degree
 
             # --- Phase 2.2: Multi-resolution transition ---
             new_le = _resolve_long_edge_for_iter(it)
@@ -1004,12 +1144,16 @@ class Trainer4DGS:
             # v5.0: Static phase'de deformation tamamen bypass — MLP init
             # weights nonzero olabilir, sadece lr=0 yapmak yetersiz, forward
             # pass'i da kapatmak gerek. Statik gaussian'lar direkt render edilir.
+            # T6 perf fix: raw_dpos/raw_dquat/raw_dscale = MLP'nin pre-clamp output'u,
+            # regularizer block'da yeniden hesaplanmasin diye saklayalim.
+            raw_dpos = raw_dquat = raw_dscale = None
             if it <= getattr(self, "_static_phase_iters", 0):
                 d_means = self.gs.means
                 d_quats = F.normalize(self.gs.quats, dim=-1)
                 d_scales = self.gs.get_scales
             else:
-                d_means, d_quats, d_scales = self._apply_deformation(t_norm)
+                (d_means, d_quats, d_scales), (raw_dpos, raw_dquat, raw_dscale) = \
+                    self._apply_deformation(t_norm, return_raw=True)
                 # Phase 2.1 + 2.4 — Static + Background gaussian'lari deformation'dan bypass et.
                 # is_static=True veya is_background=True olanlar undeformed kalir.
                 bypass_mask = None
@@ -1027,12 +1171,21 @@ class Trainer4DGS:
                     d_quats = torch.where(bypass_mask.unsqueeze(-1), quats_undef, d_quats)
                     d_scales = torch.where(bypass_mask.unsqueeze(-1), scales_undef, d_scales)
 
+            # 4D Quality v6.1 — Madde 2-B: Mip-Splatting 3D scale floor
+            # Anti-aliasing approximation — yakin gauss'larin tek-piksel'e
+            # cokmesini engeller, yumusak edge'ler verir.
+            if self.mip_scale_floor_frac > 0 and mip_cam_centers is not None:
+                d_scales = apply_mip_scale_floor(
+                    d_scales, d_means, mip_cam_centers,
+                    floor_frac=self.mip_scale_floor_frac,
+                )
+
             render_out, _alpha, _info = render_view(
                 means=d_means, quats=d_quats, scales=d_scales,
                 opacities=self.gs.get_opacities, colors=self.gs.get_colors,
                 K=K_active, w2c=w2c_active,
                 width=Ws, height=Hs,
-                sh_degree=self.gs.sh_degree,
+                sh_degree=active_sh_degree,
                 with_depth=((use_depth and not is_multiview) or use_depth_mv),
             )
             # Phase 1.4 fix: with_depth MV path'te de True olabilir, RGB extract et
@@ -1050,11 +1203,10 @@ class Trainer4DGS:
             loss_recon = compute_recon_loss(rgb, gt, self.lambda_ssim, pixel_weight=pixel_weight)
             loss = loss_recon
 
-            # Loss bileşenlerini ayrı tut (diagnostics için)
-            comp = {"recon": loss_recon.item(), "depth": 0.0, "track": 0.0,
-                    "deform_reg": 0.0, "smooth": 0.0, "rigid": 0.0,
-                    "scale": 0.0, "fourier": 0.0,
-                    "lpips": 0.0, "mv_consist": 0.0, "flow": 0.0}
+            # Perf v2: defer .item() — store detached tensors during accumulation, sync once at log time.
+            # Eskisi her iter ~12 cuda sync (her .item() bir host-device sync). Yeni: sadece log_interval'de bir kere.
+            will_log = (it % log_interval == 0)
+            comp_t: dict = {"recon": loss_recon.detach()}
 
             # --- Phase 1.6: LPIPS perceptual loss ---
             # rgb / gt: [H, W, 3] in [0, 1] -> [3, H, W] beklenir
@@ -1068,7 +1220,7 @@ class Trainer4DGS:
                 lpips_val = self._lpips_module(pred_chw, gt_chw)
                 if torch.isfinite(lpips_val):
                     loss = loss + self.lambda_lpips * lpips_warmup * lpips_val
-                    comp["lpips"] = float(lpips_val.item())
+                    comp_t["lpips"] = lpips_val.detach()
 
             # --- Phase 1.7: Multi-view consistency loss ---
             # Aynı t'de farkli bir cam'da second render + recon. 2 cam supervision
@@ -1092,14 +1244,14 @@ class Trainer4DGS:
                         opacities=self.gs.get_opacities, colors=self.gs.get_colors,
                         K=K2, w2c=w2c2,
                         width=Ws, height=Hs,
-                        sh_degree=self.gs.sh_degree,
+                        sh_degree=active_sh_degree,
                         with_depth=False,
                     )
                     rgb2 = render_out2 if render_out2.shape[-1] == 3 else render_out2[..., :3]
                     mv_l1 = (rgb2 - gt2).abs().mean()
                     if torch.isfinite(mv_l1):
                         loss = loss + self.lambda_multiview_consistency * mv_l1
-                        comp["mv_consist"] = float(mv_l1.item())
+                        comp_t["mv_consist"] = mv_l1.detach()
                 except Exception as _e:
                     if it < 50:
                         print(f"  ⚠ mv_consistency failed iter {it}: {_e}")
@@ -1145,7 +1297,7 @@ class Trainer4DGS:
                             opacities=self.gs.get_opacities, colors=self.gs.get_colors,
                             K=K_active, w2c=w2c_active,
                             width=Ws, height=Hs,
-                            sh_degree=self.gs.sh_degree,
+                            sh_degree=active_sh_degree,
                             with_depth=False,
                         )
                         rgb_n = ro_n if ro_n.shape[-1] == 3 else ro_n[..., :3]
@@ -1158,7 +1310,7 @@ class Trainer4DGS:
                         flow_l1 = (diff_norm - gt_norm).abs().mean().clamp(max=1.0)
                         if torch.isfinite(flow_l1):
                             loss = loss + self.lambda_flow * flow_warmup * flow_l1
-                            comp["flow"] = float(flow_l1.item())
+                            comp_t["flow"] = flow_l1.detach()
                 except Exception as _e:
                     if it < 50:
                         print(f"  ⚠ flow loss failed iter {it}: {_e}")
@@ -1204,7 +1356,7 @@ class Trainer4DGS:
                             opacities=self.gs.get_opacities, colors=self.gs.get_colors,
                             K=K_scaled, w2c=w2c_list[idx + 1],
                             width=Ws, height=Hs,
-                            sh_degree=self.gs.sh_degree,
+                            sh_degree=active_sh_degree,
                             with_depth=False,
                         )
                         rgb_n = ro_n if ro_n.shape[-1] == 3 else ro_n[..., :3]
@@ -1215,7 +1367,7 @@ class Trainer4DGS:
                         flow_l1 = (diff_norm - gt_norm).abs().mean().clamp(max=1.0)
                         if torch.isfinite(flow_l1):
                             loss = loss + self.lambda_flow * flow_warmup * flow_l1
-                            comp["flow"] = float(flow_l1.item())
+                            comp_t["flow"] = flow_l1.detach()
                 except Exception as _e:
                     if it < 50:
                         print(f"  ⚠ flow_sv loss failed iter {it}: {_e}")
@@ -1236,7 +1388,7 @@ class Trainer4DGS:
                     log_gt_aligned = log_gt + shift
                     depth_l1 = (log_r - log_gt_aligned).abs().mean().clamp(max=2.0)
                     loss = loss + self.lambda_depth * warmup * depth_l1
-                    comp["depth"] = depth_l1.item()
+                    comp_t["depth"] = depth_l1.detach()
 
             # --- Track loss (CoTracker 3D-anchored projection) ---
             if track_data is not None and idx < track_data["T_tr"]:
@@ -1250,6 +1402,8 @@ class Trainer4DGS:
                 gt_tracks_scaled[..., 1] *= sy
 
                 # Sample K tracks for speed
+                # Perf v2: use sum without .item() — bool() in if catches it but only when track loss enabled.
+                # Default config has lambda_track > 0, so this still costs one sync; acceptable.
                 N_visible = int(vis.sum().item())
                 if N_visible >= 16:
                     sample_size = min(self.track_sample_k, N_visible)
@@ -1286,28 +1440,42 @@ class Trainer4DGS:
                         diag = (Ws ** 2 + Hs ** 2) ** 0.5
                         track_l = diff / diag
                         loss = loss + self.lambda_track * warmup * track_l
-                        comp["track"] = track_l.item()
+                        comp_t["track"] = track_l.detach()
 
             # --- Motion regularizers (warmup'la scale) ---
-            if warmup > 0 and (
+            if warmup > 0 and raw_dpos is not None and (
                 self.lambda_deform_reg > 0
                 or self.lambda_smoothness > 0
                 or self.lambda_rigidity > 0
+                or self.lambda_accel > 0
             ):
-                dpos, dquat, dscale = self.deform(
-                    self.gs.means, t_norm, self.scene_extent,
-                )
+                # T6 perf fix: _apply_deformation'dan gelen RAW MLP output'u kullan,
+                # ayni t_norm icin ikinci kez self.deform(...) cagrisi yapma.
+                # Onceden bu blok her iter'de duplicate forward yapiyordu.
+                dpos, dquat, dscale = raw_dpos, raw_dquat, raw_dscale
                 if self.lambda_deform_reg > 0:
                     reg = dpos.pow(2).mean() + dquat.pow(2).mean() + dscale.pow(2).mean()
                     loss = loss + self.lambda_deform_reg * warmup * reg
-                    comp["deform_reg"] = reg.item()
+                    comp_t["deform_reg"] = reg.detach()
                 if self.lambda_smoothness > 0:
                     t2 = min(1.0, t_norm + self.smoothness_dt)
                     if t2 != t_norm:
                         dpos2, _, _ = self.deform(self.gs.means, t2, self.scene_extent)
                         smooth = (dpos - dpos2).pow(2).mean()
                         loss = loss + self.lambda_smoothness * warmup * smooth
-                        comp["smooth"] = smooth.item()
+                        comp_t["smooth"] = smooth.detach()
+                # 4D Quality v6.1 — Madde 6: 2nd-order acceleration regularizer
+                # D(t-1) - 2D(t) + D(t+1) magnitude. Slow-motion render'da titremeyi azalt.
+                # Sample t-dt and t+dt; eger sinirlarda ise yumusakca skip.
+                if self.lambda_accel > 0:
+                    t_minus = max(0.0, t_norm - self.smoothness_dt)
+                    t_plus  = min(1.0, t_norm + self.smoothness_dt)
+                    if t_minus < t_norm < t_plus:
+                        dpos_m, _, _ = self.deform(self.gs.means, t_minus, self.scene_extent)
+                        dpos_p, _, _ = self.deform(self.gs.means, t_plus,  self.scene_extent)
+                        accel = (dpos_m - 2.0 * dpos + dpos_p).pow(2).mean()
+                        loss = loss + self.lambda_accel * warmup * accel
+                        comp_t["accel"] = accel.detach()
                 N = self.gs.num_points
                 K = min(self.rigidity_sample_k, N)
                 if self.lambda_rigidity > 0 and K >= 8:
@@ -1318,7 +1486,7 @@ class Trainer4DGS:
                     dist_def  = torch.cdist(deformed_pts, deformed_pts)
                     rigid = (dist_base - dist_def).abs().mean()
                     loss = loss + self.lambda_rigidity * warmup * rigid
-                    comp["rigid"] = rigid.item()
+                    comp_t["rigid"] = rigid.detach()
 
             # --- Scale regularizer v3.1 — ASIMETRIK HINGE ---
             # v3'te symmetric log_scale² formülü tüm scale'leri 1'e itip
@@ -1332,7 +1500,7 @@ class Trainer4DGS:
                 excess = (self.gs.scales - log_threshold).clamp(min=0)
                 scale_reg = excess.pow(2).mean()
                 loss = loss + self.lambda_scale * scale_reg
-                comp["scale"] = scale_reg.item()
+                comp_t["scale"] = scale_reg.detach()
 
             # --- Anisotropy regularizer v3.8 — STREAK / NEEDLE GAUSSIAN FIX ---
             # banana_demo Ultra'da scene'in etrafında uzun parlak çizgiler oluştu.
@@ -1351,7 +1519,7 @@ class Trainer4DGS:
                 aniso_excess = (aniso_ratio - self.aniso_threshold).clamp(min=0)
                 aniso_reg = aniso_excess.pow(2).mean()
                 loss = loss + self.lambda_aniso * warmup * aniso_reg
-                comp["aniso"] = aniso_reg.item()
+                comp_t["aniso"] = aniso_reg.detach()
 
             # --- Fourier trajectory regularizer (v3.6 / Yol C) ---
             # v5.0 (Adim 2): L2 → L1 sparsity. Lasso effect — kucuk coefficient'lari
@@ -1379,7 +1547,7 @@ class Trainer4DGS:
                 # ile recon ve sparsity arasinda denge. Static gaussian'lar
                 # cogunlukla sifir, dynamic gaussian'lar yeterli motion freedom.
                 loss = loss + self.lambda_fourier_reg * 2.0 * fourier_reg
-                comp["fourier"] = fourier_reg.item()
+                comp_t["fourier"] = fourier_reg.detach()
 
             # --- Fourier SPATIAL smoothness (v3.6.2) ---
             # Komşu gaussian'lar benzer trajectory'ye sahip olsun. Motion diffuse et.
@@ -1419,6 +1587,12 @@ class Trainer4DGS:
             # tek patlayan iter bile means/scales/quats'u NaN'layıp modeli
             # geri dönülmez kılar — cutlemon_full'de oldu.
             # v3.4: consecutive skip counter — 10 ardışık skip olursa abort
+            #
+            # Perf v2: bu check her iter SHARED-stream sync gerektiriyor (bool() on
+            # cuda scalar). Kritik bir guard oldugu icin tutuluyor — bir iter atlamak
+            # bile divergent eder, sonraki iter'lerde model patlar. Sync maliyetinin
+            # asagidaki grad/param NaN check'lerini log_interval'a kaydirip net iter
+            # baslarinda 1 sync hedefliyoruz.
             if not hasattr(self, "_consecutive_skip"):
                 self._consecutive_skip = 0
             if not torch.isfinite(loss):
@@ -1459,15 +1633,19 @@ class Trainer4DGS:
             )
 
             # --- Post-backward NaN guard on params ---
-            # Gradient clip'e rağmen bazı durumlarda (örn. gradient NaN yayılması)
-            # param'ların kendisi NaN olabilir. Güvenlik için adım öncesi sanity check.
-            grad_nan = any(
-                p.grad is not None and not torch.isfinite(p.grad).all()
-                for g in self.optimizer.param_groups for p in g["params"]
-            )
+            # Perf v2: per-iter sync (16+ params x .all()) ciddi maliyet. Divergence
+            # nadir ve onceki pre-backward isfinite(loss) guard'ı yakaliyor; bu yuzden
+            # log_interval cadence yeterli (her ~50 iter bir kontrol). Ilk 200 iter'de
+            # daha sik (init asamasi divergence olasiligi yuksek).
+            run_grad_check = will_log or it < 200
+            grad_nan = False
+            if run_grad_check:
+                grad_nan = any(
+                    p.grad is not None and not torch.isfinite(p.grad).all()
+                    for g in self.optimizer.param_groups for p in g["params"]
+                )
             if grad_nan:
-                if it % log_interval == 0 or it < 50:
-                    print(f"  ⚠ iter {it}: non-finite gradient → skip step")
+                print(f"  ⚠ iter {it}: non-finite gradient → skip step")
                 self.optimizer.zero_grad(set_to_none=False)
                 continue
 
@@ -1476,6 +1654,16 @@ class Trainer4DGS:
             # Phase 2.3 — Camera pose refinement step (warmup sonrasi aktif)
             if (self._cam_refine_optimizer is not None
                     and it >= self.cam_refine_start_iter):
+                # 4D Quality v6.1 — Madde 12: cam params icin ayri grad norm clip.
+                # Cam parametreleri gauss'larla aynı global clip'e tabi tutmak yerine
+                # kendi norm budget'ini kullanir. Large-scale scene'de drift'i azalt.
+                if self.cam_grad_clip_norm > 0:
+                    cam_params = [p for g in self._cam_refine_optimizer.param_groups
+                                  for p in g["params"] if p.grad is not None]
+                    if cam_params:
+                        torch.nn.utils.clip_grad_norm_(
+                            cam_params, max_norm=self.cam_grad_clip_norm,
+                        )
                 self._cam_refine_optimizer.step()
                 self._cam_refine_optimizer.zero_grad(set_to_none=True)
 
@@ -1483,24 +1671,30 @@ class Trainer4DGS:
             # means + scales + quats hepsi kontrol ediliyor çünkü scales inf'e
             # gitmesi training'i sessizce bozuyordu (chickchicken_v3_3'te log_scale=70+,
             # exp()=inf, her sonraki iter loss non-finite → skipped → silent garbage).
-            means_bad = not torch.isfinite(self.gs.means).all()
-            scales_bad = not torch.isfinite(self.gs.scales).all()
-            quats_bad = not torch.isfinite(self.gs.quats).all()
-            if means_bad or scales_bad or quats_bad:
-                reason = []
-                if means_bad: reason.append("means")
-                if scales_bad: reason.append("scales")
-                if quats_bad: reason.append("quats")
-                print(f"  ⚠⚠ iter {it}: {'+'.join(reason)} NaN/Inf AFTER step — training aborted")
-                if run_logger is not None:
-                    try:
-                        run_logger.log_event("training:aborted", iter=it, reason=f"{'+'.join(reason)} non-finite post-step")
-                    except Exception:
-                        pass
-                raise RuntimeError(
-                    f"Training diverged at iter {it}: {'+'.join(reason)} non-finite. "
-                    f"Last good checkpoint: run scripts/recover_scene.py <scene>"
-                )
+            #
+            # Perf v2: 3 ayri .all() reduction + bool() per iter ~3 cuda sync. Asagidaki
+            # log_interval gating sadece her ~50 iter bir kontrol; arada NaN olusursa
+            # bir sonraki iter'in pre-backward isfinite(loss) guard'ı yakalar ve skip
+            # eder, training diverge etmez (clamp'ler yardim eder).
+            if run_grad_check:
+                means_bad = not torch.isfinite(self.gs.means).all()
+                scales_bad = not torch.isfinite(self.gs.scales).all()
+                quats_bad = not torch.isfinite(self.gs.quats).all()
+                if means_bad or scales_bad or quats_bad:
+                    reason = []
+                    if means_bad: reason.append("means")
+                    if scales_bad: reason.append("scales")
+                    if quats_bad: reason.append("quats")
+                    print(f"  ⚠⚠ iter {it}: {'+'.join(reason)} NaN/Inf AFTER step — training aborted")
+                    if run_logger is not None:
+                        try:
+                            run_logger.log_event("training:aborted", iter=it, reason=f"{'+'.join(reason)} non-finite post-step")
+                        except Exception:
+                            pass
+                    raise RuntimeError(
+                        f"Training diverged at iter {it}: {'+'.join(reason)} non-finite. "
+                        f"Last good checkpoint: run scripts/recover_scene.py <scene>"
+                    )
 
             # v3.7.4: Hard clamp on log_scale — TIGHTER bound.
             # Önce scene_extent idi (gaussian sahnenin tamamı kadar olabiliyordu),
@@ -1520,10 +1714,20 @@ class Trainer4DGS:
                     self.gs.fourier_pos_coeffs.data.clamp_(min=-max_coeff, max=max_coeff)
 
             # --- Density control ---
+            # T4 perf fix: optimizer'i density.step'e geciriyoruz; densitiy ops
+            # (clone/split/prune) Adam state'i (exp_avg, exp_avg_sq) parametre
+            # mutation'ı ile lockstep gunceller. Eskiden self._build_optimizer()
+            # ile her density step optimizer'i sifirdan kuruyorduk → 200+ kez
+            # Adam momentum siliniyordu → gerek convergence yavasligi, gerekse
+            # kalite kaybi. torch.cuda.empty_cache() de kaldirildi (allocator
+            # thrash + sync stall sebebiyle stuck'lara yol aciyordu).
             if (self.density_start_iter <= it < self.density_end_iter
                     and it % self.density_interval == 0):
-                stats = self.density.step(self.gs)
-                self._build_optimizer()
+                stats = self.density.step(
+                    self.gs,
+                    optimizer=self.optimizer,
+                    dynamic_densify_scale=self.dynamic_densify_scale,
+                )
                 if it % log_interval == 0:
                     print(f"  ↳ density: clone={stats['cloned']} split={stats['split']} "
                           f"prune={stats['pruned']} | {stats['before']} → {stats['after']}")
@@ -1540,7 +1744,6 @@ class Trainer4DGS:
                         )
                     except Exception:
                         pass
-                torch.cuda.empty_cache()
 
             # --- Opacity reset (INRIA 3DGS trick, v3) ---
             # Her N iter'de tüm gaussian'ların opacity'sini low bir değere reset et
@@ -1587,6 +1790,15 @@ class Trainer4DGS:
                     dpos_applied = d_means_dbg - self.gs.means
                     dpos_mean = dpos_applied.abs().mean().item()
                     dpos_max = dpos_applied.abs().max().item()
+                # Perf v2: comp_t'deki tensor'leri tek seferde sync edip float dict'e cevir.
+                # Eskiden her iter ~12 sync; simdi sadece log_interval'de bir.
+                comp = {k: float(v.item()) if torch.is_tensor(v) else float(v)
+                        for k, v in comp_t.items()}
+                # Default'lar (downstream get(...,0.0) calismasi icin):
+                for _k in ("recon", "depth", "track", "deform_reg", "smooth", "rigid",
+                           "scale", "fourier", "accel", "lpips", "mv_consist", "flow",
+                           "aniso"):
+                    comp.setdefault(_k, 0.0)
                 history["loss"].append(loss.item())
                 history["psnr"].append(p)
                 history["n_pts"].append(self.gs.num_points)

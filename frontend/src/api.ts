@@ -89,6 +89,7 @@ export interface HyperParams {
   densify_grad_threshold?: number | null;
   prune_min_opacity?: number | null;
   prune_max_scale?: number | null;
+  max_gaussians?: number | null;
   // Model
   sh_degree?: number | null;
   hexplane_resolution?: number | null;
@@ -114,6 +115,14 @@ export interface HyperParams {
   resize_long_edge?: number | null;
   colmap_matching?: string | null;        // "sequential" | "exhaustive"
   init_subsample_mode?: string | null;    // "random" | "confidence"
+  // v6.1 — 4D Quality knobs
+  sh_progressive_schedule?: number | null;  // 0|1 — backend bool olarak parse eder
+  lambda_accel?: number | null;
+  cam_grad_clip_norm?: number | null;
+  mip_scale_floor_frac?: number | null;
+  dynamic_densify_scale?: number | null;
+  // v6.1 — Sparse-view init method
+  init_method?: string | null;            // "colmap" | "dust3r" | "auto"
 }
 
 /**
@@ -144,7 +153,36 @@ export interface SubmitJobOptions {
   /** v6.0: mode'a uygun preset string. Backend tanımıyorsa default'a düşer. */
   preset: string;
   skip_foundation?: boolean;
+  /** v6.1 — NVS evaluation enabled (held-out cam metrics + orbit mp4). */
+  nvs_eval?: boolean;
   hyperparams?: HyperParams;
+}
+
+export interface NvsEvalReport {
+  available: boolean;
+  scene?: string;
+  type?: "mv" | "sv";
+  held_out_cam?: string;
+  held_out_metrics?: {
+    psnr: number;
+    ssim: number;
+    lpips: number;
+    n_frames: number;
+  };
+  temporal_holdout?: {
+    psnr: number;
+    ssim: number;
+    lpips: number;
+    n_frames: number;
+  };
+  orbit?: {
+    success: boolean;
+    n_frames: number;
+    path?: string;
+    error?: string;
+  };
+  orbit_url?: string | null;
+  message?: string;
 }
 
 export interface ProcessResponse {
@@ -230,6 +268,15 @@ export async function getJobEvents(identifier: string, tail?: number): Promise<E
   return fetchJson<EventsResponse>(`${API_BASE}/jobs/${identifier}/events${q}`);
 }
 
+// v6.1 — NVS Evaluation
+export async function getJobEval(identifier: string): Promise<NvsEvalReport> {
+  return fetchJson<NvsEvalReport>(`${API_BASE}/jobs/${identifier}/eval`);
+}
+
+export function orbitVideoUrl(identifier: string): string {
+  return `${API_BASE}/jobs/${identifier}/orbit.mp4`;
+}
+
 export function frameUrl(identifier: string, idx: number): string {
   return `${API_BASE}/splat/${identifier}/frame/${idx}`;
 }
@@ -252,6 +299,8 @@ export async function submitJob(
   fd.append("preset", options.preset);
   if (options.skip_foundation !== undefined)
     fd.append("skip_foundation", String(options.skip_foundation));
+  if (options.nvs_eval !== undefined)
+    fd.append("nvs_eval", String(options.nvs_eval));
 
   // Hyperparams — sadece null/undefined olmayanları gönder
   if (options.hyperparams) {

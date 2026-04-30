@@ -5,7 +5,22 @@
   display: flex;
   flex-direction: column;
   gap: 14px;
-  padding: 14px 20px 0;
+  padding: 14px 20px 24px;
+  /* SCROLL FIX: app-content overflow:hidden, child'larin scroll'u kendi
+     uzerinde olmali. Aksi halde gelismis hyperparam acildiginda alt
+     icerik viewport disina dusup goz disi kaliyordu. */
+  height: 100%;
+  overflow-y: auto;
+  min-height: 0;
+}
+/* Wrapper icindeki submit-panel — height/overflow'i wrapper'a birakir,
+   kendisi serbest yukseliyor. Standalone (wrapper'siz) kullanim hala
+   submit-panel'in kendi scroll'unu kullanir. */
+.submit-mode-wrapper > .submit-panel {
+  height: auto;
+  overflow: visible;
+  padding-top: 0;
+  padding-bottom: 0;
 }
 .mode-picker {
   display: flex;

@@ -41,7 +41,10 @@ class LPIPSLoss(nn.Module):
             self._available = False
             return False
         try:
-            self._model = lpips.LPIPS(net=self.net, verbose=False).to(device)
+            # T8 fix: .eval() ile BN/dropout disabled — comment 'Eval mode' diyor ama
+            # eskiden enforce edilmiyordu (alex/vgg LPIPS networklerinde bu
+            # pratikte zararsiz ama invariant tutmaliyiz).
+            self._model = lpips.LPIPS(net=self.net, verbose=False).to(device).eval()
             for p in self._model.parameters():
                 p.requires_grad_(False)
             self._available = True

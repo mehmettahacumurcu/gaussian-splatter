@@ -240,6 +240,138 @@ class GaussianModel(nn.Module):
         if hasattr(self, "is_background"):
             self.is_background = self.is_background[mask].contiguous()
 
+    # ------------------------------------------------------------------
+    # Optimizer-aware density ops (T4 — perf fix)
+    # ------------------------------------------------------------------
+    # Per-gauss parametrelerin listesi. _apply_mask_keep_optimizer ve
+    # _append_keep_optimizer bu listeyi tarar. Fourier dahil edilirse runtime
+    # eklenir.
+    _PER_GAUSS_ATTRS = ("means", "scales", "quats", "opacities", "sh_dc", "sh_rest")
+
+    def _per_gauss_attrs(self) -> tuple[str, ...]:
+        attrs = list(self._PER_GAUSS_ATTRS)
+        if self.fourier_pos_coeffs is not None:
+            attrs.append("fourier_pos_coeffs")
+        return tuple(attrs)
+
+    @staticmethod
+    def _swap_param_in_optimizer(optimizer, old_p: nn.Parameter, new_p: nn.Parameter) -> dict | None:
+        """Pop optimizer state for `old_p`, return it; replace old_p with new_p in
+        param_groups. Caller is responsible for re-attaching the (possibly mutated)
+        state under `optimizer.state[new_p]` after mutating buffer shapes."""
+        state = optimizer.state.pop(old_p, None)
+        for group in optimizer.param_groups:
+            for i, p in enumerate(group["params"]):
+                if p is old_p:
+                    group["params"][i] = new_p
+        return state
+
+    @torch.no_grad()
+    def _apply_mask_keep_optimizer(self, mask: torch.Tensor, optimizer) -> None:
+        """Per-gauss param'ları mask ile filtrele AND optimizer Adam state'ini
+        ayni mask ile filtrele.
+
+        INRIA 3DGS reference impl pattern: density step'lerde Adam'ın
+        exp_avg / exp_avg_sq buffer'ları parametre boyutuyla in-sync kalmali
+        ki momentum kaybolmasin. Onceki kod _build_optimizer() ile her density
+        step'te optimizer'i sifirdan kuruyordu — Adam momentum 200+ kez
+        sifirlaniyor → convergence ciddi yavasliyordu.
+        """
+        for attr in self._per_gauss_attrs():
+            old_p = getattr(self, attr)
+            new_data = old_p.data[mask].contiguous()
+            new_p = nn.Parameter(new_data)
+            state = self._swap_param_in_optimizer(optimizer, old_p, new_p)
+            if state is not None:
+                if "exp_avg" in state:
+                    state["exp_avg"] = state["exp_avg"][mask].contiguous()
+                if "exp_avg_sq" in state:
+                    state["exp_avg_sq"] = state["exp_avg_sq"][mask].contiguous()
+                optimizer.state[new_p] = state
+            setattr(self, attr, new_p)
+
+        # Buffer'lar (gradient yok ama N ile sync olmali)
+        if hasattr(self, "is_static"):
+            self.is_static = self.is_static[mask].contiguous()
+        if hasattr(self, "is_background"):
+            self.is_background = self.is_background[mask].contiguous()
+
+    @torch.no_grad()
+    def _append_keep_optimizer(
+        self,
+        optimizer,
+        new_means: torch.Tensor,
+        new_scales: torch.Tensor,
+        new_quats: torch.Tensor,
+        new_opacities: torch.Tensor,
+        new_sh_dc: torch.Tensor,
+        new_sh_rest: torch.Tensor,
+        new_fourier_coeffs: torch.Tensor | None = None,
+    ) -> None:
+        """Yeni gauss'ları concat AND optimizer Adam state'i icin sifir-padded uzat."""
+        device = self.means.device
+        new_data_map = {
+            "means": new_means,
+            "scales": new_scales,
+            "quats": new_quats,
+            "opacities": new_opacities,
+            "sh_dc": new_sh_dc,
+            "sh_rest": new_sh_rest,
+        }
+        if self.fourier_pos_coeffs is not None:
+            if new_fourier_coeffs is None:
+                n_new = new_means.shape[0]
+                new_fourier_coeffs = torch.zeros(
+                    n_new, self.fourier_K, 2, 3, device=device
+                )
+            new_data_map["fourier_pos_coeffs"] = new_fourier_coeffs
+
+        for attr in self._per_gauss_attrs():
+            old_p = getattr(self, attr)
+            new_chunk = new_data_map[attr].to(device)
+            new_data = torch.cat([old_p.data, new_chunk], dim=0).contiguous()
+            new_p = nn.Parameter(new_data)
+            state = self._swap_param_in_optimizer(optimizer, old_p, new_p)
+            if state is not None:
+                n_new = new_chunk.shape[0]
+                if "exp_avg" in state:
+                    ea = state["exp_avg"]
+                    pad = torch.zeros(
+                        (n_new,) + ea.shape[1:], device=ea.device, dtype=ea.dtype
+                    )
+                    state["exp_avg"] = torch.cat([ea, pad], dim=0).contiguous()
+                if "exp_avg_sq" in state:
+                    es = state["exp_avg_sq"]
+                    pad = torch.zeros(
+                        (n_new,) + es.shape[1:], device=es.device, dtype=es.dtype
+                    )
+                    state["exp_avg_sq"] = torch.cat([es, pad], dim=0).contiguous()
+                optimizer.state[new_p] = state
+            setattr(self, attr, new_p)
+
+        # Buffer'lar
+        n_new = new_means.shape[0]
+        if hasattr(self, "is_static"):
+            new_static = torch.ones(n_new, dtype=torch.bool, device=device)
+            self.is_static = torch.cat([self.is_static, new_static], dim=0).contiguous()
+        if hasattr(self, "is_background"):
+            new_bg = torch.zeros(n_new, dtype=torch.bool, device=device)
+            self.is_background = torch.cat([self.is_background, new_bg], dim=0).contiguous()
+
+    @torch.no_grad()
+    def prune_gaussians_keep_optimizer(
+        self, optimizer, min_opacity: float = 0.005, max_scale: float = 0.1
+    ) -> int:
+        """Optimizer-aware prune. Bkz. _apply_mask_keep_optimizer."""
+        keep = (
+            (self.get_opacities.squeeze(-1) > min_opacity) &
+            (self.get_scales.max(dim=-1).values < max_scale)
+        )
+        n_pruned = int((~keep).sum().item())
+        if n_pruned > 0:
+            self._apply_mask_keep_optimizer(keep, optimizer)
+        return n_pruned
+
     @torch.no_grad()
     def append_gaussians(
         self,

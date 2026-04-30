@@ -140,6 +140,7 @@ async def process_video(
     densify_grad_threshold: float | None = Form(None, description="Densify grad eşiği"),
     prune_min_opacity: float | None = Form(None, description="Prune: opacity altı"),
     prune_max_scale: float | None = Form(None, description="Prune: scale üstü"),
+    max_gaussians: int | None = Form(None, description="N hard cap — bu sayiya ulasinca split/clone kapanir, sadece prune devam. 0 = unlimited."),
     # Model mimarisi
     sh_degree: int | None = Form(None, description="Spherical Harmonics derecesi (0-3)"),
     hexplane_resolution: int | None = Form(None, description="HexPlane grid çözünürlük"),
@@ -166,6 +167,16 @@ async def process_video(
     colmap_mv_dense_mvs: bool | None = Form(None, description="Multi-view: MVS dense reconstruction (premium, +30-90 dk, 500k-2M dense point)"),
     # Phase 1.1 — Cache infrastructure
     force_preprocess: bool = Form(False, description="True: tum cache'leri yoksay, preprocessing baştan kosulsun (frames/COLMAP/depth/tracks/masks). Default False — heavy preprocess once, train many times."),
+    # v6.1 — NVS evaluation
+    nvs_eval: bool = Form(False, description="v6.1: training sonrasi held-out cam metrics + orbit mp4 render"),
+    # v6.1 — 4D Quality knobs (override config defaults)
+    sh_progressive_schedule: bool | None = Form(None, description="v6.1: SH degree iter'a göre progresif (0→3). Default ON."),
+    lambda_accel: float | None = Form(None, description="v6.1 (4D only): 2nd-order temporal smoothness — D(t-1)-2D(t)+D(t+1) ceza. Slow-motion titreme azalt. 1e-4 to 5e-4 onerilen. 0=off."),
+    cam_grad_clip_norm: float | None = Form(None, description="v6.1 (4D only): cam_K + cam_w2c parametreleri icin grad norm clip. Cam refine drift'i azalt. Default 1.0."),
+    mip_scale_floor_frac: float | None = Form(None, description="v6.1: Mip-Splatting Python-side anti-aliasing. 3D scale floor = frac × distance_to_nearest_cam. 0.001-0.005 onerilen. 0=off."),
+    dynamic_densify_scale: float | None = Form(None, description="v6.1 (4D only): dynamic gauss'lar icin densify_grad_threshold * scale. 0.5 = 2× hassas. 1.0 = no-op."),
+    # v6.1 — Sparse-view init method
+    init_method: str | None = Form(None, description="v6.1: colmap (default) | dust3r | auto (sparse-view detect)"),
 ) -> ProcessResponse:
     """
     Video'yu upload et ve pipeline'ı kuyruğa al.
@@ -252,6 +263,8 @@ async def process_video(
     # Runner kapanı — pipeline.run_pipeline'ı callback'le çağırır
     def _runner(on_progress: Any) -> dict:
         cfg = cloud_config() if cloud else default_config()
+        # v6.1 — NVS eval flag
+        cfg.train.nvs_eval_enabled = bool(nvs_eval)
 
         # ---- v6.0 Static 3DGS preset uygulayicisi ----
         # mode='static' verildiyse Static 3DGS preset'leri kosulur, sonra
@@ -263,11 +276,13 @@ async def process_video(
                 preset_name = "balanced"
             _apply_static_preset(cfg, preset_name)
             print(f"[api.static] preset={preset_name}, static_mode={cfg.train.static_mode}, "
-                  f"n_iters={cfg.train.n_iters}, max_gauss={cfg.train.max_gaussians}")
-            # Static modda foundation otomatik atlanir, ancak skip_foundation flag'i
-            # dogrudan run_pipeline'a gecirilir. Pipeline'da zaten static_mode=True
-            # ise foundation skip + 4D lambda zero-out yapiliyor, double safety.
-            effective_skip_foundation = True
+                  f"n_iters={cfg.train.n_iters}, max_gauss={cfg.train.max_gaussians}, "
+                  f"lambda_depth={cfg.train.lambda_depth}")
+            # Static modda foundation phase'in DEPTH adimi calisir (Metric3D),
+            # tracks/masks/flow ise pipeline tarafinda atlanir. lambda_depth>0
+            # oldugu icin skip_foundation=False olmali. User explicit
+            # skip_foundation=True dediyse user'in dedigi geçer (depth de skip).
+            effective_skip_foundation = bool(skip_foundation)
 
             # Apply user hyperparam overrides on top of static preset
             # (en azindan training-shared olanlari; preset-specific olanlar
@@ -298,6 +313,8 @@ async def process_video(
                 cfg.train.prune_min_opacity = prune_min_opacity
             if prune_max_scale is not None:
                 cfg.train.prune_max_scale = prune_max_scale
+            if max_gaussians is not None:
+                cfg.train.max_gaussians = max(0, int(max_gaussians))
             if resize_long_edge is not None:
                 cfg.preprocess.resize_long_edge = resize_long_edge
             if colmap_matching is not None:
@@ -308,6 +325,17 @@ async def process_video(
                 if init_subsample_mode not in ("random", "confidence"):
                     raise HTTPException(400, f"init_subsample_mode invalid: {init_subsample_mode}")
                 cfg.preprocess.init_subsample_mode = init_subsample_mode
+            # v6.1 — 4D Quality knobs (static branch — sadece mode-shared'lar etki eder)
+            if sh_progressive_schedule is not None:
+                cfg.train.sh_progressive_schedule = bool(sh_progressive_schedule)
+            if mip_scale_floor_frac is not None:
+                cfg.train.mip_scale_floor_frac = float(mip_scale_floor_frac)
+            # lambda_accel, cam_grad_clip_norm, dynamic_densify_scale 4D-only;
+            # static modda set edilse bile trainer bunlari kullanmaz (deformation off).
+            if init_method is not None:
+                if init_method not in ("colmap", "dust3r", "auto"):
+                    raise HTTPException(400, f"init_method invalid: {init_method}")
+                cfg.preprocess.init_method = init_method
 
             return run_pipeline(
                 str(video_path),
@@ -591,6 +619,8 @@ async def process_video(
             cfg.train.prune_min_opacity = prune_min_opacity
         if prune_max_scale is not None:
             cfg.train.prune_max_scale = prune_max_scale
+        if max_gaussians is not None:
+            cfg.train.max_gaussians = max(0, int(max_gaussians))
         # Model mimarisi
         if sh_degree is not None:
             cfg.model.sh_degree = sh_degree
@@ -635,6 +665,21 @@ async def process_video(
             if init_subsample_mode not in ("random", "confidence"):
                 raise HTTPException(400, f"init_subsample_mode: random | confidence ({init_subsample_mode})")
             cfg.preprocess.init_subsample_mode = init_subsample_mode
+        # v6.1 — 4D Quality knobs (dynamic branch)
+        if sh_progressive_schedule is not None:
+            cfg.train.sh_progressive_schedule = bool(sh_progressive_schedule)
+        if lambda_accel is not None:
+            cfg.train.lambda_accel = float(lambda_accel)
+        if cam_grad_clip_norm is not None:
+            cfg.train.cam_grad_clip_norm = float(cam_grad_clip_norm)
+        if mip_scale_floor_frac is not None:
+            cfg.train.mip_scale_floor_frac = float(mip_scale_floor_frac)
+        if dynamic_densify_scale is not None:
+            cfg.train.dynamic_densify_scale = float(dynamic_densify_scale)
+        if init_method is not None:
+            if init_method not in ("colmap", "dust3r", "auto"):
+                raise HTTPException(400, f"init_method: colmap | dust3r | auto ({init_method})")
+            cfg.preprocess.init_method = init_method
         if colmap_mv_timestamps is not None:
             if colmap_mv_timestamps < 1 or colmap_mv_timestamps > 50:
                 raise HTTPException(400, f"colmap_mv_timestamps: 1-50 ({colmap_mv_timestamps})")
@@ -925,6 +970,54 @@ def job_events(identifier: str, tail: int | None = None) -> JSONResponse:
     if tail is not None and tail > 0:
         lines = lines[-tail:]
     return JSONResponse({"events": lines, "count": len(lines)})
+
+
+# ---------------------------------------------------------------------------
+# 4D Quality v6.1 — Madde 1+8: NVS Evaluation endpoints
+# ---------------------------------------------------------------------------
+@app.get("/jobs/{identifier}/eval", tags=["eval"])
+def job_eval(identifier: str) -> JSONResponse:
+    """NVS eval JSON report — held-out cam metrics + orbit mp4 path."""
+    eval_dir = _resolve_eval_dir(identifier)
+    if eval_dir is None:
+        raise HTTPException(404, f"Eval dir bulunamadi: {identifier}")
+    eval_json = eval_dir / "nvs_eval.json"
+    if not eval_json.exists():
+        return JSONResponse({"available": False, "message": "NVS eval not run"})
+    try:
+        report = json.loads(eval_json.read_text(encoding="utf-8"))
+        # orbit.mp4 path bilgisi
+        orbit_path = eval_dir / "orbit.mp4"
+        report["available"] = True
+        report["orbit_url"] = f"/jobs/{identifier}/orbit.mp4" if orbit_path.exists() else None
+        return JSONResponse(report)
+    except Exception as e:
+        raise HTTPException(500, f"Eval okuma hatasi: {e}")
+
+
+@app.get("/jobs/{identifier}/orbit.mp4", tags=["eval"])
+def job_orbit_video(identifier: str) -> FileResponse:
+    """Orbit cam mp4'u indir/yayinla."""
+    eval_dir = _resolve_eval_dir(identifier)
+    if eval_dir is None:
+        raise HTTPException(404, f"Eval dir bulunamadi: {identifier}")
+    orbit_path = eval_dir / "orbit.mp4"
+    if not orbit_path.exists():
+        raise HTTPException(404, "Orbit mp4 yok (NVS eval calistirilmamis veya basarisiz)")
+    return FileResponse(orbit_path, media_type="video/mp4", filename="orbit.mp4")
+
+
+def _resolve_eval_dir(identifier: str) -> Path | None:
+    """Job ID veya scene name'den eval/ klasoru bul."""
+    manager: JobManager = app.state.manager
+    job = manager.get(identifier)
+    if job is not None and job.scene:
+        scene = job.scene
+    else:
+        scene = _safe_scene_name(identifier)
+    paths = scene_paths(scene)
+    eval_dir = paths["output"] / "eval"
+    return eval_dir if eval_dir.exists() else None
 
 
 # ---------------------------------------------------------------------------
