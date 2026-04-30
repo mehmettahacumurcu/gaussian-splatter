@@ -64,6 +64,44 @@ def is_multiview_scene(scene_name: str) -> bool:
     return len(video_files) >= 2
 
 
+def is_static_scene(scene_name: str) -> bool:
+    """Static 3DGS — Faz 1: photo-set / sparse-view sahnesini tespit et.
+
+    Heuristic (oncelik sirasi):
+      1. data/<scene>/static.flag → varsa True (manuel override).
+      2. data/<scene>/images/ klasoru var ve >=3 jpg/png/exr varsa True
+         (klasik 3DGS / NeRF Synthetic / Tanks & Temples / Mip-NeRF360 yapisi).
+      3. data/<scene>/video.mp4 yok, frames/ yok ama colmap/ var → True.
+         (kullanici sadece COLMAP klasoru sagladiysa fotograf seti demektir).
+      4. Yukaridakilerin hicbiri yoksa False (4D dynamic veya video pipeline'i).
+
+    Bu helper sadece tespit eder; cfg.train.static_mode'u set ETMEZ. Ust katman
+    (CLI / pipeline / preset script) bu sonuca gore kararini verir.
+    """
+    paths = scene_paths(scene_name)
+    base = paths["base"]
+    if not base.exists():
+        return False
+    # 1) Manuel flag
+    if (base / "static.flag").exists():
+        return True
+    # 2) images/ klasoru (klasik 3DGS yapisi)
+    images_dir = base / "images"
+    if images_dir.exists() and images_dir.is_dir():
+        n_imgs = 0
+        for ext in (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"):
+            n_imgs += len(list(images_dir.glob(f"*{ext}")))
+            if n_imgs >= 3:
+                return True
+    # 3) Sadece colmap/ var, video/frames yok
+    has_video = paths["video"].exists()
+    has_frames = paths["frames"].exists() and any(paths["frames"].glob("frame_*.png"))
+    has_colmap = paths["colmap"].exists() and (paths["colmap"] / "sparse").exists()
+    if has_colmap and not has_video and not has_frames:
+        return True
+    return False
+
+
 def list_multiview_cameras(scene_name: str) -> list[str]:
     """Multi-view sahnesinin kameralarını listele (cam00, cam01, ...).
 
@@ -240,6 +278,10 @@ class TrainConfig:
     # 0 = kapali (manuel API), >0 = auto-promote threshold (motion-vote frac).
     auto_static_dynamic: bool = True
     static_dynamic_threshold: float = 0.10  # gauss %10+ frame motion -> dynamic
+    # Static 3DGS — Faz 1: 4D dynamic features tamamen bypass.
+    # True: deformation MLP + Fourier trajectory yok, sadece statik 3D.
+    # Mevcut 4D kodu olduğu gibi reuse eder, training/inference sade 3DGS.
+    static_mode: bool = False
 
 
 @dataclass

@@ -266,6 +266,8 @@ class Trainer4DGS:
         self.cam_refine_start_iter = int(cam_refine_start_iter)
         # Phase 2.1 — Static/Dynamic split (default off; promote_dynamic ile aktiflesir)
         self.use_static_dynamic_split = False
+        # Static 3DGS Faz 1 — static mode flag (4D features bypass)
+        self.static_mode = False
         # Phase 2.3 — Camera pose refine optimizer placeholder (None = inactive)
         self._cam_refine_optimizer = None
         if self.lr_cam_K > 0 or self.lr_cam_w2c > 0:
@@ -331,6 +333,13 @@ class Trainer4DGS:
         self.optimizer = torch.optim.Adam(groups, eps=1e-15)
 
     def _apply_deformation(self, t: float):
+        # Static 3DGS Faz 1 — static_mode'da hiç deformation yok, identity döner
+        if getattr(self, "static_mode", False) or self.deform is None:
+            return (
+                self.gs.means,
+                F.normalize(self.gs.quats, dim=-1),
+                self.gs.get_scales,
+            )
         # MLP her zaman çağrılır (dquat, dscale için gerekli, dpos opsiyonel)
         dpos_mlp, dquat, dscale = self.deform(self.gs.means, t, self.scene_extent)
         # v3.5: dscale clamp — MLP'nin scale delta'sı ±2 ile sınırlı.
@@ -470,6 +479,83 @@ class Trainer4DGS:
               f"(threshold {threshold}/{n_total_views} views)")
         print(f"  Static: {self.gs.num_static:,}, Dynamic: {self.gs.num_dynamic:,}")
 
+    @torch.no_grad()
+    def _setup_static_dynamic_from_masks_sv(
+        self,
+        masks_dir: Path,
+        frame_paths: list,
+        cam_K: torch.Tensor,
+        w2c_list: list,
+        threshold_frac: float = 0.10,
+    ) -> None:
+        """Phase 2.1 — Single-view motion mask voting (tek cam, T frame).
+
+        Multi-view varyantının single-view portu. Her gauss tek cam'a
+        her frame'de project edilir, mask motion piksellerinde ise vote.
+        """
+        import cv2
+        masks_dir = Path(masks_dir)
+        if not masks_dir.exists():
+            print(f"[trainer.static_dyn] masks yok: {masks_dir}, skip")
+            return
+        if not hasattr(self.gs, "promote_dynamic"):
+            return
+
+        n_pts = self.gs.num_points
+        device = self.gs.means.device
+        dynamic_votes = torch.zeros(n_pts, dtype=torch.int32, device=device)
+        n_total = 0
+
+        means = self.gs.means.detach()
+        K = cam_K.to(device)
+
+        # mask file naming: mask_0001.png (frame index 0-indexed → 1-indexed?)
+        # dynamic_mask.py: mask_path = out / f"mask_{i+1:04d}.png" (1-indexed)
+        mask_files = sorted(masks_dir.glob("mask_*.png"))
+        if not mask_files:
+            print(f"[trainer.static_dyn] mask_*.png yok: {masks_dir}")
+            return
+
+        T_avail = min(len(mask_files), len(frame_paths), len(w2c_list))
+        for t in range(T_avail):
+            m_np = cv2.imread(str(mask_files[t]), cv2.IMREAD_GRAYSCALE)
+            if m_np is None:
+                continue
+            H_m, W_m = m_np.shape
+            mask_t = torch.from_numpy(m_np > 127).to(device)
+
+            w2c = w2c_list[t].to(device)
+            R = w2c[:3, :3]
+            tvec = w2c[:3, 3]
+            pts_cam = (R @ means.T).T + tvec
+            z = pts_cam[:, 2]
+            valid_z = z > 0.1
+            uv_h = (K @ pts_cam.T).T
+            u = uv_h[:, 0] / uv_h[:, 2].clamp(min=0.1)
+            v = uv_h[:, 1] / uv_h[:, 2].clamp(min=0.1)
+            in_frame = valid_z & (u >= 0) & (u < W_m) & (v >= 0) & (v < H_m)
+            if not in_frame.any():
+                continue
+            ui = u[in_frame].long().clamp(0, W_m - 1)
+            vi = v[in_frame].long().clamp(0, H_m - 1)
+            pix_motion = mask_t[vi, ui]
+            idx_in = torch.where(in_frame)[0]
+            dynamic_votes[idx_in[pix_motion]] += 1
+            n_total += 1
+
+        if n_total == 0:
+            print(f"[trainer.static_dyn] Hicbir mask okunmadi, skip")
+            return
+
+        threshold = max(1, int(n_total * threshold_frac))
+        dynamic_mask = dynamic_votes > threshold
+        n_promoted = self.gs.promote_dynamic(dynamic_mask)
+        self.use_static_dynamic_split = True
+        print(f"[trainer.static_dyn.sv] {n_promoted:,} gauss DYNAMIC "
+              f"({100 * n_promoted / max(n_pts, 1):.1f}%) "
+              f"(threshold {threshold}/{n_total} frames)")
+        print(f"  Static: {self.gs.num_static:,}, Dynamic: {self.gs.num_dynamic:,}")
+
     def _prepare_tracks(
         self,
         tracks_path: Path,
@@ -572,6 +658,8 @@ class Trainer4DGS:
         depth_dir: Path | None = None,
         mask_dir: Path | None = None,
         tracks_path: Path | None = None,
+        # Phase 1.8 single-view — RAFT optical flow path (forward_*.pt)
+        flow_dir: Path | None = None,
         run_logger: Any = None,   # RunLogger instance, opsiyonel
         mv_frame_paths=None,
         mv_cam_K=None,
@@ -586,7 +674,13 @@ class Trainer4DGS:
         # Phase 2.1 — Static/Dynamic auto-promote
         auto_static_dynamic: bool = False,
         static_dynamic_threshold: float = 0.10,
+        # Static 3DGS Faz 1 — 4D features bypass
+        static_mode: bool = False,
     ) -> dict:
+        # Static mode — 4D dynamic features bypass (deformation, Fourier, motion regs)
+        self.static_mode = bool(static_mode)
+        if self.static_mode:
+            print(f"\n[trainer.STATIC] Static 3DGS modu — 4D dynamic features kapalı")
         # v5.0: Multi-view detect
         is_multiview = mv_frame_paths is not None
         # v5.0 ARCHITECTURAL FIX: Static warmup phase.
@@ -599,8 +693,12 @@ class Trainer4DGS:
         # genelde 5-8k iter'de oturur. 50k iter run icin 25k static phase
         # gereksiz uzun, dynamic phase'e zaman birak. min(n_iters//2, 8000).
         # Single-view'da bu sorun yok, iter 1'den deformation aktif kalabilir.
-        self._static_phase_iters = min(n_iters // 2, 8000) if is_multiview else 0
-        if is_multiview:
+        # Static 3DGS modu: tüm training boyunca deformation kapalı, warmup gerekmez
+        if self.static_mode:
+            self._static_phase_iters = 0
+        else:
+            self._static_phase_iters = min(n_iters // 2, 8000) if is_multiview else 0
+        if is_multiview and not self.static_mode:
             print(f"[trainer.mv] Static warmup phase: {self._static_phase_iters} iter "
                   f"(deformation tamamen donuk)")
             # Phase 1.9 — Multi-view densify tuning: threshold'u scale ile carp.
@@ -701,18 +799,33 @@ class Trainer4DGS:
                       f"start_iter={self.cam_refine_start_iter}")
             print(f"[trainer.mv] K scaled per-cam, {len(train_cams)} entries")
 
-        # Phase 2.1 — Static/Dynamic auto-promote (multi-view only).
+        # Phase 2.1 — Static/Dynamic auto-promote.
         # Mask voting ile ilk N iter'den ONCE statik/dinamik secimini yap,
         # boylece training boyunca statik bolgeler deformation BYPASS eder.
+        # Static 3DGS Faz 1 — static_mode'da deformation komple kapali, dynamic
+        # ayrimi anlamsiz; auto-promote'u atla.
+        if self.static_mode:
+            auto_static_dynamic = False
         if (is_multiview and auto_static_dynamic and masks_mv_dir is not None
                 and hasattr(self.gs, "promote_dynamic")):
-            print(f"\n[trainer.static_dyn] Phase 2.1 auto-promote — "
+            print(f"\n[trainer.static_dyn] Phase 2.1 auto-promote (MV) — "
                   f"mask voting threshold={static_dynamic_threshold}")
             self._setup_static_dynamic_from_masks(
                 masks_mv_dir=masks_mv_dir,
                 train_cams=train_cams,
                 mv_cam_K=mv_cam_K,
                 mv_w2c=mv_w2c,
+                threshold_frac=static_dynamic_threshold,
+            )
+        elif (not is_multiview and auto_static_dynamic and mask_dir is not None
+              and hasattr(self.gs, "promote_dynamic")):
+            print(f"\n[trainer.static_dyn] Phase 2.1 auto-promote (SV) — "
+                  f"mask voting threshold={static_dynamic_threshold}")
+            self._setup_static_dynamic_from_masks_sv(
+                masks_dir=mask_dir,
+                frame_paths=frame_paths,
+                cam_K=cam_K_orig,
+                w2c_list=w2c_list,
                 threshold_frac=static_dynamic_threshold,
             )
 
@@ -734,6 +847,12 @@ class Trainer4DGS:
             if (is_multiview and flow_mv_dir is not None and self.lambda_flow > 0)
             else None
         )
+        # Phase 1.8 single-view — flow cache (single timeline, T frame)
+        flow_cached_sv = (
+            [None] * T
+            if (not is_multiview and flow_dir is not None and self.lambda_flow > 0)
+            else None
+        )
 
         use_depth = depth_dir is not None and self.lambda_depth > 0
         use_mask  = mask_dir is not None
@@ -743,6 +862,9 @@ class Trainer4DGS:
         use_flow_mv = (
             is_multiview and flow_mv_dir is not None and self.lambda_flow > 0
         )
+        use_flow_sv = (
+            not is_multiview and flow_dir is not None and self.lambda_flow > 0
+        )
         if use_depth:
             print(f"[trainer] Depth loss aktif (lambda={self.lambda_depth})")
         if use_depth_mv:
@@ -751,6 +873,9 @@ class Trainer4DGS:
         if use_flow_mv:
             print(f"[trainer.mv] Phase 1.8 Flow-MV supervision: "
                   f"lambda={self.lambda_flow}, dir={flow_mv_dir}")
+        if use_flow_sv:
+            print(f"[trainer.sv] Phase 1.8 Flow-SV supervision: "
+                  f"lambda={self.lambda_flow}, dir={flow_dir}")
         if use_mask:
             print(f"[trainer] Mask-weighted recon aktif (lambda={self.lambda_mask_motion})")
 
@@ -777,8 +902,9 @@ class Trainer4DGS:
         # Her ikisini de warmup'la ramp up.
         DEFORM_GROUP_IDX = 6   # deform MLP
         FOURIER_GROUP_IDX = 7  # fourier (yoksa len < 8)
-        target_lr_deform = self.lr_deform
-        target_lr_fourier = self.lr_fourier
+        # Static 3DGS modu: deformation/fourier optimizer'ları LR=0
+        target_lr_deform = 0.0 if self.static_mode else self.lr_deform
+        target_lr_fourier = 0.0 if self.static_mode else self.lr_fourier
         has_fourier_group = len(self.optimizer.param_groups) > FOURIER_GROUP_IDX
 
         for it in range(1, n_iters + 1):
@@ -827,6 +953,9 @@ class Trainer4DGS:
                             depth_cached = [None] * T
                         if use_mask:
                             mask_cached = [None] * T
+                        # Phase 1.8 SV — flow cache da invalidate
+                        if flow_cached_sv is not None:
+                            flow_cached_sv = [None] * T
 
             # --- Ground truth load ---
             if is_multiview:
@@ -1033,6 +1162,63 @@ class Trainer4DGS:
                 except Exception as _e:
                     if it < 50:
                         print(f"  ⚠ flow loss failed iter {it}: {_e}")
+
+            # --- Phase 1.8 SV: RAFT optical flow supervision (single-view) ---
+            # MV varyantın single-view portu. flow_dir/forward_*.pt cache'inden
+            # gt flow yukle, t+1 frame'i ayni cam'da render et, RGB diff vs gt L1.
+            if (use_flow_sv and self.lambda_flow > 0
+                    and idx < T - 1
+                    and it > getattr(self, "_static_phase_iters", 0)
+                    and not is_multiview):
+                try:
+                    flow_path = flow_dir / f"forward_{idx:04d}.pt"
+                    if flow_path.exists():
+                        if flow_cached_sv[idx] is None:
+                            flow_cached_sv[idx] = torch.load(
+                                flow_path, map_location=self.device
+                            ).float()
+                        gt_flow = flow_cached_sv[idx]
+                        gt_flow_resized = F.interpolate(
+                            gt_flow.unsqueeze(0), size=(Hs, Ws),
+                            mode='bilinear', align_corners=False,
+                        ).squeeze(0)
+                        gt_flow_mag = gt_flow_resized.norm(dim=0)
+                        # Render frame t+1 same cam pose (single-view next frame'in pose'u list'te)
+                        t_next_norm = (idx + 1) / max(T - 1, 1)
+                        d_means_n, d_quats_n, d_scales_n = self._apply_deformation(t_next_norm)
+                        if (self.use_static_dynamic_split
+                                and hasattr(self.gs, "is_static")):
+                            bypass = self.gs.is_static.to(d_means_n.device)
+                            if hasattr(self.gs, "is_background"):
+                                bypass = bypass | self.gs.is_background.to(d_means_n.device)
+                            if bypass.any():
+                                m_und = self.gs.means
+                                q_und = F.normalize(self.gs.quats, dim=-1)
+                                s_und = self.gs.get_scales
+                                d_means_n = torch.where(bypass.unsqueeze(-1), m_und, d_means_n)
+                                d_quats_n = torch.where(bypass.unsqueeze(-1), q_und, d_quats_n)
+                                d_scales_n = torch.where(bypass.unsqueeze(-1), s_und, d_scales_n)
+                        # Single-view next frame için K + w2c (cam_K_orig + w2c_list[idx+1])
+                        ro_n, _, _ = render_view(
+                            means=d_means_n, quats=d_quats_n, scales=d_scales_n,
+                            opacities=self.gs.get_opacities, colors=self.gs.get_colors,
+                            K=K_scaled, w2c=w2c_list[idx + 1],
+                            width=Ws, height=Hs,
+                            sh_degree=self.gs.sh_degree,
+                            with_depth=False,
+                        )
+                        rgb_n = ro_n if ro_n.shape[-1] == 3 else ro_n[..., :3]
+                        rendered_diff_mag = (rgb_n - rgb).abs().mean(dim=-1)
+                        flow_warmup = min(1.0, it / max(1, self.flow_warmup_iters))
+                        gt_norm = gt_flow_mag / (gt_flow_mag.max() + 1e-6)
+                        diff_norm = rendered_diff_mag / (rendered_diff_mag.max() + 1e-6)
+                        flow_l1 = (diff_norm - gt_norm).abs().mean().clamp(max=1.0)
+                        if torch.isfinite(flow_l1):
+                            loss = loss + self.lambda_flow * flow_warmup * flow_l1
+                            comp["flow"] = float(flow_l1.item())
+                except Exception as _e:
+                    if it < 50:
+                        print(f"  ⚠ flow_sv loss failed iter {it}: {_e}")
 
             # --- Depth consistency (log-space, warmup-gated, clamped) ---
             # Log-space L1 scale-invariant ve outlier'a karşı dayanıklı.

@@ -80,6 +80,32 @@ def run_pipeline(
     cb: ProgressCallback = progress_callback or _noop_cb
     status = {}
 
+    # Static 3DGS Faz 1 — static_mode aktifse foundation modelleri (depth/tracks/
+    # masks/flow) gerekmez. 4D dynamic loss'lar zaten kapali, sadece RGB+SSIM+LPIPS.
+    # NOT: Lambda'lar otomatik 0'lanir (lambda_depth, lambda_flow vs.) ki cache
+    # yokken trainer crash etmesin.
+    static_mode_active = bool(getattr(cfg.train, "static_mode", False))
+    if static_mode_active:
+        if not skip_foundation:
+            print("[Static 3DGS] static_mode=True → foundation modeller atlandi "
+                  "(depth/tracks/masks/flow)")
+            skip_foundation = True
+        # 4D-only loss'larin lambda'larini sifirla — preprocess yok ise crash riski.
+        for _attr in ("lambda_depth", "lambda_mask_motion", "lambda_track",
+                      "lambda_flow", "lambda_smoothness", "lambda_rigidity",
+                      "lambda_deform_reg", "lambda_fourier_reg",
+                      "lambda_multiview_consistency"):
+            try:
+                if getattr(cfg.train, _attr, 0.0) > 0:
+                    setattr(cfg.train, _attr, 0.0)
+            except Exception:
+                pass
+        # Phase 2.1 auto-promote da gereksiz — statik sahnede dynamic ayrimi yok.
+        try:
+            cfg.train.auto_static_dynamic = False
+        except Exception:
+            pass
+
     # Run logger — tüm pipeline'ı takip eder, metrics/events/summary yazar
     run_logger = RunLogger(paths["output"] / "logs", scene=scene_name)
     run_logger.log_event(
@@ -88,6 +114,7 @@ def run_pipeline(
         skip_training=skip_training,
         skip_export=skip_export,
         video_path=str(video_path),
+        static_mode=static_mode_active,
     )
     try:
         # Config'i de event olarak yaz (dataclass → dict)
@@ -535,6 +562,42 @@ def run_pipeline(
                 print(f"⚠ Maske başarısız, atlanıyor: {e}")
                 foundation_status["masks"] = f"failed: {e}"
 
+        # 3d — Phase 1.8 SV: RAFT optical flow (lambda_flow>0 ise preprocess)
+        if getattr(cfg.train, "lambda_flow", 0.0) > 0:
+            flow_cached_sv = (
+                not force_preprocess
+                and is_step_cached(paths, "flow",
+                                   min_count=max(1, n_frames_for_mask - 6),
+                                   cfg=cfg, scene_dir=paths["base"])
+            )
+            if flow_cached_sv:
+                n_flow = len(list(paths["flow"].glob("forward_*.pt")))
+                log_cache("flow", paths["flow"], hit=True, count=n_flow)
+                foundation_status["flow"] = f"ok (cache hit, {n_flow})"
+            else:
+                log_cache("flow", paths["flow"], hit=False)
+                try:
+                    from .preprocess.optical_flow import (
+                        estimate_flow, release_models as _rf,
+                    )
+                    estimate_flow(
+                        paths["frames"], paths["flow"],
+                        device="cuda" if torch.cuda.is_available() else "cpu",
+                        overwrite=False,
+                    )
+                    n_flow = len(list(paths["flow"].glob("forward_*.pt")))
+                    foundation_status["flow"] = f"ok ({n_flow})"
+                    write_cache_marker(paths["base"], "flow", {
+                        "n_frames": n_frames_for_mask,
+                        "n_flow_total": n_flow,
+                    }, cfg=cfg)
+                    _rf()
+                except Exception as e:
+                    print(f"⚠ SV flow basarisiz, atlanir: {e}")
+                    foundation_status["flow"] = f"failed: {e}"
+        else:
+            foundation_status["flow"] = "skip (lambda_flow=0)"
+
         status["foundation"] = ", ".join(f"{k}={v}" for k, v in foundation_status.items())
         cb("foundation", 1.0, f"Foundation bitti: {status['foundation']}", foundation_status)
     else:
@@ -606,16 +669,29 @@ def run_pipeline(
     gs = GaussianModel(init_pts, init_colors=init_rgb,
                        sh_degree=cfg.model.sh_degree,
                        fourier_K=cfg.model.fourier_K)
-    deform = DeformationField(
-        resolution=cfg.model.hexplane_resolution,
-        feat_dim=cfg.model.hexplane_feat_dim,
-        mlp_width=cfg.model.mlp_width,
-        mlp_depth=cfg.model.mlp_depth,
-        num_time_freqs=cfg.model.num_time_freqs,
-        # Phase 2.5 — opt-in multi-res HexPlane
-        multires_resolutions=getattr(cfg.model, "multires_resolutions", None) or None,
-        multires_feat_dim=getattr(cfg.model, "multires_feat_dim", None),
-    )
+    # Static 3DGS Faz 1 — DeformationField construct skip if static_mode
+    if getattr(cfg.train, "static_mode", False):
+        print(f"  [Static 3DGS] DeformationField construct atlandi (static_mode=True)")
+        # Hala None geçirmemek için minimal placeholder — _apply_deformation
+        # static_mode kontrolüyle bypass eder, ama ckpt save'de gerekli
+        deform = DeformationField(
+            resolution=8, feat_dim=4, mlp_width=32, mlp_depth=1,
+            num_time_freqs=2,
+        )
+        # Tüm deformation parametrelerini gradient'siz yap (LR=0 zaten ama kesin)
+        for p in deform.parameters():
+            p.requires_grad_(False)
+    else:
+        deform = DeformationField(
+            resolution=cfg.model.hexplane_resolution,
+            feat_dim=cfg.model.hexplane_feat_dim,
+            mlp_width=cfg.model.mlp_width,
+            mlp_depth=cfg.model.mlp_depth,
+            num_time_freqs=cfg.model.num_time_freqs,
+            # Phase 2.5 — opt-in multi-res HexPlane
+            multires_resolutions=getattr(cfg.model, "multires_resolutions", None) or None,
+            multires_feat_dim=getattr(cfg.model, "multires_feat_dim", None),
+        )
     if is_mv:
         extent = float(mv_ctx["scene_extent"])
     else:
@@ -779,6 +855,13 @@ def run_pipeline(
             and any(paths["flow_mv"].rglob("forward_*.pt")))
         else None
     )
+    # Phase 1.8 single-view — flow_dir trainer wire
+    flow_dir_arg = (
+        paths["flow"]
+        if (not is_mv and paths["flow"].exists()
+            and any(paths["flow"].glob("forward_*.pt")))
+        else None
+    )
 
     history = trainer.train(
         frame_paths, K_first, w2c_list,
@@ -791,6 +874,7 @@ def run_pipeline(
         depth_dir=depth_dir_arg,
         mask_dir=mask_dir_arg,
         tracks_path=tracks_path_arg,
+        flow_dir=flow_dir_arg,  # Phase 1.8 single-view RAFT flow
         run_logger=run_logger,
         mv_frame_paths=mv_frame_paths_arg,
         mv_cam_K=mv_cam_K_arg,
@@ -803,6 +887,8 @@ def run_pipeline(
         # Phase 2.1 — Static/Dynamic auto-promote
         auto_static_dynamic=getattr(cfg.train, "auto_static_dynamic", True),
         static_dynamic_threshold=getattr(cfg.train, "static_dynamic_threshold", 0.10),
+        # Static 3DGS Faz 1 — 4D bypass
+        static_mode=getattr(cfg.train, "static_mode", False),
     )
     run_logger.phase_end(
         "training",
