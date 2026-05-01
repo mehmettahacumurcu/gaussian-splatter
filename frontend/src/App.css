@@ -803,3 +803,58 @@ html, body, #root {
   border-top: 1px dashed var(--border);
   font-family: var(--ff-mono);
 }
+
+/* ===================================================================
+   Hyperparams panel — T6 additions
+   =================================================================== */
+.hparam-search-row {
+  padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--border);
+}
+.hparam-search {
+  width: 100%;
+  padding: 5px 10px;
+  background: #0a0a0a;
+  border: 1px solid var(--border-1);
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-12);
+}
+.hparam-search:focus { outline: none; border-color: var(--accent); }
+
+.hparam-reset-btn {
+  margin-left: var(--sp-2);
+  padding: 2px 8px;
+  background: transparent;
+  border: 1px solid var(--border-1);
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-11);
+  cursor: pointer;
+}
+.hparam-reset-btn:hover:enabled { background: var(--bg-3); color: var(--text); }
+.hparam-reset-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.hparam-empty {
+  padding: var(--sp-3) var(--sp-4);
+  font-size: var(--fs-12);
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.hparam-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.hparam-field-row {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-1);
+}
+.hparam-preset-hint {
+  margin-left: auto;
+  font-size: var(--fs-11);
+  color: var(--text-muted);
+  font-family: var(--ff-mono);
+}

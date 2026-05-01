@@ -1,25 +1,22 @@
 /**
  * HyperparameterPanel — tüm training hiperparametrelerini override eder.
  *
- * Gruplar (her biri collapsible):
- *   - Temel: iters, resolution, num_timestamps, fps
- *   - Loss weights: lambda_ssim + motion regularizers
- *   - Learning rates: lr_deform, lr_means
- *   - Density control: start/end/interval/thresholds
- *   - Model: sh_degree, hexplane, mlp_width
- *
  * Her field "optional override": boş bırakılırsa backend default'u kullanır.
- * Preset (smoke/cloud) seçili ise preset'in yazdığı değer üzerine uygulanır.
+ * Preset seçili ise field placeholder'ında "preset: X" hint görülür
+ * (PRESET_DEFAULTS tablosundan).
+ *
+ * T6 — search, info-on-every-field, preset-default placeholder, reset,
+ * override-count badges.
  */
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { HyperParams, JobMode } from "../api";
+import { PRESET_DEFAULTS } from "../presets";
+import { InfoButton } from "./ui/InfoButton";
 
 interface Props {
   value: HyperParams;
   onChange: (next: HyperParams) => void;
-  /** v6.0 — Static modda 4D-only grup'lar gizlenir. */
   mode?: JobMode;
-  /** Salt bilgi amacli — header'da "X preset default'lari" yazar. */
   preset?: string;
 }
 
@@ -37,7 +34,6 @@ interface FieldSpec {
 interface GroupSpec {
   title: string;
   icon: string;
-  /** True ise sadece 4D modda gosterilir (deformation/Fourier/motion regs). */
   dynamicOnly?: boolean;
   fields: FieldSpec[];
 }
@@ -51,7 +47,7 @@ const GROUPS: GroupSpec[] = [
       { key: "resolution", label: "Resolution", placeholder: "640x360", kind: "string" },
       { key: "num_timestamps", label: "Timestamps (export)", placeholder: "preset", kind: "number", min: 2, step: 1 },
       { key: "fps", label: "Frame extraction FPS", placeholder: "10", kind: "number", min: 1, step: 1 },
-      { key: "warmup_iters", label: "Warmup iters", placeholder: "500", kind: "number", min: 0, step: 100, help: "Regularizer'lar linear 0→full over this many iter. v3 full default: 500 (eski: 2000)" },
+      { key: "warmup_iters", label: "Warmup iters", placeholder: "500", kind: "number", min: 0, step: 100, help: "Regularizer'lar linear 0→full over this many iter. v3 full default: 500." },
     ],
   },
   {
@@ -59,16 +55,16 @@ const GROUPS: GroupSpec[] = [
     icon: "λ",
     fields: [
       { key: "lambda_ssim", label: "λ SSIM", placeholder: "0.2", kind: "number", step: 0.05, help: "0=L1 only, 1=SSIM only" },
-      { key: "lambda_scale", label: "λ scale reg", placeholder: "0.005", kind: "number", step: 0.001, help: "ASIMETRIK hinge: sadece scale > 5% × scene_extent olanları cezalandır (outlier-only). Static + Dynamic." },
-      { key: "lambda_depth", label: "λ depth (Metric3D)", placeholder: "0.1", kind: "number", step: 0.05, help: "Scale-invariant L1 between rendered & Metric3D depth. Static modda da kullanilabilir (geometric prior). 0 = depth supervision off." },
+      { key: "lambda_scale", label: "λ scale reg", placeholder: "0.005", kind: "number", step: 0.001, help: "Asimetrik hinge: scale > 5% × scene_extent olanları cezalandırır." },
+      { key: "lambda_depth", label: "λ depth (Metric3D)", placeholder: "0.1", kind: "number", step: 0.05, help: "Scale-invariant L1 between rendered & Metric3D depth. 0 = depth supervision off." },
     ],
   },
   {
-    title: "Motion / 4D loss ağırlıkları",
+    title: "Motion / 4D loss",
     icon: "🎬",
     dynamicOnly: true,
     fields: [
-      { key: "lambda_deform_reg", label: "λ deform L2", placeholder: "0.0003", kind: "number", step: 0.0001, help: "Δpos/Δquat/Δscale mag regularizer." },
+      { key: "lambda_deform_reg", label: "λ deform L2", placeholder: "0.0003", kind: "number", step: 0.0001, help: "Δpos/Δquat/Δscale magnitude regularizer." },
       { key: "lambda_smoothness", label: "λ temporal smoothness", placeholder: "0.002", kind: "number", step: 0.001, help: "D(t) vs D(t+dt)." },
       { key: "lambda_rigidity", label: "λ isometric rigidity", placeholder: "0.002", kind: "number", step: 0.001, help: "Local geometry koruma." },
       { key: "lambda_mask_motion", label: "λ mask-weighted recon", placeholder: "1.0", kind: "number", step: 0.1, help: "Dynamic mask'li bölgelerde reconstruction weight boost." },
@@ -97,13 +93,13 @@ const GROUPS: GroupSpec[] = [
     icon: "●",
     fields: [
       { key: "density_start_iter", label: "Density start iter", placeholder: "preset", kind: "number", min: 0, step: 100 },
-      { key: "density_end_iter", label: "Density end iter", placeholder: "preset", kind: "number", min: 0, step: 100, help: "v3 default full'de 22k (eski: 15k) — final prune'lar için" },
+      { key: "density_end_iter", label: "Density end iter", placeholder: "preset", kind: "number", min: 0, step: 100, help: "v3 default full'de 22k — final prune'lar için." },
       { key: "density_interval", label: "Density interval", placeholder: "100", kind: "number", min: 1, step: 10 },
       { key: "densify_grad_threshold", label: "Densify grad threshold", placeholder: "0.0002", kind: "number", step: 0.0001 },
       { key: "prune_min_opacity", label: "Prune min opacity", placeholder: "0.005", kind: "number", step: 0.001 },
-      { key: "prune_max_scale", label: "Prune max scale (fraction)", placeholder: "0.02", kind: "number", step: 0.005, help: "v3.2: scene_extent'in FRACTION'u. Örn scene=70 → 0.02×70=1.4 units cap. Önceden absolute idi, bug'tı" },
-      { key: "max_gaussians", label: "Max gauss (N hard cap)", placeholder: "0 (unlimited)", kind: "number", min: 0, step: 10000, help: "v3.7.2: bu sayıya ulaşınca split+clone DURDURULUR, sadece prune devam. 0 = sınırsız (preset'in kendi cap'i). 200000 onerilir 1080p 8GB için." },
-      { key: "opacity_reset_interval", label: "Opacity reset aralığı", placeholder: "0 (kapalı)", kind: "number", min: 0, step: 500, help: "v3.1 default: 0 (KAPALI, density control zaten yapıyor). >0 koyarsan her N iter reset yapar" },
+      { key: "prune_max_scale", label: "Prune max scale (fraction)", placeholder: "0.02", kind: "number", step: 0.005, help: "v3.2: scene_extent'in fraction'u. 0.02×scene_extent units cap." },
+      { key: "max_gaussians", label: "Max gauss (N hard cap)", placeholder: "0 (unlimited)", kind: "number", min: 0, step: 10000, help: "v3.7.2: Bu sayıya ulaşınca split+clone durdurulur, sadece prune devam. 0 = sınırsız." },
+      { key: "opacity_reset_interval", label: "Opacity reset aralığı", placeholder: "0 (kapalı)", kind: "number", min: 0, step: 500, help: "v3.1 default: 0 (kapalı). >0 koyarsan her N iter reset yapar." },
     ],
   },
   {
@@ -129,32 +125,32 @@ const GROUPS: GroupSpec[] = [
     ],
   },
   {
-    title: "Foundation modeller (Faz 3, 4D only)",
+    title: "Foundation modeller (4D only)",
     icon: "🜚",
     dynamicOnly: true,
     fields: [
-      { key: "metric3d_model", label: "Metric3D model", placeholder: "metric3d_vit_small", kind: "string", help: "metric3d_vit_small (default, hızlı) | metric3d_vit_large (daha keskin depth) | metric3d_vit_giant2 (en iyi)" },
+      { key: "metric3d_model", label: "Metric3D model", placeholder: "metric3d_vit_small", kind: "string", help: "small (hızlı) | large (keskin) | giant2 (en iyi)" },
       { key: "cotracker_num_points", label: "CoTracker nokta sayısı", placeholder: "2048", kind: "number", min: 256, step: 256 },
       { key: "cotracker_grid_size", label: "CoTracker grid NxN", placeholder: "30", kind: "number", min: 10, max: 60, step: 5 },
       { key: "sam2_threshold", label: "SAM2 threshold", placeholder: "0.5", kind: "number", min: 0, max: 1, step: 0.05 },
     ],
   },
   {
-    title: "Preprocessing (v3.9 STATIC MAX)",
+    title: "Preprocessing",
     icon: "🎬",
     fields: [
-      { key: "resize_long_edge", label: "Frame extract long edge (px)", placeholder: "960", kind: "number", min: 480, step: 160, help: "Default 960. 1280-1440 daha çok detail ama COLMAP yavaşlar." },
-      { key: "colmap_matching", label: "COLMAP matching", placeholder: "sequential", kind: "string", help: "sequential (default, hızlı) | exhaustive (yavaş N², orbital camera için loop closure sağlar)" },
-      { key: "init_subsample_mode", label: "Init subsample mode", placeholder: "random", kind: "string", help: "random (default) | confidence (track length / reproj error tabanlı, kaliteli noktaları korur)" },
+      { key: "resize_long_edge", label: "Frame extract long edge (px)", placeholder: "960", kind: "number", min: 480, step: 160, help: "1280-1440 daha çok detail ama COLMAP yavaşlar." },
+      { key: "colmap_matching", label: "COLMAP matching", placeholder: "sequential", kind: "string", help: "sequential (hızlı) | exhaustive (yavaş, orbital camera için loop closure)" },
+      { key: "init_subsample_mode", label: "Init subsample mode", placeholder: "random", kind: "string", help: "random | confidence (track length / reproj error tabanlı)" },
     ],
   },
   {
     title: "v6.1 Quality (mode-shared)",
     icon: "✨",
     fields: [
-      { key: "mip_scale_floor_frac", label: "Mip-Splatting scale floor frac", placeholder: "0", kind: "number", step: 0.0005, min: 0, max: 0.01, help: "v6.1 Madde 2-B: 3D scale floor = frac × distance_to_nearest_cam. Anti-aliasing approx. 0.001-0.005 onerilen, 0=off (default). Yakın gauss'larin tek-piksel bozulmasini engeller." },
-      { key: "sh_progressive_schedule", label: "SH progressive schedule (0/1)", placeholder: "1", kind: "number", min: 0, max: 1, step: 1, help: "v6.1 Madde 11: SH degree iter'a gore 0→3 progresif. 1=ON (default), 0=OFF (sabit max degree). PSNR +0.3-0.5 dB." },
-      { key: "init_method", label: "Init method", placeholder: "colmap", kind: "string", help: "v6.1 Madde 3: colmap (default) | dust3r (sparse-view, ~500MB model) | auto (frame<20 ise dust3r)" },
+      { key: "mip_scale_floor_frac", label: "Mip-Splatting scale floor frac", placeholder: "0", kind: "number", step: 0.0005, min: 0, max: 0.01, help: "3D scale floor = frac × distance_to_nearest_cam. Anti-aliasing approx." },
+      { key: "sh_progressive_schedule", label: "SH progressive schedule (0/1)", placeholder: "1", kind: "number", min: 0, max: 1, step: 1, help: "1=ON (default), 0=OFF (sabit max degree). PSNR +0.3-0.5 dB." },
+      { key: "init_method", label: "Init method", placeholder: "colmap", kind: "string", help: "colmap | dust3r (sparse-view) | auto (frame<20 ise dust3r)" },
     ],
   },
   {
@@ -162,9 +158,9 @@ const GROUPS: GroupSpec[] = [
     icon: "✨",
     dynamicOnly: true,
     fields: [
-      { key: "lambda_accel", label: "λ accel (2nd-order smoothness)", placeholder: "0", kind: "number", step: 0.0001, min: 0, max: 0.01, help: "v6.1 Madde 6: D(t-1)-2D(t)+D(t+1) ceza. Slow-motion render titremesini azalt. 1e-4 to 5e-4 onerilen, 0=off." },
-      { key: "cam_grad_clip_norm", label: "Cam refine grad clip", placeholder: "1.0", kind: "number", step: 0.1, min: 0, help: "v6.1 Madde 12: cam_K + cam_w2c grad norm budget. Default 1.0. 0=off. Large-scale scene cam drift'i azalt." },
-      { key: "dynamic_densify_scale", label: "Dynamic densify scale", placeholder: "0.5", kind: "number", step: 0.1, min: 0, max: 2, help: "v6.1 Madde 7: dynamic gauss icin densify_grad_threshold * scale. 0.5 = 2× hassas. 1.0 = no-op. Phase 2.1 split'le birlikte calisir." },
+      { key: "lambda_accel", label: "λ accel (2nd-order smoothness)", placeholder: "0", kind: "number", step: 0.0001, min: 0, max: 0.01, help: "Slow-motion render titremesini azalt. 1e-4 to 5e-4 önerilen." },
+      { key: "cam_grad_clip_norm", label: "Cam refine grad clip", placeholder: "1.0", kind: "number", step: 0.1, min: 0, help: "cam_K + cam_w2c grad norm budget. 0=off." },
+      { key: "dynamic_densify_scale", label: "Dynamic densify scale", placeholder: "0.5", kind: "number", step: 0.1, min: 0, max: 2, help: "0.5 = 2× hassas. 1.0 = no-op." },
     ],
   },
   {
@@ -172,21 +168,44 @@ const GROUPS: GroupSpec[] = [
     icon: "★",
     dynamicOnly: true,
     fields: [
-      { key: "lambda_aniso", label: "λ anisotropy", placeholder: "0", kind: "number", step: 0.005, help: "max/min scale ratio threshold üstü gauss'ları cezalandır. 0=kapalı, 0.02=Ultra Clean default" },
-      { key: "aniso_threshold", label: "Aniso threshold", placeholder: "5", kind: "number", min: 1, step: 0.5, help: "max/min < threshold serbest. Düşük=daha agresif streak fix." },
-      { key: "dpos_total_cap_frac", label: "Δpos total cap fraction", placeholder: "0.2", kind: "number", min: 0.01, max: 0.5, step: 0.01, help: "Per-iter motion cap × scene_extent. Default 0.2; Ultra Clean 0.05 (4× sıkı)." },
+      { key: "lambda_aniso", label: "λ anisotropy", placeholder: "0", kind: "number", step: 0.005, help: "max/min scale ratio threshold üstü gauss'ları cezalandır." },
+      { key: "aniso_threshold", label: "Aniso threshold", placeholder: "5", kind: "number", min: 1, step: 0.5, help: "Düşük=daha agresif streak fix." },
+      { key: "dpos_total_cap_frac", label: "Δpos total cap fraction", placeholder: "0.2", kind: "number", min: 0.01, max: 0.5, step: 0.01, help: "Per-iter motion cap × scene_extent." },
     ],
   },
 ];
 
 export function HyperparameterPanel({ value, onChange, mode = "dynamic", preset }: Props) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set(["Temel"]));
+  const [search, setSearch] = useState("");
 
-  // Static modda 4D-only grup'lari gizle
-  const visibleGroups = GROUPS.filter((g) => {
-    if (mode === "static" && g.dynamicOnly) return false;
-    return true;
-  });
+  const presetDefaults = useMemo(
+    () => (preset ? PRESET_DEFAULTS[mode]?.[preset] : undefined) ?? {},
+    [mode, preset],
+  );
+
+  const visibleGroups = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return GROUPS
+      .filter((g) => !(mode === "static" && g.dynamicOnly))
+      .map((g) => {
+        if (!q) return g;
+        const fields = g.fields.filter(
+          (f) =>
+            f.label.toLowerCase().includes(q) ||
+            String(f.key).toLowerCase().includes(q),
+        );
+        return fields.length > 0 ? { ...g, fields } : null;
+      })
+      .filter((g): g is GroupSpec => g !== null);
+  }, [mode, search]);
+
+  const effectiveExpanded = useMemo(() => {
+    if (!search.trim()) return expanded;
+    const next = new Set(expanded);
+    for (const g of visibleGroups) next.add(g.title);
+    return next;
+  }, [expanded, search, visibleGroups]);
 
   const toggle = (title: string) => {
     setExpanded((prev) => {
@@ -198,8 +217,15 @@ export function HyperparameterPanel({ value, onChange, mode = "dynamic", preset 
   };
 
   const overrideCount = Object.values(value).filter(
-    (v) => v !== null && v !== undefined && v !== ""
+    (v) => v !== null && v !== undefined && v !== "",
   ).length;
+
+  const handleReset = () => {
+    if (overrideCount === 0) return;
+    if (window.confirm(`Reset ${overrideCount} override${overrideCount > 1 ? "s" : ""}?`)) {
+      onChange({});
+    }
+  };
 
   return (
     <div className="hparam-panel">
@@ -215,11 +241,32 @@ export function HyperparameterPanel({ value, onChange, mode = "dynamic", preset 
             ? `${preset ?? "default"} preset default'ları`
             : `${overrideCount} override`}
         </span>
+        <button
+          type="button"
+          className="hparam-reset-btn"
+          onClick={handleReset}
+          disabled={overrideCount === 0}
+          title="Tüm override'ları temizle"
+        >
+          Reset
+        </button>
       </div>
+      <div className="hparam-search-row">
+        <input
+          type="text"
+          className="hparam-search"
+          placeholder="🔍 Field ara…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+      </div>
+      {visibleGroups.length === 0 && (
+        <div className="hparam-empty">Eşleşen field yok.</div>
+      )}
       {visibleGroups.map((g) => {
-        const isOpen = expanded.has(g.title);
+        const isOpen = effectiveExpanded.has(g.title);
         const groupOverrides = g.fields.filter(
-          (f) => value[f.key] !== null && value[f.key] !== undefined && value[f.key] !== ""
+          (f) => value[f.key] !== null && value[f.key] !== undefined && value[f.key] !== "",
         ).length;
         return (
           <div key={g.title} className={`hparam-group ${isOpen ? "open" : ""}`}>
@@ -241,7 +288,8 @@ export function HyperparameterPanel({ value, onChange, mode = "dynamic", preset 
                   <NumberOrTextField
                     key={f.key}
                     spec={f}
-                    value={value[f.key] as any}
+                    value={value[f.key] as number | string | null | undefined}
+                    presetDefault={presetDefaults[f.key] as number | string | null | undefined}
                     onChange={(val) => onChange({ ...value, [f.key]: val })}
                   />
                 ))}
@@ -254,31 +302,23 @@ export function HyperparameterPanel({ value, onChange, mode = "dynamic", preset 
   );
 }
 
-
-// ---------------------------------------------------------------------------
-// NumberOrTextField — locale-safe input (text + decimal mode)
-// HTML5 number input Turkce Windows'ta nokta-decimal'i ("0.001") reddediyor.
-// Local raw text buffer ile yarim sayilarin (0., 0.0, 0.00) korunmasini saglar.
-// ---------------------------------------------------------------------------
 function NumberOrTextField({
   spec,
   value,
+  presetDefault,
   onChange,
 }: {
   spec: FieldSpec;
   value: number | string | null | undefined;
+  presetDefault: number | string | null | undefined;
   onChange: (val: number | string | null) => void;
 }) {
   const isNum = spec.kind === "number";
-  // Local raw text buffer — controlled input ama yarim sayilar kayboldurmasin
   const [raw, setRaw] = useState<string>(
     value === null || value === undefined ? "" : String(value),
   );
-  // Dis prop value degistiginde raw'i senkronize et (preset secimi vs.)
   useEffect(() => {
     const ext = value === null || value === undefined ? "" : String(value);
-    // Sadece kullanici-girisi olmayan dis degisikliklerde set et:
-    // raw'in parse'i value ile eslesiyorsa zaten senkron; aksi halde override.
     const parsed = isNum ? parseFloat(raw.replace(",", ".")) : NaN;
     const sameAsValue =
       (raw === "" && (value === null || value === undefined)) ||
@@ -290,17 +330,11 @@ function NumberOrTextField({
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const r = e.target.value;
-    setRaw(r);  // Her zaman ham metni koru
-    if (r === "") {
-      onChange(null);
-      return;
-    }
+    setRaw(r);
+    if (r === "") { onChange(null); return; }
     if (isNum) {
       const normalized = r.replace(",", ".").trim();
-      if (normalized === "-" || normalized === "." || normalized === "-.") {
-        // Yarim sayi — parent value degistirme, kullanici devam ediyor
-        return;
-      }
+      if (normalized === "-" || normalized === "." || normalized === "-.") return;
       const n = parseFloat(normalized);
       if (Number.isFinite(n)) onChange(n);
     } else {
@@ -308,11 +342,18 @@ function NumberOrTextField({
     }
   };
 
+  const presetHint =
+    presetDefault !== undefined && presetDefault !== null && presetDefault !== ""
+      ? `preset: ${presetDefault}`
+      : null;
+
   return (
-    <label className="hparam-field">
-      <span className="hparam-label" title={spec.help}>
-        {spec.label}
-      </span>
+    <div className="hparam-field">
+      <div className="hparam-field-row">
+        <span className="hparam-label">{spec.label}</span>
+        {spec.help && <InfoButton label={`${spec.label} help`}>{spec.help}</InfoButton>}
+        {presetHint && <span className="hparam-preset-hint">{presetHint}</span>}
+      </div>
       <input
         type="text"
         inputMode={isNum ? "decimal" : "text"}
@@ -320,6 +361,6 @@ function NumberOrTextField({
         value={raw}
         onChange={handleChange}
       />
-    </label>
+    </div>
   );
 }
