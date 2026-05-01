@@ -23,7 +23,7 @@
  */
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
-// @ts-expect-error — Spark types henüz tam değil
+// @ts-ignore — Spark types henüz tam değil
 import { SplatMesh, SparkRenderer } from "@sparkjsdev/spark";
 import { frameUrl } from "../api";
 

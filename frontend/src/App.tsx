@@ -7,7 +7,6 @@
  *   - Viewer: seçilen job'ın 4D splat render'ı + timeline
  */
 import { useCallback, useEffect, useState } from "react";
-import "./App.css";
 import { SplatViewer } from "./components/SplatViewer";
 import { SplatViewerSpark } from "./components/SplatViewerSpark";
 import { TimelineSlider } from "./components/TimelineSlider";
