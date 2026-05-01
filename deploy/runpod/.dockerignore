@@ -1,0 +1,28 @@
+# Keep the Docker build context tight — these directories are huge or
+# irrelevant for the cloud backend image.
+
+frontend/node_modules
+frontend/src-tauri/target
+frontend/dist
+frontend/.vite
+
+# All scene / output data lives on a runtime volume, not in the image.
+data/
+.cache/
+.huggingface/
+.torch_extensions/
+
+# Local dev artefacts.
+.git/
+.venv/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+*.log
+build_log.txt
+adam_error.txt
+jobs.json
+
+# Notebooks and one-off junk.
+notebooks/
+*.ipynb

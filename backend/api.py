@@ -11,16 +11,18 @@ Swagger UI:
 from __future__ import annotations
 import io
 import json
+import os
 import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
 import torch
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from .api_models import (
     HealthResponse,
@@ -58,7 +60,13 @@ app = FastAPI(
 )
 
 
-# CORS — Tauri / localhost web client'ları için
+# CORS — Tauri / localhost client'ları için.
+# Cloud deployment: CORS_ALLOW_ORIGINS env var'ı virgülle ayrılmış origin
+# listesi alır (örn. "https://my-tauri-app.local,https://abc.runpod.io").
+# Boşsa default localhost + Tauri allow-list kullanılır.
+_extra_origins = os.environ.get("CORS_ALLOW_ORIGINS", "").strip()
+_extra_list = [o.strip() for o in _extra_origins.split(",") if o.strip()] if _extra_origins else []
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -66,12 +74,52 @@ app.add_middleware(
         "http://127.0.0.1:*",
         "tauri://localhost",
         "https://tauri.localhost",
+        *_extra_list,
     ],
     allow_origin_regex=r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?|tauri://localhost|https://tauri\.localhost)$",
     allow_credentials=True,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Optional bearer-token auth (cloud deployments).
+#
+# When RUNPOD_AUTH_TOKEN is set in the environment, every request must include
+#     Authorization: Bearer <token>
+# A few low-risk endpoints stay public so health checks and CORS preflights
+# work without credentials.
+# When the env var is unset (local dev), this middleware is a no-op.
+# ---------------------------------------------------------------------------
+_AUTH_TOKEN = os.environ.get("RUNPOD_AUTH_TOKEN", "").strip()
+_AUTH_PUBLIC_PATHS = {"/", "/docs", "/openapi.json", "/redoc"}
+
+
+class BearerTokenMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if not _AUTH_TOKEN:
+            return await call_next(request)
+        if request.method == "OPTIONS":
+            return await call_next(request)
+        if request.url.path in _AUTH_PUBLIC_PATHS:
+            return await call_next(request)
+        header = request.headers.get("authorization", "")
+        if not header.startswith("Bearer "):
+            return JSONResponse(
+                {"detail": "Missing bearer token"}, status_code=401,
+            )
+        token = header[len("Bearer "):].strip()
+        if token != _AUTH_TOKEN:
+            return JSONResponse(
+                {"detail": "Invalid bearer token"}, status_code=401,
+            )
+        return await call_next(request)
+
+
+app.add_middleware(BearerTokenMiddleware)
+if _AUTH_TOKEN:
+    print(f"[api] Bearer-token auth enabled (token len={len(_AUTH_TOKEN)})")
 
 
 # ---------------------------------------------------------------------------
