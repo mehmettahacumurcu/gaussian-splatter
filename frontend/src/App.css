@@ -775,3 +775,31 @@ html, body, #root {
   background: var(--bg-3);
   border-color: var(--accent);
 }
+
+/* ===================================================================
+   Submit panel — T5 redesign chrome
+   =================================================================== */
+.submit-context-line {
+  font-size: var(--fs-12);
+  color: var(--text-muted);
+  margin: -8px 0 var(--sp-4);
+}
+.preset-chip-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--sp-2);
+  width: 100%;
+}
+.preset-chip-content { flex: 1; min-width: 0; }
+.preset-chip ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: var(--fs-11);
+}
+.preset-chip li { margin-bottom: 2px; }
+.preset-vs {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  font-family: var(--ff-mono);
+}

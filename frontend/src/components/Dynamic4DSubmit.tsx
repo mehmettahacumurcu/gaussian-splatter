@@ -3,14 +3,13 @@
  *
  * Video input zorunlu (frame extraction → COLMAP → foundation → training).
  * Multi-view auto-detect: data/<scene>/videos/cam*.mp4 varsa N3V mode aktif.
- *
- * Preset'ler backend api.py /process'teki mevcut preset listesini kullanir
- * (eski boolean flag yerine v6.0 mode='dynamic' + preset string).
  */
 import { useMemo, useState } from "react";
 import type { DynamicPreset, HyperParams, ProcessResponse } from "../api";
 import { submitJob } from "../api";
 import { HyperparameterPanel } from "./HyperparameterPanel";
+import { Card } from "./ui/Card";
+import { PresetChip } from "./PresetChip";
 
 interface Props {
   onJobSubmitted: (response: ProcessResponse, sceneName: string) => void;
@@ -25,62 +24,14 @@ interface PresetSpec {
 }
 
 const PRESETS: PresetSpec[] = [
-  {
-    id: "micro",
-    name: "Micro",
-    badge: "⚡",
-    duration: "30 sn–10 dk",
-    desc: "200 iter · 320×180 · 5 ts · dev iteration / preflight smoke",
-  },
-  {
-    id: "smoke",
-    name: "Smoke",
-    badge: "💨",
-    duration: "5-15 dk",
-    desc: "500 iter · 480×270 · 10 ts · pipeline saglik check",
-  },
-  {
-    id: "full",
-    name: "Full",
-    badge: "🟢",
-    duration: "30-60 dk",
-    desc: "30k iter · 640×360 · 60 ts · 3060 Ti default",
-  },
-  {
-    id: "high",
-    name: "High",
-    badge: "⭐",
-    duration: "3-4 saat",
-    desc: "50k iter · 640×360 · 90 ts · Fourier K=10 · N cap 60k · enhanced",
-  },
-  {
-    id: "ultra",
-    name: "Ultra",
-    badge: "🔥",
-    duration: "6-9 saat",
-    desc: "80k iter · 720×405 · 90 ts · HexPlane 112/56 · MLP 640/4 · K=12 · N cap 80k",
-  },
-  {
-    id: "ultra_clean",
-    name: "Ultra Clean",
-    badge: "✨",
-    duration: "7-9 saat",
-    desc: "v3.8 anti-streak · aniso reg + sıkı dpos clamp + rigid 5× + fourier_reg 10×",
-  },
-  {
-    id: "static_max",
-    name: "Static Max (legacy)",
-    badge: "🎯",
-    duration: "10-13 saat",
-    desc: "v3.9 4D ama statik-leaning · fps=20 + vit_large depth + COLMAP exhaustive. NOT: gercek statik icin Static 3D modunu kullan.",
-  },
-  {
-    id: "cloud",
-    name: "Cloud",
-    badge: "☁",
-    duration: "RunPod / RTX 4090",
-    desc: "60k iter · 1920×1080 · 120 ts · cloud GPU",
-  },
+  { id: "micro",       name: "Micro",       badge: "⚡", duration: "30 sn–10 dk", desc: "200 iter · 320×180 · 5 ts · dev iteration / preflight smoke" },
+  { id: "smoke",       name: "Smoke",       badge: "💨", duration: "5-15 dk",     desc: "500 iter · 480×270 · 10 ts · pipeline sağlık check" },
+  { id: "full",        name: "Full",        badge: "🟢", duration: "30-60 dk",    desc: "30k iter · 640×360 · 60 ts · 3060 Ti default" },
+  { id: "high",        name: "High",        badge: "⭐", duration: "3-4 saat",    desc: "50k iter · 640×360 · 90 ts · Fourier K=10 · N cap 60k · enhanced" },
+  { id: "ultra",       name: "Ultra",       badge: "🔥", duration: "6-9 saat",    desc: "80k iter · 720×405 · 90 ts · HexPlane 112/56 · MLP 640/4 · K=12 · N cap 80k" },
+  { id: "ultra_clean", name: "Ultra Clean", badge: "✨", duration: "7-9 saat",    desc: "v3.8 anti-streak · aniso reg + sıkı dpos clamp + rigid 5× + fourier_reg 10×" },
+  { id: "static_max",  name: "Static Max",  badge: "🎯", duration: "10-13 saat",  desc: "v3.9 4D ama statik-leaning · fps=20 + vit_large depth + COLMAP exhaustive" },
+  { id: "cloud",       name: "Cloud",       badge: "☁",  duration: "RunPod",      desc: "60k iter · 1920×1080 · 120 ts · cloud GPU" },
 ];
 
 export function Dynamic4DSubmit({ onJobSubmitted }: Props) {
@@ -88,7 +39,6 @@ export function Dynamic4DSubmit({ onJobSubmitted }: Props) {
   const [scene, setScene] = useState("");
   const [preset, setPreset] = useState<DynamicPreset>("smoke");
   const [skipFoundation, setSkipFoundation] = useState(false);
-  // v6.1 — NVS evaluation
   const [nvsEval, setNvsEval] = useState(true);
   const [hyperparams, setHyperparams] = useState<HyperParams>({});
   const [showAdvanced, setShowAdvanced] = useState(false);
@@ -109,8 +59,6 @@ export function Dynamic4DSubmit({ onJobSubmitted }: Props) {
     return `${(videoFile.size / 1024 / 1024).toFixed(1)} MB`;
   }, [videoFile]);
 
-  // 4D modda multi-view scene icin video upload zorunlu degil (sahne onceden
-  // load_n3v.py ile import edilmis olabilir). Sadece sahne adi yeterli.
   const canSubmit = scene.trim() !== "" && !submitting;
 
   const handleSubmit = async () => {
@@ -136,17 +84,14 @@ export function Dynamic4DSubmit({ onJobSubmitted }: Props) {
 
   return (
     <div className="submit-panel">
-      <div className="submit-panel-mode-banner submit-panel-mode-dynamic">
-        🎬 <strong>4D Dynamic Mode</strong> — zaman-dinamik sahneler. Deformation MLP +
-        per-Gaussian Fourier trajectory + foundation modeller (depth/track/flow) aktif.
-        Multi-view auto-detect: <code>data/&lt;sahne&gt;/videos/cam*.mp4</code> varsa N3V mode.
-      </div>
-
       <h2 className="submit-title">Yeni 4D Dynamic Job</h2>
+      <p className="submit-context-line">
+        🎬 Zaman-dinamik sahneler. Deformation MLP + per-Gaussian Fourier trajectory
+        + foundation modeller (depth/track/flow) aktif. Multi-view auto-detect:{" "}
+        <code>data/&lt;sahne&gt;/videos/cam*.mp4</code>.
+      </p>
 
-      {/* Video */}
-      <div className="submit-section">
-        <label className="submit-label">Video dosyası</label>
+      <Card title="Video dosyası">
         <div className="file-picker">
           <input
             type="file"
@@ -165,15 +110,11 @@ export function Dynamic4DSubmit({ onJobSubmitted }: Props) {
           )}
         </div>
         <p className="submit-hint">
-          MP4 veya MOV — kamera hareketli, sahnede belirgin doku. HyperNeRF dataset:{" "}
-          <code>scripts/hypernerf_to_mp4.py</code> ile mp4'e cevir. Multi-view scene
-          icin sahne onceden hazir ise video upload skip edilebilir.
+          MP4 veya MOV. Multi-view scene için sahne önceden hazır ise upload skip edilebilir.
         </p>
-      </div>
+      </Card>
 
-      {/* Sahne adi */}
-      <div className="submit-section">
-        <label className="submit-label">Sahne adı</label>
+      <Card title="Sahne adı">
         <input
           type="text"
           className="submit-input"
@@ -181,35 +122,27 @@ export function Dynamic4DSubmit({ onJobSubmitted }: Props) {
           onChange={(e) => setScene(e.target.value)}
           placeholder="örn. banana_demo, flame_steak"
         />
-      </div>
+      </Card>
 
-      {/* Preset */}
-      <div className="submit-section">
-        <label className="submit-label">Preset</label>
+      <Card title="Preset">
         <div className="preset-row">
           {PRESETS.map((p) => (
-            <label
+            <PresetChip
               key={p.id}
-              className={`preset-chip ${preset === p.id ? "active" : ""}`}
-            >
-              <input
-                type="radio"
-                checked={preset === p.id}
-                onChange={() => setPreset(p.id)}
-              />
-              <div>
-                <div className="preset-name">
-                  {p.name} {p.badge} <span className="preset-duration">({p.duration})</span>
-                </div>
-                <div className="preset-desc">{p.desc}</div>
-              </div>
-            </label>
+              pipeline="dynamic"
+              presetId={p.id}
+              name={p.name}
+              badge={p.badge}
+              duration={p.duration}
+              desc={p.desc}
+              selected={preset === p.id}
+              onSelect={() => setPreset(p.id)}
+            />
           ))}
         </div>
-      </div>
+      </Card>
 
-      {/* Foundation toggle */}
-      <div className="submit-section">
+      <Card title="Options">
         <label className="submit-checkbox">
           <input
             type="checkbox"
@@ -217,9 +150,7 @@ export function Dynamic4DSubmit({ onJobSubmitted }: Props) {
             onChange={(e) => setSkipFoundation(e.target.checked)}
           />
           Foundation modelleri atla (Metric3D / CoTracker / Farneback / RAFT)
-          <span className="submit-hint-inline">
-            — micro/smoke preset'leri icin onerilir
-          </span>
+          <span className="submit-hint-inline">— micro/smoke için önerilir</span>
         </label>
         <label className="submit-checkbox" style={{ marginTop: 6 }}>
           <input
@@ -227,40 +158,46 @@ export function Dynamic4DSubmit({ onJobSubmitted }: Props) {
             checked={nvsEval}
             onChange={(e) => setNvsEval(e.target.checked)}
           />
-          NVS Evaluation — onerilir
+          NVS Evaluation — önerilir
           <span className="submit-hint-inline">
-            — training sonrasi held-out PSNR/SSIM/LPIPS + orbit mp4. Eval tab'da gorulur.
+            — held-out PSNR/SSIM/LPIPS + orbit mp4
           </span>
         </label>
-      </div>
+      </Card>
 
-      {/* Advanced */}
-      <div className="submit-section">
-        <button
-          className="btn-secondary advanced-toggle"
-          onClick={() => setShowAdvanced(!showAdvanced)}
-          type="button"
-        >
-          {showAdvanced ? "▾" : "▸"} Gelişmiş hiperparametreler
-        </button>
-        {showAdvanced && (
+      <Card
+        title="Hiperparametreler"
+        actions={
+          <button
+            className="btn-secondary"
+            onClick={() => setShowAdvanced(!showAdvanced)}
+            type="button"
+          >
+            {showAdvanced ? "▾ Gizle" : "▸ Göster"}
+          </button>
+        }
+      >
+        {showAdvanced ? (
           <HyperparameterPanel
             value={hyperparams}
             onChange={setHyperparams}
             mode="dynamic"
             preset={preset}
           />
+        ) : (
+          <p className="submit-hint">
+            "{preset}" preset default'larını kullan. Override eklemek için Göster.
+          </p>
         )}
-      </div>
+      </Card>
 
-      {/* Submit */}
       <div className="submit-actions">
         <button
           className="btn-primary submit-btn"
           disabled={!canSubmit}
           onClick={handleSubmit}
         >
-          {submitting ? "Gönderiliyor..." : "4D Dynamic Job baslat"}
+          {submitting ? "Gönderiliyor..." : "4D Dynamic Job başlat"}
         </button>
         {submitError && <div className="submit-error">Hata: {submitError}</div>}
       </div>

@@ -255,8 +255,7 @@ function App() {
       <main className="app-content">
         {tab === "submit" && (
           <JobSubmitPanel
-            mode={pipeline}
-            onModeChange={handlePipelineChange}
+            pipeline={pipeline}
             onJobSubmitted={handleJobSubmitted}
           />
         )}
