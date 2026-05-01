@@ -308,7 +308,7 @@ function App() {
               </button>
             </div>
             {analyticsScene ? (
-              <TrainingAnalytics scene={analyticsScene} autoRefresh={true} />
+              <TrainingAnalytics scene={analyticsScene} pipeline={pipeline} autoRefresh={true} />
             ) : (
               <div style={{ padding: 20, color: "#888" }}>
                 Sahne adını gir ve Enter — ya da "Aktif/son job" butonuna bas.
