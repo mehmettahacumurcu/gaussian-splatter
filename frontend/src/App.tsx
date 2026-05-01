@@ -263,7 +263,7 @@ function App() {
         {tab === "jobs" && (
           <div className="tab-content">
             <h2 className="tab-title">Tüm Jobs</h2>
-            <JobsList onViewJob={handleViewJob} />
+            <JobsList pipeline={pipeline} onViewJob={handleViewJob} />
           </div>
         )}
 

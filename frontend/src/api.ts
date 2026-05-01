@@ -43,6 +43,7 @@ export interface Job {
   error: string | null;
   ply_dir: string | null;
   download_url: string | null;
+  mode?: JobMode;
 }
 
 export interface SceneListItem {

@@ -858,3 +858,39 @@ html, body, #root {
   color: var(--text-muted);
   font-family: var(--ff-mono);
 }
+
+/* ===================================================================
+   Jobs filter + mode chip — T7
+   =================================================================== */
+.jobs-filter-row {
+  display: flex;
+  gap: var(--sp-1);
+  padding: 0 0 var(--sp-3);
+  flex-wrap: wrap;
+}
+.jobs-filter-chip {
+  padding: 4px 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-12);
+  cursor: pointer;
+}
+.jobs-filter-chip:hover { color: var(--text); }
+.jobs-filter-chip.active {
+  background: var(--accent-bg);
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.job-mode-chip {
+  font-size: var(--fs-11);
+  padding: 1px 6px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-3);
+  color: var(--text-muted);
+  margin-right: var(--sp-1);
+}
+.job-mode-static { color: var(--accent-static); }
+.job-mode-dynamic { color: var(--accent-dynamic); }
