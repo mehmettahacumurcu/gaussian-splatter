@@ -19,7 +19,7 @@
 import { useEffect, useRef } from "react";
 // @ts-expect-error — kütüphanede type tanımı yok
 import * as GaussianSplats3D from "@mkkellogg/gaussian-splats-3d";
-import { frameUrl } from "../api";
+import { frameUrl, type PerfStats } from "../api";
 
 interface Props {
   jobId: string;
@@ -28,6 +28,7 @@ interface Props {
   onLoadProgress?: (loaded: number, total: number) => void;
   onReady?: () => void;
   onError?: (msg: string) => void;
+  onPerfTick?: (stats: PerfStats) => void;
   singleFrameMode?: boolean; // compat — şu an tek mod (cached swap)
 }
 
@@ -38,6 +39,7 @@ export function SplatViewer({
   onLoadProgress,
   onReady,
   onError,
+  onPerfTick,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const viewerRef = useRef<any>(null);
@@ -220,8 +222,29 @@ export function SplatViewer({
 
     init();
 
+    // Performance HUD: independent rAF loop counts FPS via a moving avg of
+    // frame deltas. Gauss count not exposed by mkkellogg — left at 0.
+    let perfRAF = 0;
+    let lastTick = performance.now();
+    const fpsBuf: number[] = [];
+    const tickPerf = () => {
+      if (!mountedRef.current) return;
+      const now = performance.now();
+      const dt = now - lastTick;
+      lastTick = now;
+      fpsBuf.push(1000 / Math.max(dt, 1));
+      if (fpsBuf.length > 30) fpsBuf.shift();
+      if (onPerfTick) {
+        const fps = fpsBuf.reduce((a, b) => a + b, 0) / fpsBuf.length;
+        onPerfTick({ fps, gaussCount: 0 });
+      }
+      perfRAF = requestAnimationFrame(tickPerf);
+    };
+    perfRAF = requestAnimationFrame(tickPerf);
+
     return () => {
       mountedRef.current = false;
+      cancelAnimationFrame(perfRAF);
       try {
         viewer.stop?.();
         viewer.dispose?.();

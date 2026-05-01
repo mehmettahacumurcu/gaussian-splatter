@@ -25,7 +25,7 @@ import { useEffect, useRef } from "react";
 import * as THREE from "three";
 // @ts-ignore — Spark types henüz tam değil
 import { SplatMesh, SparkRenderer } from "@sparkjsdev/spark";
-import { frameUrl } from "../api";
+import { frameUrl, type PerfStats } from "../api";
 
 interface Props {
   jobId: string;
@@ -34,6 +34,7 @@ interface Props {
   onLoadProgress?: (loaded: number, total: number) => void;
   onReady?: () => void;
   onError?: (msg: string) => void;
+  onPerfTick?: (stats: PerfStats) => void;
 }
 
 export function SplatViewerSpark({
@@ -43,6 +44,7 @@ export function SplatViewerSpark({
   onLoadProgress,
   onReady,
   onError,
+  onPerfTick,
 }: Props) {
   const containerRef = useRef<HTMLDivElement | null>(null);
 
@@ -330,6 +332,18 @@ export function SplatViewerSpark({
         renderer.render(scene, camera);
       } catch (err) {
         console.warn("[SplatViewerSpark] render error:", err);
+      }
+
+      // Emit perf stats (FPS via dt; gauss count = total over loaded meshes)
+      if (onPerfTick && dtSec > 0) {
+        const fps = 1 / dtSec;
+        let gaussCount = 0;
+        for (const m of meshesRef.current) {
+          const n = (m as { numSplats?: number; splatCount?: number; count?: number } | null)
+            ?.numSplats ?? (m as { splatCount?: number } | null)?.splatCount ?? 0;
+          if (typeof n === "number") gaussCount += n;
+        }
+        onPerfTick({ fps, gaussCount });
       }
     };
     animate();

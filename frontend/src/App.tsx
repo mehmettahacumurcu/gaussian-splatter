@@ -14,6 +14,9 @@ import { JobSubmitPanel } from "./components/JobSubmitPanel";
 import { JobsList } from "./components/JobsList";
 import { TrainingAnalytics } from "./components/TrainingAnalytics";
 import { NvsEvalPanel } from "./components/NvsEvalPanel";
+import { ViewerSidebar } from "./components/ViewerSidebar";
+import { ViewerSettings, type ViewerEngine } from "./components/ViewerSettings";
+import { ViewerHUD } from "./components/ViewerHUD";
 import {
   API_BASE,
   getHealth,
@@ -23,6 +26,7 @@ import {
   type HealthResponse,
   type Job,
   type JobMode,
+  type PerfStats,
   type SceneListItem,
   type SplatInfo,
 } from "./api";
@@ -87,7 +91,9 @@ function App() {
   const [diskLoading, setDiskLoading] = useState(false);
   // v3.7.7 Debug: tek frame yükleme modu — visibility toggle bypass
   const [singleFrameMode, setSingleFrameMode] = useState(false);
-  const [viewerEngine, setViewerEngine] = useState<"legacy" | "spark">("legacy");
+  const [viewerEngine, setViewerEngine] = useState<ViewerEngine>("legacy");
+  const [hudVisible, setHudVisible] = useState(true);
+  const [perfStats, setPerfStats] = useState<PerfStats | null>(null);
   // Analytics — son/aktif job için
   const [analyticsScene, setAnalyticsScene] = useState<string>("");
 
@@ -343,7 +349,7 @@ function App() {
 
         {tab === "viewer" && (
           <div className="viewer-tab">
-            <div className="viewer-controls">
+            <div className="viewer-toolbar">
               <input
                 type="text"
                 value={jobIdInput}
@@ -352,6 +358,7 @@ function App() {
                 onKeyDown={(e) => {
                   if (e.key === "Enter") loadInViewer(jobIdInput);
                 }}
+                className="viewer-toolbar-input"
               />
               <button className="btn-primary" onClick={() => loadInViewer(jobIdInput)}>
                 Yükle
@@ -362,26 +369,14 @@ function App() {
               <button className="btn-secondary" onClick={toggleDiskPanel}>
                 Diskten {diskPanelOpen ? "▲" : "▼"}
               </button>
-              <label
-                style={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: 6,
-                  marginLeft: 12,
-                  fontSize: 12,
-                  color: "#888",
-                  cursor: "pointer",
-                }}
-                title="v3.7.7'den itibaren default: cached blob swap. Bu kapatılamaz (multi-mode broken)."
-              >
-                <input
-                  type="checkbox"
-                  checked={true}
-                  disabled
-                  readOnly
-                />
-                ✅ Cached single-frame swap (auto)
-              </label>
+              <ViewerSettings
+                engine={viewerEngine}
+                onEngineChange={setViewerEngine}
+                hudVisible={hudVisible}
+                onHudToggle={setHudVisible}
+                singleFrameMode={singleFrameMode}
+                onSingleFrameToggle={setSingleFrameMode}
+              />
             </div>
 
             {diskPanelOpen && (
@@ -412,7 +407,6 @@ function App() {
               </div>
             )}
 
-            {/* Viewer state hint */}
             {viewerState.kind === "idle" && (
               <div className="viewer-empty">
                 <p className="hint">Bir job_id yapıştır veya "Diskten" butonundan seç.</p>
@@ -427,83 +421,68 @@ function App() {
               </div>
             )}
 
-            {/* Viewer */}
             {viewerState.kind === "ready" && (
-              <>
-                <div className="viewer-statusbar">
-                  <span>
-                    {sceneProgress && !sceneProgress.done
-                      ? `Scene'ler yükleniyor: ${sceneProgress.loaded}/${sceneProgress.total}`
-                      : `${viewerState.info.num_frames} frame — "${viewerState.info.scene}" (${formatBytes(viewerState.info.total_size_bytes)})`}
-                  </span>
-                  <span style={{ marginLeft: 16, display: "inline-flex", gap: 6, alignItems: "center" }}>
-                    <span style={{ fontSize: 11, color: "var(--text-muted)" }}>Engine:</span>
-                    <button
-                      type="button"
-                      onClick={() => setViewerEngine("legacy")}
-                      className={viewerEngine === "legacy" ? "viewer-engine-btn active" : "viewer-engine-btn"}
-                    >
-                      legacy (mkkellogg)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setViewerEngine("spark")}
-                      className={viewerEngine === "spark" ? "viewer-engine-btn active" : "viewer-engine-btn"}
-                    >
-                      Spark (4DGS) ✨
-                    </button>
-                  </span>
-                </div>
-                <div className="viewer-canvas">
-                  {viewerEngine === "spark" ? (
-                    <SplatViewerSpark
-                      key={`spark-${viewerState.info.job_id}`}
-                      jobId={viewerState.info.job_id}
+              <div className="viewer-body">
+                <div className="viewer-canvas-wrap">
+                  <div className="viewer-canvas">
+                    {viewerEngine === "spark" ? (
+                      <SplatViewerSpark
+                        key={`spark-${viewerState.info.job_id}`}
+                        jobId={viewerState.info.job_id}
+                        numFrames={viewerState.info.num_frames}
+                        currentFrame={currentFrame}
+                        onLoadProgress={(loaded, total) =>
+                          setSceneProgress({ loaded, total, done: false })
+                        }
+                        onReady={() =>
+                          setSceneProgress((prev) =>
+                            prev ? { ...prev, done: true } : prev
+                          )
+                        }
+                        onError={(msg) =>
+                          setViewerState({ kind: "error", message: msg })
+                        }
+                        onPerfTick={setPerfStats}
+                      />
+                    ) : (
+                      <SplatViewer
+                        key={`${viewerState.info.job_id}-${singleFrameMode ? "single" : "multi"}`}
+                        jobId={viewerState.info.job_id}
+                        numFrames={viewerState.info.num_frames}
+                        currentFrame={currentFrame}
+                        singleFrameMode={singleFrameMode}
+                        onLoadProgress={(loaded, total) =>
+                          setSceneProgress({ loaded, total, done: false })
+                        }
+                        onReady={() =>
+                          setSceneProgress((prev) =>
+                            prev ? { ...prev, done: true } : prev
+                          )
+                        }
+                        onError={(msg) =>
+                          setViewerState({ kind: "error", message: msg })
+                        }
+                        onPerfTick={setPerfStats}
+                      />
+                    )}
+                    <ViewerHUD stats={perfStats} visible={hudVisible} />
+                    {sceneProgress && !sceneProgress.done && (
+                      <div className="viewer-progress-overlay">
+                        Scene'ler yükleniyor: {sceneProgress.loaded}/{sceneProgress.total}
+                      </div>
+                    )}
+                  </div>
+                  <div className="viewer-timeline">
+                    <TimelineSlider
                       numFrames={viewerState.info.num_frames}
                       currentFrame={currentFrame}
-                      onLoadProgress={(loaded, total) =>
-                        setSceneProgress({ loaded, total, done: false })
-                      }
-                      onReady={() =>
-                        setSceneProgress((prev) =>
-                          prev ? { ...prev, done: true } : prev
-                        )
-                      }
-                      onError={(msg) =>
-                        setViewerState({ kind: "error", message: msg })
-                      }
+                      onFrameChange={setCurrentFrame}
+                      baseFps={10}
                     />
-                  ) : (
-                    <SplatViewer
-                      // key includes singleFrameMode → mode değişince viewer remount
-                      key={`${viewerState.info.job_id}-${singleFrameMode ? "single" : "multi"}`}
-                      jobId={viewerState.info.job_id}
-                      numFrames={viewerState.info.num_frames}
-                      currentFrame={currentFrame}
-                      singleFrameMode={singleFrameMode}
-                      onLoadProgress={(loaded, total) =>
-                        setSceneProgress({ loaded, total, done: false })
-                      }
-                      onReady={() =>
-                        setSceneProgress((prev) =>
-                          prev ? { ...prev, done: true } : prev
-                        )
-                      }
-                      onError={(msg) =>
-                        setViewerState({ kind: "error", message: msg })
-                      }
-                    />
-                  )}
+                  </div>
                 </div>
-                <div className="viewer-timeline">
-                  <TimelineSlider
-                    numFrames={viewerState.info.num_frames}
-                    currentFrame={currentFrame}
-                    onFrameChange={setCurrentFrame}
-                    baseFps={10}
-                  />
-                </div>
-              </>
+                <ViewerSidebar info={viewerState.info} />
+              </div>
             )}
           </div>
         )}
