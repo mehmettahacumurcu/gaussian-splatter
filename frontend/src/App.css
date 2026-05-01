@@ -1,78 +1,4 @@
-/* 4DGS Viewer — dark theme, tab layout, job UI */
-
-/* ===== v6.0 — Mode picker (Static 3D / 4D Dynamic) ===== */
-.submit-mode-wrapper {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  padding: 14px 20px 24px;
-  /* SCROLL FIX: app-content overflow:hidden, child'larin scroll'u kendi
-     uzerinde olmali. Aksi halde gelismis hyperparam acildiginda alt
-     icerik viewport disina dusup goz disi kaliyordu. */
-  height: 100%;
-  overflow-y: auto;
-  min-height: 0;
-}
-/* Wrapper icindeki submit-panel — height/overflow'i wrapper'a birakir,
-   kendisi serbest yukseliyor. Standalone (wrapper'siz) kullanim hala
-   submit-panel'in kendi scroll'unu kullanir. */
-.submit-mode-wrapper > .submit-panel {
-  height: auto;
-  overflow: visible;
-  padding-top: 0;
-  padding-bottom: 0;
-}
-.mode-picker {
-  display: flex;
-  gap: 10px;
-  background: var(--bg-1, #161618);
-  padding: 6px;
-  border-radius: 10px;
-  border: 1px solid var(--border-1, #2a2a2e);
-  align-self: flex-start;
-}
-.mode-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 12px;
-  padding: 10px 18px;
-  background: transparent;
-  color: var(--text-muted, #aaa);
-  border: 1px solid transparent;
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 13px;
-  transition: background 0.15s, border-color 0.15s, color 0.15s;
-}
-.mode-btn:hover { background: var(--bg-2, #1f1f23); color: var(--text-primary, #f1f1f1); }
-.mode-btn.active {
-  color: var(--text-primary, #f1f1f1);
-  border-color: var(--border-2, #4a4a52);
-}
-.mode-btn-static.active { background: rgba(80, 160, 255, 0.12); border-color: #4a8cf0; }
-.mode-btn-dynamic.active { background: rgba(255, 140, 80, 0.12); border-color: #f08c4a; }
-.mode-btn-icon { font-size: 22px; }
-.mode-btn-content { display: flex; flex-direction: column; align-items: flex-start; }
-.mode-btn-name { font-weight: 600; font-size: 14px; }
-.mode-btn-sub { font-size: 11px; color: var(--text-muted, #888); }
-
-.submit-panel-mode-banner {
-  padding: 10px 14px;
-  border-radius: 6px;
-  font-size: 12px;
-  border: 1px solid;
-  margin-bottom: 16px;
-}
-.submit-panel-mode-static {
-  background: rgba(80, 160, 255, 0.08);
-  border-color: rgba(80, 160, 255, 0.4);
-  color: #b8d4ff;
-}
-.submit-panel-mode-dynamic {
-  background: rgba(255, 140, 80, 0.08);
-  border-color: rgba(255, 140, 80, 0.4);
-  color: #ffd4b8;
-}
+/* 4DGS Studio — dark theme, tab layout, job UI */
 
 .preset-duration {
   font-weight: 400;
@@ -606,30 +532,6 @@ html, body, #root {
   height: 100%;
   min-height: 0;
 }
-.viewer-controls {
-  display: flex;
-  gap: 8px;
-  padding: 10px 14px;
-  background: var(--bg-1);
-  border-bottom: 1px solid var(--border);
-}
-.viewer-controls input {
-  flex: 1;
-  padding: 6px 10px;
-  background: #0a0a0a;
-  border: 1px solid var(--border-1);
-  color: var(--text);
-  border-radius: 4px;
-  font-family: "SF Mono", Consolas, Monaco, monospace;
-  font-size: 12px;
-}
-.viewer-statusbar {
-  padding: 6px 14px;
-  font-size: 12px;
-  color: var(--text-muted);
-  background: var(--bg-1);
-  border-bottom: 1px solid var(--border);
-}
 .viewer-canvas {
   flex: 1 1 auto;
   min-height: 300px;
@@ -721,29 +623,6 @@ html, body, #root {
   color: #444;
   font-family: "SF Mono", Consolas, Monaco, monospace;
   pointer-events: none;
-}
-
-
-/* Viewer engine toggle */
-.viewer-engine-btn {
-  background: var(--bg-1);
-  border: 1px solid var(--border-1);
-  color: var(--text-muted);
-  padding: 3px 8px;
-  border-radius: 3px;
-  font-size: 11px;
-  font-family: inherit;
-  cursor: pointer;
-  transition: border-color 0.1s, background 0.1s, color 0.1s;
-}
-.viewer-engine-btn:hover {
-  background: var(--bg-3);
-  color: var(--text-primary);
-}
-.viewer-engine-btn.active {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: white;
 }
 
 
