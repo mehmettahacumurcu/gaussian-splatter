@@ -848,3 +848,24 @@ html, body, #root {
   padding: 12px 16px;
   border-top: 1px solid var(--border);
 }
+
+/* Submit form validation hints + improved error visibility */
+.hint-warn {
+  color: var(--warn);
+  background: rgba(211, 146, 120, 0.08);
+  border: 1px solid rgba(211, 146, 120, 0.4);
+  border-radius: 4px;
+  padding: 6px 10px;
+  margin-top: 6px;
+  font-size: 12px;
+}
+.submit-error {
+  margin-top: 8px;
+  padding: 10px 12px;
+  background: rgba(229, 128, 128, 0.1);
+  border: 1px solid var(--err);
+  border-radius: 4px;
+  color: var(--err);
+  font-size: 13px;
+  word-break: break-word;
+}

@@ -26,24 +26,35 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-# System deps:
+# System deps. NB: we deliberately do NOT apt-install colmap. The Ubuntu
+# package forces software OpenGL on headless pods which silently falls back
+# to CPU SIFT (~6-10x slower). Instead we install conda-forge's CUDA-enabled
+# colmap below.
 #   - python3.11 + venv + headers (gsplat compiles C++ extensions)
 #   - build-essential + ninja (for the JIT compile)
-#   - colmap (preprocessing pipeline)
 #   - ffmpeg (frame extraction)
-#   - git (for cloning user data / submodules if any)
-#   - curl, ca-certificates (for downloading model weights)
+#   - git, curl, wget, ca-certificates (cloning, model downloads, miniconda)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3.11 python3.11-dev python3.11-venv python3-pip \
         build-essential ninja-build \
-        colmap \
         ffmpeg \
-        git curl ca-certificates \
+        git curl wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 # Make python3.11 the default python/python3.
 RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 && \
     update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1
+
+# Miniconda + CUDA-enabled COLMAP from conda-forge.
+ENV MINICONDA_DIR=/opt/miniconda \
+    PATH=/opt/miniconda/bin:${PATH}
+RUN wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+        -O /tmp/miniconda_installer.sh && \
+    bash /tmp/miniconda_installer.sh -b -p /opt/miniconda && \
+    rm /tmp/miniconda_installer.sh && \
+    /opt/miniconda/bin/conda install -y -c conda-forge colmap && \
+    /opt/miniconda/bin/conda clean -afy && \
+    ln -sf /opt/miniconda/bin/colmap /usr/bin/colmap
 
 WORKDIR /app
 

@@ -262,7 +262,21 @@ export function Dynamic4DSubmit({ onJobSubmitted }: Props) {
         >
           {submitting ? "Gönderiliyor..." : "4D Dynamic Job baslat"}
         </button>
-        {submitError && <div className="submit-error">Hata: {submitError}</div>}
+        {!scene.trim() && (
+          <div className="submit-hint hint-warn">
+            ⚠ Sahne adı zorunlu — submit için doldur.
+          </div>
+        )}
+        {scene.trim() && !videoFile && (
+          <div className="submit-hint hint-warn">
+            ⚠ Video dosyası seçilmedi. Sahne backend'de yoksa submit 400 ile reddedilir.
+          </div>
+        )}
+        {submitError && (
+          <div className="submit-error" role="alert">
+            <strong>✗ Submit failed:</strong> {submitError}
+          </div>
+        )}
       </div>
     </div>
   );

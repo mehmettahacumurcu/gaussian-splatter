@@ -140,6 +140,12 @@ tail -n 10 /workspace/backend.log
 
 **Phase 2 done when:** `tail` shows `Uvicorn running on http://0.0.0.0:8000`.
 
+> **Note:** the bootstrap installs **conda-forge's CUDA-enabled COLMAP** under
+> `/opt/miniconda` (not Ubuntu's apt build). The apt build forces software
+> OpenGL on headless cloud GPUs and silently falls back to CPU SIFT — for a
+> long video that's a 6-10x slowdown on preprocessing. With the conda build,
+> COLMAP feature extraction + matching runs on the GPU at full speed.
+
 ---
 
 ## Phase 3 — Connect your desktop app to the pod (~30 seconds)

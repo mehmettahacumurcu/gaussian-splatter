@@ -247,7 +247,16 @@ export function Static3DSubmit({ onJobSubmitted }: Props) {
         >
           {submitting ? "Gönderiliyor..." : "Static 3D Job baslat"}
         </button>
-        {submitError && <div className="submit-error">Hata: {submitError}</div>}
+        {!scene.trim() && (
+          <div className="submit-hint hint-warn">
+            ⚠ Sahne adı zorunlu — submit için doldur.
+          </div>
+        )}
+        {submitError && (
+          <div className="submit-error" role="alert">
+            <strong>✗ Submit failed:</strong> {submitError}
+          </div>
+        )}
       </div>
     </div>
   );

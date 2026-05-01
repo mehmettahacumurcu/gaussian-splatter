@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # 4DGS Studio backend boot — binds 0.0.0.0:8000 for RunPod's HTTP proxy.
 #
+# Auto-detects project root from the script's location: this lives at
+#   <PROJECT_ROOT>/deploy/runpod/start.sh
+# so the project root is two levels up. Override with BACKEND_WORKDIR if
+# the script gets placed somewhere unusual.
+#
 # Env vars consumed:
 #   RUNPOD_AUTH_TOKEN  Required for cloud. Bearer token clients must send.
 #                      If unset, backend runs unauthenticated (dev only).
@@ -8,10 +13,21 @@
 #                      Default (localhost / Tauri) is always allowed.
 #   PORT               Port to bind. Default 8000.
 #   WORKERS            uvicorn workers. Keep 1 (GPU-bound, single JobManager).
+#   BACKEND_WORKDIR    Override project root (defaults to script's grandparent).
 
 set -euo pipefail
 
-cd /app
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="${BACKEND_WORKDIR:-$(cd "${SCRIPT_DIR}/../.." && pwd)}"
+
+if [[ ! -d "${PROJECT_DIR}/backend" ]]; then
+  echo "[start.sh] ERROR: ${PROJECT_DIR}/backend not found." >&2
+  echo "[start.sh] Set BACKEND_WORKDIR to the directory that contains backend/." >&2
+  exit 1
+fi
+
+cd "${PROJECT_DIR}"
+echo "[start.sh] Project dir: ${PROJECT_DIR}"
 
 PORT="${PORT:-8000}"
 WORKERS="${WORKERS:-1}"
