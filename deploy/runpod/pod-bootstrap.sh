@@ -57,10 +57,15 @@ fi
 
 if ! command -v colmap >/dev/null 2>&1 \
    || [[ "$(readlink -f "$(command -v colmap)")" != *miniconda* ]]; then
-    echo "==> conda install colmap (CUDA-enabled, ~3-5 min first time)"
-    "${MINICONDA_DIR}/bin/conda" install -y -c conda-forge colmap \
+    echo "==> Accepting Anaconda channel TOS (no-op if already accepted)"
+    "${MINICONDA_DIR}/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main >/dev/null 2>&1 || true
+    "${MINICONDA_DIR}/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r >/dev/null 2>&1 || true
+
+    echo "==> conda install colmap + faiss (CUDA-enabled, ~5-8 min first time)"
+    # faiss bundled with colmap to satisfy libfaiss.so loading inside colmap binary.
+    "${MINICONDA_DIR}/bin/conda" install -y -c conda-forge colmap faiss \
         >/tmp/conda-colmap.log 2>&1 || {
-        echo "[!] conda install colmap failed; see /tmp/conda-colmap.log"
+        echo "[!] conda install colmap+faiss failed; see /tmp/conda-colmap.log"
         tail -n 30 /tmp/conda-colmap.log
         exit 1
     }
@@ -101,17 +106,41 @@ fi
 cd "${WORKDIR}"
 
 # ---------------------------------------------------------------------------
-# Pip deps. The stock RunPod PyTorch image already has torch/torchvision —
-# only install if not already present.
+# Pip deps. Explicitly target the RunPod base image's python (where torch is
+# pre-installed) — avoids the conda-vs-system PATH ambiguity that bit us when
+# start.sh's `python` resolved to conda but uvicorn was installed elsewhere.
+# Using /usr/local/bin/python ensures everything lands in ONE python that
+# start.sh can also locate via auto-detection.
 # ---------------------------------------------------------------------------
-echo "==> pip install requirements"
-python -m pip install --upgrade pip setuptools wheel >/dev/null
-if ! python -c "import torch" >/dev/null 2>&1; then
-    python -m pip install \
+TARGET_PYTHON=/usr/local/bin/python
+if [[ ! -x "${TARGET_PYTHON}" ]]; then
+    # Fallback: any python3 we can find that has torch
+    for cand in /usr/local/bin/python3 /usr/bin/python3 python3; do
+        if command -v "${cand}" >/dev/null 2>&1 \
+           && "${cand}" -c "import torch" >/dev/null 2>&1; then
+            TARGET_PYTHON="${cand}"
+            break
+        fi
+    done
+fi
+echo "==> pip install requirements into ${TARGET_PYTHON}"
+"${TARGET_PYTHON}" -m pip install --upgrade pip setuptools wheel >/dev/null
+if ! "${TARGET_PYTHON}" -c "import torch" >/dev/null 2>&1; then
+    "${TARGET_PYTHON}" -m pip install \
         torch==2.5.1 torchvision==0.20.1 \
         --index-url https://download.pytorch.org/whl/cu124
 fi
-python -m pip install -r requirements.txt
+"${TARGET_PYTHON}" -m pip install -r requirements.txt
+
+# Verify uvicorn is importable in the python start.sh will use.
+if ! "${TARGET_PYTHON}" -c "import uvicorn, fastapi, backend.api" 2>/dev/null; then
+    cd "${WORKDIR}"
+    if ! "${TARGET_PYTHON}" -c "import uvicorn, fastapi" 2>/dev/null; then
+        echo "[!] uvicorn or fastapi NOT importable in ${TARGET_PYTHON} after pip install."
+        "${TARGET_PYTHON}" -m pip install "uvicorn[standard]" "fastapi" "python-multipart"
+    fi
+fi
+echo "==> ${TARGET_PYTHON} ready: $(${TARGET_PYTHON} -c 'import torch, uvicorn, fastapi; print(f"torch={torch.__version__} uvicorn={uvicorn.__version__} fastapi={fastapi.__version__}")' 2>&1)"
 
 # Pre-build extension cache locations.
 mkdir -p /workspace/.torch_extensions /workspace/.cache/huggingface

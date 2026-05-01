@@ -177,6 +177,41 @@ class JobManager:
             )
 
     # ------------------------------------------------------------------
+    # Cancel
+    # ------------------------------------------------------------------
+    def cancel(self, job_id: str) -> tuple[bool, str]:
+        """Cancel a job. Returns (success, message).
+        - QUEUED jobs: Future cancelled, status set to FAILED. Reliable.
+        - RUNNING jobs: best-effort. We can't actually interrupt subprocess.run
+          calls (ffmpeg, colmap) running in the executor thread. We mark the
+          job as cancellation-requested but it will still run to completion
+          or natural failure.
+        """
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False, "Job not found"
+            future = self._futures.get(job_id)
+            if job.status == JobStatus.QUEUED:
+                if future is not None and future.cancel():
+                    job.status = JobStatus.FAILED
+                    job.finished_at = time.time()
+                    job.error = "Cancelled by user (queued)"
+                    return True, "Cancelled queued job"
+                # Future raced into running between .get() and .cancel() — fall through
+            if job.status == JobStatus.RUNNING:
+                # Can't actually stop a running job from outside. Mark a flag
+                # the pipeline could check, but for now the best we can do is
+                # let it finish or hang. Don't lie to the user.
+                return False, (
+                    "Job is already running; cancellation not supported once "
+                    "subprocess phase begins. Stop the pod to abort."
+                )
+            if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
+                return False, f"Job already {job.status.value}"
+            return False, f"Unknown status: {job.status}"
+
+    # ------------------------------------------------------------------
     # Shutdown
     # ------------------------------------------------------------------
     def shutdown(self, wait: bool = False) -> None:

@@ -298,19 +298,33 @@ async def process_video(
         except Exception as e:
             raise HTTPException(500, f"Video yazılamadı: {e}")
     else:
-        # Static mode + photo set / pre-loaded scene durumu — video gerekmez,
-        # ama sahne klasorunde frames/ veya images/ olmali.
-        if not static_mode_active:
-            raise HTTPException(400, "Dynamic mode'da video upload zorunludur")
-        has_images = (paths["base"] / "images").exists()
-        has_frames = paths["frames"].exists() and any(paths["frames"].glob("frame_*.png"))
-        has_video = video_path.exists()
-        if not (has_images or has_frames or has_video):
+        # No video upload. Two ways this is OK:
+        #   1. Static mode with pre-existing photo set / frames / cached video.mp4
+        #   2. Dynamic mode multi-view scene with pre-uploaded videos/cam*.mp4
+        #      (N3V layout — pipeline auto-detects multi-view from this folder)
+        # Otherwise reject.
+        mv_videos_dir = paths["base"] / "videos"
+        has_mv_videos = (
+            mv_videos_dir.exists()
+            and any(mv_videos_dir.glob("cam*.mp4"))
+        )
+        if static_mode_active:
+            has_images = (paths["base"] / "images").exists()
+            has_frames = paths["frames"].exists() and any(paths["frames"].glob("frame_*.png"))
+            has_video = video_path.exists()
+            if not (has_images or has_frames or has_video):
+                raise HTTPException(
+                    400,
+                    f"Static mode'da video yok ve {paths['base']}/ altinda images/, frames/ veya video.mp4 hiçbiri bulunamadı. "
+                    f"Photo set kullaniyorsan: data/{safe_scene}/images/IMG_*.jpg klasorunu hazirla."
+                )
+        elif not has_mv_videos:
             raise HTTPException(
                 400,
-                f"Static mode'da video yok ve {paths['base']}/ altinda images/, frames/ veya video.mp4 hiçbiri bulunamadı. "
-                f"Photo set kullaniyorsan: data/{safe_scene}/images/IMG_*.jpg klasorunu hazirla."
+                f"Dynamic mode'da video upload zorunludur. "
+                f"(Multi-view kullaniyorsan {paths['base']}/videos/cam*.mp4 ile sahneyi onceden hazirla.)"
             )
+        # else: dynamic + multi-view scene already on disk — fall through, no upload needed
 
     # Job kaydını oluştur
     manager: JobManager = app.state.manager
@@ -772,6 +786,24 @@ def get_status(job_id: str) -> Job:
     if job is None:
         raise HTTPException(404, f"Job bulunamadı: {job_id}")
     return job
+
+
+@app.post("/cancel/{job_id}", tags=["jobs"])
+def cancel_job(job_id: str) -> dict:
+    """Cancel a job.
+    - QUEUED jobs: marked as failed, future cancelled, no GPU work happens.
+    - RUNNING jobs: cannot be cancelled cleanly (subprocess phase blocks).
+      Returns 409 with a hint to stop the pod if you really need to abort.
+    """
+    manager: JobManager = app.state.manager
+    job = manager.get(job_id)
+    if job is None:
+        raise HTTPException(404, f"Job not found: {job_id}")
+    success, message = manager.cancel(job_id)
+    if not success:
+        # 409 = conflict (e.g. running and uncancellable, or already done)
+        raise HTTPException(409, message)
+    return {"status": "cancelled", "job_id": job_id, "message": message}
 
 
 # ---------------------------------------------------------------------------

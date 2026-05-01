@@ -334,22 +334,37 @@ export async function submitJob(
     fd.append("nvs_eval", String(options.nvs_eval));
 
   // Hyperparams — sadece null/undefined olmayanları gönder
+  const overrideKeys: string[] = [];
   if (options.hyperparams) {
     for (const [key, value] of Object.entries(options.hyperparams)) {
       if (value !== null && value !== undefined && value !== "") {
         fd.append(key, String(value));
+        overrideKeys.push(`${key}=${value}`);
       }
     }
   }
+
+  // Diagnostic — without this, intermittent submit failures are unsolvable.
+  // Open browser devtools (Tauri: right-click → Inspect Element) to see these.
+  console.log("[submitJob] target:", `${getApiBase()}/process`);
+  console.log("[submitJob] scene:", options.scene, "mode:", options.mode, "preset:", options.preset);
+  console.log("[submitJob] video file:", videoFile ? `${videoFile.name} (${videoFile.size} bytes)` : "<none>");
+  console.log("[submitJob] hyperparam overrides:", overrideKeys.length === 0 ? "<none>" : overrideKeys);
 
   const res = await fetch(`${getApiBase()}/process`, {
     method: "POST",
     body: fd,
     headers: authHeaders(),
+  }).catch((err) => {
+    console.error("[submitJob] fetch threw:", err);
+    throw new Error(`Network error: ${err}. Check connection settings + backend log.`);
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
+    console.error("[submitJob] HTTP error:", res.status, res.statusText, text);
     throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
   }
-  return res.json() as Promise<ProcessResponse>;
+  const json = (await res.json()) as ProcessResponse;
+  console.log("[submitJob] success:", json);
+  return json;
 }
