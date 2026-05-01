@@ -334,13 +334,16 @@ export function SplatViewerSpark({
         console.warn("[SplatViewerSpark] render error:", err);
       }
 
-      // Emit perf stats (FPS via dt; gauss count = total over loaded meshes)
+      // Emit perf stats (FPS via dt; gauss count = only visible meshes —
+      // 4D loads every timestamp as its own SplatMesh, summing them all
+      // would report ~N_frames × N_per_frame which is misleading).
       if (onPerfTick && dtSec > 0) {
         const fps = 1 / dtSec;
         let gaussCount = 0;
         for (const m of meshesRef.current) {
-          const n = (m as { numSplats?: number; splatCount?: number; count?: number } | null)
-            ?.numSplats ?? (m as { splatCount?: number } | null)?.splatCount ?? 0;
+          const mesh = m as { visible?: boolean; numSplats?: number; splatCount?: number } | null;
+          if (!mesh || mesh.visible === false) continue;
+          const n = mesh.numSplats ?? mesh.splatCount ?? 0;
           if (typeof n === "number") gaussCount += n;
         }
         onPerfTick({ fps, gaussCount });
