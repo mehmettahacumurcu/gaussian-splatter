@@ -9,7 +9,7 @@
  */
 import { useEffect, useState } from "react";
 import type { Job } from "../api";
-import { listJobs } from "../api";
+import { downloadUrl, listJobs } from "../api";
 
 interface Props {
   onViewJob: (job: Job) => void;
@@ -158,7 +158,7 @@ function JobRow({ job, expanded, onToggleExpand, onView }: RowProps) {
               </button>
               <a
                 className="btn-secondary"
-                href={`http://127.0.0.1:8000/download/${job.id}`}
+                href={downloadUrl(job.id)}
                 target="_blank"
                 rel="noreferrer"
               >

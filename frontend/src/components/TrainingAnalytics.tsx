@@ -21,52 +21,6 @@ interface Props {
   autoRefresh?: boolean;    // true = 3 sn'de bir poll
 }
 
-type ChartConfig = {
-  title: string;
-  yKey: keyof TrainMetric | ((m: TrainMetric) => number);
-  color: string;
-  yLog?: boolean;
-  yFormat?: (v: number) => string;
-};
-
-const CHARTS: ChartConfig[] = [
-  {
-    title: "Total loss",
-    yKey: "loss",
-    color: "#ff6b6b",
-    yFormat: (v) => v.toFixed(4),
-  },
-  {
-    title: "PSNR",
-    yKey: "psnr",
-    color: "#4ecdc4",
-    yFormat: (v) => v.toFixed(2) + " dB",
-  },
-  {
-    title: "N (gaussian count)",
-    yKey: "n_points",
-    color: "#ffe66d",
-    yFormat: (v) => v.toLocaleString(),
-  },
-  {
-    title: "Δpos mean (motion magnitude)",
-    yKey: "dpos_mean",
-    color: "#95e1d3",
-    yFormat: (v) => v.toFixed(4),
-  },
-  {
-    title: "Loss components",
-    yKey: (m) => m.recon, // overridden in multi-series
-    color: "#a8dadc",
-  },
-  {
-    title: "it/s",
-    yKey: "it_per_sec",
-    color: "#c77dff",
-    yFormat: (v) => v.toFixed(1),
-  },
-];
-
 /**
  * Simple SVG line chart.
  */

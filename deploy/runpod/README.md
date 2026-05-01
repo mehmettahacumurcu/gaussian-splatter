@@ -1,255 +1,385 @@
-# RunPod Deployment — SOTA Verification on a Cloud GPU
+# RunPod Deployment — Cloud SOTA Verification
 
-This folder packages the 4DGS Studio backend so you can run the SOTA
-verification (`docs/SOTA_VERIFICATION.md`) on a rented RunPod 4090 instead of
-your local 3060 Ti — the only way to get a verdict that isn't compute-capped
-by 8 GB VRAM.
+Run the SOTA verification (`docs/SOTA_VERIFICATION.md`) on a rented cloud GPU.
+Your local 3060 Ti is too thin to give a clean verdict; on a 24-80 GB cloud
+card the verdict actually means something.
 
-The end-to-end flow takes about **5 minutes of setup + ~3-5 hours of training**
-and costs roughly **$2-4** at current RunPod rates ($0.40-0.60/hour for a 4090).
+This runbook is **phase by phase**. Each phase has a fixed end state — finish
+the phase, then move on. If something goes wrong, the troubleshooting section
+at the bottom maps phase → fix.
 
----
-
-## What's in this folder
-
-| File                  | Purpose                                                                 |
-|-----------------------|-------------------------------------------------------------------------|
-| `Dockerfile`          | CUDA 12.1 + Python 3.11 + project deps + COLMAP. Bake-once image.       |
-| `start.sh`            | Container entrypoint. Binds `0.0.0.0:8000`. Reads `RUNPOD_AUTH_TOKEN`.  |
-| `pod-bootstrap.sh`    | Alternative to Docker: run on a stock RunPod PyTorch container.         |
-| `bench_flame_steak.sh`| Submits the verification job from your laptop.                          |
-| `.dockerignore`       | Keeps the build context lean.                                           |
+**Total cost for one verification run:** roughly **$2-15** depending on GPU
+choice (see Phase 1) and **3-6 hours** of training wall time.
 
 ---
 
-## Prerequisites
+## Pick your GPU
 
-- A RunPod account with a payment method.
-- The branch with the verification harness pushed to a remote you can `git clone`
-  from the pod. The default in `pod-bootstrap.sh` points at this repo's
-  `feat/sota-verification` branch.
-- About 3-5 GB free upload bandwidth (one-time `data/flame_steak/` push). On a
-  reasonable home connection this is 5-30 minutes.
-- An SSH client (Windows: WSL, Git Bash, or PowerShell with OpenSSH).
+You said 4090 is not enough. Here is the menu, ranked by quality ceiling.
+For 4D SOTA on N3V, **A100 80GB** is the sweet spot — big enough VRAM to fit
+1M+ Gaussians, half the price of H100, and perfectly competitive with paper
+hardware.
+
+| GPU                | VRAM   | RunPod cost (≈)  | Speed (rel.) | Recommended use                                |
+|--------------------|-------:|-----------------:|-------------:|------------------------------------------------|
+| RTX 4090           |  24 GB | $0.40 - 0.60 /h  | 1.0×         | Smoke / cheap iteration. Was your starting pt. |
+| RTX 6000 Ada       |  48 GB | $0.80 - 1.00 /h  | 1.1×         | Bigger N cap than 4090, similar speed.         |
+| A40                |  48 GB | $0.40 - 0.60 /h  | 0.7×         | Cheapest 48 GB option; older arch.             |
+| **A100 80GB PCIe** |  80 GB | **$1.50 - 2.00 /h** | **1.5×**  | **Recommended for SOTA verification.**         |
+| A100 80GB SXM      |  80 GB | $1.80 - 2.50 /h  | 1.6×         | Same VRAM as PCIe; SXM only matters multi-GPU. |
+| H100 PCIe          |  80 GB | $2.50 - 3.00 /h  | 2.0×         | Faster A100; ~$15 for a 5h run.                |
+| H100 SXM           |  80 GB | $3.00 - 4.00 /h  | 2.2×         | Fastest commonly available card.               |
+| H200               | 141 GB | $4.00 - 5.00 /h  | 2.3×         | Overkill unless you push to 2M+ Gaussians.     |
+
+Prices fluctuate — check the live RunPod console. **Community Cloud** is
+usually 30-50% cheaper than **Secure Cloud**; Community is fine for a single
+training run as long as you finish before someone with higher priority bumps
+you. If you need uninterruptible, pick Secure.
+
+### Hyperparam overrides for big-VRAM cards
+
+The default `cloud` preset is sized for a 24 GB 4090. To actually use the
+extra VRAM on an 80 GB card, override these via the Hyperparameter panel
+(or pass them as form fields — see Phase 5).
+
+Settings you set in the UI as **overrides** (everything else inherits from
+the `cloud` preset):
+
+| Field                   | 24 GB (default) | 48 GB             | 80 GB (A100/H100)  |
+|-------------------------|-----------------|-------------------|--------------------|
+| `max_gaussians`         | 1,000,000       | 1,500,000         | **2,500,000**      |
+| `iters`                 | 60,000          | 80,000            | **100,000**        |
+| `resolution`            | `1920x1080`     | `1920x1080`       | `1920x1080` (or `2560x1440` if you want max paper-tier; doubles training time) |
+| `mlp_width`             | 512             | 640               | **768**            |
+| `hexplane_resolution`   | 96              | 112               | **128**            |
+| `metric3d_model`        | `metric3d_vit_small` | `metric3d_vit_large` | `metric3d_vit_giant2` |
+
+The "**bold**" 80 GB column is what I'd suggest for the verification run.
+This is closer to paper config and will exercise the algorithm at full
+capacity. Expect ~4-6 hours wall time on an A100.
 
 ---
 
-## Path A — Bootstrap on a stock RunPod image (recommended for first run)
+## Phase 0 — One-time RunPod account setup
 
-This skips `docker build` entirely and just runs Python on the pod. Fastest path
-to "is it working?"
+Skip this section if you already use RunPod.
 
-### 1. Create the pod
+1. Sign up at <https://www.runpod.io/> and add a payment method. The
+   minimum credit deposit is $10.
+2. Generate an SSH key on your laptop if you don't already have one:
+   - **Windows (Git Bash / PowerShell):** `ssh-keygen -t ed25519 -C "your@email"` (accept defaults).
+   - The public key is at `~/.ssh/id_ed25519.pub` — copy its contents.
+3. Add it in **RunPod Console → Settings → SSH Public Keys → New SSH Key**.
+4. (Optional) install the [RunPod CLI](https://docs.runpod.io/cli/) — not
+   required, the web UI works for everything below.
 
-1. Log in to <https://www.runpod.io/console/pods>.
-2. Click **Deploy** → **GPU Pods**.
-3. **GPU type:** `RTX 4090` (24 GB VRAM is essential). `RTX 3090` works too.
-4. **Container image:** `runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04`
-   (or whatever the latest `runpod/pytorch:*-cuda12.x-devel` is — the `devel`
-   variant has the CUDA toolchain gsplat needs to JIT-compile).
-5. **Container disk:** 30 GB (enough for repo + model weights + outputs).
-6. **Volume:** create a persistent volume on `/workspace` (50 GB). This caches
-   foundation-model weights between pod restarts.
-7. **Expose HTTP ports:** add port `8000`. RunPod will give you a public URL
-   like `https://<pod-id>-8000.proxy.runpod.net`.
-8. **Start the pod.** First start takes ~1-2 minutes.
+**Phase 0 done when:** you can log into RunPod and your SSH key is registered.
 
-### 2. SSH into the pod
+---
 
-From the RunPod web UI, copy the SSH command (looks like
-`ssh root@<host> -p <port> -i ~/.ssh/id_ed25519`). Run it on your laptop.
+## Phase 1 — Start the pod (every run, 1-2 minutes)
 
-### 3. Bootstrap the repo
+1. Go to **RunPod Console → Pods → Deploy**.
+2. Pick the GPU from the table above. **A100 80GB PCIe** is the recommendation.
+3. **Container image:**
+   ```
+   runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+   ```
+   The `devel` variant is essential — it has the CUDA toolchain `gsplat`
+   needs to JIT-compile.
+4. **Container Disk:** `30 GB` (enough for repo + model weights + outputs).
+5. **Volume:** create a persistent **`/workspace` volume of 80 GB**. This
+   caches foundation-model weights and lets you re-use across pod restarts
+   without re-downloading.
+6. **Expose HTTP Ports:** add port `8000`. RunPod gives you a public URL
+   like `https://<pod-id>-8000.proxy.runpod.net` — write it down, you'll
+   paste it into the desktop app.
+7. Click **Deploy On-Demand**. First start takes ~1-2 minutes.
+8. From the pod's **Connect** tab, copy the SSH command. It looks like
+   `ssh root@<host>.proxy.runpod.net -p <port> -i ~/.ssh/id_ed25519`.
 
-On the pod (you'll be `root@`):
+**Phase 1 done when:** the pod is "Running" and you've copied:
+- the **public URL** (`https://<pod-id>-8000.proxy.runpod.net`)
+- the **SSH command** (for Phase 2 + 3)
+
+---
+
+## Phase 2 — Set up the backend on the pod (every run, ~5 minutes)
+
+SSH into the pod with the command from Phase 1, then run:
 
 ```bash
-# Pull the bootstrap script and run it. Takes ~3-5 minutes (apt + pip).
-curl -sSL https://raw.githubusercontent.com/mehmettahacumurcu/gaussian-splatter/feat/sota-verification/4dgs-studio/deploy/runpod/pod-bootstrap.sh \
-  | bash -s -- https://github.com/mehmettahacumurcu/gaussian-splatter.git feat/sota-verification
-
-# OR if the repo is private / curl can't fetch raw:
-git clone --depth 1 --branch feat/sota-verification https://github.com/mehmettahacumurcu/gaussian-splatter.git /workspace/repo
+# 1. Clone the repo + install all deps. Takes ~3-5 min the first time.
+git clone --depth 1 --branch feat/sota-verification \
+  https://github.com/mehmettahacumurcu/gaussian-splatter.git /workspace/repo
 bash /workspace/repo/4dgs-studio/deploy/runpod/pod-bootstrap.sh \
-     https://github.com/mehmettahacumurcu/gaussian-splatter.git feat/sota-verification
-```
+  https://github.com/mehmettahacumurcu/gaussian-splatter.git \
+  feat/sota-verification
 
-### 4. Generate an auth token + start the backend
-
-```bash
+# 2. Move into the project root.
 cd /workspace/4dgs-studio
+
+# 3. Generate an auth token. Save it somewhere — you need it on your laptop.
 export RUNPOD_AUTH_TOKEN="$(openssl rand -hex 32)"
-echo "TOKEN: $RUNPOD_AUTH_TOKEN"   # copy this — you'll need it from your laptop
+echo
+echo "==================================================================="
+echo "  TOKEN: $RUNPOD_AUTH_TOKEN"
+echo "  COPY THIS NOW — you will paste it into the desktop app."
+echo "==================================================================="
+echo
 
-# Optional: also allow your local Tauri origin via CORS.
-# export CORS_ALLOW_ORIGINS="tauri://localhost,https://tauri.localhost"
-
-# Start backend in the background, log to a file.
+# 4. Start the backend in the background, log to a file.
 nohup bash deploy/runpod/start.sh > /workspace/backend.log 2>&1 &
 disown
+
+# 5. Confirm it started.
 sleep 3
-tail -n 20 /workspace/backend.log
+tail -n 10 /workspace/backend.log
+# You should see: "Uvicorn running on http://0.0.0.0:8000"
 ```
 
-You should see `Uvicorn running on http://0.0.0.0:8000`. Confirm from your
-laptop:
+**Phase 2 done when:** `tail` shows `Uvicorn running on http://0.0.0.0:8000`.
+
+---
+
+## Phase 3 — Connect your desktop app to the pod (~30 seconds)
+
+This is the new part — no more curl wrangling.
+
+1. Open the 4DGS Studio desktop app on your laptop. (If the backend was
+   already running locally, leave it; the desktop app can switch between
+   local and cloud at any time.)
+2. In the topbar, click the **⚙ icon** next to the backend status badge.
+3. The **Backend Connection** modal opens. Fill in:
+   - **API Base URL:** the public URL from Phase 1
+     (e.g. `https://abc123-8000.proxy.runpod.net`).
+   - **Auth Token:** the token printed in Phase 2.
+4. Click **Test connection**. Within ~1 second you should see:
+   > ✓ Reachable. GPU available: `NVIDIA A100 80GB PCIe`.
+   If you see ✗, check the troubleshooting section.
+5. Click **Save**.
+
+The badge in the topbar now shows `CLOUD Backend OK · GPU: ... · Aktif: 0`.
+Every API call from now on goes to the pod.
+
+**Phase 3 done when:** the topbar badge says **CLOUD** and the GPU name
+matches your pod's GPU.
+
+---
+
+## Phase 4 — Upload the dataset (every run, 10-30 min on a home line)
+
+`flame_steak/` is multi-GB, mostly preprocessed frames + flow + masks. From
+**your laptop** (Git Bash on Windows, or any Unix shell):
 
 ```bash
-curl -H "Authorization: Bearer $RUNPOD_AUTH_TOKEN" \
-  https://<pod-id>-8000.proxy.runpod.net/
-```
-
-Expected: a JSON health blob with `gpu_available: true`.
-
-### 5. Upload the dataset
-
-From your laptop (use the same SSH connection details):
-
-```bash
-# Adjust path to your local 4dgs-studio repo.
+# Substitute your local path + the SSH host/port/key from Phase 1.
 LOCAL_DATA="C:/Users/TAHA/Desktop/gaussian-splatter/Gaussian Splatter/4dgs-studio/data/flame_steak"
-POD_HOST="<host>"
-POD_PORT="<port>"
+POD_HOST="<the host from your SSH command>"
+POD_PORT="<the port from your SSH command>"
 POD_KEY="$HOME/.ssh/id_ed25519"
 
-# rsync resumes on disconnect — better than scp for multi-GB uploads on a
-# home connection.
-rsync -avzP --partial -e "ssh -p $POD_PORT -i $POD_KEY" \
+rsync -avzP --partial \
+  -e "ssh -p $POD_PORT -i $POD_KEY" \
   "$LOCAL_DATA" \
   root@$POD_HOST:/workspace/4dgs-studio/data/
 ```
 
-This uploads `frames_multiview/`, `colmap_multiview/`, `depth_multiview/`,
-`flow_multiview/`, `masks_multiview/`, `videos/`, `calibration.json`,
-`poses_bounds.npy` — about 3-5 GB. Expect 10-30 min on a typical home line.
-
-### 6. Submit the verification job
-
-From your laptop:
+`--partial` resumes if your connection drops. If `rsync` isn't on Windows
+Git Bash, install it via `pacman -S rsync` (MSYS2) or use:
 
 ```bash
-cd /path/to/local/4dgs-studio
+scp -r -P $POD_PORT -i $POD_KEY \
+  "$LOCAL_DATA" \
+  root@$POD_HOST:/workspace/4dgs-studio/data/
+```
+
+(scp doesn't resume — be sure your connection is stable.)
+
+**Phase 4 done when:** the upload completes and `ssh` to the pod shows the
+data:
+
+```bash
+ssh root@$POD_HOST -p $POD_PORT 'ls /workspace/4dgs-studio/data/flame_steak/'
+# expect: calibration.json colmap_multiview depth_multiview flame_steak ...
+```
+
+---
+
+## Phase 5 — Submit the verification job (~10 seconds, then wait)
+
+Now that the desktop app talks to the pod, just use the UI:
+
+1. Open the **Yeni Job** tab.
+2. Pick mode **🎬 4D Dynamic** (or just leave default).
+3. **Sahne adı:** `flame_steak`.
+4. **Preset:** `Cloud ☁` (the entry that says `RunPod / RTX 4090`). For
+   bigger cards, also expand the **Hiperparametreler** panel and enter the
+   80 GB overrides from the GPU table above.
+5. Make sure the **NVS Evaluation** checkbox is **on**. This is how you
+   get a verdict at the end.
+6. Click **4D Dynamic Job başlat**.
+
+Switch to the **Jobs** tab — your job should appear within 1-2 seconds with
+status `queued` → `running`. Switch to the **Analiz** tab to watch live
+metrics stream in.
+
+If you want to do this from a script instead, the curl wrapper still works:
+
+```bash
 BACKEND_URL=https://<pod-id>-8000.proxy.runpod.net \
-AUTH_TOKEN=<the token you saved> \
+AUTH_TOKEN=<your token> \
 PRESET=cloud \
 bash deploy/runpod/bench_flame_steak.sh
 ```
 
-This POSTs `/process` with `scene=flame_steak, mode=dynamic, preset=cloud,
-nvs_eval=true, skip_foundation=false` and prints the `job_id`.
+**Phase 5 done when:** the Jobs tab shows the `flame_steak` job in
+`running` state and the Analiz tab is drawing charts.
 
-### 7. Wait
+---
 
-`cloud` preset on a 4090 takes ~3-5 hours total (foundation models ~30-60 min,
-training 60k iters ~3-4 hours, NVS eval ~10-20 min).
+## Phase 6 — Wait + watch
 
-Monitor on the pod:
+Expected wall time:
+
+| GPU         | Foundation | Training      | Eval      | Total          |
+|-------------|-----------:|--------------:|----------:|---------------:|
+| RTX 4090    | ~30-60 min | 3-4 h (60k)   | 10-20 min | ~4-5 h         |
+| A100 80GB   | ~25-45 min | 3-4 h (100k)  | 15-30 min | **~4-6 h**     |
+| H100 80GB   | ~20-30 min | 1.5-2 h (100k)| 15-30 min | ~2-3 h         |
+
+Things to watch in the desktop app:
+
+- **Analiz tab:** PSNR climbing into the high 20s / low 30s. If after 10k
+  iters PSNR is below 22 dB, something's wrong — see troubleshooting.
+- **Jobs tab:** the row's progress bar moves from 0% to 100%. The phase
+  pill cycles `extract → colmap → foundation → train → eval`.
+- **Eval tab:** stays empty until the very end (`eval` phase). When it
+  populates, training is done.
+
+You can close the desktop app and reopen it any time — connection settings
+persist; the backend keeps running on the pod.
+
+**Phase 6 done when:** the Jobs tab row goes `completed`. The Eval tab
+shows PSNR/SSIM/LPIPS and an orbit video.
+
+---
+
+## Phase 7 — Read the verdict
+
+You can do this from the desktop app or from a terminal.
+
+### From the desktop app
+
+The Eval tab now shows the held-out cam metrics. Compare PSNR to:
+- **`flame_steak`** paper baseline: **33.51 dB** (Spacetime Gaussians).
+- ΔPSNR ≥ -1 dB → **SOTA-tier** ✅. Compute pays off; pipeline is sound.
+- -3 dB ≤ ΔPSNR < -1 dB → **Below SOTA** ⚠. Tunable; try larger overrides.
+- ΔPSNR < -3 dB → **Algorithmic gap** ✗. Don't keep paying for cloud; fix
+  the pipeline first. See `docs/SOTA_VERIFICATION.md` for triage.
+
+### From a terminal (more detail)
 
 ```bash
-ssh root@$POD_HOST -p $POD_PORT
-tail -f /workspace/backend.log
-```
-
-Or poll status from your laptop:
-
-```bash
-watch -n 60 \
-  "curl -s -H 'Authorization: Bearer $AUTH_TOKEN' \
-     https://<pod-id>-8000.proxy.runpod.net/status/<job_id> | python -m json.tool"
-```
-
-The Analiz tab in the local Tauri app **will not** show this remote job's
-metrics yet — that needs the frontend `API_BASE` toggle (separate work). For
-now use the curl polling.
-
-### 8. Pull results back
-
-When the job's `status` is `completed`:
-
-```bash
-# Eval JSON (small — KB).
+# 1. Pull the eval JSON from the pod.
 scp -P $POD_PORT -i $POD_KEY \
   root@$POD_HOST:/workspace/4dgs-studio/data/flame_steak/output/eval/nvs_eval.json \
   ./flame_steak_nvs_eval.json
 
-# Orbit video (small — MB).
-scp -P $POD_PORT -i $POD_KEY \
-  root@$POD_HOST:/workspace/4dgs-studio/data/flame_steak/output/eval/orbit.mp4 \
-  ./flame_steak_orbit.mp4
-
-# (Optional) trained PLYs — multi-GB. Skip unless you want to view locally.
-# rsync -avzP -e "ssh -p $POD_PORT -i $POD_KEY" \
-#   root@$POD_HOST:/workspace/4dgs-studio/data/flame_steak/output/ply/ \
-#   ./flame_steak_ply/
-```
-
-### 9. Read the verdict
-
-```bash
+# 2. Run the comparator (it prints the verdict).
 python scripts/sota_compare.py flame_steak --eval-path flame_steak_nvs_eval.json
 ```
 
-You'll see one of `SOTA-tier ✅` / `Below SOTA ⚠` / `Algorithmic gap ✗`. See
-`docs/SOTA_VERIFICATION.md` for what to do with each.
+### Pulling the orbit video
 
-### 10. Tear down the pod
+The desktop app's Eval tab can play it directly (the `?token=` query-param
+auth fallback handles `<video>` tags). Or download:
 
-Stop the pod from the RunPod UI. Storage volume bills separately — keep the
-`/workspace` volume if you'll re-run, otherwise delete it.
+```bash
+scp -P $POD_PORT -i $POD_KEY \
+  root@$POD_HOST:/workspace/4dgs-studio/data/flame_steak/output/eval/orbit.mp4 \
+  ./flame_steak_orbit.mp4
+```
+
+**Phase 7 done when:** you have a verdict (✅ / ⚠ / ✗).
 
 ---
 
-## Path B — Build the Docker image (faster restarts; recommended after Path A works)
+## Phase 8 — Tear down
 
-If you'll iterate, building the image once and running it cuts cold-start time
-to ~30 s instead of 3-5 min.
+In the RunPod console, click **Stop** on the pod. Important:
+
+- **Stop** stops billing for compute but keeps the volume (cheap).
+- **Terminate** also deletes the volume (loses your foundation-model cache,
+  bootstrap state, etc).
+
+For a one-off verification: **Terminate** is fine if you don't plan another
+run soon. For repeat runs: **Stop** the pod and just **Resume** it later —
+your volume will still have everything pre-installed.
+
+---
+
+## Live PLY playback — known limitation
+
+The Viewer tab fetches PLYs from the backend. Through RunPod's HTTP proxy
+those fetches work, but high-frame-rate playback is bandwidth-bound (10-30
+MB/s typical home connection vs. 200-500 MB/s local). Your verdict comes
+from the Eval tab — the orbit video — not live PLY playback. To view the
+trained scene smoothly:
 
 ```bash
-# Build locally (or on the pod).
-docker build -t 4dgs-studio:cu121 -f deploy/runpod/Dockerfile .
+# Pull all PLYs locally.
+mkdir -p ~/4dgs-flame-steak-output
+rsync -avzP -e "ssh -p $POD_PORT -i $POD_KEY" \
+  root@$POD_HOST:/workspace/4dgs-studio/data/flame_steak/output/ply/ \
+  ~/4dgs-flame-steak-output/
 
-# Push to a registry RunPod can pull from (Docker Hub, GHCR, etc.):
-docker tag 4dgs-studio:cu121 <your-registry>/4dgs-studio:cu121
-docker push <your-registry>/4dgs-studio:cu121
+# Then point a *local* backend (set in the desktop app's connection
+# settings: http://127.0.0.1:8000, no token) at the local data folder.
 ```
-
-In the RunPod UI, use `<your-registry>/4dgs-studio:cu121` as the container
-image. RunPod will pull it on pod creation. Pod boot then runs `start.sh`
-automatically; SSH in to set `RUNPOD_AUTH_TOKEN` and restart, or pass it via
-the pod's environment-variables UI.
 
 ---
 
 ## Troubleshooting
 
-**`401 Unauthorized` on every request from my laptop.**
-You set `RUNPOD_AUTH_TOKEN` on the pod but didn't pass it from the client.
-Always include `-H "Authorization: Bearer $AUTH_TOKEN"` in `curl`, or set
-`AUTH_TOKEN=...` for `bench_flame_steak.sh`.
+### "Test connection" shows `✗ Failed to fetch`
+- Did Phase 1 expose port `8000`? Re-check the pod's Connect tab.
+- Is the URL exactly `https://<pod-id>-8000.proxy.runpod.net` (with
+  `-8000-`, not `-22-`)?
+- Did Phase 2 finish the bootstrap? `ssh` in and check
+  `tail /workspace/backend.log`.
 
-**`gsplat` import takes 2-3 minutes the first time.**
-Normal — gsplat 1.5.3 JIT-compiles a CUDA extension. The compiled artifact is
-cached under `/workspace/.torch_extensions` (persistent volume) so subsequent
-imports are <1 s.
+### "Test connection" shows `✗ HTTP 401: Missing or invalid bearer token`
+- The token in the desktop app doesn't match `RUNPOD_AUTH_TOKEN` on the pod.
+- Re-run on the pod: `echo $RUNPOD_AUTH_TOKEN` — check it matches.
+- If you restarted the pod, the env var is gone — re-export it and restart
+  the backend.
 
-**`scp` / `rsync` is very slow.**
-Home upload speeds. The flame_steak data is 3-5 GB; use `rsync --partial
---progress` so it resumes on disconnect, and start it during a meal.
+### Job submits but immediately fails with "scene not found"
+- Phase 4 didn't put data in the right place. Verify:
+  ```bash
+  ssh root@$POD_HOST -p $POD_PORT 'ls /workspace/4dgs-studio/data/flame_steak/'
+  ```
+  Should list `calibration.json`, `frames_multiview/`, etc.
 
-**`curl` says `Could not resolve host: <pod-id>-8000.proxy.runpod.net`.**
-Did you expose port 8000 in the RunPod pod settings? Check the pod's "Connect"
-tab — you should see an HTTP service link there.
+### Backend logs show `gpu_available: false`
+- Either the pod was created without a GPU (re-create with one), or the
+  RunPod template didn't pass through `--gpus all` (rare; raise a support
+  ticket).
 
-**Backend logs show `gpu_available: false`.**
-Either: pod was created without a GPU (re-create with one), or the container
-isn't using `--gpus all` (the RunPod template should do this automatically;
-double-check in pod settings).
+### gsplat first import takes 2-3 minutes
+- Normal — JIT compile. Cached after that under `/workspace/.torch_extensions`.
+- If you re-create the pod with a fresh volume, expect this once again.
 
-**Job fails with "scene not found".**
-The data didn't upload to the right path. The pipeline expects
-`/workspace/4dgs-studio/data/flame_steak/`. Verify with
-`ssh root@... 'ls /workspace/4dgs-studio/data/flame_steak/'`.
+### Out of memory on an A100 80GB
+- You probably set `max_gaussians` too high *and* increased resolution.
+  Drop one of them, or pull `mlp_width` back to 640.
 
-**Out of memory on a 4090.**
-The `cloud` preset is sized for 24 GB but with foundation models loaded the
-peak can spike. Try `ultra` instead (8 GB cap) — slightly less aggressive.
+### Live training metrics stop updating in Analiz
+- Auto-refresh polls every 3s; if the pod's HTTP proxy is rate-limiting,
+  refresh manually with the **Refresh** button. Otherwise check
+  `tail -f /workspace/backend.log` on the pod for errors.
+
+### Want to run the verification on a different scene
+- Override via `SCENE=cook_spinach` in `bench_flame_steak.sh`, or just pick
+  the scene name in the UI. Make sure the data is uploaded first.

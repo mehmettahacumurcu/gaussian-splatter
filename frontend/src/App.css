@@ -746,3 +746,105 @@ html, body, #root {
   color: white;
 }
 
+
+/* ===== Connection settings (modal + topbar button) ===== */
+.conn-settings-btn {
+  width: 28px; height: 28px;
+  margin-left: 8px;
+  background: transparent;
+  border: 1px solid var(--border-1);
+  color: var(--text-muted);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+.conn-settings-btn:hover { color: var(--text); border-color: var(--accent); }
+
+.badge-tag {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 5px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  border-radius: 3px;
+  vertical-align: middle;
+}
+.badge-tag-local { background: #1a3d2a; color: var(--ok); }
+.badge-tag-cloud { background: #3d2a1a; color: var(--warn); }
+
+.api-base-auth { color: var(--ok); }
+
+.conn-settings-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 1000;
+}
+.conn-settings {
+  width: 480px;
+  max-width: calc(100vw - 32px);
+  background: var(--bg-1);
+  border: 1px solid var(--border-1);
+  border-radius: 6px;
+  display: flex; flex-direction: column;
+}
+.conn-settings-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.conn-settings-header h3 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+.conn-settings-close {
+  background: transparent; border: none; color: var(--text-muted);
+  font-size: 18px; cursor: pointer; padding: 0 4px;
+}
+.conn-settings-close:hover { color: var(--text); }
+
+.conn-settings-body {
+  padding: 16px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.conn-settings-field {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.conn-settings-field span { font-weight: 500; color: var(--text); }
+.conn-settings-field input {
+  padding: 6px 10px;
+  background: #0a0a0a;
+  border: 1px solid var(--border-1);
+  color: var(--text);
+  border-radius: 4px;
+  font-family: "SF Mono", Consolas, Monaco, monospace;
+  font-size: 12px;
+}
+.conn-settings-field input:focus { outline: none; border-color: var(--accent); }
+.conn-settings-hint { font-size: 11px; color: var(--text-muted); }
+.conn-settings-hint code {
+  font-family: "SF Mono", Consolas, Monaco, monospace;
+  background: var(--bg-3);
+  padding: 1px 4px; border-radius: 2px;
+}
+
+.conn-settings-status {
+  padding: 8px 10px;
+  font-size: 12px;
+  border-radius: 4px;
+  border: 1px solid var(--border-1);
+  background: var(--bg-2);
+}
+.conn-settings-ok { color: var(--ok); border-color: rgba(120, 211, 146, 0.4); }
+.conn-settings-err { color: var(--err); border-color: rgba(229, 128, 128, 0.4); }
+
+.conn-settings-actions {
+  display: flex; gap: 8px; align-items: center;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+}

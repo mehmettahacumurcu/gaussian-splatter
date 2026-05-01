@@ -15,8 +15,8 @@ import { JobSubmitPanel } from "./components/JobSubmitPanel";
 import { JobsList } from "./components/JobsList";
 import { TrainingAnalytics } from "./components/TrainingAnalytics";
 import { NvsEvalPanel } from "./components/NvsEvalPanel";
+import { ConnectionSettings } from "./components/ConnectionSettings";
 import {
-  API_BASE,
   getHealth,
   getSplatInfo,
   listJobs,
@@ -27,6 +27,7 @@ import {
   type SceneListItem,
   type SplatInfo,
 } from "./api";
+import { getConnection, isLocal, onConnectionChange } from "./connection";
 
 type Tab = "submit" | "jobs" | "viewer" | "analytics" | "eval";
 
@@ -82,11 +83,17 @@ function App() {
   const [diskScenes, setDiskScenes] = useState<SceneListItem[] | null>(null);
   const [diskPanelOpen, setDiskPanelOpen] = useState(false);
   const [diskLoading, setDiskLoading] = useState(false);
-  // v3.7.7 Debug: tek frame yükleme modu — visibility toggle bypass
-  const [singleFrameMode, setSingleFrameMode] = useState(false);
+  // v3.7.7 Debug: tek frame yükleme modu — visibility toggle bypass.
+  // Setter not currently exposed in UI (no toggle); retained as state so a
+  // future settings popover can flip it without a refactor.
+  const [singleFrameMode] = useState(false);
   const [viewerEngine, setViewerEngine] = useState<"legacy" | "spark">("legacy");
   // Analytics — son/aktif job için
   const [analyticsScene, setAnalyticsScene] = useState<string>("");
+  // Connection — backend URL + auth token (apiBase shown in topbar; settings modal toggles)
+  const [connSettingsOpen, setConnSettingsOpen] = useState(false);
+  const [connection, setConnectionState] = useState(() => getConnection());
+  useEffect(() => onConnectionChange(setConnectionState), []);
 
   // Health poll (her 5 sn)
   useEffect(() => {
@@ -174,11 +181,20 @@ function App() {
   }, [diskPanelOpen]);
 
   const backendBadge = (() => {
-    if (!health) return <span className="badge badge-unknown">Backend: bağlantı yok</span>;
+    const localTag = isLocal()
+      ? <span className="badge-tag badge-tag-local">LOCAL</span>
+      : <span className="badge-tag badge-tag-cloud">CLOUD</span>;
+    if (!health) {
+      return (
+        <span className="badge badge-unknown">
+          {localTag} Backend: bağlantı yok
+        </span>
+      );
+    }
     const gpu = health.gpu_available ? `GPU: ${health.gpu_name ?? "?"}` : "GPU: yok";
     return (
       <span className="badge badge-ok">
-        Backend OK · {gpu} · Aktif: {health.active_jobs}
+        {localTag} Backend OK · {gpu} · Aktif: {health.active_jobs}
       </span>
     );
   })();
@@ -225,7 +241,18 @@ function App() {
             Eval
           </button>
         </nav>
-        <div className="app-status">{backendBadge}</div>
+        <div className="app-status">
+          {backendBadge}
+          <button
+            type="button"
+            className="conn-settings-btn"
+            onClick={() => setConnSettingsOpen(true)}
+            title="Backend connection settings"
+            aria-label="Backend connection settings"
+          >
+            ⚙
+          </button>
+        </div>
       </header>
 
       {/* İçerik */}
@@ -487,7 +514,15 @@ function App() {
         )}
       </main>
 
-      <div className="api-base">API: {API_BASE}</div>
+      <div className="api-base" title="Click ⚙ in the topbar to change">
+        API: {connection.apiBase}
+        {connection.authToken && <span className="api-base-auth"> · auth ✓</span>}
+      </div>
+
+      <ConnectionSettings
+        open={connSettingsOpen}
+        onClose={() => setConnSettingsOpen(false)}
+      />
     </div>
   );
 }

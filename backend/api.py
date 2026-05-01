@@ -97,6 +97,12 @@ _AUTH_PUBLIC_PATHS = {"/", "/docs", "/openapi.json", "/redoc"}
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):
+    """Auth middleware. Accepts the token in either:
+       - Authorization: Bearer <token>     (preferred — used by fetchJson)
+       - ?token=<token> query parameter    (fallback for <video> / blob fetches
+                                            and the splat-library frame loader,
+                                            which can't set custom headers)
+    """
     async def dispatch(self, request: Request, call_next):
         if not _AUTH_TOKEN:
             return await call_next(request)
@@ -104,17 +110,19 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
         if request.url.path in _AUTH_PUBLIC_PATHS:
             return await call_next(request)
+        # Header check.
         header = request.headers.get("authorization", "")
-        if not header.startswith("Bearer "):
-            return JSONResponse(
-                {"detail": "Missing bearer token"}, status_code=401,
-            )
-        token = header[len("Bearer "):].strip()
-        if token != _AUTH_TOKEN:
-            return JSONResponse(
-                {"detail": "Invalid bearer token"}, status_code=401,
-            )
-        return await call_next(request)
+        if header.startswith("Bearer "):
+            token = header[len("Bearer "):].strip()
+            if token == _AUTH_TOKEN:
+                return await call_next(request)
+        # Query-param fallback.
+        qp_token = request.query_params.get("token", "").strip()
+        if qp_token and qp_token == _AUTH_TOKEN:
+            return await call_next(request)
+        return JSONResponse(
+            {"detail": "Missing or invalid bearer token"}, status_code=401,
+        )
 
 
 app.add_middleware(BearerTokenMiddleware)
