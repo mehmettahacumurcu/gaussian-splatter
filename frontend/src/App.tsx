@@ -57,19 +57,23 @@ function formatTime(ts: number): string {
 
 function App() {
   const [tab, setTab] = useState<Tab>("submit");
-  // v6.0 — Pipeline mode (Static 3D / 4D Dynamic). Submit panel mode'a göre
-  // alt component render eder. localStorage'a hatirlatir, refresh'te kalır.
-  const [mode, setMode] = useState<JobMode>(() => {
+  // Pipeline switch (Static 3D / 4D Dynamic). Persisted to localStorage;
+  // first load migrates from the legacy "4dgs.mode" key once.
+  const [pipeline, setPipeline] = useState<JobMode>(() => {
     try {
-      const saved = window.localStorage.getItem("4dgs.mode");
-      return saved === "static" || saved === "dynamic" ? saved : "dynamic";
-    } catch {
-      return "dynamic";
-    }
+      const saved = window.localStorage.getItem("4dgs.pipeline");
+      if (saved === "static" || saved === "dynamic") return saved;
+      const legacy = window.localStorage.getItem("4dgs.mode");
+      if (legacy === "static" || legacy === "dynamic") {
+        window.localStorage.setItem("4dgs.pipeline", legacy);
+        return legacy;
+      }
+    } catch { /* ignore */ }
+    return "dynamic";
   });
-  const handleModeChange = useCallback((m: JobMode) => {
-    setMode(m);
-    try { window.localStorage.setItem("4dgs.mode", m); } catch { /* ignore */ }
+  const handlePipelineChange = useCallback((p: JobMode) => {
+    setPipeline(p);
+    try { window.localStorage.setItem("4dgs.pipeline", p); } catch { /* ignore */ }
   }, []);
   const [health, setHealth] = useState<HealthResponse | null>(null);
 
@@ -183,11 +187,31 @@ function App() {
   })();
 
   return (
-    <div className="app">
+    <div className={`app pipeline-${pipeline}`}>
       {/* Üst bar */}
       <header className="app-topbar">
         <div className="app-brand">
-          <h1>4DGS Viewer</h1>
+          <h1>4DGS Studio</h1>
+        </div>
+        <div className="pipeline-switch" role="tablist" aria-label="Pipeline">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={pipeline === "static"}
+            className={`pipeline-switch-btn ${pipeline === "static" ? "active" : ""}`}
+            onClick={() => handlePipelineChange("static")}
+          >
+            📸 Static 3D
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={pipeline === "dynamic"}
+            className={`pipeline-switch-btn ${pipeline === "dynamic" ? "active" : ""}`}
+            onClick={() => handlePipelineChange("dynamic")}
+          >
+            🎬 4D Dynamic
+          </button>
         </div>
         <nav className="app-tabs">
           <button
@@ -231,8 +255,8 @@ function App() {
       <main className="app-content">
         {tab === "submit" && (
           <JobSubmitPanel
-            mode={mode}
-            onModeChange={handleModeChange}
+            mode={pipeline}
+            onModeChange={handlePipelineChange}
             onJobSubmitted={handleJobSubmitted}
           />
         )}

@@ -746,3 +746,32 @@ html, body, #root {
   color: white;
 }
 
+
+/* ===================================================================
+   Pipeline switch on top bar — added during redesign T4
+   =================================================================== */
+.pipeline-switch {
+  display: inline-flex;
+  background: var(--bg-2);
+  padding: 3px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  gap: 2px;
+}
+.pipeline-switch-btn {
+  padding: 4px 12px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-12);
+  font-weight: var(--fw-medium);
+  transition: background 0.12s, color 0.12s, border-color 0.12s;
+}
+.pipeline-switch-btn:hover { color: var(--text); background: var(--bg-3); }
+.pipeline-switch-btn.active {
+  color: var(--text);
+  background: var(--bg-3);
+  border-color: var(--accent);
+}
