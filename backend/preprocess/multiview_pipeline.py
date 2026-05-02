@@ -500,61 +500,78 @@ def prepare_multiview_scene(
     # N3V poses dogru olabilir ama random init densify+prune dinamigi icin
     # yetersiz (gaussian'lar dogru yerde olmadigindan static phase oturmuyor).
     # COLMAP cikti'yi kullanarak hem init hem (opsiyonel) poses replace edilir.
+    #
+    # GUARD: Eger cfg.preprocess.use_provided_poses=True (default) ve
+    # calibration.json mevcut ise, COLMAP tamamen atlanir. N3V (ve LLFF)
+    # icin saglanan calibration submillimeter-accurate; near-coplanar 21-cam
+    # rig'lerde COLMAP BA Cholesky failure → degraded poses (~1-2 dB PSNR
+    # cost). Downstream init_xyz_colmap=None pathi (estimate_scene_extent_from_n3v
+    # + init_random_points_in_bbox) zaten safe.
+    skip_colmap = (
+        bool(getattr(cfg.preprocess, "use_provided_poses", True))
+        and paths["calibration"].exists()
+    )
     init_xyz_colmap = None
     init_rgb_colmap = None
     colmap_cams = None
-    try:
-        colmap_cams, init_xyz_colmap, init_rgb_colmap = _bootstrap_colmap_init(
-            paths, frames_dict, cfg, on_progress=on_progress,
-            force_preprocess=force_preprocess,
+    if skip_colmap:
+        print(
+            f"  [bootstrap] use_provided_poses=True + calibration.json present "
+            f"→ skipping COLMAP, using N3V poses directly"
         )
-        # STRICT VALIDATION: tum cam'lar COLMAP'ta register olmali, ve
-        # yeterli sparse cloud uretilmeli. Aksi halde world-mixing bug
-        # (kismi COLMAP + kismi N3V → farkli world frame, training collapse).
-        # NOT: colmap_cams artik per-cam grouped (multi-time bootstrap).
-        new_calib: Dict[str, Dict] = {}
-        for cam_name, cam_info in colmap_cams.items():
-            new_calib[cam_name] = {
-                "K": np.array(cam_info["K"], dtype=np.float64),
-                "w2c": np.array(cam_info["w2c"], dtype=np.float64),
-                "R": np.array(cam_info["R"], dtype=np.float64),
-                "t": np.array(cam_info["t"], dtype=np.float64),
-                "width": int(cam_info["width"]),
-                "height": int(cam_info["height"]),
-            }
-        n_n3v = len(calib)
-        n_colmap = len(new_calib)
-        n_pts = len(init_xyz_colmap) if init_xyz_colmap is not None else 0
-        MIN_POINTS = 1500   # smoke test threshold — densify buyutebilir
-        MIN_CAMS_RATIO = 0.95  # ≥ 95% cam register olmali (world-mixing onleme)
-        if n_colmap < n_n3v * MIN_CAMS_RATIO:
-            raise RuntimeError(
-                f"COLMAP only registered {n_colmap}/{n_n3v} cams "
-                f"(threshold {MIN_CAMS_RATIO*100}%). World-mixing risk. "
-                f"Fallback to N3V + random init."
+    else:
+        try:
+            colmap_cams, init_xyz_colmap, init_rgb_colmap = _bootstrap_colmap_init(
+                paths, frames_dict, cfg, on_progress=on_progress,
+                force_preprocess=force_preprocess,
             )
-        if n_pts < MIN_POINTS:
-            raise RuntimeError(
-                f"COLMAP produced only {n_pts} points (threshold {MIN_POINTS}). "
-                f"Insufficient for densify+prune dynamics. "
-                f"Fallback to N3V + random init."
-            )
-        # Sample K + w2c print for sanity
-        sample_cam = sorted(new_calib.keys())[0]
-        K0 = new_calib[sample_cam]["K"]
-        w2c0 = new_calib[sample_cam]["w2c"]
-        c2w0 = np.linalg.inv(w2c0)
-        pos0 = c2w0[:3, 3]
-        fwd0 = c2w0[:3, 2]
-        print(f"  [bootstrap] {sample_cam} K[0,0]={K0[0,0]:.1f} K[0,2]={K0[0,2]:.1f}")
-        print(f"  [bootstrap] {sample_cam} pos={pos0.round(2)} fwd={fwd0.round(2)}")
-        calib = new_calib
-        print(f"  [bootstrap] ✓ Using COLMAP-derived calibration ({len(calib)} cams, {n_pts:,} points)")
-    except Exception as e:
-        print(f"  [bootstrap] ✗ COLMAP failed: {e}")
-        print(f"  [bootstrap] Falling back to N3V calibration + random init")
-        init_xyz_colmap = None
-        init_rgb_colmap = None
+            # STRICT VALIDATION: tum cam'lar COLMAP'ta register olmali, ve
+            # yeterli sparse cloud uretilmeli. Aksi halde world-mixing bug
+            # (kismi COLMAP + kismi N3V → farkli world frame, training collapse).
+            # NOT: colmap_cams artik per-cam grouped (multi-time bootstrap).
+            new_calib: Dict[str, Dict] = {}
+            for cam_name, cam_info in colmap_cams.items():
+                new_calib[cam_name] = {
+                    "K": np.array(cam_info["K"], dtype=np.float64),
+                    "w2c": np.array(cam_info["w2c"], dtype=np.float64),
+                    "R": np.array(cam_info["R"], dtype=np.float64),
+                    "t": np.array(cam_info["t"], dtype=np.float64),
+                    "width": int(cam_info["width"]),
+                    "height": int(cam_info["height"]),
+                }
+            n_n3v = len(calib)
+            n_colmap = len(new_calib)
+            n_pts = len(init_xyz_colmap) if init_xyz_colmap is not None else 0
+            MIN_POINTS = 1500   # smoke test threshold — densify buyutebilir
+            MIN_CAMS_RATIO = 0.95  # ≥ 95% cam register olmali (world-mixing onleme)
+            if n_colmap < n_n3v * MIN_CAMS_RATIO:
+                raise RuntimeError(
+                    f"COLMAP only registered {n_colmap}/{n_n3v} cams "
+                    f"(threshold {MIN_CAMS_RATIO*100}%). World-mixing risk. "
+                    f"Fallback to N3V + random init."
+                )
+            if n_pts < MIN_POINTS:
+                raise RuntimeError(
+                    f"COLMAP produced only {n_pts} points (threshold {MIN_POINTS}). "
+                    f"Insufficient for densify+prune dynamics. "
+                    f"Fallback to N3V + random init."
+                )
+            # Sample K + w2c print for sanity
+            sample_cam = sorted(new_calib.keys())[0]
+            K0 = new_calib[sample_cam]["K"]
+            w2c0 = new_calib[sample_cam]["w2c"]
+            c2w0 = np.linalg.inv(w2c0)
+            pos0 = c2w0[:3, 3]
+            fwd0 = c2w0[:3, 2]
+            print(f"  [bootstrap] {sample_cam} K[0,0]={K0[0,0]:.1f} K[0,2]={K0[0,2]:.1f}")
+            print(f"  [bootstrap] {sample_cam} pos={pos0.round(2)} fwd={fwd0.round(2)}")
+            calib = new_calib
+            print(f"  [bootstrap] ✓ Using COLMAP-derived calibration ({len(calib)} cams, {n_pts:,} points)")
+        except Exception as e:
+            print(f"  [bootstrap] ✗ COLMAP failed: {e}")
+            print(f"  [bootstrap] Falling back to N3V calibration + random init")
+            init_xyz_colmap = None
+            init_rgb_colmap = None
 
     # 3) Test/train camera ayrimi
     all_cams = sorted(calib.keys())
