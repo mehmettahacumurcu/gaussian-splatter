@@ -755,7 +755,14 @@ def run_pipeline(
         status["foundation"] = ", ".join(f"{k}={v}" for k, v in foundation_status.items())
         cb("foundation", 1.0, f"Foundation bitti: {status['foundation']}", foundation_status)
     else:
-        print("\n[Faz 3] Foundation modeller atlandı (--skip-foundation)")
+        # The else here covers two cases: (1) skip_foundation=True (user opted out)
+        # OR (2) is_mv=True (multi-view scene; SV foundation not applicable, but MV
+        # foundation already ran above). Distinguish them in the log so users
+        # don't think MV foundation was skipped.
+        if skip_foundation:
+            print("\n[Faz 3] Foundation modeller atlandı (skip_foundation=True)")
+        else:
+            print("\n[Faz 3] Single-view foundation atlandı (multi-view scene; MV foundation completed above)")
         status["foundation"] = "skipped"
         cb("foundation", 1.0, "Atlandı", {"skipped": True})
 

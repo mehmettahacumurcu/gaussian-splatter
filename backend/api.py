@@ -31,7 +31,7 @@ from .api_models import (
     JobStatus,
     ProcessResponse,
 )
-from .config import default_config, cloud_config, scene_paths
+from .config import default_config, cloud_config, local_max_config, scene_paths
 from .job_manager import JobManager, get_manager
 from .pipeline import run_pipeline
 
@@ -164,7 +164,7 @@ async def process_video(
     ultra_test: bool = Form(False, description="[LEGACY] use mode='dynamic' + preset='ultra'"),
     ultra_clean: bool = Form(False, description="[LEGACY] use mode='dynamic' + preset='ultra_clean'"),
     static_max: bool = Form(False, description="[LEGACY] use mode='dynamic' + preset='static_max'"),
-    skip_foundation: bool = Form(True, description="Foundation modelleri atla"),
+    skip_foundation: bool = Form(False, description="Foundation modellerini atla. Default False — foundation (depth/masks/flow/tracks) calistirilir; True verirsen atlanir (sadece smoke / mekanik test icin)."),
     # --- Override parametreleri (preset üzerine uygulanır) ---
     # Temel training
     iters: int | None = Form(None, description="Override training iter sayısı"),
@@ -233,6 +233,15 @@ async def process_video(
     dynamic_densify_scale: float | None = Form(None, description="v6.1 (4D only): dynamic gauss'lar icin densify_grad_threshold * scale. 0.5 = 2× hassas. 1.0 = no-op."),
     # v6.1 — Sparse-view init method
     init_method: str | None = Form(None, description="v6.1: colmap (default) | dust3r | auto (sparse-view detect)"),
+    # SOTA-tier knobs (2026-05-02 audit) — previously config-only, now Form-exposed
+    lambda_lpips: float | None = Form(None, description="LPIPS perceptual loss weight"),
+    lpips_net: str | None = Form(None, description="'alex' or 'vgg' for LPIPS backbone"),
+    lambda_flow: float | None = Form(None, description="Optical flow loss weight (requires foundation)"),
+    lambda_multiview_consistency: float | None = Form(None, description="Multi-view cross-cam supervision (4D MV only)"),
+    lr_cam_K: float | None = Form(None, description="Joint BA on intrinsics (1e-7 typical)"),
+    lr_cam_w2c: float | None = Form(None, description="Joint BA on extrinsics (1e-7 typical)"),
+    cam_refine_start_iter: int | None = Form(None, description="Iter to start joint BA"),
+    multires_schedule: str | None = Form(None, description='Comma-separated "iter:long_edge" pairs, e.g., "0:480,10000:720,25000:1080"'),
 ) -> ProcessResponse:
     """
     Video'yu upload et ve pipeline'ı kuyruğa al.
@@ -255,6 +264,8 @@ async def process_video(
     if mode_norm not in ("static", "dynamic"):
         raise HTTPException(400, f"mode '{mode}' invalid — use 'static' or 'dynamic'")
     static_mode_active = (mode_norm == "static")
+    # Default local_max preset flag — preset='local_max' verilmedikce False kalir
+    local_max = False
     if preset:
         preset_lc = preset.strip().lower()
         if static_mode_active:
@@ -274,6 +285,7 @@ async def process_video(
                 "ultra": "ultra_test",
                 "ultra_clean": "ultra_clean",
                 "static_max": "static_max",
+                "local_max": "local_max",
             }
             if preset_lc not in mapping:
                 raise HTTPException(400, f"dynamic preset '{preset}' invalid — use one of {sorted(mapping.keys())}")
@@ -286,6 +298,7 @@ async def process_video(
             ultra_clean = (target == "ultra_clean")
             static_max = (target == "static_max")
             cloud = (target == "cloud")
+            local_max = (target == "local_max")
 
     # ---- Video upload ----
     video_path = paths["base"] / "video.mp4"
@@ -332,8 +345,13 @@ async def process_video(
 
     # Runner kapanı — pipeline.run_pipeline'ı callback'le çağırır
     def _runner(on_progress: Any) -> dict:
-        cfg = cloud_config() if cloud else default_config()
-        # v6.1 — NVS eval flag
+        if cloud:
+            cfg = cloud_config()
+        elif local_max:
+            cfg = local_max_config()
+        else:
+            cfg = default_config()
+        # v6.1 — NVS eval flag (overridable; local_max_config sets it True by default)
         cfg.train.nvs_eval_enabled = bool(nvs_eval)
 
         # ---- v6.0 Static 3DGS preset uygulayicisi ----
@@ -406,6 +424,40 @@ async def process_video(
                 if init_method not in ("colmap", "dust3r", "auto"):
                     raise HTTPException(400, f"init_method invalid: {init_method}")
                 cfg.preprocess.init_method = init_method
+
+            # New SOTA-tier overrides — static mode (added 2026-05-02).
+            # Static 3DGS'te lambda_flow / lambda_multiview_consistency etkisiz
+            # ama yine de cfg'e yaziyoruz ki user explicit isterse trainer gorsun.
+            if lambda_lpips is not None:
+                cfg.train.lambda_lpips = float(lambda_lpips)
+            if lpips_net is not None:
+                if lpips_net not in ("alex", "vgg"):
+                    raise HTTPException(400, f"lpips_net invalid: {lpips_net}")
+                cfg.train.lpips_net = lpips_net
+            if lambda_flow is not None:
+                cfg.train.lambda_flow = float(lambda_flow)
+            if lambda_multiview_consistency is not None:
+                cfg.train.lambda_multiview_consistency = float(lambda_multiview_consistency)
+            if lr_cam_K is not None:
+                cfg.train.lr_cam_K = float(lr_cam_K)
+            if lr_cam_w2c is not None:
+                cfg.train.lr_cam_w2c = float(lr_cam_w2c)
+            if cam_refine_start_iter is not None:
+                cfg.train.cam_refine_start_iter = int(cam_refine_start_iter)
+            if opacity_reset_interval is not None:
+                cfg.train.opacity_reset_interval = int(opacity_reset_interval)
+            if multires_schedule is not None:
+                try:
+                    schedule = []
+                    for pair in multires_schedule.split(","):
+                        pair = pair.strip()
+                        if not pair:
+                            continue
+                        k, v = pair.split(":")
+                        schedule.append((int(k.strip()), int(v.strip())))
+                    cfg.train.multires_schedule = schedule
+                except Exception as e:
+                    raise HTTPException(400, f"multires_schedule parse failed: {e}")
 
             return run_pipeline(
                 str(video_path),
@@ -756,6 +808,38 @@ async def process_video(
             cfg.preprocess.colmap_mv_timestamps = int(colmap_mv_timestamps)
         if colmap_mv_dense_mvs is not None:
             cfg.preprocess.colmap_mv_dense_mvs = bool(colmap_mv_dense_mvs)
+
+        # New SOTA-tier overrides (added 2026-05-02). opacity_reset_interval
+        # zaten yukarida override edilmis durumda; burada eklemiyoruz.
+        if lambda_lpips is not None:
+            cfg.train.lambda_lpips = float(lambda_lpips)
+        if lpips_net is not None:
+            if lpips_net not in ("alex", "vgg"):
+                raise HTTPException(400, f"lpips_net invalid: {lpips_net}")
+            cfg.train.lpips_net = lpips_net
+        if lambda_flow is not None:
+            cfg.train.lambda_flow = float(lambda_flow)
+        if lambda_multiview_consistency is not None:
+            cfg.train.lambda_multiview_consistency = float(lambda_multiview_consistency)
+        if lr_cam_K is not None:
+            cfg.train.lr_cam_K = float(lr_cam_K)
+        if lr_cam_w2c is not None:
+            cfg.train.lr_cam_w2c = float(lr_cam_w2c)
+        if cam_refine_start_iter is not None:
+            cfg.train.cam_refine_start_iter = int(cam_refine_start_iter)
+        if multires_schedule is not None:
+            # Parse "0:480,10000:720,25000:1080" → [(0, 480), (10000, 720), (25000, 1080)]
+            try:
+                schedule = []
+                for pair in multires_schedule.split(","):
+                    pair = pair.strip()
+                    if not pair:
+                        continue
+                    k, v = pair.split(":")
+                    schedule.append((int(k.strip()), int(v.strip())))
+                cfg.train.multires_schedule = schedule
+            except Exception as e:
+                raise HTTPException(400, f"multires_schedule parse failed: {e}")
 
         return run_pipeline(
             str(video_path),
