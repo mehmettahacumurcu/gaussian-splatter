@@ -59,6 +59,7 @@ def render_view(
         backgrounds=bg,
         render_mode="RGB",
         packed=False,
+        antialiased=True,
     )
     # rgb: (1, H, W, 3), alpha: (1, H, W, 1)
 
@@ -81,6 +82,7 @@ def render_view(
         backgrounds=bg_d,
         render_mode="ED",
         packed=False,
+        antialiased=True,
     )
     # depth: (1, H, W, 1)
 
