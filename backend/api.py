@@ -479,6 +479,9 @@ async def process_video(
             cfg.train.density_interval = 50
             cfg.train.warmup_iters = 100   # smoke'ta kısa: iter 200'de full
             cfg.export.num_timestamps = 10
+            # 2026-05-02: smoke is end-to-end pipeline check; cap N hard so init
+            # is fast even when COLMAP is bypassed (random fill samples to cap).
+            cfg.train.max_gaussians = 50_000
 
         # MICRO TEST — ultra hızlı dev iteration / preflight
         # skip_foundation user'ın seçimine bırakıldı:
@@ -490,6 +493,7 @@ async def process_video(
             cfg.preprocess.resize_long_edge = 480        # yarı çözünürlük
             cfg.train.n_iters = 200
             cfg.train.image_resolution = (320, 180)
+            cfg.train.max_gaussians = 30_000             # cap N — micro is sanity check, fast init
             cfg.train.ckpt_interval = 200
             cfg.train.log_interval = 10
             cfg.train.density_start_iter = 50
