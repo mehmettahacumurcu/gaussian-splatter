@@ -283,10 +283,6 @@ class TrainConfig:
     # ve foundation phase'de gating'lenir, bu yuzden default 0.0 kaliyor.
     lambda_flow: float = 0.0
     flow_warmup_iters: int = 1000
-    # v6.1 — temporal 2nd-order acceleration smoothness. 0 = off.
-    lambda_accel: float = 1e-4  # was 0.0
-    # v6.1 — Python-side mip anti-alias scale floor (fraction of pixel size). 0 = off.
-    mip_scale_floor_frac: float = 0.001  # was 0.0
     # Phase 1.9 — Densify dynamics tuning (multi-view spesifik defaults)
     # Multi-view'da daha aggresif densify gerekir (her cam ayri view).
     densify_mv_threshold_scale: float = 0.7  # 1.0 = single-view ile ayni, 0.7 = %30 daha hassas
@@ -321,7 +317,8 @@ class TrainConfig:
     dynamic_densify_scale: float = 0.5
     # 4D Quality v6.1 — Madde 6: 2nd-order temporal smoothness (acceleration ceza)
     # D(t-1) - 2D(t) + D(t+1) magnitude on dpos. 0 = off.
-    lambda_accel: float = 0.0
+    # 2026-05-02 audit: was 0.0 default; bumped to 1e-4 (recommended for SOTA).
+    lambda_accel: float = 1e-4
     # 4D Quality v6.1 — Madde 12: Cam refinement gradient norm clipping
     # cam_K + cam_w2c parametreleri icin ayri grad_norm clip degeri. 0 = off.
     cam_grad_clip_norm: float = 1.0
@@ -329,7 +326,8 @@ class TrainConfig:
     # 3D scale floor — her gauss'a min scale = mip_scale_floor_frac × distance_to_nearest_cam.
     # 0.0 = off. 0.0005-0.002 onerilen. Anti-aliasing approximation; tam Mip-Splatting CUDA
     # kernel degil, ama ekran-uzayinda yakin gauss'larin "noktalasmasini" engeller.
-    mip_scale_floor_frac: float = 0.0
+    # 2026-05-02 audit: was 0.0 default; bumped to 0.001 (recommended).
+    mip_scale_floor_frac: float = 0.001
     # 4D Quality v6.1 — NVS evaluation
     # Training sonrasi held-out cam metrics + orbit cam mp4 render.
     # False default: pipeline'a ek faz eklemeden run. UI/CLI flag ile aktive edilir.
