@@ -109,10 +109,16 @@ Skip this section if you already use RunPod.
 SSH into the pod with the command from Phase 1, then run:
 
 ```bash
-# 1. Clone the repo + install all deps. Takes ~3-5 min the first time.
-git clone --depth 1 --branch feat/sota-verification \
-  https://github.com/mehmettahacumurcu/gaussian-splatter.git /workspace/repo
-bash /workspace/repo/4dgs-studio/deploy/runpod/pod-bootstrap.sh \
+# 1. Fetch the bootstrap script directly + run it. Takes ~3-5 min first time.
+#    The bootstrap clones the repo into /workspace/4dgs-studio itself —
+#    no intermediate /workspace/repo clone needed.
+#    If a stale /workspace/repo or /workspace/4dgs-studio exists from a
+#    previous attempt on this volume, wipe them first:
+#      rm -rf /workspace/repo /workspace/4dgs-studio
+curl -fsSL \
+  https://raw.githubusercontent.com/mehmettahacumurcu/gaussian-splatter/feat/sota-verification/deploy/runpod/pod-bootstrap.sh \
+  -o /tmp/pod-bootstrap.sh
+bash /tmp/pod-bootstrap.sh \
   https://github.com/mehmettahacumurcu/gaussian-splatter.git \
   feat/sota-verification
 
