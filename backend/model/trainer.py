@@ -139,10 +139,22 @@ def load_frame_tensor(
       - "uint8": returns uint8 tensor (CPU). Caller is responsible for
         converting to float on GPU via `.float() / 255.0` after `.to(device)`.
         ~3.5x memory savings vs float32 — used by preload_to_ram cache.
+
+    Corrupt-cache resilience: cv2.imread returns None for truncated/corrupt
+    PNGs (from prior pipeline crashes). We raise FileNotFoundError so the
+    upstream cache marker mismatch surfaces clearly. If you'd rather skip
+    silently, swap the raise for `return None` + adjust the type hint.
     """
     import cv2
     img = cv2.imread(str(frame_path))
     if img is None:
+        # Could be missing OR corrupt. Delete if exists so next run regenerates.
+        if Path(frame_path).exists():
+            print(f"[frame] WARN: corrupt {Path(frame_path).name}; deleting")
+            try:
+                Path(frame_path).unlink()
+            except Exception:
+                pass
         raise FileNotFoundError(frame_path)
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     if target_size is not None:
@@ -166,12 +178,28 @@ def _load_depth_for_frame(
       - "float32" (default, legacy): float32 CPU tensor.
       - "float16": float16 CPU tensor (~2x memory savings). Caller should
         cast to float32 on GPU via `.to(device).float()`.
+
+    Corrupt-cache resilience: if the .npy is truncated / unreadable
+    (e.g., because a prior pipeline crash left a partial write),
+    delete it + return None instead of crashing the run. Pipeline
+    will see no depth for this frame and either regenerate it on
+    the next foundation run, or skip depth supervision for it.
     """
     import cv2
     candidate = Path(depth_dir) / f"{Path(frame_path).stem}_depth.npy"
     if not candidate.exists():
         return None
-    arr = np.load(candidate).astype(np.float32)
+    try:
+        arr = np.load(candidate).astype(np.float32)
+    except (EOFError, ValueError, OSError, Exception) as e:
+        # Truncated / corrupt .npy from a prior crash — delete + skip.
+        print(f"[depth] WARN: corrupt {candidate.name} ({type(e).__name__}: {e}); "
+              f"deleting + skipping frame")
+        try:
+            candidate.unlink()
+        except Exception:
+            pass
+        return None
     if target_size is not None:
         arr = cv2.resize(arr, target_size, interpolation=cv2.INTER_LINEAR)
     t = torch.from_numpy(arr)
