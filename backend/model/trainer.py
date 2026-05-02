@@ -11,12 +11,13 @@ v3 — Stage 2 motion supervision tam:
 from __future__ import annotations
 import math
 import time
+import concurrent.futures
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from .gaussian_model import GaussianModel
 from .deformation import DeformationField, decode_fourier_trajectory
@@ -126,8 +127,19 @@ def apply_mip_scale_floor(
 # ---------------------------------------------------------------------------
 # Frame / depth / mask / tracks yardımcıları
 # ---------------------------------------------------------------------------
-def load_frame_tensor(frame_path: Path, target_size: tuple[int, int] | None = None) -> torch.Tensor:
-    """PNG → (H, W, 3) float [0, 1]."""
+def load_frame_tensor(
+    frame_path: Path,
+    target_size: tuple[int, int] | None = None,
+    dtype: str = "float32",
+) -> torch.Tensor:
+    """PNG → (H, W, 3) tensor.
+
+    dtype:
+      - "float32" (default, legacy): returns float32 tensor in [0, 1] (CPU).
+      - "uint8": returns uint8 tensor (CPU). Caller is responsible for
+        converting to float on GPU via `.float() / 255.0` after `.to(device)`.
+        ~3.5x memory savings vs float32 — used by preload_to_ram cache.
+    """
     import cv2
     img = cv2.imread(str(frame_path))
     if img is None:
@@ -135,13 +147,26 @@ def load_frame_tensor(frame_path: Path, target_size: tuple[int, int] | None = No
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     if target_size is not None:
         img = cv2.resize(img, target_size, interpolation=cv2.INTER_AREA)
+    if dtype == "uint8":
+        # cv2 returns uint8 by default; keep as-is for memory-efficient cache.
+        return torch.from_numpy(np.ascontiguousarray(img))  # uint8 (H, W, 3)
+    # Legacy default: float32 [0, 1]
     return torch.from_numpy(img).float() / 255.0
 
 
 def _load_depth_for_frame(
-    depth_dir: Path, frame_path: Path, target_size: tuple[int, int] | None = None,
+    depth_dir: Path,
+    frame_path: Path,
+    target_size: tuple[int, int] | None = None,
+    dtype: str = "float32",
 ) -> torch.Tensor | None:
-    """Metric3D/MiDaS depth .npy → (H, W) float32."""
+    """Metric3D/MiDaS depth .npy → (H, W) tensor.
+
+    dtype:
+      - "float32" (default, legacy): float32 CPU tensor.
+      - "float16": float16 CPU tensor (~2x memory savings). Caller should
+        cast to float32 on GPU via `.to(device).float()`.
+    """
     import cv2
     candidate = Path(depth_dir) / f"{Path(frame_path).stem}_depth.npy"
     if not candidate.exists():
@@ -149,13 +174,25 @@ def _load_depth_for_frame(
     arr = np.load(candidate).astype(np.float32)
     if target_size is not None:
         arr = cv2.resize(arr, target_size, interpolation=cv2.INTER_LINEAR)
-    return torch.from_numpy(arr)
+    t = torch.from_numpy(arr)
+    if dtype == "float16":
+        t = t.to(torch.float16)
+    return t
 
 
 def _load_mask_for_frame(
-    mask_dir: Path, frame_path: Path, target_size: tuple[int, int] | None = None,
+    mask_dir: Path,
+    frame_path: Path,
+    target_size: tuple[int, int] | None = None,
+    dtype: str = "float32",
 ) -> torch.Tensor | None:
-    """Dynamic mask .png → (H, W) float [0,1]."""
+    """Dynamic mask .png → (H, W) tensor.
+
+    dtype:
+      - "float32" (default, legacy): float32 in [0, 1].
+      - "uint8": raw uint8 [0, 255]. Caller converts via `.float() / 255.0`
+        on GPU. Used for the preload_to_ram cache (~4x memory savings).
+    """
     import cv2
     import re
     stem = Path(frame_path).stem
@@ -171,6 +208,8 @@ def _load_mask_for_frame(
         return None
     if target_size is not None:
         img = cv2.resize(img, target_size, interpolation=cv2.INTER_NEAREST)
+    if dtype == "uint8":
+        return torch.from_numpy(np.ascontiguousarray(img))  # uint8 (H, W)
     return torch.from_numpy(img.astype("float32") / 255.0)
 
 
@@ -635,6 +674,162 @@ class Trainer4DGS:
               f"(threshold {threshold}/{n_total} frames)")
         print(f"  Static: {self.gs.num_static:,}, Dynamic: {self.gs.num_dynamic:,}")
 
+    def _preload_all_to_ram(
+        self,
+        T: int,
+        target_size: tuple[int, int],
+        is_multiview: bool,
+        # SV
+        frame_paths: Sequence[Path] | None = None,
+        depth_dir: Path | None = None,
+        mask_dir: Path | None = None,
+        frames_cached: list | None = None,
+        depth_cached: list | None = None,
+        mask_cached: list | None = None,
+        # MV
+        train_cams: list | None = None,
+        mv_frame_paths: dict | None = None,
+        depth_mv_dir: Path | None = None,
+        masks_mv_dir: Path | None = None,  # Reserved; MV does not preload masks (consumed at startup only)
+        frames_cached_mv: dict | None = None,
+        depth_cached_mv: dict | None = None,
+        max_workers: int = 16,
+    ) -> None:
+        """Eagerly load all frames/depth/masks into RAM at master resolution.
+
+        Uses ThreadPoolExecutor — most time is spent in cv2.imread/np.load (IO + decode),
+        which releases the GIL. Each task writes to a pre-allocated cache slot.
+
+        Cache dtypes (memory-efficient):
+          - frames: uint8 (3.5x savings vs float32)
+          - depth:  fp16  (2x savings)
+          - mask:   uint8 (4x savings)
+        Caller (per-iter load site) converts to float32 on GPU after .to(device).
+        """
+        # Build the task list. Each task = (cache_slot_setter, callable that returns tensor).
+        tasks: list[tuple[Callable[[torch.Tensor | None], None], Callable[[], torch.Tensor | None]]] = []
+
+        if is_multiview:
+            assert train_cams is not None and mv_frame_paths is not None and frames_cached_mv is not None
+            for cam_id in train_cams:
+                paths_for_cam = mv_frame_paths[cam_id]
+                cache_frames = frames_cached_mv[cam_id]
+                cache_depth = depth_cached_mv[cam_id] if depth_cached_mv is not None else None
+                for i in range(T):
+                    fp = Path(paths_for_cam[i])
+                    # RGB
+                    def _set_rgb(t, cache=cache_frames, idx=i):
+                        cache[idx] = t
+                    def _load_rgb(p=fp, ts=target_size):
+                        return load_frame_tensor(p, ts, dtype="uint8")
+                    tasks.append((_set_rgb, _load_rgb))
+                    # Depth
+                    if cache_depth is not None and depth_mv_dir is not None:
+                        depth_subdir = Path(depth_mv_dir) / cam_id
+                        def _set_d(t, cache=cache_depth, idx=i):
+                            cache[idx] = t
+                        def _load_d(d=depth_subdir, p=fp, ts=target_size):
+                            return _load_depth_for_frame(d, p, ts, dtype="float16")
+                        tasks.append((_set_d, _load_d))
+            # Note: MV path does NOT use per-frame mask cache at training time
+            # (mask_cached_mv is not part of the existing trainer state). Masks
+            # are consumed only by _setup_static_dynamic_from_masks at startup.
+        else:
+            assert frame_paths is not None and frames_cached is not None
+            for i, fp in enumerate(frame_paths):
+                fp = Path(fp)
+                # RGB
+                def _set_rgb(t, idx=i):
+                    frames_cached[idx] = t
+                def _load_rgb(p=fp, ts=target_size):
+                    return load_frame_tensor(p, ts, dtype="uint8")
+                tasks.append((_set_rgb, _load_rgb))
+                # Depth
+                if depth_cached is not None and depth_dir is not None:
+                    def _set_d(t, idx=i):
+                        depth_cached[idx] = t
+                    def _load_d(d=depth_dir, p=fp, ts=target_size):
+                        return _load_depth_for_frame(d, p, ts, dtype="float16")
+                    tasks.append((_set_d, _load_d))
+                # Mask
+                if mask_cached is not None and mask_dir is not None:
+                    def _set_m(t, idx=i):
+                        mask_cached[idx] = t
+                    def _load_m(d=mask_dir, p=fp, ts=target_size):
+                        return _load_mask_for_frame(d, p, ts, dtype="uint8")
+                    tasks.append((_set_m, _load_m))
+
+        total = len(tasks)
+        if total == 0:
+            print("[preload] hicbir task yok, skip")
+            return
+
+        print(f"[preload] {total} task baslatiliyor "
+              f"(workers={max_workers}, target_size={target_size}, "
+              f"is_multiview={is_multiview}, T={T})")
+
+        t_start = time.time()
+        progress_step = max(1, total // 10)
+        done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = []
+            for setter, loader in tasks:
+                fut = ex.submit(loader)
+                futures.append((fut, setter))
+            for fut, setter in futures:
+                try:
+                    result = fut.result()
+                    setter(result)
+                except Exception as e:
+                    # Don't kill preload on a single bad file; log + leave None.
+                    print(f"[preload] task hatasi: {e}")
+                done += 1
+                if done % progress_step == 0 or done == total:
+                    elapsed = time.time() - t_start
+                    rate = done / max(elapsed, 1e-6)
+                    eta = (total - done) / max(rate, 1e-6)
+                    print(f"[preload] {done}/{total} loaded "
+                          f"({elapsed:.1f}s, {rate:.0f} task/s, eta {eta:.1f}s)")
+
+        # Pin host memory so subsequent .to(device, non_blocking=True) is faster.
+        # Optional best-effort — wrap in try; skip on failure (e.g. OOM).
+        try:
+            self._pin_cache_in_place(
+                frames_cached_mv if is_multiview else frames_cached,
+                depth_cached_mv if (is_multiview and depth_cached_mv is not None) else depth_cached,
+                mask_cached if not is_multiview else None,
+                is_multiview=is_multiview,
+            )
+        except Exception as _e:
+            print(f"[preload] pin_memory skipped: {_e}")
+
+        elapsed_total = time.time() - t_start
+        print(f"[preload] DONE — {total} tensors in {elapsed_total:.1f}s")
+
+    @staticmethod
+    def _pin_cache_in_place(frames_obj, depth_obj, mask_obj, is_multiview: bool) -> None:
+        """Pin host memory of every cached tensor in place. Best-effort."""
+        def _pin_list(lst):
+            if lst is None:
+                return
+            for i, t in enumerate(lst):
+                if t is not None and not t.is_pinned():
+                    try:
+                        lst[i] = t.pin_memory()
+                    except Exception:
+                        pass
+        if is_multiview:
+            if frames_obj is not None:
+                for c, lst in frames_obj.items():
+                    _pin_list(lst)
+            if depth_obj is not None:
+                for c, lst in depth_obj.items():
+                    _pin_list(lst)
+        else:
+            _pin_list(frames_obj)
+            _pin_list(depth_obj)
+            _pin_list(mask_obj)
+
     def _prepare_tracks(
         self,
         tracks_path: Path,
@@ -761,6 +956,8 @@ class Trainer4DGS:
         cam_grad_clip_norm: float = 0.0,
         mip_scale_floor_frac: float = 0.0,
         dynamic_densify_scale: float = 1.0,
+        # Perf — RAM preload + uint8/fp16 cache + multires fix
+        preload_to_ram: bool = False,
     ) -> dict:
         # Static mode — 4D dynamic features bypass (deformation, Fourier, motion regs)
         self.static_mode = bool(static_mode)
@@ -862,6 +1059,27 @@ class Trainer4DGS:
             Ws, Hs = _resize_to_long_edge(initial_le, W0, H0)
             print(f"[trainer.multires] Initial schedule: long_edge={initial_le} -> ({Ws}x{Hs})")
 
+        # Perf — Master cache resolution.
+        # OLD behavior: cache stored tensors at Ws,Hs. Multires resolution change
+        # forced full disk re-read of all T frames per cam (5040x cam at 1080p MFS
+        # = ~5min thrash per resolution step).
+        # NEW: cache stores at LARGEST resolution that will appear in the schedule.
+        # Per-iter, downsample on GPU via F.interpolate (bilinear+antialias for RGB,
+        # bilinear for depth, nearest for mask). Resolution change is now free —
+        # just toggle (Ws, Hs); cache untouched.
+        if self.multires_schedule:
+            max_le = max(le for (_, le) in self.multires_schedule)
+            Wm, Hm = _resize_to_long_edge(max_le, W0, H0)
+            # Master must be >= every scheduled resolution; if image_size > schedule
+            # max (edge case), keep image_size as master.
+            if Wm < image_size[0] or Hm < image_size[1]:
+                Wm, Hm = image_size
+        else:
+            # No schedule — master == single training resolution.
+            Wm, Hm = Ws, Hs
+        print(f"[trainer.cache] Master cache resolution: ({Wm}x{Hm}) "
+              f"(current train ({Ws}x{Hs}); preload_to_ram={preload_to_ram})")
+
         sx, sy = Ws / W0, Hs / H0
         K_scaled = cam_K_orig.clone()         # training resolution (single-view fallback)
         K_scaled[0, 0] *= sx; K_scaled[0, 2] *= sx
@@ -930,7 +1148,9 @@ class Trainer4DGS:
                 threshold_frac=static_dynamic_threshold,
             )
 
-        # Cache'ler
+        # Cache'ler — stored at master resolution (Wm, Hm); per-iter downsampled on GPU.
+        # uint8 RGB / fp16 depth / uint8 mask (memory-efficient). Caller converts
+        # to float on GPU after .to(device) (free with non_blocking=True).
         frames_cached: list = [None] * T
         depth_cached:  list = [None] * T
         mask_cached:   list = [None] * T
@@ -979,6 +1199,31 @@ class Trainer4DGS:
                   f"lambda={self.lambda_flow}, dir={flow_dir}")
         if use_mask:
             print(f"[trainer] Mask-weighted recon aktif (lambda={self.lambda_mask_motion})")
+
+        # Perf — Eager preload all frames/depth/masks into RAM via ThreadPoolExecutor.
+        # Eliminates per-iter MFS network filesystem latency. uint8 RGB (~3.5x mem
+        # savings vs float32) + fp16 depth + uint8 mask. Cast to float on GPU after
+        # .to(device, non_blocking=True) — free with pinned host memory.
+        if preload_to_ram:
+            self._preload_all_to_ram(
+                T=T,
+                target_size=(Wm, Hm),
+                is_multiview=is_multiview,
+                # SV
+                frame_paths=(frame_paths if not is_multiview else None),
+                depth_dir=(depth_dir if (not is_multiview and use_depth) else None),
+                mask_dir=(mask_dir if (not is_multiview and use_mask) else None),
+                frames_cached=(frames_cached if not is_multiview else None),
+                depth_cached=(depth_cached if (not is_multiview and use_depth) else None),
+                mask_cached=(mask_cached if (not is_multiview and use_mask) else None),
+                # MV
+                train_cams=(train_cams if is_multiview else None),
+                mv_frame_paths=(mv_frame_paths if is_multiview else None),
+                depth_mv_dir=(depth_mv_dir if (is_multiview and use_depth_mv) else None),
+                masks_mv_dir=(masks_mv_dir if (is_multiview and use_mask) else None),
+                frames_cached_mv=(frames_cached_mv if is_multiview else None),
+                depth_cached_mv=(depth_cached_mv if (is_multiview and use_depth_mv) else None),
+            )
 
         # Track data (CoTracker 3D anchors)
         track_data = None
@@ -1058,12 +1303,15 @@ class Trainer4DGS:
                 active_sh_degree = self.gs.sh_degree
 
             # --- Phase 2.2: Multi-resolution transition ---
+            # Perf fix: NO LONGER invalidate the cache on resolution change.
+            # The cache holds master-resolution tensors (Wm, Hm); we just toggle
+            # (Ws, Hs) and per-iter downsample on GPU below.
             new_le = _resolve_long_edge_for_iter(it)
             if new_le is not None:
                 new_Ws, new_Hs = _resize_to_long_edge(new_le, W0, H0)
                 if new_Ws != Ws or new_Hs != Hs:
                     print(f"[trainer.multires] Iter {it}: resolution {Ws}x{Hs} → {new_Ws}x{new_Hs} "
-                          f"(long_edge={new_le})")
+                          f"(long_edge={new_le}); cache PRESERVED at master ({Wm}x{Hm})")
                     Ws, Hs = new_Ws, new_Hs
                     sx, sy = Ws / W0, Hs / H0
                     K_scaled = cam_K_orig.clone()
@@ -1075,37 +1323,82 @@ class Trainer4DGS:
                             K_c[0, 0] *= sx; K_c[0, 2] *= sx
                             K_c[1, 1] *= sy; K_c[1, 2] *= sy
                             K_scaled_mv[c] = K_c
-                        # frame cache invalidate (yeni resolution ile reload)
+                    # Flow cache: flow tensors are pre-resized per-iter via F.interpolate
+                    # already (see flow blocks below), so safe to keep. We invalidate
+                    # only flow caches that were stored at the OLD training resolution
+                    # (defensive — they're loaded lazily, just clear stale entries).
+                    # Note: existing flow code does its own per-iter F.interpolate, so
+                    # we can leave them alone — but to stay consistent with prior
+                    # behavior (flow magnitudes computed at training resolution), we
+                    # keep the lazy load-cached-at-load-time approach: just drop them.
+                    if is_multiview and flow_cached_mv is not None:
                         for c in train_cams:
-                            frames_cached_mv[c] = [None] * T
-                        # Phase 1.4 fix: depth_mv cache da invalidate (resolution
-                        # degisti — eski 240p depth + yeni 320p render = mismatch)
-                        if depth_cached_mv is not None:
-                            for c in train_cams:
-                                depth_cached_mv[c] = [None] * T
-                        # Phase 1.8 fix: flow_mv cache invalidate ayni sebep
-                        if flow_cached_mv is not None:
-                            for c in train_cams:
-                                flow_cached_mv[c] = [None] * T
-                    else:
-                        frames_cached = [None] * T
-                        if use_depth:
-                            depth_cached = [None] * T
-                        if use_mask:
-                            mask_cached = [None] * T
-                        # Phase 1.8 SV — flow cache da invalidate
-                        if flow_cached_sv is not None:
-                            flow_cached_sv = [None] * T
+                            flow_cached_mv[c] = [None] * T
+                    if not is_multiview and flow_cached_sv is not None:
+                        flow_cached_sv = [None] * T
+
+            # GPU-side resize helpers — convert cached uint8/fp16 master tensor
+            # to float32 at current training resolution (Ws, Hs).
+            def _gt_rgb_from_cache(t_cpu: torch.Tensor) -> torch.Tensor:
+                """Cached uint8 (H, W, 3) → device float32 (Hs, Ws, 3) in [0, 1]."""
+                t = t_cpu.to(self.device, non_blocking=True)
+                if t.dtype == torch.uint8:
+                    t = t.float() / 255.0
+                else:
+                    # Legacy float32 cache (preload_to_ram=False, dtype default)
+                    t = t.float()
+                # Resize if not at training resolution.
+                # cache shape is (H_cache, W_cache, 3). F.interpolate wants NCHW.
+                Hc, Wc = t.shape[:2]
+                if Wc != Ws or Hc != Hs:
+                    t_chw = t.permute(2, 0, 1).unsqueeze(0)  # (1, 3, Hc, Wc)
+                    t_chw = F.interpolate(
+                        t_chw, size=(Hs, Ws), mode="bilinear",
+                        align_corners=False, antialias=True,
+                    )
+                    t = t_chw.squeeze(0).permute(1, 2, 0).contiguous()
+                return t
+
+            def _gt_depth_from_cache(t_cpu: torch.Tensor) -> torch.Tensor:
+                """Cached fp16/fp32 (H, W) → device float32 (Hs, Ws)."""
+                t = t_cpu.to(self.device, non_blocking=True).float()
+                Hc, Wc = t.shape[:2]
+                if Wc != Ws or Hc != Hs:
+                    t_chw = t.unsqueeze(0).unsqueeze(0)  # (1, 1, Hc, Wc)
+                    t_chw = F.interpolate(
+                        t_chw, size=(Hs, Ws), mode="bilinear",
+                        align_corners=False,
+                    )
+                    t = t_chw.squeeze(0).squeeze(0)
+                return t
+
+            def _gt_mask_from_cache(t_cpu: torch.Tensor) -> torch.Tensor:
+                """Cached uint8/float (H, W) → device float32 (Hs, Ws) in [0, 1]."""
+                t = t_cpu.to(self.device, non_blocking=True)
+                if t.dtype == torch.uint8:
+                    t = t.float() / 255.0
+                else:
+                    t = t.float()
+                Hc, Wc = t.shape[:2]
+                if Wc != Ws or Hc != Hs:
+                    t_chw = t.unsqueeze(0).unsqueeze(0)
+                    t_chw = F.interpolate(
+                        t_chw, size=(Hs, Ws), mode="nearest",
+                    )
+                    t = t_chw.squeeze(0).squeeze(0)
+                return t
 
             # --- Ground truth load ---
             if is_multiview:
                 # v5.0: random cam selection
                 cam_id = train_cams[int(torch.randint(0, len(train_cams), (1,)).item())]
                 if frames_cached_mv[cam_id][idx] is None:
+                    # Lazy disk read at master resolution (cache survives multires).
                     frames_cached_mv[cam_id][idx] = load_frame_tensor(
-                        Path(mv_frame_paths[cam_id][idx]), (Ws, Hs)
+                        Path(mv_frame_paths[cam_id][idx]), (Wm, Hm),
+                        dtype=("uint8" if preload_to_ram else "float32"),
                     )
-                gt = frames_cached_mv[cam_id][idx].to(self.device)
+                gt = _gt_rgb_from_cache(frames_cached_mv[cam_id][idx])
                 # Phase 1.4 — Per-cam depth load (MV path)
                 gt_depth = None
                 if use_depth_mv:
@@ -1117,25 +1410,41 @@ class Trainer4DGS:
                             depth_cached_mv[cam_id][idx] = _load_depth_for_frame(
                                 depth_mv_dir / cam_id,
                                 Path(mv_frame_paths[cam_id][idx]),
-                                (Ws, Hs),
+                                (Wm, Hm),
+                                dtype=("float16" if preload_to_ram else "float32"),
                             )
                     if depth_cached_mv[cam_id][idx] is not None:
-                        gt_depth = depth_cached_mv[cam_id][idx].to(self.device)
+                        gt_depth = _gt_depth_from_cache(depth_cached_mv[cam_id][idx])
                 frame_mask = None
                 K_active = K_scaled_mv[cam_id]
                 w2c_active = w2c_mv[cam_id]
             else:
                 if frames_cached[idx] is None:
-                    frames_cached[idx] = load_frame_tensor(Path(frame_paths[idx]), (Ws, Hs))
-                gt = frames_cached[idx].to(self.device)
+                    frames_cached[idx] = load_frame_tensor(
+                        Path(frame_paths[idx]), (Wm, Hm),
+                        dtype=("uint8" if preload_to_ram else "float32"),
+                    )
+                gt = _gt_rgb_from_cache(frames_cached[idx])
 
                 if use_depth and depth_cached[idx] is None:
-                    depth_cached[idx] = _load_depth_for_frame(depth_dir, frame_paths[idx], (Ws, Hs))
-                gt_depth = depth_cached[idx].to(self.device) if (use_depth and depth_cached[idx] is not None) else None
+                    depth_cached[idx] = _load_depth_for_frame(
+                        depth_dir, frame_paths[idx], (Wm, Hm),
+                        dtype=("float16" if preload_to_ram else "float32"),
+                    )
+                gt_depth = (
+                    _gt_depth_from_cache(depth_cached[idx])
+                    if (use_depth and depth_cached[idx] is not None) else None
+                )
 
                 if use_mask and mask_cached[idx] is None:
-                    mask_cached[idx] = _load_mask_for_frame(mask_dir, frame_paths[idx], (Ws, Hs))
-                frame_mask = mask_cached[idx].to(self.device) if (use_mask and mask_cached[idx] is not None) else None
+                    mask_cached[idx] = _load_mask_for_frame(
+                        mask_dir, frame_paths[idx], (Wm, Hm),
+                        dtype=("uint8" if preload_to_ram else "float32"),
+                    )
+                frame_mask = (
+                    _gt_mask_from_cache(mask_cached[idx])
+                    if (use_mask and mask_cached[idx] is not None) else None
+                )
 
                 K_active = K_scaled
                 w2c_active = w2c_list[idx]
@@ -1234,9 +1543,10 @@ class Trainer4DGS:
                     cam_id2 = other_cams[int(torch.randint(0, len(other_cams), (1,)).item())]
                     if frames_cached_mv[cam_id2][idx] is None:
                         frames_cached_mv[cam_id2][idx] = load_frame_tensor(
-                            Path(mv_frame_paths[cam_id2][idx]), (Ws, Hs)
+                            Path(mv_frame_paths[cam_id2][idx]), (Wm, Hm),
+                            dtype=("uint8" if preload_to_ram else "float32"),
                         )
-                    gt2 = frames_cached_mv[cam_id2][idx].to(self.device)
+                    gt2 = _gt_rgb_from_cache(frames_cached_mv[cam_id2][idx])
                     K2 = K_scaled_mv[cam_id2]
                     w2c2 = w2c_mv[cam_id2]
                     render_out2, _, _ = render_view(

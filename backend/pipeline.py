@@ -1049,6 +1049,8 @@ def run_pipeline(
         cam_grad_clip_norm=getattr(cfg.train, "cam_grad_clip_norm", 0.0),
         mip_scale_floor_frac=getattr(cfg.train, "mip_scale_floor_frac", 0.0),
         dynamic_densify_scale=getattr(cfg.train, "dynamic_densify_scale", 1.0),
+        # Perf — RAM preload (eliminates per-iter MFS latency on cloud filesystems)
+        preload_to_ram=getattr(cfg.train, "preload_to_ram", False),
     )
     run_logger.phase_end(
         "training",

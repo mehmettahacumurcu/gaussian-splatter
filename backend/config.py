@@ -324,6 +324,13 @@ class TrainConfig:
     nvs_eval_enabled: bool = False
     nvs_eval_orbit_frames: int = 60  # orbit mp4 frame count
     nvs_eval_orbit_fps: int = 30
+    # Perf — RAM preload all frames/depth/masks at training start.
+    # False (default) keeps the existing lazy disk-read path. True triggers
+    # ThreadPoolExecutor(16) parallel preload at master cache resolution
+    # (uint8 RGB / fp16 depth / uint8 mask). Eliminates per-iter MFS network
+    # filesystem latency on cloud setups (RunPod, etc). flame_steak at 1080p
+    # ~53 GB total — fits comfortably in 232 GB cloud RAM.
+    preload_to_ram: bool = False
 
 
 @dataclass
