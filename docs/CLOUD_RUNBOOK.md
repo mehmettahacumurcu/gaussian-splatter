@@ -473,29 +473,104 @@ Look at each job's `result.eval` — `PSNR=NN.NN, orbit=ok`.
 | 🍌 **banana_demo** (SV HyperNeRF) | (your PSNR) | ~22-25 dB (HyperNeRF) | ≥24 dB ✅ paper-tier; 20-24 dB ⚠ tunable; <20 dB ✗ gap |
 | 🔥 **flame_steak** (MV N3V) | (your PSNR) | **33.51 dB** (Spacetime Gaussians) | ≥32.5 dB ✅ SOTA-tier; 30.5-32.5 ⚠ tunable; <30.5 ✗ gap |
 
-### 🖥️ LAPTOP — PowerShell (download both sets of artifacts)
+### 🛰️ POD — SSH terminal (pre-package the artifacts before scp — much faster than transferring many small files)
+
+```bash
+# Per-scene tarball builder. Bundles PLYs + eval + logs into one .tar.gz.
+# Pass --exports-only to skip intermediate checkpoint PLYs (saves ~10 GB per scene).
+package_scene() {
+    local scene="$1"
+    local mode="${2:-full}"   # "full" or "exports-only"
+    local out="/workspace/${scene}_results.tar.gz"
+    local base="/workspace/4dgs-studio/data/${scene}/output"
+
+    cd /workspace/4dgs-studio/data/${scene}
+
+    if [[ "$mode" == "exports-only" ]]; then
+        # Only the 120 export PLYs (final deliverable) + eval + logs.
+        # Detected by name pattern: export_*.ply or timestamp_*.ply (depends on exporter).
+        # Adjust pattern if needed.
+        find output -type f \( \
+            -name "export_*.ply" -o \
+            -name "timestamp_*.ply" -o \
+            -name "*.json" -o \
+            -name "*.jsonl" -o \
+            -name "*.log" -o \
+            -name "*.mp4" \
+        \) -print0 | tar --null -czf "$out" -T -
+    else
+        tar -czf "$out" output/
+    fi
+
+    du -h "$out"
+}
+
+# Pick what you want:
+package_scene banana_demo exports-only   # ~1-3 GB
+package_scene flame_steak exports-only   # ~5-10 GB
+
+# OR for full archive (ALL ckpts + exports + logs — much bigger):
+# package_scene banana_demo full
+# package_scene flame_steak full
+```
+
+You'll see something like:
+```
+2.1G    /workspace/banana_demo_results.tar.gz
+8.4G    /workspace/flame_steak_results.tar.gz
+```
+
+### 🖥️ LAPTOP — PowerShell (download the tarballs)
 
 ```powershell
 $POD_HOST = "157.157.x.x"     # same as Phase 3
 $POD_PORT = "12345"
 $POD_KEY  = "$env:USERPROFILE\.ssh\id_ed25519"
 
-mkdir cloud_results -ErrorAction SilentlyContinue
-mkdir cloud_results\banana_demo -ErrorAction SilentlyContinue
-mkdir cloud_results\flame_steak -ErrorAction SilentlyContinue
+mkdir cloud_results -Force | Out-Null
 
-# Banana artifacts:
-scp -P $POD_PORT -i $POD_KEY root@${POD_HOST}:/workspace/4dgs-studio/data/banana_demo/output/eval/nvs_eval.json `
-  cloud_results\banana_demo\nvs_eval.json
-scp -P $POD_PORT -i $POD_KEY root@${POD_HOST}:/workspace/4dgs-studio/data/banana_demo/output/eval/orbit.mp4 `
-  cloud_results\banana_demo\orbit.mp4
+# Pull tarballs (fast — single big file each):
+scp -P $POD_PORT -i $POD_KEY root@${POD_HOST}:/workspace/banana_demo_results.tar.gz `
+  cloud_results\banana_demo_results.tar.gz
+scp -P $POD_PORT -i $POD_KEY root@${POD_HOST}:/workspace/flame_steak_results.tar.gz `
+  cloud_results\flame_steak_results.tar.gz
 
-# Flame_steak artifacts:
-scp -P $POD_PORT -i $POD_KEY root@${POD_HOST}:/workspace/4dgs-studio/data/flame_steak/output/eval/nvs_eval.json `
-  cloud_results\flame_steak\nvs_eval.json
-scp -P $POD_PORT -i $POD_KEY root@${POD_HOST}:/workspace/4dgs-studio/data/flame_steak/output/eval/orbit.mp4 `
-  cloud_results\flame_steak\orbit.mp4
+# Extract:
+cd cloud_results
+tar -xzf banana_demo_results.tar.gz -C banana_demo_results
+tar -xzf flame_steak_results.tar.gz -C flame_steak_results
 ```
+
+> **Quick eval-only download** (if you just want to see the PSNR + orbit and skip PLYs entirely):
+> ```powershell
+> scp -P $POD_PORT -i $POD_KEY root@${POD_HOST}:/workspace/4dgs-studio/data/banana_demo/output/eval/nvs_eval.json cloud_results\banana_eval.json
+> scp -P $POD_PORT -i $POD_KEY root@${POD_HOST}:/workspace/4dgs-studio/data/banana_demo/output/eval/orbit.mp4 cloud_results\banana_orbit.mp4
+> scp -P $POD_PORT -i $POD_KEY root@${POD_HOST}:/workspace/4dgs-studio/data/flame_steak/output/eval/nvs_eval.json cloud_results\flame_eval.json
+> scp -P $POD_PORT -i $POD_KEY root@${POD_HOST}:/workspace/4dgs-studio/data/flame_steak/output/eval/orbit.mp4 cloud_results\flame_orbit.mp4
+> ```
+> Total: ~50-100 MB across both scenes. Useful for "did it work?" check before committing to the bigger PLY pull.
+
+### What you'll have on your laptop after extraction
+
+```
+cloud_results/
+├─ banana_demo_results/
+│  └─ output/
+│     ├─ ply/
+│     │  ├─ export_001.ply ... export_120.ply    ← 4D Gaussian model at each timestamp
+│     │  └─ (checkpoint_*.ply if mode=full)
+│     ├─ eval/
+│     │  ├─ nvs_eval.json                        ← held-out PSNR/SSIM/LPIPS
+│     │  └─ orbit.mp4                            ← camera-orbit render
+│     └─ logs/
+│        ├─ events.log                           ← pipeline events
+│        ├─ metrics.jsonl                        ← per-iter PSNR + loss
+│        └─ summary.json                         ← run config + final metrics
+└─ flame_steak_results/
+   └─ (same structure)
+```
+
+**The 120 export PLYs are the deliverable** — load them in any 4DGS viewer (the desktop app's Viewer tab loads them, or any standard PLY viewer like Three.js gaussian-splat-viewer).
 
 ### 🖥️ LAPTOP — PowerShell (run the comparator)
 
