@@ -144,6 +144,12 @@ class PreprocessConfig:
     # multiview_mode: 'auto' (detect from data/), 'single', 'multi'
     multiview_mode: str = "auto"
     # Eger poses_bounds.npy varsa (N3V format), COLMAP atlanir mi?
+    # True (default): multiview_pipeline calibration.json varsa
+    # _bootstrap_colmap_init'i tamamen atlar ve N3V poses'lari direkt kullanir.
+    # Init points init_random_points_in_bbox + estimate_scene_extent_from_n3v
+    # ile uretilir. ~27dk preprocess tasarrufu, +1.0-2.5 dB PSNR (N3V near-
+    # coplanar 21-cam rig'lerde COLMAP dense BA Cholesky failure cikariyor).
+    # False: her zaman COLMAP bootstrap (eski davranis).
     use_provided_poses: bool = True
     # Multi-view'de hangi kamera'yi "test" (held-out) olarak ayir?
     # N3V convention: cam00 test, kalanlar train. None ise hepsi train.
