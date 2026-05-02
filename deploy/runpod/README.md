@@ -147,10 +147,43 @@ tail -n 10 /workspace/backend.log
 **Phase 2 done when:** `tail` shows `Uvicorn running on http://0.0.0.0:8000`.
 
 > **Note:** the bootstrap installs **conda-forge's CUDA-enabled COLMAP** under
-> `/opt/miniconda` (not Ubuntu's apt build). The apt build forces software
-> OpenGL on headless cloud GPUs and silently falls back to CPU SIFT — for a
-> long video that's a 6-10x slowdown on preprocessing. With the conda build,
-> COLMAP feature extraction + matching runs on the GPU at full speed.
+> `/workspace/miniconda` (not Ubuntu's apt build). The apt build forces
+> software OpenGL on headless cloud GPUs and silently falls back to CPU SIFT
+> — for a long video that's a 6-10x slowdown on preprocessing. With the
+> conda build, COLMAP feature extraction + matching runs on the GPU at full
+> speed.
+>
+> **Why `/workspace/miniconda` and not `/opt/miniconda`?** `/workspace` is
+> the persistent volume — surviving pod stop/resume/resize — while `/opt`
+> is the container disk that gets wiped each restart. Persisting miniconda
+> means the ~10 min `conda install colmap+faiss` step only runs once per
+> volume, not once per pod boot. Re-bootstraps on the same volume are
+> near-instant.
+
+### Performance optimization — stage the dataset to RAM
+
+`/workspace` is a network filesystem (MFS). Per-file latency is high enough
+that training stalls at ~3 it/s with 13% GPU utilization on an A100 — the
+GPU spends most of its time waiting for the next frame. Copying the scene
+to `/dev/shm` (RAM disk) bypasses MFS entirely and pushes training to
+~30+ it/s.
+
+After Phase 4 (data uploaded) and before Phase 5 (job submit), run on the
+pod:
+
+```bash
+cd /workspace/4dgs-studio
+bash deploy/runpod/stage_dataset.sh flame_steak
+export DATA_ROOT=/dev/shm/4dgs-studio/data
+# Restart the backend so it picks up DATA_ROOT:
+pkill -f 'uvicorn backend.api' || true
+nohup bash deploy/runpod/start.sh > /workspace/backend.log 2>&1 &
+disown
+```
+
+The helper sanity-checks `/dev/shm` size before copying — flame_steak is
+~6 GB, your pod's RAM should comfortably fit it. For huge datasets, set
+`SOURCE`/`TARGET` env vars or use `rsync --exclude` patterns directly.
 
 ---
 

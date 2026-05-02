@@ -13,7 +13,7 @@ set -euo pipefail
 REPO_URL="${1:-https://github.com/mehmettahacumurcu/gaussian-splatter.git}"
 BRANCH="${2:-feat/sota-verification}"
 WORKDIR="${WORKDIR:-/workspace/4dgs-studio}"
-MINICONDA_DIR="${MINICONDA_DIR:-/opt/miniconda}"
+MINICONDA_DIR="${MINICONDA_DIR:-/workspace/miniconda}"
 
 echo "==> Bootstrapping 4DGS Studio backend"
 echo "    repo:   ${REPO_URL}"
@@ -38,6 +38,11 @@ rm -rf /var/lib/apt/lists/*
 # conda-forge's colmap build has CUDA SIFT extraction + matching enabled out
 # of the box, which is what we need for fast preprocessing on big videos.
 # Skip if already installed (e.g. on a re-run with a persistent volume).
+#
+# MINICONDA_DIR points at /workspace/miniconda — the persistent volume — so
+# the install survives pod restart/resize. (The container disk at /opt is
+# wiped each time, which forced a ~10 min conda colmap+faiss reinstall on
+# every boot. Persisting to /workspace makes re-bootstraps near-instant.)
 # ---------------------------------------------------------------------------
 if [[ ! -x "${MINICONDA_DIR}/bin/conda" ]]; then
     echo "==> Installing miniconda to ${MINICONDA_DIR}"
@@ -146,7 +151,8 @@ echo "==> ${TARGET_PYTHON} ready: $(${TARGET_PYTHON} -c 'import torch, uvicorn, 
 mkdir -p /workspace/.torch_extensions /workspace/.cache/huggingface
 export TORCH_EXTENSIONS_DIR=/workspace/.torch_extensions
 export HF_HOME=/workspace/.cache/huggingface
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512
+# expandable_segments:True crashes gsplat custom kernels (PyTorch bug). Do NOT re-enable.
+export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 
 echo
 echo "==> Bootstrap complete."
