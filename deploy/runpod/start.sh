@@ -31,9 +31,10 @@ echo "[start.sh] Project dir: ${PROJECT_DIR}"
 # Find a Python that has uvicorn installed.
 #
 # Multiple Pythons coexist on RunPod's PyTorch image:
-#   /opt/miniconda/bin/python  (added by our pod-bootstrap when conda colmap installs)
-#   /usr/local/bin/python      (RunPod base image's primary python with torch et al.)
-#   /usr/bin/python3           (Ubuntu system python)
+#   /workspace/miniconda/bin/python  (current bootstrap location — persistent volume)
+#   /opt/miniconda/bin/python        (legacy bootstrap location — kept for back-compat)
+#   /usr/local/bin/python            (RunPod base image's primary python with torch et al.)
+#   /usr/bin/python3                 (Ubuntu system python)
 #
 # pip install in pod-bootstrap targets whichever 'python' is first on PATH at
 # that moment, which depends on PATH ordering. start.sh shouldn't assume.
@@ -42,6 +43,7 @@ echo "[start.sh] Project dir: ${PROJECT_DIR}"
 PYTHON_BIN="${BACKEND_PYTHON:-}"
 if [[ -z "${PYTHON_BIN}" ]]; then
   for candidate in \
+      /workspace/miniconda/bin/python \
       /usr/local/bin/python \
       /usr/local/bin/python3 \
       /opt/miniconda/bin/python \
@@ -58,7 +60,7 @@ fi
 
 if [[ -z "${PYTHON_BIN}" ]]; then
   echo "[start.sh] ERROR: no Python with uvicorn + fastapi + backend.api importable found." >&2
-  echo "[start.sh] Tried: /usr/local/bin/python, /opt/miniconda/bin/python, /usr/bin/python3, python3, python" >&2
+  echo "[start.sh] Tried: /workspace/miniconda/bin/python, /usr/local/bin/python, /opt/miniconda/bin/python, /usr/bin/python3, python3, python" >&2
   echo "[start.sh] Run on the pod:" >&2
   echo "[start.sh]   /usr/local/bin/python -m pip install -r ${PROJECT_DIR}/requirements.txt" >&2
   echo "[start.sh] or set BACKEND_PYTHON=/path/to/python" >&2
