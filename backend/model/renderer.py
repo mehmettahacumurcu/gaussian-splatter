@@ -62,6 +62,7 @@ def render_view(
         backgrounds=bg,                # gsplat extends with 0 for depth chan internally
         render_mode=mode,
         packed=False,
+        antialiased=True,
     )
     # out: (1, H, W, 3) for RGB, (1, H, W, 4) for RGB+ED. alpha: (1, H, W, 1)
     return out[0], alpha[0], info
