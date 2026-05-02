@@ -174,12 +174,29 @@ pod:
 ```bash
 cd /workspace/4dgs-studio
 bash deploy/runpod/stage_dataset.sh flame_steak
-export DATA_ROOT=/dev/shm/4dgs-studio/data
-# Restart the backend so it picks up DATA_ROOT:
+export FOURDGS_DATA_ROOT=/dev/shm/4dgs-studio/data
+# Restart the backend so it picks up the new DATA_ROOT:
 pkill -f 'uvicorn backend.api' || true
 nohup bash deploy/runpod/start.sh > /workspace/backend.log 2>&1 &
 disown
+
+# Verify the override took effect:
+grep "DATA_ROOT overridden" /workspace/backend.log
+# Expected: [config] DATA_ROOT overridden via FOURDGS_DATA_ROOT=/dev/shm/4dgs-studio/data
 ```
+
+`backend/config.py` reads `FOURDGS_DATA_ROOT` at module-load. If set, ALL
+scene path lookups (frames, depth, masks, flow, output) route through
+`/dev/shm` instead of `/workspace/4dgs-studio/data/`.
+
+`stage_dataset.sh` automatically symlinks `output/` and `.cache_markers/`
+inside the staged scene back to `/workspace/<scene>/`, so:
+- **PLY checkpoints + eval renders persist** across pod restart (writes
+  go through the symlink to MFS).
+- **Cache markers persist** — re-runs of the same scene skip the 30-60
+  min preprocessing if the markers are still valid.
+- The bulk read traffic (frames + depth + masks + flow) stays on
+  `/dev/shm` for the speedup.
 
 The helper sanity-checks `/dev/shm` size before copying — flame_steak is
 ~6 GB, your pod's RAM should comfortably fit it. For huge datasets, set

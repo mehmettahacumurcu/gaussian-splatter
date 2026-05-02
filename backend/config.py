@@ -14,7 +14,21 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_ROOT = PROJECT_ROOT / "data"
+
+# DATA_ROOT — where scene folders (frames_multiview/, depth_multiview/, ...) live.
+# Default: <project>/data/. Override via FOURDGS_DATA_ROOT env var.
+#
+# Use case: on RunPod, /workspace/<repo>/data is on MFS network filesystem
+# which bottlenecks training at ~3 it/s. Stage the dataset to /dev/shm via
+# deploy/runpod/stage_dataset.sh, then `export FOURDGS_DATA_ROOT=/dev/shm/4dgs-studio/data`
+# before launching the backend → ~30+ it/s (compute-bound, not IO-bound).
+import os as _os
+_data_root_env = _os.environ.get("FOURDGS_DATA_ROOT")
+if _data_root_env:
+    DATA_ROOT = Path(_data_root_env).resolve()
+    print(f"[config] DATA_ROOT overridden via FOURDGS_DATA_ROOT={DATA_ROOT}")
+else:
+    DATA_ROOT = PROJECT_ROOT / "data"
 
 
 def scene_paths(scene_name: str) -> dict[str, Path]:
