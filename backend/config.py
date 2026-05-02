@@ -247,14 +247,14 @@ class TrainConfig:
     # bu degeri 0'a (sinirsiz) ceker.
     max_gaussians: int = 400_000
     prune_max_scale: float = 0.02       # v3.2: FRACTION of scene_extent
-    opacity_reset_interval: int = 0
+    opacity_reset_interval: int = 3000  # INRIA-3DGS standard (was 0)
     # Motion regularizers (Stage 1) — v3.4 denge
     lambda_deform_reg: float = 3e-5
     lambda_smoothness: float = 2e-4
     lambda_rigidity: float = 2e-4
     # Scale + anti-streak (v3 / v3.8)
     lambda_scale: float = 5e-3
-    lambda_aniso: float = 0.0
+    lambda_aniso: float = 0.01  # anti-streak base (0.01-0.05 onerilen, was 0.0)
     aniso_threshold: float = 5.0
     dpos_total_cap_frac: float = 0.2
     # Foundation model losses (Stage 2)
@@ -270,17 +270,23 @@ class TrainConfig:
     # Higher -> daha tutarli multi-view supervision, daha yavas iter.
     multiview_cams_per_iter: int = 1
     # Multi-view consistency loss: ayni 3D point farkli cam'lardan benzer renk vermeli.
-    # 0 = kapali (default), >0 = aktif (Phase 1.7 implementation).
-    lambda_multiview_consistency: float = 0.0
+    # 0 = kapali, >0 = aktif (Phase 1.7 implementation).
+    lambda_multiview_consistency: float = 0.05  # SOTA-tier MV cross-cam supervision (was 0.0)
     # Phase 1.6 — LPIPS perceptual loss. 0 = off.
     # VGG (kaliteli, edge sharpness) vs alex (hizli ama low-detail).
     # Production tier: vgg + lambda 0.1+. Mini smoke: alex + 0.05.
-    lambda_lpips: float = 0.0
-    lpips_net: str = "vgg"  # vgg (kaliteli, default) | alex (hizli) | squeeze
+    lambda_lpips: float = 0.05  # perceptual loss base (was 0.0)
+    lpips_net: str = "alex"  # alex (hizli, pipeline default) | vgg (kaliteli) | squeeze
     lpips_warmup_iters: int = 1000
     # Phase 1.8 — RAFT optical flow loss. 0 = off.
+    # NOTE: 0.05 onerilen for SOTA-tier (cloud_config); pahali (RAFT inference)
+    # ve foundation phase'de gating'lenir, bu yuzden default 0.0 kaliyor.
     lambda_flow: float = 0.0
     flow_warmup_iters: int = 1000
+    # v6.1 — temporal 2nd-order acceleration smoothness. 0 = off.
+    lambda_accel: float = 1e-4  # was 0.0
+    # v6.1 — Python-side mip anti-alias scale floor (fraction of pixel size). 0 = off.
+    mip_scale_floor_frac: float = 0.001  # was 0.0
     # Phase 1.9 — Densify dynamics tuning (multi-view spesifik defaults)
     # Multi-view'da daha aggresif densify gerekir (her cam ayri view).
     densify_mv_threshold_scale: float = 0.7  # 1.0 = single-view ile ayni, 0.7 = %30 daha hassas
@@ -357,7 +363,11 @@ def default_config() -> Config:
 
 
 def cloud_config() -> Config:
-    """Daha agir is icin cloud GPU (RTX 4090 24GB) konfigurasyonu."""
+    """Daha agir is icin cloud GPU (RTX 4090 24GB / A100 80GB) konfigurasyonu.
+
+    SOTA-tier overrides: stronger perceptual + MV consistency, RAFT flow loss
+    enabled (foundation phase generates), joint bundle adjustment (cam refine).
+    """
     cfg = default_config()
     cfg.preprocess.fps = 24
     cfg.preprocess.resize_long_edge = 1920
@@ -376,5 +386,72 @@ def cloud_config() -> Config:
     cfg.train.batch_size = 4
     # 24GB VRAM has headroom — lift the 8GB cap.
     cfg.train.max_gaussians = 0
+    # SOTA-tier quality overrides (override defaults UPWARD for 24-80 GB cards)
+    cfg.train.lambda_lpips = 0.1                  # stronger perceptual
+    cfg.train.lambda_multiview_consistency = 0.1  # stronger MV
+    cfg.train.lambda_aniso = 0.02
+    cfg.train.lambda_accel = 2e-4
+    cfg.train.lambda_flow = 0.05                  # enable RAFT flow loss
+    cfg.train.lr_cam_K = 1e-7                     # joint BA
+    cfg.train.lr_cam_w2c = 1e-7
+    cfg.train.cam_refine_start_iter = 8000
+    cfg.export.num_timestamps = 120
+    return cfg
+
+
+def local_max_config() -> Config:
+    """Max-quality config for 8GB GPU (RTX 3060 Ti). 14-22h overnight runs.
+    Pushes 8GB to its limits: 350k Gaussians, HexPlane 96/40, MLP 512/4,
+    Fourier K=12, all v6.1 quality features enabled, perceptual loss on (alex)."""
+    cfg = default_config()
+    # Preprocess
+    cfg.preprocess.fps = 15
+    cfg.preprocess.resize_long_edge = 1280
+    cfg.preprocess.colmap_matching = "exhaustive"
+    cfg.preprocess.init_subsample_mode = "confidence"
+    # Foundation (small models, must fit alongside training in 8GB)
+    cfg.foundation.metric3d_model = "metric3d_vit_small"
+    cfg.foundation.cotracker_grid_size = 22
+    cfg.foundation.cotracker_num_points = 1400
+    # Model
+    cfg.model.hexplane_resolution = 96
+    cfg.model.hexplane_feat_dim = 40
+    cfg.model.mlp_width = 512
+    cfg.model.mlp_depth = 4
+    cfg.model.num_time_freqs = 8
+    cfg.model.fourier_K = 12
+    cfg.model.deform_pos_mode = "hybrid"
+    cfg.model.sh_degree = 3
+    # Train
+    cfg.train.n_iters = 80_000
+    cfg.train.image_resolution = (800, 450)
+    cfg.train.batch_size = 1
+    cfg.train.max_gaussians = 350_000
+    cfg.train.density_start_iter = 800
+    cfg.train.density_end_iter = 45_000
+    cfg.train.density_interval = 200
+    cfg.train.densify_grad_threshold = 3e-4
+    cfg.train.prune_max_scale = 0.012
+    cfg.train.warmup_iters = 1500
+    cfg.train.lambda_aniso = 0.02
+    cfg.train.aniso_threshold = 5.0
+    cfg.train.dpos_total_cap_frac = 0.08
+    cfg.train.lambda_rigidity = 8e-4
+    cfg.train.lambda_fourier_reg = 5e-3
+    cfg.train.lambda_accel = 2e-4
+    cfg.train.lambda_flow = 0.05
+    cfg.train.flow_warmup_iters = 1500
+    cfg.train.lambda_lpips = 0.05
+    cfg.train.lpips_net = "alex"
+    cfg.train.lpips_warmup_iters = 1500
+    cfg.train.dynamic_densify_scale = 0.4
+    cfg.train.mip_scale_floor_frac = 0.0015
+    cfg.train.cam_grad_clip_norm = 1.0
+    cfg.train.lr_cam_K = 1e-7
+    cfg.train.lr_cam_w2c = 1e-7
+    cfg.train.cam_refine_start_iter = 8000
+    cfg.train.nvs_eval_enabled = True
+    cfg.train.ckpt_interval = 4000
+    # Export
     cfg.export.num_timestamps = 120
     return cfg
