@@ -323,6 +323,12 @@ export function downloadUrl(jobId: string): string {
   return withTokenParam(`${getApiBase()}/download/${jobId}`);
 }
 
+/** Training-frame URL for the EditPanel framepicker. Bearer token added as
+ *  `?token=` query param so plain `<img src>` (which can't set headers) works. */
+export function sceneFrameUrl(scene: string, idx: number): string {
+  return withTokenParam(`${getApiBase()}/scenes/${encodeURIComponent(scene)}/frame/${idx}`);
+}
+
 // ---------------------------------------------------------------------------
 // Edit mode — object deletion
 // ---------------------------------------------------------------------------

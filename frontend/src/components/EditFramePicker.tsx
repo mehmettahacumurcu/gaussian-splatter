@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { getApiBase } from "../connection";
+import { sceneFrameUrl } from "../api";
 
 interface Props {
   scene: string;
@@ -24,9 +24,14 @@ export function EditFramePicker({ scene, totalFrames, onSelect }: Props) {
           }}
         >
           <img
-            src={`${getApiBase()}/scenes/${scene}/frame/${idx}`}
+            src={sceneFrameUrl(scene, idx)}
             alt={`Frame ${idx}`}
             style={{ width: 160, height: "auto", display: "block" }}
+            onError={(e) => {
+              // Show a visible placeholder so the user knows which frame failed
+              (e.currentTarget as HTMLImageElement).style.background = "#400";
+              (e.currentTarget as HTMLImageElement).style.minHeight = "80px";
+            }}
           />
           <div style={{ textAlign: "center", color: "#aaa", fontSize: 11 }}>#{idx}</div>
         </div>

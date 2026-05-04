@@ -1,5 +1,5 @@
 import { useRef } from "react";
-import { getApiBase } from "../connection";
+import { sceneFrameUrl } from "../api";
 
 interface Props {
   scene: string;
@@ -22,7 +22,7 @@ export function EditMaskPreview({ scene, frameIdx, onClick, maskUrl }: Props) {
       }}
     >
       <img
-        src={`${getApiBase()}/scenes/${scene}/frame/${frameIdx}`}
+        src={sceneFrameUrl(scene, frameIdx)}
         alt={`Frame ${frameIdx}`}
         style={{ display: "block", maxWidth: "100%", maxHeight: "70vh" }}
       />
