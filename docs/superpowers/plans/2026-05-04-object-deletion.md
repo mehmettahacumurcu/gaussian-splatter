@@ -2214,7 +2214,7 @@ git commit -m "feat(test): synthetic cube fixture for edit integration tests"
 **Files:**
 - Create: `scripts/integration_test_edit.py`
 
-- [ ] **Step 1: Implement the integration test**
+- [x] **Step 1: Implement the integration test**
 
 ```python
 # scripts/integration_test_edit.py
