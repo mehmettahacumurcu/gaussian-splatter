@@ -350,7 +350,7 @@ git commit -m "chore(edit): create edit package marker"
 - Create: `backend/edit/gauss_classifier.py`
 - Create: `scripts/test_edit_gauss_classifier.py`
 
-- [ ] **Step 1: Write the failing test (synthetic projection)**
+- [x] **Step 1: Write the failing test (synthetic projection)**
 
 ```python
 # scripts/test_edit_gauss_classifier.py
@@ -436,7 +436,7 @@ if __name__ == "__main__":
     print("ok: test_gauss_clearly_in_mask")
 ```
 
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 
 ```
 python scripts/test_edit_gauss_classifier.py
@@ -444,7 +444,7 @@ python scripts/test_edit_gauss_classifier.py
 
 Expected: `ImportError` or `AttributeError` because the module doesn't exist yet.
 
-- [ ] **Step 3: Implement the classifier**
+- [x] **Step 3: Implement the classifier**
 
 Create `backend/edit/gauss_classifier.py`:
 
@@ -530,7 +530,7 @@ def classify_gaussians_for_deletion(
     return flags
 ```
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 
 ```
 python scripts/test_edit_gauss_classifier.py
@@ -542,7 +542,7 @@ ok: test_two_gauss_one_in_mask
 ok: test_gauss_clearly_in_mask
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add backend/edit/gauss_classifier.py scripts/test_edit_gauss_classifier.py
