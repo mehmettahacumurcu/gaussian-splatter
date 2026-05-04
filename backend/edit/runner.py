@@ -192,33 +192,142 @@ class EditJobRunner:
             shutil.rmtree(anchors_final)
         anchors_tmp.rename(anchors_final)
 
-        # ==== Phase 4b: Build full inpainted frame stack ====
-        # v1 fallback approach: for non-anchor frames where the mask is non-empty,
-        # use the nearest anchor's inpainted RGB as a substitute (no warp). The
-        # full depth-warp implementation is in Task C4 — until C4 lands, the
-        # fallback gives a valid (if blurrier) inpainted frame stack for refit.
-        self.progress_cb("inpaint", 0.85, "Building full inpainted frames")
+        # ==== Phase 4b: Build full inpainted frame stack (depth-warp) ====
+        # For each non-anchor frame whose mask is non-empty, warp the 2 nearest
+        # anchors' inpainted RGB into the target view using existing depth maps,
+        # then blend by pose distance. Where warp fails (e.g., no depth file),
+        # fall back to nearest-anchor RGB so the loop never aborts mid-flight.
+        self.progress_cb("inpaint", 0.85, "Building full inpainted frames (depth-warp)")
         full_frames_dir = self.edit_dir / "inpainted_frames"
         full_frames_dir.mkdir(exist_ok=True)
+
+        depth_dir = self.scene_dir / "depth"
+        # Per-frame depth file path (existing convention: frame_NNNNNN_depth.npy)
+        def _depth_path(fi: int) -> Path:
+            return depth_dir / f"frame_{fi:06d}_depth.npy"
+
+        # K_mask + w2cs are already computed in Phase 3 — reuse them.
+        # Cache anchor inpainted RGBs as (3, H, W) float tensors for grid_sample.
+        # H, W here are the mask resolution; warp expects matching K.
+        anchor_rgb_cache: dict[int, torch.Tensor] = {}
+        for ai in anchor_indices:
+            anchor_path = anchors_final / f"anchor_{ai:06d}.png"
+            if not anchor_path.exists():
+                continue
+            anchor_arr = np.array(Image.open(anchor_path).convert("RGB"))
+            # Resize to mask resolution if needed
+            if anchor_arr.shape[:2] != (H_mask, W_mask):
+                anchor_arr = np.array(
+                    Image.fromarray(anchor_arr).resize((W_mask, H_mask), Image.LANCZOS)
+                )
+            t = torch.from_numpy(anchor_arr).float().permute(2, 0, 1) / 255.0
+            anchor_rgb_cache[ai] = t
+
         for fi in range(T):
             self._check_cancel("inpaint")
-            img = np.array(Image.open(all_frames[fi]).convert("RGB"))
+            img_orig = np.array(Image.open(all_frames[fi]).convert("RGB"))
             mask = mask_stack_np[fi]
+
             if mask.sum() == 0:
-                Image.fromarray(img).save(full_frames_dir / f"frame_{fi:06d}.png")
+                Image.fromarray(img_orig).save(full_frames_dir / f"frame_{fi:06d}.png")
                 continue
 
-            if fi in anchor_indices:
-                inpainted = np.array(Image.open(anchors_final / f"anchor_{fi:06d}.png").convert("RGB"))
-            else:
-                # Nearest anchor fallback (C4 will replace with depth-warp).
-                nearest_anchor = min(anchor_indices, key=lambda a: abs(a - fi))
-                inpainted = np.array(Image.open(anchors_final / f"anchor_{nearest_anchor:06d}.png").convert("RGB"))
+            # If THIS frame is an anchor, use its own inpainted version directly.
+            if fi in anchor_indices and fi in anchor_rgb_cache:
+                t = anchor_rgb_cache[fi]
+                # Convert tensor (3, H_mask, W_mask) → uint8 RGB at original size
+                inpainted_arr = (t.permute(1, 2, 0).clamp(0, 1).numpy() * 255).astype(np.uint8)
+                if inpainted_arr.shape[:2] != img_orig.shape[:2]:
+                    inpainted_arr = np.array(
+                        Image.fromarray(inpainted_arr).resize(
+                            (img_orig.shape[1], img_orig.shape[0]), Image.LANCZOS
+                        )
+                    )
+                out = img_orig.copy()
+                mask_b = mask.astype(bool)
+                out[mask_b] = inpainted_arr[mask_b]
+                Image.fromarray(out).save(full_frames_dir / f"frame_{fi:06d}.png")
+                continue
 
-            out = img.copy()
+            # Non-anchor: try depth-warp from 2 nearest anchors
+            anchors_sorted = sorted(anchor_indices, key=lambda a: abs(a - fi))[:2]
+            depth_p = _depth_path(fi)
+            warp_ok = depth_p.exists() and all(a in anchor_rgb_cache for a in anchors_sorted)
+
+            if warp_ok:
+                try:
+                    target_depth_full = np.load(depth_p)  # (H_native, W_native) probably
+                    # Resize depth to mask resolution if needed
+                    if target_depth_full.shape != (H_mask, W_mask):
+                        # Use bilinear via PIL on a float array; round-trip via PIL float mode
+                        td_pil = Image.fromarray(target_depth_full.astype(np.float32), mode="F")
+                        td_pil = td_pil.resize((W_mask, H_mask), Image.BILINEAR)
+                        target_depth = torch.from_numpy(np.array(td_pil, dtype=np.float32))
+                    else:
+                        target_depth = torch.from_numpy(target_depth_full.astype(np.float32))
+
+                    warped_layers = []
+                    for ai in anchors_sorted:
+                        warped = warp_anchor_to_target(
+                            anchor_rgb=anchor_rgb_cache[ai],
+                            target_depth=target_depth,
+                            K_anchor=K_mask, K_target=K_mask,
+                            w2c_anchor=w2cs[ai], w2c_target=w2cs[fi],
+                        )  # (3, H_mask, W_mask)
+                        warped_layers.append(warped)
+
+                    # Blend by inverse pose distance (closer anchor weighted higher)
+                    if len(warped_layers) >= 2:
+                        d0 = max(abs(anchors_sorted[0] - fi), 1)
+                        d1 = max(abs(anchors_sorted[1] - fi), 1)
+                        w0 = 1.0 / d0
+                        w1 = 1.0 / d1
+                        wsum = w0 + w1
+                        blend = (w0 * warped_layers[0] + w1 * warped_layers[1]) / max(wsum, 1e-6)
+                    else:
+                        blend = warped_layers[0]
+
+                    inpainted_t = blend.permute(1, 2, 0).clamp(0, 1).numpy()
+                    inpainted_arr = (inpainted_t * 255).astype(np.uint8)
+
+                    # Resize warp result back to original frame size (for compositing)
+                    if inpainted_arr.shape[:2] != img_orig.shape[:2]:
+                        inpainted_arr = np.array(
+                            Image.fromarray(inpainted_arr).resize(
+                                (img_orig.shape[1], img_orig.shape[0]), Image.LANCZOS
+                            )
+                        )
+                except Exception as e:
+                    print(f"[runner] frame {fi} warp failed ({e}); falling back to nearest anchor")
+                    warp_ok = False
+
+            if not warp_ok:
+                # Fallback: nearest anchor's inpainted RGB at original resolution
+                nearest_anchor = anchors_sorted[0] if anchors_sorted else min(anchor_indices, key=lambda a: abs(a - fi))
+                anchor_path = anchors_final / f"anchor_{nearest_anchor:06d}.png"
+                if anchor_path.exists():
+                    fallback = np.array(Image.open(anchor_path).convert("RGB"))
+                    if fallback.shape[:2] != img_orig.shape[:2]:
+                        fallback = np.array(
+                            Image.fromarray(fallback).resize(
+                                (img_orig.shape[1], img_orig.shape[0]), Image.LANCZOS
+                            )
+                        )
+                    inpainted_arr = fallback
+                else:
+                    # No anchor available — use the original RGB (no edit applied)
+                    inpainted_arr = img_orig
+
+            out = img_orig.copy()
             mask_b = mask.astype(bool)
-            out[mask_b] = inpainted[mask_b]
+            out[mask_b] = inpainted_arr[mask_b]
             Image.fromarray(out).save(full_frames_dir / f"frame_{fi:06d}.png")
+
+            if fi % 50 == 0:
+                self.progress_cb(
+                    "inpaint", 0.85 + 0.15 * (fi / max(T, 1)),
+                    f"Frame {fi}/{T} composed",
+                )
         self.progress_cb("inpaint", 1.0, "Inpaint complete")
 
         # ==== Phase 5: Local refit ====

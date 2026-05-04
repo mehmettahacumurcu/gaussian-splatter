@@ -1547,7 +1547,7 @@ git commit -m "feat(edit): EditJobRunner orchestrating 5-phase pipeline"
 **Files:**
 - Modify: `backend/edit/runner.py` (replace fallback warp with real implementation)
 
-- [ ] **Step 1: Replace the fallback warp loop with depth-warp**
+- [x] **Step 1: Replace the fallback warp loop with depth-warp**
 
 Replace the placeholder block in Phase 4 with:
 
@@ -1597,7 +1597,7 @@ Replace the placeholder block in Phase 4 with:
             Image.fromarray(out).save(full_frames_dir / f"frame_{fi:06d}.png")
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add backend/edit/runner.py
