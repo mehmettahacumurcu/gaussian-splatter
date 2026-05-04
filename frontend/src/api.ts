@@ -323,6 +323,49 @@ export function downloadUrl(jobId: string): string {
   return withTokenParam(`${getApiBase()}/download/${jobId}`);
 }
 
+// ---------------------------------------------------------------------------
+// Edit mode — object deletion
+// ---------------------------------------------------------------------------
+export interface EditSubmitOptions {
+  scene: string;
+  source_ckpt: string;
+  frame_idx: number;
+  click_x: number;  // [0, 1]
+  click_y: number;  // [0, 1]
+  quality_mode: "A" | "B";
+}
+
+export async function submitEditJob(opts: EditSubmitOptions): Promise<ProcessResponse> {
+  const fd = new FormData();
+  fd.append("scene", opts.scene);
+  fd.append("mode", "edit");
+  fd.append("source_ckpt", opts.source_ckpt);
+  fd.append("frame_idx", String(opts.frame_idx));
+  fd.append("click_x", String(opts.click_x));
+  fd.append("click_y", String(opts.click_y));
+  fd.append("quality_mode", opts.quality_mode);
+
+  console.log("[submitEditJob] target:", `${getApiBase()}/process`);
+  console.log("[submitEditJob] scene:", opts.scene, "frame_idx:", opts.frame_idx, "quality_mode:", opts.quality_mode);
+
+  const res = await fetch(`${getApiBase()}/process`, {
+    method: "POST",
+    body: fd,
+    headers: authHeaders(),
+  }).catch((err) => {
+    console.error("[submitEditJob] fetch threw:", err);
+    throw new Error(`Network error: ${err}. Check connection settings + backend log.`);
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    console.error("[submitEditJob] HTTP error:", res.status, res.statusText, text);
+    throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
+  }
+  const json = (await res.json()) as ProcessResponse;
+  console.log("[submitEditJob] success:", json);
+  return json;
+}
+
 /**
  * Video dosyası + params -> job submit.
  * Backend FormData bekler (multipart upload).

@@ -1245,6 +1245,19 @@ def _resolve_eval_dir(identifier: str) -> Path | None:
 
 
 # ---------------------------------------------------------------------------
+# Scenes — training frame thumbnails (for EditPanel framepicker)
+# ---------------------------------------------------------------------------
+@app.get("/scenes/{scene}/frame/{idx}", tags=["scenes"])
+def scene_frame(scene: str, idx: int) -> FileResponse:
+    """Serve a single extracted training frame for the EditPanel framepicker."""
+    safe = _safe_scene_name(scene)
+    p = scene_paths(safe)["frames"] / f"frame_{idx:06d}.png"
+    if not p.exists():
+        raise HTTPException(404, f"Frame not found: {p}")
+    return FileResponse(str(p), media_type="image/png")
+
+
+# ---------------------------------------------------------------------------
 # Yardimcilar
 # ---------------------------------------------------------------------------
 def _safe_scene_name(raw: str) -> str:
