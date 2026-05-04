@@ -1288,7 +1288,7 @@ git commit -m "feat(edit): refit with frozen survivors + depth-loss mask"
 **Files:**
 - Create: `backend/edit/runner.py`
 
-- [ ] **Step 1: Implement EditJobRunner**
+- [x] **Step 1: Implement EditJobRunner**
 
 Create `backend/edit/runner.py`:
 
@@ -1535,7 +1535,7 @@ class EditJobRunner:
 
 Note: the depth-warp branch in Phase 4 is intentionally left as a fallback in this plan (uses original RGB inside mask region for non-anchor frames). For a true v1 release, the warp must be implemented end-to-end using `warp.warp_anchor_to_target` + the existing depth maps. The fallback path lets the integration test pass without forcing the depth-warp to be perfect on first try.
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add backend/edit/runner.py
