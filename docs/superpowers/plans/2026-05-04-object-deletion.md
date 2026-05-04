@@ -1162,7 +1162,7 @@ git commit -m "feat(edit): refit skeleton + affected-zone helpers"
 - Modify: `backend/model/trainer.py` (add `mask_stack` parameter, depth-loss skip logic, freeze-mask gradient zeroing)
 - Modify: `backend/edit/refit.py` (complete the implementation)
 
-- [ ] **Step 1: Add `filter_in_place` and `set_freeze_mask` to GaussianModel**
+- [x] **Step 1: Add `filter_in_place` and `set_freeze_mask` to GaussianModel**
 
 In `backend/model/gaussian_model.py`, add these methods to the `GaussianModel` class:
 
@@ -1195,7 +1195,7 @@ In `backend/model/gaussian_model.py`, add these methods to the `GaussianModel` c
 
 Note: the exact attribute names (`means`, `scales`, etc.) need to match what's actually on `GaussianModel`. Read the file first, adapt the loop to the real attribute list. If the class already has helpers for filtering (it might — check methods like `prune` or similar), prefer those.
 
-- [ ] **Step 2: Read existing GaussianModel structure**
+- [x] **Step 2: Read existing GaussianModel structure**
 
 ```
 grep -n "def \|self\.\(means\|scales\|quats\|opacities\|colors\|features\)" backend/model/gaussian_model.py | head -40
@@ -1203,7 +1203,7 @@ grep -n "def \|self\.\(means\|scales\|quats\|opacities\|colors\|features\)" back
 
 Adjust the `filter_in_place` attr list to the actual fields. Make a note in the method docstring listing the real fields.
 
-- [ ] **Step 3: Add mask-stack + freeze-mask awareness to `Trainer4DGS.train`**
+- [x] **Step 3: Add mask-stack + freeze-mask awareness to `Trainer4DGS.train`**
 
 In `backend/model/trainer.py`, in the `train()` signature (around line 949 after the cancel_check addition), add:
 
@@ -1231,7 +1231,7 @@ Right before `optimizer.step()`, if `gs._freeze_mask` exists (a buffer), zero gr
                             p.grad[fm] = 0.0
 ```
 
-- [ ] **Step 4: Complete `backend/edit/refit.py` with the trainer call**
+- [x] **Step 4: Complete `backend/edit/refit.py` with the trainer call**
 
 Replace the `raise NotImplementedError(...)` with:
 
@@ -1276,7 +1276,7 @@ Replace the `raise NotImplementedError(...)` with:
 
 This is the full integration. The exact constructor/call kwargs must match what `pipeline.py` does — copy the call site verbatim and only change what differs (frame source, mask stack, n_iters).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add backend/model/gaussian_model.py backend/model/trainer.py backend/edit/refit.py

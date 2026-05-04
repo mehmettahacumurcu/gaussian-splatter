@@ -416,6 +416,45 @@ class GaussianModel(nn.Module):
             self.is_background = torch.cat([self.is_background, new_bg], dim=0).contiguous()
 
     # ------------------------------------------------------------------
+    # Edit / refit helpers (Task C2 — object deletion)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def filter_in_place(self, keep: torch.Tensor) -> None:
+        """Drop Gaussians where *keep* is False. Modifies all parameter tensors.
+
+        Wraps the existing ``_apply_mask`` helper which already handles the
+        full attribute list (``means``, ``scales``, ``quats``, ``opacities``,
+        ``sh_dc``, ``sh_rest``, ``fourier_pos_coeffs``, ``is_static``,
+        ``is_background``).
+
+        After this call the optimizer state for these params is stale — the
+        caller is responsible for rebuilding the optimizer.  The edit-refit
+        flow always rebuilds via ``Trainer4DGS.__init__``, so this is fine.
+        """
+        assert keep.dtype == torch.bool, "keep must be a bool tensor"
+        assert keep.shape[0] == self.num_points, (
+            f"keep length {keep.shape[0]} != num_points {self.num_points}"
+        )
+        if (~keep).any():
+            self._apply_mask(keep)
+
+    def set_freeze_mask(self, freeze_mask: torch.Tensor) -> None:
+        """Mark Gaussians as frozen (no gradient updates this iter).
+
+        Used by edit-refit to restrict gradient updates to the affected zone.
+        Stored as a plain attribute (not register_buffer) since GaussianModel
+        is an nn.Module but the mask is ephemeral and should not be
+        checkpointed.  Trainer4DGS reads ``gs._freeze_mask`` just before
+        ``optimizer.step()`` and zeros the gradients for frozen Gaussians.
+        """
+        assert freeze_mask.dtype == torch.bool, "freeze_mask must be a bool tensor"
+        assert freeze_mask.shape[0] == self.num_points, (
+            f"freeze_mask length {freeze_mask.shape[0]} != num_points {self.num_points}"
+        )
+        self._freeze_mask: torch.Tensor = freeze_mask
+
+    # ------------------------------------------------------------------
     # I/O
     # ------------------------------------------------------------------
     def state_for_save(self) -> dict:

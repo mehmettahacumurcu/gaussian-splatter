@@ -995,6 +995,10 @@ class Trainer4DGS:
         # returns the partial history. Caller transitions the job to a
         # cancelled/failed state. Default = no-op (training runs to completion).
         cancel_check: Callable[[], bool] | None = None,
+        # Edit refit: per-frame inpaint mask. When provided, depth supervision
+        # is skipped (zeroed) for masked pixels (no GT depth in inpainted
+        # regions).  Shape: (T, H, W) bool, on CPU — fetched per-iter.
+        edit_mask_stack: torch.Tensor | None = None,
     ) -> dict:
         # Static mode — 4D dynamic features bypass (deformation, Fourier, motion regs)
         self.static_mode = bool(static_mode)
@@ -1751,6 +1755,18 @@ class Trainer4DGS:
             # Clamp(2.0): tek frame outlier'ı tüm run'ı batırmasın.
             if (use_depth or use_depth_mv) and gt_depth is not None and rendered_depth is not None:
                 valid = (gt_depth > 0.01) & (rendered_depth > 0.01)
+                # Edit refit: inpainted pixels have no reliable GT depth —
+                # exclude them from depth supervision.
+                if edit_mask_stack is not None:
+                    inpaint_m = edit_mask_stack[idx].to(self.device).bool()
+                    # Resize mask to match depth map spatial dims if needed
+                    if inpaint_m.shape != valid.shape:
+                        inpaint_m = torch.nn.functional.interpolate(
+                            inpaint_m.float().unsqueeze(0).unsqueeze(0),
+                            size=valid.shape[-2:],
+                            mode="nearest",
+                        ).squeeze(0).squeeze(0).bool()
+                    valid = valid & (~inpaint_m)
                 if valid.sum() > 100:
                     gt_v = gt_depth[valid].clamp(min=0.01, max=100.0)
                     r_v  = rendered_depth[valid].clamp(min=0.01, max=100.0)
@@ -2023,6 +2039,19 @@ class Trainer4DGS:
                 continue
 
             self.density.accumulate(self.gs)
+            # Edit refit: zero gradients on out-of-zone (frozen) Gaussians so
+            # only Gaussians inside the affected zone are updated this step.
+            _fm = getattr(self.gs, "_freeze_mask", None)
+            if _fm is not None:
+                _fm_dev = _fm.to(self.device)
+                for _attr in ("means", "scales", "quats", "opacities", "sh_dc", "sh_rest"):
+                    _p = getattr(self.gs, _attr, None)
+                    if isinstance(_p, torch.nn.Parameter) and _p.grad is not None:
+                        _p.grad[_fm_dev] = 0.0
+                if self.gs.fourier_pos_coeffs is not None:
+                    _p = self.gs.fourier_pos_coeffs
+                    if isinstance(_p, torch.nn.Parameter) and _p.grad is not None:
+                        _p.grad[_fm_dev] = 0.0
             self.optimizer.step()
             # Phase 2.3 — Camera pose refinement step (warmup sonrasi aktif)
             if (self._cam_refine_optimizer is not None
