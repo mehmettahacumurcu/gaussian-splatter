@@ -252,7 +252,10 @@ export function SplatViewer({
         width: "100%",
         height: "100%",
         position: "relative",
-        backgroundColor: "#1a1a1a",
+        // mkkellogg viewer already uses setClearColor(0x000000, 0.0) — its WebGL
+        // canvas is transparent where no Gaussian renders. This CSS gradient
+        // shows through and replaces the black void around the captured volume.
+        background: "linear-gradient(to bottom, #3d4658 0%, #2a2832 55%, #1c1916 100%)",
       }}
     />
   );

@@ -74,7 +74,9 @@ export function SplatViewerSpark({
 
     // --- Three.js scene + camera + renderer ---
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x1a1a1a);
+    // No scene.background — we want the CSS gradient on the container div to
+    // show through where no Gaussian covers a pixel. Renderer is configured
+    // below with alpha:true and a fully-transparent clear color.
     sceneRef.current = scene;
 
     const camera = new THREE.PerspectiveCamera(
@@ -90,9 +92,12 @@ export function SplatViewerSpark({
     const renderer = new THREE.WebGLRenderer({
       antialias: true,
       preserveDrawingBuffer: false,
+      alpha: true,           // canvas can be transparent → container CSS shows
+      premultipliedAlpha: false,
     });
     renderer.setSize(container.clientWidth, container.clientHeight);
     renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.setClearColor(0x000000, 0.0);   // fully transparent clear
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
 
@@ -449,7 +454,10 @@ export function SplatViewerSpark({
         width: "100%",
         height: "100%",
         position: "relative",
-        backgroundColor: "#1a1a1a",
+        // Vertical gradient backdrop (top → cool ambient, bottom → warm dark).
+        // Renderer is alpha:true with clearColor alpha=0, so this CSS shows
+        // through wherever no Gaussian covers a pixel — replaces the black void.
+        background: "linear-gradient(to bottom, #3d4658 0%, #2a2832 55%, #1c1916 100%)",
         overflow: "hidden",
       }}
     />
