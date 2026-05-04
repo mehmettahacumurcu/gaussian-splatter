@@ -58,4 +58,7 @@ build.ninja
 # OS
 *~
 COMMIT_MSG*.txt
-notebooks/ 
+notebooks/
+
+# Build artifact from scripts/build_cube_fixture.py
+tests/fixtures/cube_scene/

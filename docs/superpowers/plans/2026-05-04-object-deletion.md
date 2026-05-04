@@ -2166,7 +2166,7 @@ git commit -m "feat(ui): wire EditSubmit panel into New Job tab"
 - Create: `scripts/build_cube_fixture.py`
 - Create: `tests/fixtures/cube_scene/` (output dir)
 
-- [ ] **Step 1: Implement the fixture builder**
+- [x] **Step 1: Implement the fixture builder**
 
 ```python
 # scripts/build_cube_fixture.py
@@ -2193,7 +2193,7 @@ Run: python scripts/build_cube_fixture.py
 
 The full implementation is straightforward but lengthy. Pseudocode above; ~150 lines. Implement each step inline; use existing code patterns from `backend/preprocess/parse_colmap.py` for the COLMAP-text format.
 
-- [ ] **Step 2: Run the fixture builder**
+- [x] **Step 2: Run the fixture builder**
 
 ```
 python scripts/build_cube_fixture.py
@@ -2202,7 +2202,7 @@ ls tests/fixtures/cube_scene/
 
 Expected output: directory tree matching `data/<scene>/` layout but minimal.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add scripts/build_cube_fixture.py tests/fixtures/cube_scene/
