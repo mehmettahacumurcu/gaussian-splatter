@@ -1791,7 +1791,7 @@ git commit -m "feat(jobs): submit_edit dispatches EditJobRunner"
 **Files:**
 - Modify: `frontend/src/api.ts`
 
-- [ ] **Step 1: Add the function**
+- [x] **Step 1: Add the function**
 
 After the existing `submitJob` function in `frontend/src/api.ts`, add:
 
@@ -1821,7 +1821,7 @@ export async function submitEditJob(opts: EditSubmitOptions): Promise<ProcessRes
 }
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add frontend/src/api.ts
@@ -1833,7 +1833,7 @@ git commit -m "feat(api): submitEditJob in frontend api.ts"
 **Files:**
 - Create: `frontend/src/components/EditFramePicker.tsx`
 
-- [ ] **Step 1: Implement the component**
+- [x] **Step 1: Implement the component**
 
 ```tsx
 // frontend/src/components/EditFramePicker.tsx
@@ -1878,7 +1878,7 @@ export function EditFramePicker({ scene, totalFrames, onSelect }: Props) {
 
 The `${getApiBase()}/scenes/${scene}/frame/${idx}` endpoint serves training frame thumbnails. **Note: this endpoint may not exist yet** — if it doesn't, add it as a small backend endpoint that returns the file at `data/<scene>/frames/frame_<idx:06d>.png` with `FileResponse`.
 
-- [ ] **Step 2: Verify the frame-serve endpoint exists or add it**
+- [x] **Step 2: Verify the frame-serve endpoint exists or add it**
 
 Check `backend/api.py` for an endpoint matching the `frames/frame_NNNNNN.png` pattern. If absent, add:
 
@@ -1891,7 +1891,7 @@ def scene_frame(scene: str, idx: int) -> FileResponse:
     return FileResponse(p)
 ```
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add frontend/src/components/EditFramePicker.tsx backend/api.py
@@ -1903,7 +1903,7 @@ git commit -m "feat(edit): frame picker component + scene frame endpoint"
 **Files:**
 - Create: `frontend/src/components/EditMaskPreview.tsx`
 
-- [ ] **Step 1: Implement the overlay**
+- [x] **Step 1: Implement the overlay**
 
 ```tsx
 // frontend/src/components/EditMaskPreview.tsx
@@ -1952,7 +1952,7 @@ export function EditMaskPreview({ scene, frameIdx, onClick, maskUrl }: Props) {
 }
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add frontend/src/components/EditMaskPreview.tsx
@@ -1964,7 +1964,7 @@ git commit -m "feat(edit): mask preview overlay component"
 **Files:**
 - Create: `frontend/src/components/EditQualityDialog.tsx`
 
-- [ ] **Step 1: Implement the dialog**
+- [x] **Step 1: Implement the dialog**
 
 ```tsx
 // frontend/src/components/EditQualityDialog.tsx
@@ -2010,7 +2010,7 @@ export function EditQualityDialog({ onSelect, onCancel }: Props) {
 }
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add frontend/src/components/EditQualityDialog.tsx
@@ -2022,7 +2022,7 @@ git commit -m "feat(edit): quality mode dialog"
 **Files:**
 - Create: `frontend/src/components/EditSubmit.tsx`
 
-- [ ] **Step 1: Implement the panel**
+- [x] **Step 1: Implement the panel**
 
 ```tsx
 // frontend/src/components/EditSubmit.tsx
@@ -2108,7 +2108,7 @@ export function EditSubmit({ scene, sourceCkpt, totalFrames, onSubmitted }: Prop
 }
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add frontend/src/components/EditSubmit.tsx
@@ -2120,7 +2120,7 @@ git commit -m "feat(edit): EditSubmit panel state machine"
 **Files:**
 - Modify: `frontend/src/App.tsx`
 
-- [ ] **Step 1: Import and add to the New Job tab**
+- [x] **Step 1: Import and add to the New Job tab**
 
 In `frontend/src/App.tsx`, find where `Static3DSubmit` and `Dynamic4DSubmit` are rendered (search for `Static3DSubmit`). Add a third tab "Object edit" that renders `EditSubmit` when a completed scene is available.
 
@@ -2149,7 +2149,7 @@ import { EditSubmit } from "./components/EditSubmit";
 
 Reload Tauri. Navigate to New Job → Object edit. Pick a scene that has a completed training run. Confirm the framepicker loads, you can click a frame, click an object, see the quality dialog, and submit reaches the backend (which will fail until B/C/D phases are wired — that's expected; this only validates the UI path).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add frontend/src/App.tsx
