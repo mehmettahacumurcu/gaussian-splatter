@@ -7,12 +7,12 @@
  *
  * v6.2: "Obje Silme" (edit) modu eklendi — EditSubmit component.
  */
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { JobMode, ProcessResponse } from "../api";
 import { Static3DSubmit } from "./Static3DSubmit";
 import { Dynamic4DSubmit } from "./Dynamic4DSubmit";
 import { EditSubmit } from "./EditSubmit";
-import { listDiskScenes } from "../api";
+import { listDiskScenes, getSceneInfo } from "../api";
 
 /** Extends JobMode with "edit" for the submit panel picker. */
 type SubmitMode = JobMode | "edit";
@@ -31,6 +31,25 @@ export function JobSubmitPanel({ mode, onModeChange, onJobSubmitted }: Props) {
   const [editScene, setEditScene] = useState<string>("");
   const [diskScenes, setDiskScenes] = useState<string[] | null>(null);
   const [loadingScenes, setLoadingScenes] = useState(false);
+  // Real frame count for the chosen scene (drives EditFramePicker stride).
+  // Defaults to a sentinel until /scenes/<scene>/info answers.
+  const [sceneNFrames, setSceneNFrames] = useState<number | null>(null);
+
+  // Whenever editScene changes (and we're in edit mode), re-fetch n_frames so
+  // the framepicker requests indices that actually exist on disk.
+  useEffect(() => {
+    if (submitMode !== "edit" || !editScene) return;
+    let cancelled = false;
+    setSceneNFrames(null);
+    getSceneInfo(editScene)
+      .then((info) => { if (!cancelled) setSceneNFrames(info.n_frames); })
+      .catch((err) => {
+        console.error("[JobSubmitPanel] getSceneInfo failed:", err);
+        if (!cancelled) setSceneNFrames(0);
+      });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editScene, submitMode]);
 
   const handleModeClick = async (m: SubmitMode) => {
     setSubmitMode(m);
@@ -135,14 +154,22 @@ export function JobSubmitPanel({ mode, onModeChange, onJobSubmitted }: Props) {
             )}
           </div>
 
-          {editScene && (
+          {editScene && sceneNFrames === null && (
+            <p className="submit-hint">Sahne bilgisi yukleniyor...</p>
+          )}
+          {editScene && sceneNFrames === 0 && (
+            <p className="submit-hint hint-warn">
+              Sahne'de frame bulunamadi (data/{editScene}/frames/ bos veya yok).
+              Once Static 3D job calistirip frames uret.
+            </p>
+          )}
+          {editScene && sceneNFrames !== null && sceneNFrames > 0 && (
             <EditSubmit
               scene={editScene}
               sourceCkpt="output/ckpt/ckpt_final.pt"
-              totalFrames={1000}
+              totalFrames={sceneNFrames}
               onSubmitted={(jobId) => {
                 console.log("[App] edit job submitted:", jobId);
-                // Switch to jobs tab via onJobSubmitted with a dummy ProcessResponse
                 onJobSubmitted(
                   { job_id: jobId, status: "queued", status_url: `/status/${jobId}`, message: "Edit job queued" },
                   editScene,

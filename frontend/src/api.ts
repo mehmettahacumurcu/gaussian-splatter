@@ -329,6 +329,16 @@ export function sceneFrameUrl(scene: string, idx: number): string {
   return withTokenParam(`${getApiBase()}/scenes/${encodeURIComponent(scene)}/frame/${idx}`);
 }
 
+/** Fetch n_frames for a scene (drives EditPanel's framepicker stride). */
+export async function getSceneInfo(scene: string): Promise<{ scene: string; n_frames: number }> {
+  const res = await fetch(
+    `${getApiBase()}/scenes/${encodeURIComponent(scene)}/info`,
+    { headers: authHeaders() },
+  );
+  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
 // ---------------------------------------------------------------------------
 // Edit mode — object deletion
 // ---------------------------------------------------------------------------

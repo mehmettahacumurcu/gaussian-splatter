@@ -1249,12 +1249,34 @@ def _resolve_eval_dir(identifier: str) -> Path | None:
 # ---------------------------------------------------------------------------
 @app.get("/scenes/{scene}/frame/{idx}", tags=["scenes"])
 def scene_frame(scene: str, idx: int) -> FileResponse:
-    """Serve a single extracted training frame for the EditPanel framepicker."""
+    """Serve a single extracted training frame for the EditPanel framepicker.
+
+    Resolves the frame by sorted position (idx 0 = first file in the
+    directory). Robust to padding convention — ffmpeg uses %04d, the
+    photo-set copy uses %06d, both work.
+    """
     safe = _safe_scene_name(scene)
-    p = scene_paths(safe)["frames"] / f"frame_{idx:06d}.png"
-    if not p.exists():
-        raise HTTPException(404, f"Frame not found: {p}")
-    return FileResponse(str(p), media_type="image/png")
+    frames_dir = scene_paths(safe)["frames"]
+    if not frames_dir.exists():
+        raise HTTPException(404, f"Scene frames dir not found: {frames_dir}")
+    files = sorted(frames_dir.glob("frame_*.png"))
+    if idx < 0 or idx >= len(files):
+        raise HTTPException(
+            404,
+            f"Frame index {idx} out of range (scene '{safe}' has {len(files)} frames)",
+        )
+    return FileResponse(str(files[idx]), media_type="image/png")
+
+
+@app.get("/scenes/{scene}/info", tags=["scenes"])
+def scene_info(scene: str) -> JSONResponse:
+    """Return basic scene info (frame count) for the EditPanel framepicker."""
+    safe = _safe_scene_name(scene)
+    frames_dir = scene_paths(safe)["frames"]
+    if not frames_dir.exists():
+        raise HTTPException(404, f"Scene frames dir not found: {frames_dir}")
+    n_frames = len(list(frames_dir.glob("frame_*.png")))
+    return JSONResponse({"scene": safe, "n_frames": n_frames})
 
 
 # ---------------------------------------------------------------------------
