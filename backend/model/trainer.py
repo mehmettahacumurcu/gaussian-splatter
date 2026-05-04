@@ -986,6 +986,15 @@ class Trainer4DGS:
         dynamic_densify_scale: float = 1.0,
         # Perf — RAM preload + uint8/fp16 cache + multires fix
         preload_to_ram: bool = False,
+        # NVS hold-out — frame indices to EXCLUDE from training (single-view path).
+        # Eval can then measure true novel-view PSNR on these. None = train on all.
+        # Multi-view path uses mv_test_camera for held-out; this is SV-only.
+        holdout_indices: Sequence[int] | None = None,
+        # Cooperative cancel: callable returning True when training should stop.
+        # Polled every iter; if True, the loop exits cleanly and the function
+        # returns the partial history. Caller transitions the job to a
+        # cancelled/failed state. Default = no-op (training runs to completion).
+        cancel_check: Callable[[], bool] | None = None,
     ) -> dict:
         # Static mode — 4D dynamic features bypass (deformation, Fourier, motion regs)
         self.static_mode = bool(static_mode)
@@ -1314,8 +1323,34 @@ class Trainer4DGS:
                 print(f"[trainer.v6.1] Mip cam_centers hata, devre disi: {_e}")
                 self.mip_scale_floor_frac = 0.0
 
+        # SV training-index pool — excludes NVS hold-out frames so eval can
+        # measure true novel views. MV uses mv_test_camera elsewhere; for MV
+        # the pool is unused (train loop samples cam_id then idx from full T).
+        if (not is_multiview) and holdout_indices:
+            _holdout_set = {int(i) for i in holdout_indices if 0 <= int(i) < T}
+            _train_idx_pool = torch.tensor(
+                [i for i in range(T) if i not in _holdout_set],
+                dtype=torch.long,
+            )
+            if _train_idx_pool.numel() == 0:
+                raise ValueError(
+                    f"holdout_indices excluded ALL {T} frames; nothing to train on"
+                )
+            print(f"[trainer.holdout] SV: {len(_holdout_set)}/{T} frames held out from training "
+                  f"(pool size={_train_idx_pool.numel()})")
+        else:
+            _train_idx_pool = None  # sample uniformly from [0, T)
+
         for it in range(1, n_iters + 1):
-            idx = int(torch.randint(0, T, (1,)).item())
+            if cancel_check is not None and cancel_check():
+                print(f"[trainer] cancel requested at iter {it}, stopping cleanly")
+                break
+            if _train_idx_pool is not None:
+                idx = int(_train_idx_pool[
+                    torch.randint(0, _train_idx_pool.numel(), (1,)).item()
+                ].item())
+            else:
+                idx = int(torch.randint(0, T, (1,)).item())
             t_norm = idx / max(T - 1, 1)
             warmup = self._warmup_factor(it)
 

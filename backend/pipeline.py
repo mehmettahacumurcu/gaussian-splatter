@@ -58,6 +58,7 @@ def run_pipeline(
     skip_export: bool = False,
     progress_callback: ProgressCallback | None = None,
     force_preprocess: bool = False,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict:
     """
     Returns: { phase: durum }
@@ -1024,6 +1025,22 @@ def run_pipeline(
         else None
     )
 
+    # ---- NVS hold-out indices (single source of truth for trainer + Faz 7 eval) ----
+    # SV path only. Multi-view's held-out test cam is handled separately via
+    # mv_test_camera. If nvs_eval_enabled is off we still compute (cheap) so the
+    # trainer can optionally exclude views, but pass [] to keep behavior unchanged.
+    sv_holdout_indices: list[int] = []
+    if (not is_mv) and len(frame_paths) > 5 and getattr(cfg.train, "nvs_eval_enabled", False):
+        T_sv = len(frame_paths)
+        if getattr(cfg.train, "static_mode", False):
+            # Static: every 8th interleaved (Mip-NeRF360 / vanilla 3DGS convention)
+            sv_holdout_indices = list(range(7, T_sv, 8))
+        else:
+            # 4D: contiguous tail = novel-time eval
+            sv_holdout_indices = list(range(max(0, T_sv - max(1, T_sv // 10)), T_sv))
+        print(f"[pipeline.holdout] SV NVS hold-out: {len(sv_holdout_indices)} of {T_sv} frames "
+              f"({'static_interleaved' if cfg.train.static_mode else 'temporal_tail'})")
+
     history = trainer.train(
         frame_paths, K_first, w2c_list,
         n_iters=cfg.train.n_iters,
@@ -1058,6 +1075,11 @@ def run_pipeline(
         dynamic_densify_scale=getattr(cfg.train, "dynamic_densify_scale", 1.0),
         # Perf — RAM preload (eliminates per-iter MFS latency on cloud filesystems)
         preload_to_ram=getattr(cfg.train, "preload_to_ram", False),
+        # NVS hold-out — exclude these frame indices from SV training so eval
+        # measures real novel-view PSNR. Recomputed identically in Faz 7.
+        holdout_indices=(sv_holdout_indices if sv_holdout_indices else None),
+        # Cooperative cancel — passed through from run_pipeline caller.
+        cancel_check=cancel_check,
     )
     run_logger.phase_end(
         "training",
@@ -1114,11 +1136,30 @@ def run_pipeline(
             eval_dir.mkdir(parents=True, exist_ok=True)
             report = {"scene": scene_name, "type": "mv" if is_mv else "sv"}
 
+            # K_first comes from COLMAP at the native frame resolution; eval renders
+            # at cfg.train.image_resolution. Without this rescale the focal length /
+            # principal point are off by (render / native), reprojection collapses,
+            # and PSNR floor-pegs at ~8 dB regardless of model quality.
+            def _scale_K(K_native: torch.Tensor, w_native: int, h_native: int,
+                         w_render: int, h_render: int) -> torch.Tensor:
+                sx, sy = w_render / w_native, h_render / h_native
+                K_s = K_native.clone()
+                K_s[0, 0] *= sx; K_s[0, 2] *= sx
+                K_s[1, 1] *= sy; K_s[1, 2] *= sy
+                return K_s
+
+            _render_w, _render_h = cfg.train.image_resolution
+
             if is_mv and mv_ctx is not None and mv_ctx.get("test_cam"):
                 # Held-out test cam (N3V cam00 default)
                 test_cam = mv_ctx["test_cam"]
-                test_K = torch.from_numpy(np.array(mv_ctx["calibration"][test_cam]["K"])).float()
-                test_w2c = torch.from_numpy(np.array(mv_ctx["calibration"][test_cam]["w2c"])).float()
+                _calib = mv_ctx["calibration"][test_cam]
+                test_K_native = torch.from_numpy(np.array(_calib["K"])).float()
+                test_w2c = torch.from_numpy(np.array(_calib["w2c"])).float()
+                test_native_w = int(_calib.get("width", _render_w))
+                test_native_h = int(_calib.get("height", _render_h))
+                test_K = _scale_K(test_K_native, test_native_w, test_native_h,
+                                  _render_w, _render_h)
                 test_frame_paths = mv_ctx["frame_paths_per_cam"].get(test_cam, [])
                 if test_frame_paths:
                     cb("eval", 0.2, f"Held-out cam {test_cam} render", {})
@@ -1126,8 +1167,8 @@ def run_pipeline(
                         gs=trainer.gs, deform=trainer.deform,
                         cam_K=test_K, cam_w2c=test_w2c,
                         frame_paths=test_frame_paths,
-                        width=cfg.train.image_resolution[0],
-                        height=cfg.train.image_resolution[1],
+                        width=_render_w,
+                        height=_render_h,
                         static_mode=getattr(cfg.train, "static_mode", False),
                         scene_extent=extent, device=device,
                     )
@@ -1141,16 +1182,28 @@ def run_pipeline(
                     print(f"  Held-out [{test_cam}]: PSNR={held_out['psnr_mean']:.2f} "
                           f"SSIM={held_out['ssim_mean']:.4f} LPIPS={held_out['lpips_mean']:.4f}")
             elif not is_mv and len(frame_paths) > 5:
-                # Single-view temporal hold-out: son %10'unu test ayır
-                T = len(frame_paths)
-                holdout = list(range(max(0, T - max(1, T // 10)), T))
-                cb("eval", 0.2, f"Temporal hold-out ({len(holdout)} frame)", {})
+                # Reuse the same hold-out indices the trainer was told to skip
+                # (single source of truth — see sv_holdout_indices construction
+                # before the trainer.train() call). With the trainer fix these
+                # indices are TRUE novel views; comparable to paper baselines.
+                holdout = list(sv_holdout_indices)
+                holdout_kind = (
+                    "static_interleaved_every_8"
+                    if getattr(cfg.train, "static_mode", False)
+                    else "temporal_tail_10pct"
+                )
+                # Scale K to render resolution
+                _first_cam = cams[sorted(cams.keys())[0]]
+                _native_w = int(_first_cam["width"])
+                _native_h = int(_first_cam["height"])
+                K_eval = _scale_K(K_first, _native_w, _native_h, _render_w, _render_h)
+                cb("eval", 0.2, f"Temporal hold-out ({len(holdout)} frame, {holdout_kind})", {})
                 t_metrics = eval_temporal_holdout(
                     gs=trainer.gs, deform=trainer.deform,
-                    cam_K=K_first, cam_w2c_per_frame=w2c_list,
+                    cam_K=K_eval, cam_w2c_per_frame=w2c_list,
                     frame_paths=frame_paths, holdout_indices=holdout,
-                    width=cfg.train.image_resolution[0],
-                    height=cfg.train.image_resolution[1],
+                    width=_render_w,
+                    height=_render_h,
                     static_mode=getattr(cfg.train, "static_mode", False),
                     scene_extent=extent, device=device,
                 )
@@ -1159,8 +1212,10 @@ def run_pipeline(
                     "ssim": t_metrics["ssim_mean"],
                     "lpips": t_metrics["lpips_mean"],
                     "n_frames": t_metrics["n_frames"],
+                    "holdout_kind": holdout_kind,
                 }
-                print(f"  Temporal hold-out: PSNR={t_metrics['psnr_mean']:.2f} "
+                print(f"  Temporal hold-out [{holdout_kind}]: "
+                      f"PSNR={t_metrics['psnr_mean']:.2f} "
                       f"SSIM={t_metrics['ssim_mean']:.4f} LPIPS={t_metrics['lpips_mean']:.4f}")
 
             # Smooth orbit video
@@ -1172,15 +1227,26 @@ def run_pipeline(
                 torch.from_numpy(np.array(mv_ctx["calibration"][c]["w2c"])).float()
                 for c in mv_ctx["train_cams"]
             ]
-            K_for_orbit = K_first if not is_mv else torch.from_numpy(
-                np.array(mv_ctx["calibration"][mv_ctx["train_cams"][0]]["K"])
-            ).float()
+            if not is_mv:
+                _first_cam = cams[sorted(cams.keys())[0]]
+                K_for_orbit = _scale_K(
+                    K_first, int(_first_cam["width"]), int(_first_cam["height"]),
+                    _render_w, _render_h,
+                )
+            else:
+                _ref = mv_ctx["calibration"][mv_ctx["train_cams"][0]]
+                K_native = torch.from_numpy(np.array(_ref["K"])).float()
+                K_for_orbit = _scale_K(
+                    K_native, int(_ref.get("width", _render_w)),
+                    int(_ref.get("height", _render_h)),
+                    _render_w, _render_h,
+                )
             orbit_result = render_orbit_video(
                 gs=trainer.gs, deform=trainer.deform,
                 K=K_for_orbit, train_w2c=train_w2c_for_orbit,
                 out_path=orbit_path,
-                width=cfg.train.image_resolution[0],
-                height=cfg.train.image_resolution[1],
+                width=_render_w,
+                height=_render_h,
                 num_frames=n_orbit, fps=fps_orbit,
                 static_mode=getattr(cfg.train, "static_mode", False),
                 scene_extent=extent, device=device,

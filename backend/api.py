@@ -459,14 +459,18 @@ async def process_video(
                 except Exception as e:
                     raise HTTPException(400, f"multires_schedule parse failed: {e}")
 
-            return run_pipeline(
+            _result = run_pipeline(
                 str(video_path),
                 safe_scene,
                 cfg,
                 skip_foundation=effective_skip_foundation,
                 progress_callback=on_progress,
                 force_preprocess=force_preprocess,
+                cancel_check=lambda: manager.cancel_requested(job.id),
             )
+            if manager.cancel_requested(job.id):
+                raise RuntimeError("Cancelled by user")
+            return _result
 
         # ---- Dynamic mode (legacy path) ----
         if smoke_test:
@@ -845,14 +849,18 @@ async def process_video(
             except Exception as e:
                 raise HTTPException(400, f"multires_schedule parse failed: {e}")
 
-        return run_pipeline(
+        _result = run_pipeline(
             str(video_path),
             safe_scene,
             cfg,
             skip_foundation=effective_skip_foundation,
             progress_callback=on_progress,
             force_preprocess=force_preprocess,
+            cancel_check=lambda: manager.cancel_requested(job.id),
         )
+        if manager.cancel_requested(job.id):
+            raise RuntimeError("Cancelled by user")
+        return _result
 
     manager.submit(job.id, _runner)
 
@@ -880,8 +888,9 @@ def get_status(job_id: str) -> Job:
 def cancel_job(job_id: str) -> dict:
     """Cancel a job.
     - QUEUED jobs: marked as failed, future cancelled, no GPU work happens.
-    - RUNNING jobs: cannot be cancelled cleanly (subprocess phase blocks).
-      Returns 409 with a hint to stop the pod if you really need to abort.
+    - RUNNING jobs: cancel_requested flag is set; the training loop polls it
+      every iteration and stops cleanly. Non-training subprocess phases
+      (ffmpeg, COLMAP) still run to completion before the flag is observed.
     """
     manager: JobManager = app.state.manager
     job = manager.get(job_id)
