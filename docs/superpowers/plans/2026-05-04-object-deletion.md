@@ -555,7 +555,7 @@ git commit -m "feat(edit): Gaussian classifier — project, vote, threshold"
 - Create: `backend/edit/warp.py`
 - Create: `scripts/test_edit_warp.py`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```python
 # scripts/test_edit_warp.py
@@ -605,7 +605,7 @@ if __name__ == "__main__":
     print("ok: test_zero_baseline_identity")
 ```
 
-- [ ] **Step 2: Run test, verify it fails**
+- [x] **Step 2: Run test, verify it fails**
 
 ```
 python scripts/test_edit_warp.py
@@ -613,7 +613,7 @@ python scripts/test_edit_warp.py
 
 Expected: `ImportError` because `backend.edit.warp` doesn't exist.
 
-- [ ] **Step 3: Implement the warp**
+- [x] **Step 3: Implement the warp**
 
 Create `backend/edit/warp.py`:
 
@@ -692,7 +692,7 @@ def warp_anchor_to_target(
     return sampled.squeeze(0)
 ```
 
-- [ ] **Step 4: Run test, verify it passes**
+- [x] **Step 4: Run test, verify it passes**
 
 ```
 python scripts/test_edit_warp.py
@@ -700,7 +700,7 @@ python scripts/test_edit_warp.py
 
 Expected: `ok: test_zero_baseline_identity`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add backend/edit/warp.py scripts/test_edit_warp.py
