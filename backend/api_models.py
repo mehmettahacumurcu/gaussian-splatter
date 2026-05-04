@@ -47,6 +47,11 @@ class Job(BaseModel):
     ply_dir: str | None = None
     download_url: str | None = None
 
+    # Cooperative cancel — set by JobManager.cancel() for RUNNING jobs.
+    # Runners poll this via JobManager.cancel_requested(job_id) and stop
+    # cleanly at the next phase/iter checkpoint.
+    cancel_requested: bool = False
+
 
 class ProcessResponse(BaseModel):
     """POST /process cevabı."""

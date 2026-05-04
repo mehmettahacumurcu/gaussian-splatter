@@ -237,12 +237,17 @@ class JobManager:
     # Cancel
     # ------------------------------------------------------------------
     def cancel_requested(self, job_id: str) -> bool:
-        """True if cancel() was called on a still-running job. Runners poll this."""
+        """True if cancel() was called on a still-running job. Runners poll this.
+
+        Handles both Pydantic Job objects (production) and plain dicts (tests).
+        """
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
                 return False
-            return bool(job.get("cancel_requested", False))
+            if isinstance(job, dict):
+                return bool(job.get("cancel_requested", False))
+            return bool(getattr(job, "cancel_requested", False))
 
     def cancel(self, job_id: str) -> tuple[bool, str]:
         """Cancel a job. Returns (success, message).
@@ -276,7 +281,10 @@ class JobManager:
                 # RUNNING: set the flag and let the runner observe it on its next poll.
                 # The runner is responsible for stopping cleanly and transitioning to
                 # FAILED/CANCELLED. cancel_requested() exposes the flag.
-                job["cancel_requested"] = True
+                if is_dict:
+                    job["cancel_requested"] = True
+                else:
+                    job.cancel_requested = True
                 return (True, "Cancel requested; runner will stop at next checkpoint.")
             if job_status in (JobStatus.COMPLETED, JobStatus.FAILED, "completed", "failed"):
                 status_value = job_status.value if hasattr(job_status, "value") else job_status
