@@ -242,6 +242,12 @@ async def process_video(
     lr_cam_w2c: float | None = Form(None, description="Joint BA on extrinsics (1e-7 typical)"),
     cam_refine_start_iter: int | None = Form(None, description="Iter to start joint BA"),
     multires_schedule: str | None = Form(None, description='Comma-separated "iter:long_edge" pairs, e.g., "0:480,10000:720,25000:1080"'),
+    # --- Edit mode parameters (D1/D2: object deletion) ---
+    source_ckpt: str | None = Form(None, description="[edit mode] Source checkpoint relative to data/<scene>/"),
+    frame_idx: int | None = Form(None, description="[edit mode] Frame index user clicked on"),
+    click_x: float | None = Form(None, description="[edit mode] Normalized x click [0,1]"),
+    click_y: float | None = Form(None, description="[edit mode] Normalized y click [0,1]"),
+    quality_mode: str | None = Form(None, description="[edit mode] 'A' (LaMa preview) or 'B' (SD quality)"),
 ) -> ProcessResponse:
     """
     Video'yu upload et ve pipeline'ı kuyruğa al.
@@ -261,8 +267,42 @@ async def process_video(
     # Eski boolean flag'leri override eder. Mode='static' verilirse
     # static_mode_active True yapilir, alt presetlerle birlikte islenir.
     mode_norm = (mode or "dynamic").strip().lower()
-    if mode_norm not in ("static", "dynamic"):
-        raise HTTPException(400, f"mode '{mode}' invalid — use 'static' or 'dynamic'")
+    if mode_norm not in ("static", "dynamic", "edit"):
+        raise HTTPException(400, f"mode '{mode}' invalid — use 'static', 'dynamic', or 'edit'")
+
+    manager: JobManager = app.state.manager
+
+    # ---- Edit mode (object deletion) ----
+    if mode_norm == "edit":
+        if source_ckpt is None or frame_idx is None or click_x is None or click_y is None:
+            raise HTTPException(400, "edit mode requires: source_ckpt, frame_idx, click_x, click_y")
+        _quality_mode = quality_mode if quality_mode is not None else "A"
+        if _quality_mode not in ("A", "B"):
+            raise HTTPException(400, f"quality_mode must be 'A' or 'B', got '{_quality_mode}'")
+        if not (0.0 <= click_x <= 1.0 and 0.0 <= click_y <= 1.0):
+            raise HTTPException(400, "click_x/click_y must be normalized [0, 1]")
+
+        scene_dir = paths["base"]
+        source_ckpt_path = scene_dir / source_ckpt
+        if not scene_dir.exists():
+            raise HTTPException(404, f"Scene not found: {safe_scene}")
+        if not source_ckpt_path.exists():
+            raise HTTPException(404, f"Source ckpt not found: {source_ckpt_path}")
+
+        job_id = manager.submit_edit(
+            scene=safe_scene,
+            scene_dir=scene_dir,
+            source_ckpt=source_ckpt_path,
+            frame_idx=frame_idx,
+            click_xy=(click_x, click_y),
+            quality_mode=_quality_mode,
+        )
+        return ProcessResponse(
+            job_id=job_id,
+            status=JobStatus.QUEUED,
+            status_url=f"/status/{job_id}",
+        )
+
     static_mode_active = (mode_norm == "static")
     # Default local_max preset flag — preset='local_max' verilmedikce False kalir
     local_max = False
@@ -340,7 +380,6 @@ async def process_video(
         # else: dynamic + multi-view scene already on disk — fall through, no upload needed
 
     # Job kaydını oluştur
-    manager: JobManager = app.state.manager
     job = manager.create(scene=safe_scene, smoke_test=smoke_test)
 
     # Runner kapanı — pipeline.run_pipeline'ı callback'le çağırır

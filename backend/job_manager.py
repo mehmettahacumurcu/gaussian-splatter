@@ -5,6 +5,7 @@ request gelirse ThreadPoolExecutor(max_workers=1) onları sırayla işler.
 State in-memory tutuluyor — server restart'ında kaybolur.
 """
 from __future__ import annotations
+import secrets
 import threading
 import time
 import uuid
@@ -108,6 +109,62 @@ class JobManager:
         future = self._executor.submit(_wrapped)
         with self._lock:
             self._futures[job_id] = future
+
+    def submit_edit(
+        self,
+        scene: str,
+        scene_dir: Path,
+        source_ckpt: Path,
+        frame_idx: int,
+        click_xy: tuple[float, float],
+        quality_mode: str,
+    ) -> str:
+        """Queue an edit (object-deletion) job. Returns job_id."""
+        from .edit.runner import EditJobRunner
+
+        job_id = f"edit_{int(time.time() * 1000)}_{secrets.token_hex(3)}"
+        job = Job(
+            id=job_id,
+            scene=scene,
+            status=JobStatus.QUEUED,
+            smoke_test=False,
+            created_at=time.time(),
+        )
+        with self._lock:
+            self._jobs[job_id] = job
+
+        def _on_progress(phase: str, frac: float, msg: str = "",
+                         details: dict[str, Any] | None = None) -> None:
+            self._update_phase(job_id, phase, frac, msg, details or {})
+
+        def _runner_wrapper() -> None:
+            self._mark_started(job_id)
+            try:
+                runner = EditJobRunner(
+                    scene_dir=scene_dir,
+                    source_ckpt=source_ckpt,
+                    frame_idx=frame_idx,
+                    click_xy=click_xy,
+                    quality_mode=quality_mode,
+                    progress_cb=_on_progress,
+                    cancel_check=lambda: self.cancel_requested(job_id),
+                )
+                new_ckpt = runner.run()
+                result = {"new_ckpt": str(new_ckpt), "edit_dir": str(runner.edit_dir)}
+                self._mark_completed(job_id, result=result)
+                with self._lock:
+                    j = self._jobs.get(job_id)
+                    if j is not None:
+                        j.ply_dir = str(runner.edit_dir)
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                tb = traceback.format_exc()
+                self._mark_failed(job_id, error=f"{e}\n\n{tb}")
+
+        future = self._executor.submit(_runner_wrapper)
+        with self._lock:
+            self._futures[job_id] = future
+        return job_id
 
     # ------------------------------------------------------------------
     # İç state güncelleyiciler
