@@ -13,6 +13,15 @@ from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+# VGG-16 forward at 1080p needs ~3 GB of activations (conv1_x alone = 1.06 GB).
+# That blows 8 GB cards before the densifier even starts. Standard practice in
+# 3DGS papers is to downsample LPIPS input to ≤512 long-edge — the perceptual
+# signal at this scale is essentially identical (LPIPS paper used 64x64), but
+# memory drops by (orig / cap)² which is ~14× for a 1920px input.
+LPIPS_MAX_LONG_EDGE = 512
 
 
 class LPIPSLoss(nn.Module):
@@ -72,6 +81,23 @@ class LPIPSLoss(nn.Module):
         if pred.dim() == 3:
             pred = pred.unsqueeze(0)
             target = target.unsqueeze(0)
+
+        # Cap long edge so VGG activations stay bounded on 8 GB cards.
+        # Bilinear+antialias preserves the perceptual signal LPIPS cares about.
+        H, W = pred.shape[-2:]
+        if max(H, W) > LPIPS_MAX_LONG_EDGE:
+            scale = LPIPS_MAX_LONG_EDGE / max(H, W)
+            new_h = max(1, int(round(H * scale)))
+            new_w = max(1, int(round(W * scale)))
+            pred = F.interpolate(
+                pred, size=(new_h, new_w),
+                mode="bilinear", align_corners=False, antialias=True,
+            )
+            target = F.interpolate(
+                target, size=(new_h, new_w),
+                mode="bilinear", align_corners=False, antialias=True,
+            )
+
         pred_n = pred.clamp(0, 1) * 2.0 - 1.0
         target_n = target.clamp(0, 1) * 2.0 - 1.0
         # Eval mode (BN/dropout disabled), but allow gradient w.r.t. input
