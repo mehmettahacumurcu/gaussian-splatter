@@ -54,3 +54,11 @@ pyyaml>=6.0.1
 # Then download the small variant checkpoint to ~/.cache/sam2/
 #   sam2.1_hiera_small.pt
 # from https://github.com/facebookresearch/sam2#download-checkpoints
+
+# Object editing — Task B5 (inpainting backends)
+# LaMa fast preview:
+#   pip install simple-lama-inpainting
+# Stable Diffusion inpaint quality:
+#   pip install diffusers transformers accelerate
+# Optional VRAM optimization:
+#   pip install xformers

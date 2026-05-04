@@ -893,7 +893,7 @@ git commit -m "feat(edit): SAM 2 service — click-to-mask + video propagation"
 **Files:**
 - Create: `backend/edit/inpainter.py`
 
-- [ ] **Step 1: Confirm LaMa availability**
+- [x] **Step 1: Confirm LaMa availability**
 
 ```
 python -c "import lama_cleaner" 2>&1
@@ -901,7 +901,9 @@ python -c "import lama_cleaner" 2>&1
 
 If not installed: `pip install simple-lama-inpainting` (lighter than full lama-cleaner; covers our use case). Add to `requirements.txt`.
 
-- [ ] **Step 2: Implement the interface + LaMa**
+Result: `simple_lama_inpainting` NOT installed; `diffusers` NOT installed. Both documented in `requirements.txt` as install hints.
+
+- [x] **Step 2: Implement the interface + LaMa**
 
 Create `backend/edit/inpainter.py`:
 
@@ -1033,11 +1035,11 @@ class SDInpainter(InpainterBase):
         return np.array(result, dtype=np.uint8)
 ```
 
-- [ ] **Step 3: Smoke test (GPU)**
+- [ ] **Step 3: Smoke test (GPU)** — DEFERRED (user away; run live model load when back at PC)
 
 Skip in CI. Validate later when a real edit job runs.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add backend/edit/inpainter.py requirements.txt
