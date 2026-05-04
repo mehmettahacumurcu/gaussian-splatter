@@ -712,7 +712,7 @@ git commit -m "feat(edit): depth-warp anchor-to-target utility"
 **Files:**
 - Create: `backend/edit/sam_service.py`
 
-- [ ] **Step 1: Confirm SAM 2 package is available**
+- [x] **Step 1: Confirm SAM 2 package is available**
 
 ```
 python -c "import sam2; print(sam2.__version__)"
@@ -722,7 +722,7 @@ If not installed: add `sam2` (or `segment_anything_2`) to `requirements.txt` and
 
 If `sam2` package isn't on PyPI, this task uses the GitHub install: `pip install git+https://github.com/facebookresearch/sam2.git`. Document the chosen install method in `requirements.txt` with a comment.
 
-- [ ] **Step 2: Implement the service wrapper**
+- [x] **Step 2: Implement the service wrapper**
 
 Create `backend/edit/sam_service.py`:
 
@@ -881,7 +881,7 @@ s.unload()
 
 Expected: a non-zero mask roughly covering the square. If checkpoint is missing, follow the download instructions printed in the FileNotFoundError.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add backend/edit/sam_service.py requirements.txt
