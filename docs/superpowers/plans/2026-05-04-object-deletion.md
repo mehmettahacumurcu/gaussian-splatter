@@ -1613,7 +1613,7 @@ git commit -m "feat(edit): depth-warp anchor propagation in Phase 4"
 **Files:**
 - Modify: `backend/api_models.py`
 
-- [ ] **Step 1: Add EditJobRequest model**
+- [x] **Step 1: Add EditJobRequest model**
 
 In `backend/api_models.py`, after the existing models, add:
 
@@ -1633,7 +1633,7 @@ class EditJobRequest(BaseModel):
     quality_mode: str = Field(..., description="'A' (LaMa preview) or 'B' (SD quality)")
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add backend/api_models.py
@@ -1645,7 +1645,7 @@ git commit -m "feat(api): EditJobRequest model"
 **Files:**
 - Modify: `backend/api.py`
 
-- [ ] **Step 1: Read the existing `/process` endpoint**
+- [x] **Step 1: Read the existing `/process` endpoint**
 
 ```
 grep -n "@app.post(.*process" backend/api.py
@@ -1653,7 +1653,7 @@ grep -n "@app.post(.*process" backend/api.py
 
 Read the existing handler. Note how `mode` is dispatched.
 
-- [ ] **Step 2: Branch on `mode == "edit"` to dispatch EditJobRunner**
+- [x] **Step 2: Branch on `mode == "edit"` to dispatch EditJobRunner**
 
 In the `/process` handler, after the existing static/dynamic mode branches, add an `elif mode == "edit":` branch. It validates the EditJobRequest fields (form values), creates a job entry in the manager, and dispatches `EditJobRunner.run()` via the executor.
 
@@ -1691,7 +1691,7 @@ The exact integration matches the existing dispatch pattern. Pseudocode:
 
 The actual `manager.submit_edit(...)` is added in Task D3.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add backend/api.py
@@ -1703,7 +1703,7 @@ git commit -m "feat(api): /process accepts mode=edit and dispatches edit job"
 **Files:**
 - Modify: `backend/job_manager.py`
 
-- [ ] **Step 1: Add submit_edit method**
+- [x] **Step 1: Add submit_edit method**
 
 In `backend/job_manager.py`, after the existing `submit(...)` method, add:
 
@@ -1775,7 +1775,7 @@ In `backend/job_manager.py`, after the existing `submit(...)` method, add:
         return job_id
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit**
 
 ```bash
 git add backend/job_manager.py
