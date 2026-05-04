@@ -237,6 +237,17 @@ export async function getJobStatus(jobId: string): Promise<Job> {
   return fetchJson<Job>(`/status/${jobId}`);
 }
 
+export async function cancelJob(jobId: string): Promise<{ ok: boolean; message: string }> {
+  const res = await fetch(`${getApiBase()}/cancel/${jobId}`, {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+  });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+  }
+  return res.json();
+}
+
 export async function listDiskScenes(): Promise<SceneListResponse> {
   return fetchJson<SceneListResponse>(`/scenes`);
 }

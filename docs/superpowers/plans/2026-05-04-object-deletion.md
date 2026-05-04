@@ -248,7 +248,7 @@ git commit -m "feat(jobs): runners poll cancel_requested; running jobs now stop 
 - Modify: `frontend/src/api.ts`
 - Modify: `frontend/src/components/JobsList.tsx`
 
-- [ ] **Step 1: Add `cancelJob` to `frontend/src/api.ts`**
+- [x] **Step 1: Add `cancelJob` to `frontend/src/api.ts`**
 
 After the existing `getJobStatus` function (around line 236), add:
 
@@ -265,7 +265,7 @@ export async function cancelJob(jobId: string): Promise<{ ok: boolean; message: 
 }
 ```
 
-- [ ] **Step 2: Read existing JobsList.tsx to find the row component**
+- [x] **Step 2: Read existing JobsList.tsx to find the row component**
 
 ```
 cat frontend/src/components/JobsList.tsx
@@ -273,7 +273,7 @@ cat frontend/src/components/JobsList.tsx
 
 Identify where each job row renders (look for a `.map(job => ...)` block).
 
-- [ ] **Step 3: Add İptal button to running-job rows**
+- [x] **Step 3: Add İptal button to running-job rows**
 
 Inside the row map, where status badges or actions are rendered, add a conditional button. The exact integration depends on the existing JSX shape — the pattern should be:
 
@@ -299,11 +299,11 @@ Inside the row map, where status badges or actions are rendered, add a condition
 
 Add `cancelJob` to the existing imports from `../api` at the top of the file.
 
-- [ ] **Step 4: Manual UI test**
+- [x] **Step 4: Manual UI test**
 
 Reload Tauri window, submit a fast training job, click İptal mid-training, confirm dialog, observe job transitions to failed status within ~10 sec. Backend log should show the cancel message.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add frontend/src/api.ts frontend/src/components/JobsList.tsx

@@ -9,7 +9,7 @@
  */
 import { useEffect, useState } from "react";
 import type { Job } from "../api";
-import { downloadUrl, listJobs } from "../api";
+import { cancelJob, downloadUrl, listJobs } from "../api";
 
 interface Props {
   onViewJob: (job: Job) => void;
@@ -125,11 +125,26 @@ function JobRow({ job, expanded, onToggleExpand, onView }: RowProps) {
         </div>
       )}
 
-      {/* Phase + message */}
+      {/* Phase + message + cancel button */}
       {job.status === "running" && (
         <div className="job-phase-row">
           <span className="job-phase-name">{job.phase.name}</span>
           <span className="job-phase-msg">{job.phase.message}</span>
+          <button
+            className="btn-secondary btn-sm"
+            onClick={async (e) => {
+              e.stopPropagation();
+              if (!confirm(`İptal: ${job.scene}? Şu an durduralım mı?`)) return;
+              try {
+                await cancelJob(job.id);
+              } catch (err) {
+                console.error("[JobsList] cancel failed:", err);
+                alert(`Cancel failed: ${err}`);
+              }
+            }}
+          >
+            İptal
+          </button>
         </div>
       )}
 
