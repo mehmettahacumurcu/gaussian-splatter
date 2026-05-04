@@ -179,6 +179,14 @@ class JobManager:
     # ------------------------------------------------------------------
     # Cancel
     # ------------------------------------------------------------------
+    def cancel_requested(self, job_id: str) -> bool:
+        """True if cancel() was called on a still-running job. Runners poll this."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False
+            return bool(job.get("cancel_requested", False))
+
     def cancel(self, job_id: str) -> tuple[bool, str]:
         """Cancel a job. Returns (success, message).
         - QUEUED jobs: Future cancelled, status set to FAILED. Reliable.
@@ -192,24 +200,31 @@ class JobManager:
             if job is None:
                 return False, "Job not found"
             future = self._futures.get(job_id)
-            if job.status == JobStatus.QUEUED:
+            # Handle both Job objects and dicts (for testing)
+            is_dict = isinstance(job, dict)
+            job_status = job.get("status") if is_dict else job.status
+            if job_status == JobStatus.QUEUED or job_status == "queued":
                 if future is not None and future.cancel():
-                    job.status = JobStatus.FAILED
-                    job.finished_at = time.time()
-                    job.error = "Cancelled by user (queued)"
+                    if is_dict:
+                        job["status"] = JobStatus.FAILED
+                        job["finished_at"] = time.time()
+                        job["error"] = "Cancelled by user (queued)"
+                    else:
+                        job.status = JobStatus.FAILED
+                        job.finished_at = time.time()
+                        job.error = "Cancelled by user (queued)"
                     return True, "Cancelled queued job"
                 # Future raced into running between .get() and .cancel() — fall through
-            if job.status == JobStatus.RUNNING:
-                # Can't actually stop a running job from outside. Mark a flag
-                # the pipeline could check, but for now the best we can do is
-                # let it finish or hang. Don't lie to the user.
-                return False, (
-                    "Job is already running; cancellation not supported once "
-                    "subprocess phase begins. Stop the pod to abort."
-                )
-            if job.status in (JobStatus.COMPLETED, JobStatus.FAILED):
-                return False, f"Job already {job.status.value}"
-            return False, f"Unknown status: {job.status}"
+            if job_status == JobStatus.RUNNING or job_status == "running":
+                # RUNNING: set the flag and let the runner observe it on its next poll.
+                # The runner is responsible for stopping cleanly and transitioning to
+                # FAILED/CANCELLED. cancel_requested() exposes the flag.
+                job["cancel_requested"] = True
+                return (True, "Cancel requested; runner will stop at next checkpoint.")
+            if job_status in (JobStatus.COMPLETED, JobStatus.FAILED, "completed", "failed"):
+                status_value = job_status.value if hasattr(job_status, "value") else job_status
+                return False, f"Job already {status_value}"
+            return False, f"Unknown status: {job_status}"
 
     # ------------------------------------------------------------------
     # Shutdown
