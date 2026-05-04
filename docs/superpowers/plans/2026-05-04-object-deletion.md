@@ -1055,7 +1055,7 @@ git commit -m "feat(edit): inpainter interface + LaMa + SD backends"
 **Files:**
 - Create: `backend/edit/refit.py`
 
-- [ ] **Step 1: Implement refit**
+- [x] **Step 1: Implement refit**
 
 Create `backend/edit/refit.py`:
 
@@ -1148,7 +1148,7 @@ def run_refit(
 
 Note: this task creates the module and the helpers; the trainer wiring lives in Task C2 because it needs a corresponding trainer-side change. The `filter_in_place` and `set_freeze_mask` methods on `GaussianModel` are added in Task C2 step 1.
 
-- [ ] **Step 2: Commit (skeleton; complete in C2)**
+- [x] **Step 2: Commit (skeleton; complete in C2)**
 
 ```bash
 git add backend/edit/refit.py
