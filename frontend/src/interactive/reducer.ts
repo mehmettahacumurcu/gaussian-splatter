@@ -40,6 +40,11 @@ export function pickupReducer(state: PickupState, action: PickupAction): PickupS
         return { kind: 'IDLE' }
       }
       return state
+
+    default: {
+      const _exhaustive: never = state
+      return _exhaustive
+    }
   }
 }
 

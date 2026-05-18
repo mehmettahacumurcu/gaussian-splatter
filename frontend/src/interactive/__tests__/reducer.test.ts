@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { computeThrowVelocity, initialPickupState, pickupReducer } from '../reducer'
+import type { PickupAction } from '../types'
 
 describe('pickupReducer', () => {
   it('starts in IDLE', () => {
@@ -107,5 +108,37 @@ describe('computeThrowVelocity', () => {
     expect(result[0]).toBeCloseTo(10 * inv, 5)
     expect(result[1]).toBeCloseTo(0, 5)
     expect(result[2]).toBeCloseTo(-10 * inv, 5)
+  })
+})
+
+describe('state-action matrix coverage — ignored cells', () => {
+  const IDLE = { kind: 'IDLE' as const }
+  const AIMING = { kind: 'AIMING_AT_OBJ' as const, targetId: 'mug' }
+  const HOLDING = { kind: 'HOLDING' as const, targetId: 'mug' }
+  const THROWING = { kind: 'THROWING' as const, targetId: 'mug' }
+
+  it.each<[string, PickupAction]>([
+    ['PRESS_E', { type: 'PRESS_E' }],
+    ['PRESS_G', { type: 'PRESS_G' }],
+    ['LEFT_CLICK', { type: 'LEFT_CLICK' }],
+    ['THROW_COMPLETE', { type: 'THROW_COMPLETE' }],
+  ])('IDLE ignores %s', (_label, action) => {
+    expect(pickupReducer(IDLE, action)).toEqual(IDLE)
+  })
+
+  it('AIMING_AT_OBJ ignores THROW_COMPLETE', () => {
+    expect(pickupReducer(AIMING, { type: 'THROW_COMPLETE' })).toEqual(AIMING)
+  })
+
+  it('HOLDING ignores THROW_COMPLETE', () => {
+    expect(pickupReducer(HOLDING, { type: 'THROW_COMPLETE' })).toEqual(HOLDING)
+  })
+
+  it('THROWING ignores RAY_MISS', () => {
+    expect(pickupReducer(THROWING, { type: 'RAY_MISS' })).toEqual(THROWING)
+  })
+
+  it('THROWING ignores LEFT_CLICK', () => {
+    expect(pickupReducer(THROWING, { type: 'LEFT_CLICK' })).toEqual(THROWING)
   })
 })
