@@ -3,9 +3,37 @@ import { Physics } from '@react-three/rapier'
 import { Suspense } from 'react'
 import { FirstPersonController } from './FirstPersonController'
 import { StaticEnvironment } from './loaders/StaticEnvironment'
+import { DynamicObject, type DynamicObjectSpec } from './loaders/DynamicObject'
 import { DEFAULTS } from './config'
 
 const SPAWN_POSITION: [number, number, number] = [0, 1.7, 3]
+
+const TEST_OBJECTS: DynamicObjectSpec[] = [
+  {
+    id: 'ball',
+    shape: 'sphere',
+    size: [0.12, 0, 0],
+    position: [0, 1.5, 0],
+    mass: 0.2,
+    color: '#d94f4f',
+  },
+  {
+    id: 'book',
+    shape: 'box',
+    size: [0.12, 0.02, 0.18],
+    position: [0.5, 1.5, 0],
+    mass: 0.5,
+    color: '#2a6db5',
+  },
+  {
+    id: 'mug',
+    shape: 'cylinder',
+    size: [0.05, 0.06, 0],
+    position: [-0.5, 1.5, 0],
+    mass: 0.3,
+    color: '#e0e0d0',
+  },
+]
 
 export function Scene() {
   return (
@@ -19,6 +47,9 @@ export function Scene() {
         <Physics gravity={DEFAULTS.physics.gravity} timeStep={DEFAULTS.physics.fixedTimestep}>
           <FirstPersonController spawn={SPAWN_POSITION} />
           <StaticEnvironment />
+          {TEST_OBJECTS.map((o) => (
+            <DynamicObject key={o.id} {...o} />
+          ))}
         </Physics>
       </Suspense>
     </Canvas>
