@@ -121,9 +121,13 @@ export function PickupSystem({ dynamicBodies, onStateChange }: Props) {
         { x: camera.position.x, y: camera.position.y, z: camera.position.z },
         { x: dir.x, y: dir.y, z: dir.z },
       )
-      // Filter predicate (8th arg in this Rapier version): skip non-dynamic
-      // bodies. Without this the ray hits the floor or walls first (since
-      // dynamic objects rest on the floor) and we never see the pickup target.
+      // Filter predicate (8th arg in this Rapier version): accept ONLY
+      // bodies that are registered pickup targets. This excludes:
+      //   - static environment (floor/walls), which would otherwise block
+      //     the ray to floor-resting objects
+      //   - the player's own capsule, which the ray sits ON the apex of
+      //     (camera at body_y + capsuleHeight/2 = top of top hemisphere);
+      //     with solid=true Rapier reports TOI=0 self-hit otherwise.
       const hit = world.castRay(
         ray,
         DEFAULTS.pickup.rayMaxDistance,
@@ -134,7 +138,7 @@ export function PickupSystem({ dynamicBodies, onStateChange }: Props) {
         undefined,
         (collider) => {
           const parent = collider.parent()
-          return parent ? parent.bodyType() === 0 : false // 0 = dynamic
+          return parent ? findByHandle(dynamicBodies, parent.handle) !== null : false
         },
       )
       const hitBody = hit?.collider.parent()
