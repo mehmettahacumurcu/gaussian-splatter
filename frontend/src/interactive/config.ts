@@ -7,7 +7,7 @@ export const DEFAULTS = {
     capsuleHeight: 1.7,
   },
   pickup: {
-    rayMaxDistance: 3.0,
+    rayMaxDistance: 5.0,
     holdDistance: 1.5,
     holdSmoothing: 0.3,
     maxPickupMass: 20.0,

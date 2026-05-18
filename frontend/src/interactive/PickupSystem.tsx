@@ -32,11 +32,26 @@ export function PickupSystem({ dynamicBodies, onStateChange }: Props) {
   const [state, dispatch] = useReducer(pickupReducer, initialPickupState)
   const prevStateRef = useRef<PickupState>(initialPickupState)
   const stateRef = useRef<PickupState>(state)
+  const debugLogRef = useRef({ logged: false, frameCount: 0 })
 
   useEffect(() => {
     stateRef.current = state
     onStateChange?.(state)
   }, [state, onStateChange])
+
+  // One-time debug: log registered bodies once the Map is populated (after refs settle).
+  useEffect(() => {
+    const id = setTimeout(() => {
+      const entries = Array.from(dynamicBodies.entries()).map(([k, v]) => ({
+        id: k,
+        handle: v.body.handle,
+        mass: v.mass,
+        type: v.body.bodyType(),
+      }))
+      console.log('[PickupSystem] registered bodies:', entries)
+    }, 500)
+    return () => clearTimeout(id)
+  }, [dynamicBodies])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -106,16 +121,45 @@ export function PickupSystem({ dynamicBodies, onStateChange }: Props) {
         { x: camera.position.x, y: camera.position.y, z: camera.position.z },
         { x: dir.x, y: dir.y, z: dir.z },
       )
-      const hit = world.castRay(ray, DEFAULTS.pickup.rayMaxDistance, true)
+      // Filter predicate (8th arg in this Rapier version): skip non-dynamic
+      // bodies. Without this the ray hits the floor or walls first (since
+      // dynamic objects rest on the floor) and we never see the pickup target.
+      const hit = world.castRay(
+        ray,
+        DEFAULTS.pickup.rayMaxDistance,
+        true,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        (collider) => {
+          const parent = collider.parent()
+          return parent ? parent.bodyType() === 0 : false // 0 = dynamic
+        },
+      )
       const hitBody = hit?.collider.parent()
+
+      // Throttled debug — log every ~30 frames (~0.5s) when ray finds something
+      // OR when we hit a body we don't recognize, so we can diagnose mismatches.
+      debugLogRef.current.frameCount++
+      const shouldLog = debugLogRef.current.frameCount % 30 === 0
+
       if (hitBody) {
         const found = findByHandle(dynamicBodies, hitBody.handle)
+        if (shouldLog) {
+          console.log('[PickupSystem] hit body handle=', hitBody.handle, 'type=', hitBody.bodyType(), 'matched=', found?.id ?? 'NONE',
+            'mapSize=', dynamicBodies.size, 'mapHandles=', Array.from(dynamicBodies.values()).map((e) => e.body.handle))
+        }
         if (found) {
           dispatch({ type: 'RAY_HIT', targetId: found.id, mass: found.entry.mass })
         } else {
           dispatch({ type: 'RAY_MISS' })
         }
       } else {
+        if (shouldLog && debugLogRef.current.frameCount < 600) {
+          console.log('[PickupSystem] no ray hit; camera=', camera.position.toArray(), 'dir=', dir.toArray(),
+            'mapSize=', dynamicBodies.size)
+        }
         dispatch({ type: 'RAY_MISS' })
       }
     }
