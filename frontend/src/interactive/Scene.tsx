@@ -1,4 +1,5 @@
 import { Canvas } from '@react-three/fiber'
+import { FirstPersonController } from './FirstPersonController'
 
 export function Scene() {
   return (
@@ -8,10 +9,12 @@ export function Scene() {
     >
       <ambientLight intensity={0.4} />
       <directionalLight position={[5, 10, 5]} intensity={1.0} />
+      <FirstPersonController />
       <mesh position={[0, 0, 0]}>
         <boxGeometry args={[1, 1, 1]} />
         <meshStandardMaterial color="hotpink" />
       </mesh>
+      <gridHelper args={[20, 20]} />
     </Canvas>
   )
 }
