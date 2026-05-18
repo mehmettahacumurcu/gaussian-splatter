@@ -16,6 +16,7 @@ import { JobsList } from "./components/JobsList";
 import { TrainingAnalytics } from "./components/TrainingAnalytics";
 import { NvsEvalPanel } from "./components/NvsEvalPanel";
 import { ConnectionSettings } from "./components/ConnectionSettings";
+import { InteractivePage } from "./interactive/InteractivePage";
 import {
   getHealth,
   getSplatInfo,
@@ -29,7 +30,7 @@ import {
 } from "./api";
 import { getConnection, isLocal, onConnectionChange } from "./connection";
 
-type Tab = "submit" | "jobs" | "viewer" | "analytics" | "eval";
+type Tab = "submit" | "jobs" | "viewer" | "analytics" | "eval" | "interactive";
 
 type ViewerState =
   | { kind: "idle" }
@@ -239,6 +240,12 @@ function App() {
             onClick={() => setTab("eval")}
           >
             Eval
+          </button>
+          <button
+            className={`tab-btn ${tab === "interactive" ? "active" : ""}`}
+            onClick={() => setTab("interactive")}
+          >
+            Interactive
           </button>
         </nav>
         <div className="app-status">
@@ -511,6 +518,10 @@ function App() {
               </>
             )}
           </div>
+        )}
+
+        {tab === "interactive" && (
+          <InteractivePage />
         )}
       </main>
 
