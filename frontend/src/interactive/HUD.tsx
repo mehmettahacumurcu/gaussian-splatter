@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { DEFAULTS } from './config'
+import type { PickupState } from './types'
 
-export function HUD() {
+export function HUD({ pickupState }: { pickupState: PickupState }) {
   const [locked, setLocked] = useState(false)
 
   useEffect(() => {
@@ -10,41 +11,67 @@ export function HUD() {
     return () => document.removeEventListener('pointerlockchange', onLockChange)
   }, [])
 
+  const aiming = pickupState.kind === 'AIMING_AT_OBJ'
+
   return (
     <>
       {!locked && (
         <div
           style={{
-            position: 'absolute',
-            inset: 0,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            background: 'rgba(0,0,0,0.6)',
-            color: 'white',
-            fontSize: 24,
-            zIndex: 10,
-            pointerEvents: 'none',
+            position: 'absolute', inset: 0,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            background: 'rgba(0,0,0,0.6)', color: 'white', fontSize: 24,
+            zIndex: 10, pointerEvents: 'none',
           }}
         >
           Click to start
         </div>
       )}
       {locked && (
-        <div
-          style={{
-            position: 'absolute',
-            top: '50%',
-            left: '50%',
-            transform: 'translate(-50%, -50%)',
-            width: DEFAULTS.ui.crosshairSize,
-            height: DEFAULTS.ui.crosshairSize,
-            borderRadius: '50%',
-            background: 'white',
-            pointerEvents: 'none',
-            zIndex: 10,
-          }}
-        />
+        <>
+          <div
+            style={{
+              position: 'absolute', top: '50%', left: '50%',
+              transform: 'translate(-50%, -50%)',
+              width: DEFAULTS.ui.crosshairSize,
+              height: DEFAULTS.ui.crosshairSize,
+              borderRadius: '50%',
+              background: aiming ? '#ffe44d' : 'white',
+              pointerEvents: 'none', zIndex: 10,
+              transition: `background ${DEFAULTS.ui.promptFadeMs}ms`,
+            }}
+          />
+          {aiming && (
+            <div
+              style={{
+                position: 'absolute',
+                top: 'calc(50% + 20px)', left: '50%',
+                transform: 'translateX(-50%)',
+                color: 'white', fontSize: 14,
+                background: 'rgba(0,0,0,0.5)',
+                padding: '4px 8px', borderRadius: 4,
+                pointerEvents: 'none', zIndex: 10,
+              }}
+            >
+              [E] pick up
+            </div>
+          )}
+          {pickupState.kind === 'HOLDING' && (
+            <div
+              style={{
+                position: 'absolute',
+                top: 'calc(50% + 20px)', left: '50%',
+                transform: 'translateX(-50%)',
+                color: 'white', fontSize: 14,
+                background: 'rgba(0,0,0,0.5)',
+                padding: '4px 8px', borderRadius: 4,
+                pointerEvents: 'none', zIndex: 10,
+              }}
+            >
+              [G] drop &nbsp; [LClick] throw
+            </div>
+          )}
+        </>
       )}
     </>
   )

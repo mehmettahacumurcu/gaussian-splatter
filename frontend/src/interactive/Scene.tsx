@@ -1,10 +1,12 @@
 import { Canvas } from '@react-three/fiber'
-import { Physics } from '@react-three/rapier'
-import { Suspense } from 'react'
+import { Physics, type RapierRigidBody } from '@react-three/rapier'
+import { Suspense, useCallback, useRef } from 'react'
 import { FirstPersonController } from './FirstPersonController'
 import { StaticEnvironment } from './loaders/StaticEnvironment'
 import { DynamicObject, type DynamicObjectSpec } from './loaders/DynamicObject'
+import { PickupSystem, type DynamicBodyEntry } from './PickupSystem'
 import { DEFAULTS } from './config'
+import type { PickupState } from './types'
 
 const SPAWN_POSITION: [number, number, number] = [0, 1.7, 3]
 
@@ -35,7 +37,14 @@ const TEST_OBJECTS: DynamicObjectSpec[] = [
   },
 ]
 
-export function Scene() {
+export function Scene({ onStateChange }: { onStateChange?: (s: PickupState) => void }) {
+  const bodies = useRef<Map<string, DynamicBodyEntry>>(new Map())
+
+  const registerBody = useCallback((id: string, mass: number, body: RapierRigidBody | null) => {
+    if (body) bodies.current.set(id, { body, mass })
+    else bodies.current.delete(id)
+  }, [])
+
   return (
     <Canvas
       camera={{ position: SPAWN_POSITION, fov: 75 }}
@@ -48,8 +57,13 @@ export function Scene() {
           <FirstPersonController spawn={SPAWN_POSITION} />
           <StaticEnvironment />
           {TEST_OBJECTS.map((o) => (
-            <DynamicObject key={o.id} {...o} />
+            <DynamicObject
+              key={o.id}
+              {...o}
+              ref={(body) => registerBody(o.id, o.mass, body)}
+            />
           ))}
+          <PickupSystem dynamicBodies={bodies.current} onStateChange={onStateChange} />
         </Physics>
       </Suspense>
     </Canvas>
