@@ -46,9 +46,21 @@ export function FirstPersonController({ spawn }: Props) {
     const linvel = body.linvel()
     body.setLinvel({ x: dir.x, y: linvel.y, z: dir.z }, true)
 
+    // Rapier CapsuleCollider total height = halfHeight*2 + radius*2. To get a
+    // human-sized capsule (capsuleHeight ≈ 1.7m), the cylinder halfHeight is
+    // (capsuleHeight - 2*radius) / 2. At rest the body center sits at radius +
+    // halfHeight = capsuleHeight/2 above the floor, so the eye offset from
+    // body center is (capsuleHeight/2 - 2*radius/2) — but simpler: place eye
+    // at body_y + (capsuleHeight/2 - radius) so the eye lands at capsuleHeight
+    // above the floor when standing on it.
     const t = body.translation()
-    camera.position.set(t.x, t.y + DEFAULTS.player.eyeHeight / 2, t.z)
+    const eyeOffset = DEFAULTS.player.capsuleHeight / 2 - DEFAULTS.player.capsuleRadius
+    camera.position.set(t.x, t.y + eyeOffset, t.z)
   })
+
+  // Cylinder halfHeight for CapsuleCollider — total capsule height is
+  // halfHeight*2 + radius*2, which should equal capsuleHeight.
+  const capsuleHalfHeight = DEFAULTS.player.capsuleHeight / 2 - DEFAULTS.player.capsuleRadius
 
   return (
     <>
@@ -60,7 +72,7 @@ export function FirstPersonController({ spawn }: Props) {
         colliders={false}
         mass={70}
       >
-        <CapsuleCollider args={[DEFAULTS.player.capsuleHeight / 2, DEFAULTS.player.capsuleRadius]} />
+        <CapsuleCollider args={[capsuleHalfHeight, DEFAULTS.player.capsuleRadius]} />
       </RigidBody>
       <PointerLockControls />
     </>
