@@ -123,9 +123,31 @@ export function PickupSystem({ dynamicBodies, onStateChange }: Props) {
     if (current.kind === 'HOLDING') {
       const entry = dynamicBodies.get(current.targetId)
       if (entry) {
-        const target = new Vector3()
-        camera.getWorldDirection(target)
-        target.multiplyScalar(DEFAULTS.pickup.holdDistance).add(camera.position)
+        const dir = new Vector3()
+        camera.getWorldDirection(dir)
+
+        // Cast forward; exclude the held body itself so it doesn't self-hit.
+        const wallRay = new rapier.Ray(
+          { x: camera.position.x, y: camera.position.y, z: camera.position.z },
+          { x: dir.x, y: dir.y, z: dir.z },
+        )
+        const wallHit = world.castRay(
+          wallRay,
+          DEFAULTS.pickup.holdDistance + 0.5,
+          true,
+          undefined,
+          undefined,
+          undefined,
+          entry.body,
+        )
+        let effectiveHoldDist: number = DEFAULTS.pickup.holdDistance
+        if (wallHit && wallHit.timeOfImpact < DEFAULTS.pickup.holdDistance) {
+          effectiveHoldDist = Math.max(0.5, wallHit.timeOfImpact - 0.1)
+        }
+
+        const target = new Vector3(dir.x, dir.y, dir.z)
+          .multiplyScalar(effectiveHoldDist)
+          .add(camera.position)
         const cur = entry.body.translation()
         const next = new Vector3(cur.x, cur.y, cur.z).lerp(target, DEFAULTS.pickup.holdSmoothing)
         entry.body.setNextKinematicTranslation({ x: next.x, y: next.y, z: next.z })
