@@ -62,3 +62,35 @@ def test_inpaint_with_sd_uses_provided_inpainter(mocker):
     fake_inpainter.inpaint.assert_called_once()
     assert out.shape == (64, 64, 3)
     assert out.dtype == np.uint8
+
+
+def test_add_gaussians_from_pixels_increments_count():
+    from backend.image_to_scene.outpaint_loop import add_gaussians_from_pixels
+
+    points = torch.randn(100, 3)
+    colors = torch.rand(100, 3)
+    model = init_gaussian_model_from_seed(points, colors, sh_degree=0)
+    before = model.means.shape[0]
+    before_is_static = model.is_static.shape[0]
+
+    H, W = 32, 32
+    K = intrinsics_from_fov(W, H, 60.0)
+    pose = generate_bounded_room_trajectory(n_views=1)[0]
+    new_depth_aligned = np.ones((H, W), dtype=np.float32) * 2.0
+    rgb = np.full((H, W, 3), 128, dtype=np.uint8)
+    new_pixel_mask = np.zeros((H, W), dtype=bool)
+    new_pixel_mask[10:20, 10:20] = True  # 100 new pixels
+
+    added = add_gaussians_from_pixels(model, rgb, new_depth_aligned, new_pixel_mask, pose, K)
+
+    after = model.means.shape[0]
+    assert after == before + added
+    assert added <= 100  # may subsample
+    assert added > 0
+    # Buffers must also extend.
+    assert model.is_static.shape[0] == after
+    assert model.is_background.shape[0] == after
+    # And all SH params.
+    assert model.sh_dc.shape[0] == after
+    assert model.scales.shape[0] == after
+    assert model.opacities.shape[0] == after
