@@ -190,12 +190,13 @@ def add_gaussians_from_pixels(
         # SH DC from RGB
         new_sh_dc = _rgb_to_sh_dc(new_colors).unsqueeze(1)  # (M, 1, 3)
         model.sh_dc = nn.Parameter(torch.cat([model.sh_dc.data, new_sh_dc], dim=0))
-        # SH rest zero
-        if model.num_sh_rest > 0:
-            new_sh_rest = torch.zeros(
-                (M, model.num_sh_rest, 3), device=device, dtype=dtype,
-            )
-            model.sh_rest = nn.Parameter(torch.cat([model.sh_rest.data, new_sh_rest], dim=0))
+        # SH rest zero. Always extend, even when num_sh_rest == 0 (sh_degree=0),
+        # otherwise sh_rest stays at the original N while sh_dc grows, and the
+        # renderer's torch.cat([sh_dc, sh_rest], dim=1) crashes on the next call.
+        new_sh_rest = torch.zeros(
+            (M, model.num_sh_rest, 3), device=device, dtype=dtype,
+        )
+        model.sh_rest = nn.Parameter(torch.cat([model.sh_rest.data, new_sh_rest], dim=0))
         # Fourier coefs (if fourier_K > 0)
         if model.fourier_K > 0 and model.fourier_pos_coeffs is not None:
             new_fourier = torch.zeros(

@@ -237,6 +237,10 @@ def run_image_to_scene(
 
     # ── Phase 3: outpaint loop ───────────────────────────────────────────────
     cb("outpaint_loop_start", 0.30, "loading SDInpainter", {})
+    # Uses SDInpainter's default model_id ("runwayml/stable-diffusion-inpainting"),
+    # which is already cached locally. diffusers is pinned to 0.30.x because newer
+    # versions (0.32+) block loading .bin files without torch 2.6+; the runwayml
+    # HF mirror ships only .bin, so we keep diffusers older to avoid that wall.
     inpainter = SDInpainter(device=device)
 
     with tempfile.TemporaryDirectory(prefix="b_loop_") as tmp_root:
