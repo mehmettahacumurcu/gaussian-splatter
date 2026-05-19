@@ -3,7 +3,11 @@ import math
 import numpy as np
 import pytest
 import torch
-from backend.image_to_scene.outpaint_loop import render_pose, visibility_mask_from_alpha
+from backend.image_to_scene.outpaint_loop import (
+    render_pose,
+    visibility_mask_from_alpha,
+    inpaint_with_sd,
+)
 from backend.image_to_scene.trajectory import generate_bounded_room_trajectory
 from backend.image_to_scene.intrinsics import intrinsics_from_fov
 from backend.image_to_scene.seed import init_gaussian_model_from_seed
@@ -44,3 +48,17 @@ def test_visibility_mask_dilates_edge():
     alpha[5:15, 5:15] = 1.0
     visible, to_fill = visibility_mask_from_alpha(alpha, threshold=0.5, dilate_px=2)
     assert visible.sum() < 100  # eroded
+
+
+def test_inpaint_with_sd_uses_provided_inpainter(mocker):
+    fake_inpainter = mocker.Mock()
+    fake_inpainter.inpaint.return_value = np.full((64, 64, 3), 200, dtype=np.uint8)
+
+    rgb = np.full((64, 64, 3), 100, dtype=np.uint8)
+    mask = np.zeros((64, 64), dtype=np.uint8)
+    mask[10:20, 10:20] = 1
+
+    out = inpaint_with_sd(fake_inpainter, rgb, mask)
+    fake_inpainter.inpaint.assert_called_once()
+    assert out.shape == (64, 64, 3)
+    assert out.dtype == np.uint8
