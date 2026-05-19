@@ -79,7 +79,12 @@ def train_on_generated_views(
     deform = DeformationField()
     device_str = "cuda" if device.type == "cuda" else "cpu"
 
-    trainer = Trainer4DGS(gs=model, deform=deform, device=device_str)
+    # B uses fourier_K=0 (static, no time-varying motion). Trainer4DGS's default
+    # deform_pos_mode='hybrid' requires fourier_K>0, so override to "mlp" which
+    # doesn't need Fourier coefficients. In static_mode the trainer bypasses
+    # deformation entirely anyway.
+    trainer = Trainer4DGS(gs=model, deform=deform, device=device_str,
+                          deform_pos_mode="mlp")
 
     result = trainer.train(
         frame_paths=frame_paths,
