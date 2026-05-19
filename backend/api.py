@@ -31,7 +31,7 @@ from .api_models import (
     JobStatus,
     ProcessResponse,
 )
-from .config import default_config, cloud_config, local_max_config, scene_paths
+from .config import default_config, cloud_config, local_max_config, safe_4d_8gb_config, scene_paths
 from .job_manager import JobManager, get_manager
 from .pipeline import run_pipeline
 
@@ -155,7 +155,7 @@ async def process_video(
     scene: str = Form("unnamed_scene", description="Sahne ismi — data/<scene>/ altında çalışılır"),
     # v6.0 — Mode + preset (single source of truth)
     mode: str = Form("dynamic", description="'static' (Static 3DGS) | 'dynamic' (4D, default)"),
-    preset: str | None = Form(None, description="Mode'a göre preset adı. Static: fast/balanced/high/premium. Dynamic: micro/smoke/full/high/cloud/ultra/ultra_clean/static_max."),
+    preset: str | None = Form(None, description="Mode'a göre preset adı. Static: fast/balanced/high/premium. Dynamic: micro/smoke/full/safe_4d_8gb/high/cloud/ultra/ultra_clean/static_max."),
     # Legacy boolean preset flag'leri (geriye uyumluluk — yeni clientlar mode+preset gönderir)
     smoke_test: bool = Form(False, description="[LEGACY] use mode='dynamic' + preset='smoke'"),
     micro_test: bool = Form(False, description="[LEGACY] use mode='dynamic' + preset='micro'"),
@@ -306,6 +306,7 @@ async def process_video(
     static_mode_active = (mode_norm == "static")
     # Default local_max preset flag — preset='local_max' verilmedikce False kalir
     local_max = False
+    safe_4d_8gb = False
     if preset:
         preset_lc = preset.strip().lower()
         if static_mode_active:
@@ -320,6 +321,7 @@ async def process_video(
                 "micro": "micro_test",
                 "smoke": "smoke_test",
                 "full": None,  # default config, ek flag yok
+                "safe_4d_8gb": "safe_4d_8gb",
                 "high": "high_test",
                 "cloud": "cloud",
                 "ultra": "ultra_test",
@@ -339,6 +341,7 @@ async def process_video(
             static_max = (target == "static_max")
             cloud = (target == "cloud")
             local_max = (target == "local_max")
+            safe_4d_8gb = (target == "safe_4d_8gb")
 
     # ---- Video upload ----
     video_path = paths["base"] / "video.mp4"
@@ -388,6 +391,8 @@ async def process_video(
             cfg = cloud_config()
         elif local_max:
             cfg = local_max_config()
+        elif safe_4d_8gb:
+            cfg = safe_4d_8gb_config()
         else:
             cfg = default_config()
         # v6.1 — NVS eval flag (overridable; local_max_config sets it True by default)
@@ -907,6 +912,52 @@ async def process_video(
         job_id=job.id,
         status=job.status,
         status_url=f"/status/{job.id}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sub-project B — single-image full-scene splat
+# ---------------------------------------------------------------------------
+
+@app.post("/image-to-splat", response_model=ProcessResponse, status_code=202, tags=["jobs"])
+async def image_to_splat_endpoint(
+    image: UploadFile = File(..., description="Single input image (PNG/JPG)"),
+    scene_name: str = Form(..., description="Slug for worlds/<slug>/"),
+    config_profile: str = Form("default", description="fast | default | quality"),
+):
+    """Single-image full-scene splat reconstruction (sub-project B).
+
+    Submits a background job. Poll /status/{job_id} for progress.
+    Spec: docs/superpowers/specs/2026-05-19-single-image-fullscene-splat-design.md
+    """
+    if config_profile not in {"fast", "default", "quality"}:
+        raise HTTPException(status_code=400, detail="config_profile must be fast/default/quality")
+
+    upload_dir = Path("data") / "uploads"
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    suffix = Path(image.filename or "input.png").suffix.lower() or ".png"
+    stable_path = upload_dir / f"{scene_name}{suffix}"
+    contents = await image.read()
+    stable_path.write_bytes(contents)
+
+    manager: JobManager = app.state.manager
+    job = manager.create(scene=scene_name)
+
+    def _runner(progress_cb):
+        from backend.image_to_scene import run_image_to_scene
+        return run_image_to_scene(
+            image_path=stable_path,
+            scene_name=scene_name,
+            cfg=config_profile,
+            progress_callback=progress_cb,
+        )
+
+    manager.submit(job.id, _runner)
+    return ProcessResponse(
+        job_id=job.id,
+        status=JobStatus.QUEUED,
+        status_url=f"/status/{job.id}",
+        message="image-to-splat job submitted",
     )
 
 
