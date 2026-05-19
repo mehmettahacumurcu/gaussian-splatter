@@ -3,7 +3,7 @@ import math
 import numpy as np
 import pytest
 import torch
-from backend.image_to_scene.outpaint_loop import render_pose
+from backend.image_to_scene.outpaint_loop import render_pose, visibility_mask_from_alpha
 from backend.image_to_scene.trajectory import generate_bounded_room_trajectory
 from backend.image_to_scene.intrinsics import intrinsics_from_fov
 from backend.image_to_scene.seed import init_gaussian_model_from_seed
@@ -28,3 +28,19 @@ def test_render_pose_returns_rgb_alpha_depth():
     assert depth.shape == (64, 64)
     assert rgb.dtype == np.float32
     assert alpha.max() > 0.0
+
+
+def test_visibility_mask_basic():
+    alpha = np.zeros((10, 10), dtype=np.float32)
+    alpha[2:8, 2:8] = 1.0
+    visible, to_fill = visibility_mask_from_alpha(alpha, threshold=0.5)
+    assert visible.sum() == 36
+    assert to_fill.sum() == 100 - 36
+    assert (visible & to_fill).sum() == 0
+
+
+def test_visibility_mask_dilates_edge():
+    alpha = np.zeros((20, 20), dtype=np.float32)
+    alpha[5:15, 5:15] = 1.0
+    visible, to_fill = visibility_mask_from_alpha(alpha, threshold=0.5, dilate_px=2)
+    assert visible.sum() < 100  # eroded
