@@ -11,7 +11,11 @@ import { DEFAULTS } from './config'
 import type { PickupState } from './types'
 import type { WorldEntry } from './WorldSelector'
 
-const SPAWN_POSITION: [number, number, number] = [0, 1.7, 3]
+const DEFAULT_SPAWN: [number, number, number] = [0, 1.7, 3]
+// When a fixture world is loaded, spawn at the capture point (origin) facing
+// +Z (into the scene) — that's where the input image was taken from, so the
+// splat's actual content is right there.
+const WORLD_SPAWN_FALLBACK: [number, number, number] = [0, 1.7, 0]
 
 const TEST_OBJECTS: DynamicObjectSpec[] = [
   {
@@ -78,16 +82,28 @@ export function Scene({ world, onStateChange }: SceneProps) {
     else bodies.current.delete(id)
   }, [])
 
+  // Spawn from collider JSON when present, else fallback. When NO world is
+  // selected, stay at the historical D+E spawn so the D+E test scene still works.
+  const effectiveSpawn: [number, number, number] = colliderData
+    ? colliderData.spawn.position
+    : world
+      ? WORLD_SPAWN_FALLBACK
+      : DEFAULT_SPAWN
+
+  // Force-remount the controller when the spawn changes so the rigidbody
+  // gets repositioned. Physics RigidBody only reads `position` at mount.
+  const controllerKey = world ? `world:${world.slug}` : 'default'
+
   return (
     <Canvas
-      camera={{ position: SPAWN_POSITION, fov: 75 }}
+      camera={{ position: effectiveSpawn, fov: 75 }}
       style={{ width: '100%', height: '100%', background: '#101015' }}
     >
       <ambientLight intensity={0.4} />
       <directionalLight position={[5, 10, 5]} intensity={1.0} />
       <Suspense fallback={null}>
         <Physics gravity={DEFAULTS.physics.gravity} timeStep={DEFAULTS.physics.fixedTimestep}>
-          <FirstPersonController spawn={SPAWN_POSITION} />
+          <FirstPersonController key={controllerKey} spawn={effectiveSpawn} />
           {world ? (
             <>
               {/* Visual splat — independent of collider, so it renders even
@@ -96,16 +112,17 @@ export function Scene({ world, onStateChange }: SceneProps) {
               {colliderData ? (
                 <WorldCollider data={colliderData} />
               ) : (
-                // Fallback: a flat ground plane at y=0 so the player has
-                // something to stand on while the collider JSON loads or
-                // if it fails entirely.
+                // Fallback: flat ground at y=0 + four invisible far walls so
+                // the player doesn't fall infinitely while collider JSON loads.
                 <StaticEnvironment />
               )}
             </>
           ) : (
             <StaticEnvironment />
           )}
-          {TEST_OBJECTS.map((o) => (
+          {/* Hide the D+E primitive test props when a fixture world is loaded;
+              they were obscuring the splat. They stay in the built-in scene. */}
+          {!world && TEST_OBJECTS.map((o) => (
             <DynamicObject
               key={o.id}
               {...o}
