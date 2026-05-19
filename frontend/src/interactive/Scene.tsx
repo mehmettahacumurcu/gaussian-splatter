@@ -55,12 +55,19 @@ export function Scene({ world, onStateChange }: SceneProps) {
       return
     }
     let cancelled = false
+    console.log(`[Scene] fetching collider ${world.colliderJsonUrl}`)
     fetch(world.colliderJsonUrl)
-      .then((r) => r.json() as Promise<WorldColliderData>)
-      .then((data) => {
-        if (!cancelled) setColliderData(data)
+      .then(async (r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status} ${r.statusText}`)
+        return (await r.json()) as WorldColliderData
       })
-      .catch((e) => console.error('collider fetch failed', e))
+      .then((data) => {
+        if (!cancelled) {
+          console.log('[Scene] collider loaded', data)
+          setColliderData(data)
+        }
+      })
+      .catch((e) => console.warn('[Scene] collider fetch failed; splat will render without physics walls:', e))
     return () => {
       cancelled = true
     }
@@ -81,10 +88,19 @@ export function Scene({ world, onStateChange }: SceneProps) {
       <Suspense fallback={null}>
         <Physics gravity={DEFAULTS.physics.gravity} timeStep={DEFAULTS.physics.fixedTimestep}>
           <FirstPersonController spawn={SPAWN_POSITION} />
-          {world && colliderData ? (
+          {world ? (
             <>
+              {/* Visual splat — independent of collider, so it renders even
+                  when the collider JSON 404s. */}
               <SplatBackground url={world.plyUrl} />
-              <WorldCollider data={colliderData} />
+              {colliderData ? (
+                <WorldCollider data={colliderData} />
+              ) : (
+                // Fallback: a flat ground plane at y=0 so the player has
+                // something to stand on while the collider JSON loads or
+                // if it fails entirely.
+                <StaticEnvironment />
+              )}
             </>
           ) : (
             <StaticEnvironment />

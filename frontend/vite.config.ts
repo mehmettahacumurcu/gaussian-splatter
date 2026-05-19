@@ -16,19 +16,36 @@ export default defineConfig(async () => ({
     {
       name: "serve-worlds-dir",
       configureServer(server) {
+        // Resolve once at config load; URL-decode pathname so directories with
+        // spaces (e.g. "Gaussian Splatter") survive the file:// round-trip.
+        const configDir = path.dirname(
+          decodeURIComponent(
+            new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, "$1"),
+          ),
+        );
+        const worldsRoot = path.resolve(configDir, "..", "worlds");
+        console.log(`[serve-worlds-dir] mounted /worlds -> ${worldsRoot}`);
+
         server.middlewares.use("/worlds", (req, res, next) => {
-          const filepath = path.join(
-            path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, "$1")),
-            "..",
-            "worlds",
-            req.url ?? "",
-          );
+          // req.url already starts with "/" relative to the mount path.
+          const reqPath = decodeURIComponent((req.url ?? "/").split("?")[0]);
+          const filepath = path.join(worldsRoot, reqPath);
           fs.stat(filepath, (err, stat) => {
-            if (err || !stat.isFile()) return next();
+            if (err || !stat.isFile()) {
+              console.warn(
+                `[serve-worlds-dir] miss ${req.url} -> ${filepath} (${err?.code ?? "not a file"})`,
+              );
+              return next();
+            }
             const ext = path.extname(filepath).toLowerCase();
             const contentType =
-              ext === ".json" ? "application/json" : "application/octet-stream";
+              ext === ".json"
+                ? "application/json"
+                : ext === ".ply"
+                  ? "application/octet-stream"
+                  : "application/octet-stream";
             res.setHeader("Content-Type", contentType);
+            res.setHeader("Cache-Control", "no-cache");
             fs.createReadStream(filepath).pipe(res);
           });
         });
