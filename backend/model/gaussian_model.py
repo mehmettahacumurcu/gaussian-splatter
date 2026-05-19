@@ -109,12 +109,24 @@ class GaussianModel(nn.Module):
         if N <= k + 1:
             return torch.full((N,), 0.01)
 
-        # Bellek dostu chunked nearest-neighbor (büyük N için)
-        chunk = 4096
+        # Büyük nokta bulutları için referans seti küçültülür: ölçek tahmini
+        # yaklaşık olabilir, exact KNN gerekmez. Bellek bütçesi: hedef ~256 MB.
+        # ref_size × 4 bytes × chunk ≤ 256 MB → ref_size ≤ 16k for chunk=4096.
+        ref_size = min(N, 16_000)
+        if ref_size < N:
+            ref_idx = torch.randperm(N)[:ref_size]
+            ref_points = points[ref_idx]
+        else:
+            ref_points = points
+
+        # Bellek dostu chunked nearest-neighbor (büyük N için).
+        # cdist(chunk, ref_size) → float32 matrix; hedef max ~256 MB per chunk.
+        max_bytes = 256 * 1024 * 1024  # 256 MB
+        chunk = max(1, min(4096, max_bytes // (ref_size * 4)))
         dists = []
         for s in range(0, N, chunk):
             e = min(s + chunk, N)
-            d = torch.cdist(points[s:e], points)        # (chunk, N)
+            d = torch.cdist(points[s:e], ref_points)    # (chunk, ref_size)
             d, _ = torch.topk(d, k=k + 1, largest=False)  # +1: kendisi
             dists.append(d[:, 1:].mean(dim=1))           # kendini at
         mean_dist = torch.cat(dists, dim=0)              # (N,)

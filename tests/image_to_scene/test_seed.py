@@ -41,3 +41,25 @@ def test_image_to_pointcloud_returns_torch_tensors(tmp_path):
     assert colors.shape == (32 * 32, 3)
     assert colors.max() <= 1.0 and colors.min() >= 0.0
     np.testing.assert_allclose(colors[0].numpy(), [200/255, 100/255, 50/255], atol=1e-3)
+
+
+from backend.image_to_scene.seed import init_gaussian_model_from_seed
+
+
+def test_init_gaussian_model_has_correct_count():
+    points = torch.randn(1000, 3)
+    colors = torch.rand(1000, 3)
+    model = init_gaussian_model_from_seed(points, colors, sh_degree=0)
+    assert model.means.shape == (1000, 3)
+
+
+def test_init_gaussian_model_handles_empty_input():
+    with pytest.raises(ValueError):
+        init_gaussian_model_from_seed(torch.empty((0, 3)), torch.empty((0, 3)))
+
+
+def test_init_gaussian_model_subsamples_if_too_many():
+    points = torch.randn(2_000_000, 3)
+    colors = torch.rand(2_000_000, 3)
+    model = init_gaussian_model_from_seed(points, colors, max_points=500_000)
+    assert model.means.shape == (500_000, 3)

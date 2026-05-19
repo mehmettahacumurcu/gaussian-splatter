@@ -60,3 +60,37 @@ def image_to_pointcloud(
     points = torch.from_numpy(points_np).float()
     colors = torch.from_numpy(colors_np).float()
     return points, colors
+
+
+from backend.model.gaussian_model import GaussianModel
+
+
+def init_gaussian_model_from_seed(
+    points: torch.Tensor,
+    colors: torch.Tensor,
+    sh_degree: int = 0,
+    fourier_K: int = 0,
+    max_points: int = 1_500_000,
+) -> GaussianModel:
+    """Build an initial GaussianModel from a seed point cloud.
+
+    For sub-project B static_mode, fourier_K=0 (no motion). sh_degree=0 keeps
+    parameter count down; the trainer will progressively unlock higher SH if needed.
+
+    Subsamples uniformly at random if input exceeds max_points (8 GB VRAM budget).
+    """
+    if points.shape[0] == 0:
+        raise ValueError("init_gaussian_model_from_seed: empty point cloud")
+
+    N = points.shape[0]
+    if N > max_points:
+        idx = torch.randperm(N)[:max_points]
+        points = points[idx]
+        colors = colors[idx]
+
+    return GaussianModel(
+        init_points=points,
+        init_colors=colors,
+        sh_degree=sh_degree,
+        fourier_K=fourier_K,
+    )
