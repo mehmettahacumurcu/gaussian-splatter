@@ -10,23 +10,37 @@ interface Props {
   onChange: (entry: WorldEntry | null) => void
 }
 
-// MVP: fixture worlds hardcoded. Future: fetch index from backend.
+// MVP: worlds hardcoded. Future: fetch index from backend.
+// Real-quality entries from the project's static 3DGS pipeline come first;
+// the early single-image LucidDreamer fixtures are kept below for comparison.
 const FIXTURE_WORLDS: WorldEntry[] = [
   {
+    slug: 'myroom-v2',
+    displayName: 'My Room v2 (static 3DGS)',
+    plyUrl: '/worlds/myroom-v2/output/world/0-world.ply',
+    colliderJsonUrl: '/worlds/myroom-v2/output/world/0-world-collider.json',
+  },
+  {
+    slug: 'banana-demo',
+    displayName: 'Banana Demo (static 3DGS)',
+    plyUrl: '/worlds/banana-demo/output/world/0-world.ply',
+    colliderJsonUrl: '/worlds/banana-demo/output/world/0-world-collider.json',
+  },
+  {
     slug: 'fixture-a-render',
-    displayName: 'Fixture A (render)',
+    displayName: 'Fixture A (single-image, low quality)',
     plyUrl: '/worlds/fixture-a-render/output/world/0-world.ply',
     colliderJsonUrl: '/worlds/fixture-a-render/output/world/0-world-collider.json',
   },
   {
     slug: 'fixture-b-empty-photo',
-    displayName: 'Fixture B (empty photo)',
+    displayName: 'Fixture B (single-image, low quality)',
     plyUrl: '/worlds/fixture-b-empty-photo/output/world/0-world.ply',
     colliderJsonUrl: '/worlds/fixture-b-empty-photo/output/world/0-world-collider.json',
   },
   {
     slug: 'fixture-c-photo-with-objects',
-    displayName: 'Fixture C (photo + objects)',
+    displayName: 'Fixture C (single-image, low quality)',
     plyUrl: '/worlds/fixture-c-photo-with-objects/output/world/0-world.ply',
     colliderJsonUrl: '/worlds/fixture-c-photo-with-objects/output/world/0-world-collider.json',
   },

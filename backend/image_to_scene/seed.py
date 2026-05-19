@@ -16,6 +16,40 @@ from PIL import Image
 from .intrinsics import CameraIntrinsics
 
 
+def normalize_seed_depth(
+    depth: np.ndarray,
+    target_near: float = 0.5,
+    target_far: float = 5.0,
+    clip_low_pct: float = 2.0,
+    clip_high_pct: float = 98.0,
+) -> np.ndarray:
+    """Rescale MiDaS-style scale-invariant depth into a usable metric range.
+
+    MiDaS produces inverse depth with arbitrary scale; the upstream
+    `estimate_depth()` converts it via `1/x` with only a max-depth clamp,
+    leaving a few near pixels at ~0.001 units and far pixels at 100+ units.
+    Deprojecting that produces a vertical "plume" (most points clumped near
+    the camera origin, a few stretched to infinity).
+
+    This helper clips outliers via percentiles and linear-rescales the kept
+    range to [target_near, target_far] metres — a plausible indoor-room scale.
+    The depth ORDERING is preserved; only the scale changes.
+    """
+    valid = depth > 0
+    if not valid.any():
+        return depth.astype(np.float32)
+    vals = depth[valid]
+    lo = float(np.percentile(vals, clip_low_pct))
+    hi = float(np.percentile(vals, clip_high_pct))
+    if hi - lo < 1e-6:
+        return np.full_like(depth, (target_near + target_far) / 2.0, dtype=np.float32)
+    clipped = np.clip(depth, lo, hi)
+    norm = (clipped - lo) / (hi - lo)
+    scaled = target_near + norm * (target_far - target_near)
+    scaled[~valid] = 0.0
+    return scaled.astype(np.float32)
+
+
 def deproject_depth(
     depth: np.ndarray,
     K: CameraIntrinsics,

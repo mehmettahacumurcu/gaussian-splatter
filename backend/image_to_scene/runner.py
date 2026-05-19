@@ -31,7 +31,7 @@ from backend.edit.inpainter import SDInpainter
 from .config import ImageToSceneConfig, profile as cfg_profile
 from .disk_layout import ensure_envelope, artifact_path, request_path
 from .intrinsics import CameraIntrinsics, intrinsics_for_image
-from .seed import image_to_pointcloud, init_gaussian_model_from_seed
+from .seed import image_to_pointcloud, init_gaussian_model_from_seed, normalize_seed_depth
 from .trajectory import CameraPose, generate_bounded_room_trajectory
 from .outpaint_loop import run_outpaint_loop, render_pose, _w2c_from_pose
 from .collider import derive_minimal_collider, write_collider_json
@@ -104,6 +104,86 @@ def train_on_generated_views(
 # ---------------------------------------------------------------------------
 # Phase 9 — Full pipeline orchestration
 # ---------------------------------------------------------------------------
+
+def wrap_scene_as_world(
+    ply_path: str | Path,
+    world_slug: str,
+    worlds_root: Path | None = None,
+    eye_height_m: float = 1.7,
+) -> dict:
+    """Wrap an already-trained 3DGS .ply (e.g. from `run_pipeline()`) into the
+    `worlds/<slug>/` layout that the Interactive viewer consumes.
+
+    No reconstruction happens here. The .ply already exists. We just:
+      1. Copy it to `worlds/<slug>/output/world/0-world.ply`
+      2. Derive the minimal collider (ground plane + bounding-box walls) from
+         its point positions
+      3. Write the sidecar JSONs (collider, trajectory stub, request metadata)
+
+    This is the Option-A path for sub-project B: use the user's existing,
+    proven static 3DGS pipeline (multi-image / video → splat), then layer
+    physics + first-person walking on top.
+
+    Args:
+        ply_path: Path to an existing trained .ply.
+        world_slug: Slug for `worlds/<slug>/`.
+        worlds_root: Override; defaults to `<cwd>/worlds`.
+        eye_height_m: Spawn height above the derived ground plane.
+
+    Returns dict with paths to outputs.
+    """
+    ply_path = Path(ply_path).resolve()
+    if not ply_path.exists():
+        raise FileNotFoundError(f"ply not found: {ply_path}")
+
+    worlds_root = Path(worlds_root) if worlds_root else (Path.cwd() / "worlds")
+    worlds_root = worlds_root.resolve()
+    env = ensure_envelope(worlds_root, world_slug)
+
+    out_index = 0
+    dest_ply = artifact_path(env.output_world, out_index, "world", ".ply")
+    if dest_ply.resolve() != ply_path:
+        shutil.copyfile(ply_path, dest_ply)
+
+    # Derive collider from the .ply's point positions only.
+    from plyfile import PlyData
+    plydata = PlyData.read(str(dest_ply))
+    verts = plydata["vertex"]
+    pts_np = np.stack([np.asarray(verts["x"]),
+                       np.asarray(verts["y"]),
+                       np.asarray(verts["z"])], axis=-1).astype(np.float32)
+    collider = derive_minimal_collider(pts_np, eye_height_m=eye_height_m)
+    collider_path = artifact_path(env.output_world, out_index, "world-collider", ".json")
+    write_collider_json(collider_path, collider)
+
+    # Trajectory stub: just the spawn pose. (Multi-image scenes already had
+    # their own poses during training; we don't reuse them here.)
+    traj_path = artifact_path(env.output_world, out_index, "world-trajectory", ".json")
+    traj_path.write_text(json.dumps({
+        "schema_version": 1,
+        "kind": "wrapped-static-scene",
+        "spawn_position": collider.spawn_position.tolist(),
+        "spawn_look_direction": collider.spawn_look_direction.tolist(),
+    }, indent=2), encoding="utf-8")
+
+    req_path = request_path(env.output_world, out_index, "world")
+    req_path.write_text(json.dumps({
+        "schema_version": 1,
+        "kind": "wrap-scene-as-world",
+        "world": env.slug,
+        "source_ply": str(ply_path),
+        "n_points": int(pts_np.shape[0]),
+    }, indent=2), encoding="utf-8")
+
+    return {
+        "scene_name": env.slug,
+        "ply_path": str(dest_ply),
+        "collider_json_path": str(collider_path),
+        "trajectory_json_path": str(traj_path),
+        "request_json_path": str(req_path),
+        "n_points": int(pts_np.shape[0]),
+    }
+
 
 def _make_depth_fn(tmp_root: Path, device: str = "cuda"):
     """Closure that takes (H, W, 3) uint8 RGB and returns (H, W) float32 depth.
@@ -221,7 +301,15 @@ def run_image_to_scene(
                        device=("cuda" if torch.cuda.is_available() else "cpu"),
                        overwrite=True)
         depth0_path = out_dir / "frame_0000_depth.npy"
-        depth0 = np.load(depth0_path).astype(np.float32)
+        depth0_raw = np.load(depth0_path).astype(np.float32)
+
+    # MiDaS is scale-invariant; upstream estimate_depth's 1/x conversion leaves
+    # the depth with huge variance (near pixels at ~0.001, far at 100+), which
+    # collapses the deprojected points into a vertical plume near origin instead
+    # of a 3D scene. Normalize to a plausible indoor scale before deprojecting.
+    depth0 = normalize_seed_depth(depth0_raw, target_near=0.5, target_far=5.0)
+    cb("depth_normalized", 0.15,
+       f"depth range raw=[{depth0_raw.min():.3f}, {depth0_raw.max():.3f}] -> [0.5, 5.0]m", {})
 
     points, colors = image_to_pointcloud(src_stage, depth0, K)
     cb("seed", 0.20, f"seed pointcloud: {points.shape[0]} pts", {})
