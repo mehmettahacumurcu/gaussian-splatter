@@ -1,0 +1,13 @@
+# Minimal pyproject.toml — pytest config only. Package metadata stays in
+# requirements.txt for now.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-ra -q"
+markers = [
+    "slow: marks tests that take more than 5s",
+    "gpu: marks tests that require CUDA",
+    "integration: end-to-end tests using real models",
+]
