@@ -63,3 +63,21 @@ def test_init_gaussian_model_subsamples_if_too_many():
     colors = torch.rand(2_000_000, 3)
     model = init_gaussian_model_from_seed(points, colors, max_points=500_000)
     assert model.means.shape == (500_000, 3)
+
+
+@pytest.mark.integration
+def test_seed_end_to_end_tiny_image(tmp_path):
+    """Full seed pipeline: synthetic image → fake depth → point cloud → GaussianModel."""
+    from PIL import Image
+    img_path = tmp_path / "tiny.png"
+    Image.new("RGB", (64, 48), color=(128, 128, 128)).save(img_path)
+
+    K = intrinsics_from_fov(64, 48, 60.0)
+    depth = np.ones((48, 64), dtype=np.float32) * 2.5
+
+    points, colors = image_to_pointcloud(img_path, depth, K)
+    model = init_gaussian_model_from_seed(points, colors)
+
+    assert model.means.shape[0] == 64 * 48
+    z_values = model.means[:, 2]
+    assert torch.allclose(z_values, torch.tensor(2.5), atol=1e-3)
