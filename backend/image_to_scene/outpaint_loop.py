@@ -17,6 +17,15 @@ from typing import Callable
 import numpy as np
 import torch
 
+__all__ = [
+    "render_pose",
+    "visibility_mask_from_alpha",
+    "inpaint_with_sd",
+    "add_gaussians_from_pixels",
+    "OutpaintLoopStats",
+    "run_outpaint_loop",
+]
+
 from .config import ImageToSceneConfig
 from .depth_align import align_new_view, apply_scale_shift, AlignmentResult
 from .intrinsics import CameraIntrinsics
