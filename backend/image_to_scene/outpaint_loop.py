@@ -26,6 +26,9 @@ __all__ = [
     "run_outpaint_loop",
 ]
 
+# Apply the MSVC-compat shim BEFORE anything triggers gsplat JIT compile.
+from . import _gsplat_msvc_shim as _gsplat_msvc_shim  # noqa: F401
+
 from .config import ImageToSceneConfig
 from .depth_align import align_new_view, apply_scale_shift, AlignmentResult
 from .intrinsics import CameraIntrinsics

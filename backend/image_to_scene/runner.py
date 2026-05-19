@@ -17,6 +17,9 @@ import numpy as np
 import torch
 from PIL import Image
 
+# Apply the MSVC-compat shim BEFORE anything triggers gsplat JIT compile.
+from . import _gsplat_msvc_shim as _gsplat_msvc_shim  # noqa: F401
+
 # Module-level imports of upstream modules — patched in tests via mocker.patch
 from backend.model.gaussian_model import GaussianModel
 from backend.model.deformation import DeformationField
@@ -113,10 +116,11 @@ def _make_depth_fn(tmp_root: Path, device: str = "cuda"):
     def depth_fn(rgb_uint8: np.ndarray) -> np.ndarray:
         i = counter["i"]
         counter["i"] += 1
-        stem = f"loopframe_{i:05d}"
+        # estimate_depth() only globs `frame_*.png`, so the filename MUST start
+        # with `frame_` and end with `.png`.
+        stem = f"frame_{i:05d}"
         img_path = frames_dir / f"{stem}.png"
         Image.fromarray(rgb_uint8).save(img_path)
-        # estimate_depth writes <output_dir>/<stem>_depth.npy
         estimate_depth(frames_dir=str(frames_dir), output_dir=str(depths_dir), device=device, overwrite=True)
         npy = depths_dir / f"{stem}_depth.npy"
         depth = np.load(npy).astype(np.float32)
@@ -196,18 +200,22 @@ def run_image_to_scene(
     cb("depth", 0.10, "running MiDaS on input", {})
     K = intrinsics_for_image(src_stage, fallback_fov_deg=cfg.default_fov_deg)
 
-    # Depth on the input image: copy to a temp dir, call estimate_depth, read back .npy.
+    # Depth on the input image. estimate_depth() only globs `frame_*.png`, so the
+    # source file must be re-encoded as a PNG named `frame_XXXX.png` before being
+    # passed in.
     with tempfile.TemporaryDirectory(prefix="b_seed_") as td:
         td = Path(td)
         in_dir = td / "in"
         in_dir.mkdir()
-        seed_input = in_dir / src_stage.name
-        shutil.copyfile(src_stage, seed_input)
+        seed_input = in_dir / "frame_0000.png"
+        # Re-encode whatever input format we got (jpg/png/webp) into a PNG.
+        with Image.open(src_stage) as _im:
+            _im.convert("RGB").save(seed_input, "PNG")
         out_dir = td / "out"
         estimate_depth(frames_dir=str(in_dir), output_dir=str(out_dir),
                        device=("cuda" if torch.cuda.is_available() else "cpu"),
                        overwrite=True)
-        depth0_path = out_dir / f"{seed_input.stem}_depth.npy"
+        depth0_path = out_dir / "frame_0000_depth.npy"
         depth0 = np.load(depth0_path).astype(np.float32)
 
     points, colors = image_to_pointcloud(src_stage, depth0, K)
