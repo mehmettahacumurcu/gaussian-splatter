@@ -1,12 +1,15 @@
 import { Canvas } from '@react-three/fiber'
 import { Physics, type RapierRigidBody } from '@react-three/rapier'
-import { Suspense, useCallback, useRef } from 'react'
+import { Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { FirstPersonController } from './FirstPersonController'
 import { StaticEnvironment } from './loaders/StaticEnvironment'
+import { SplatBackground } from './loaders/SplatBackground'
+import { WorldCollider, type WorldColliderData } from './loaders/WorldCollider'
 import { DynamicObject, type DynamicObjectSpec } from './loaders/DynamicObject'
 import { PickupSystem, type DynamicBodyEntry } from './PickupSystem'
 import { DEFAULTS } from './config'
 import type { PickupState } from './types'
+import type { WorldEntry } from './WorldSelector'
 
 const SPAWN_POSITION: [number, number, number] = [0, 1.7, 3]
 
@@ -37,8 +40,31 @@ const TEST_OBJECTS: DynamicObjectSpec[] = [
   },
 ]
 
-export function Scene({ onStateChange }: { onStateChange?: (s: PickupState) => void }) {
+interface SceneProps {
+  world?: WorldEntry | null
+  onStateChange?: (s: PickupState) => void
+}
+
+export function Scene({ world, onStateChange }: SceneProps) {
   const bodies = useRef<Map<string, DynamicBodyEntry>>(new Map())
+  const [colliderData, setColliderData] = useState<WorldColliderData | null>(null)
+
+  useEffect(() => {
+    if (!world) {
+      setColliderData(null)
+      return
+    }
+    let cancelled = false
+    fetch(world.colliderJsonUrl)
+      .then((r) => r.json() as Promise<WorldColliderData>)
+      .then((data) => {
+        if (!cancelled) setColliderData(data)
+      })
+      .catch((e) => console.error('collider fetch failed', e))
+    return () => {
+      cancelled = true
+    }
+  }, [world])
 
   const registerBody = useCallback((id: string, mass: number, body: RapierRigidBody | null) => {
     if (body) bodies.current.set(id, { body, mass })
@@ -55,7 +81,14 @@ export function Scene({ onStateChange }: { onStateChange?: (s: PickupState) => v
       <Suspense fallback={null}>
         <Physics gravity={DEFAULTS.physics.gravity} timeStep={DEFAULTS.physics.fixedTimestep}>
           <FirstPersonController spawn={SPAWN_POSITION} />
-          <StaticEnvironment />
+          {world && colliderData ? (
+            <>
+              <SplatBackground url={world.plyUrl} />
+              <WorldCollider data={colliderData} />
+            </>
+          ) : (
+            <StaticEnvironment />
+          )}
           {TEST_OBJECTS.map((o) => (
             <DynamicObject
               key={o.id}
