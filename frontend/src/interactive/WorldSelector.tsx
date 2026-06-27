@@ -15,6 +15,18 @@ interface Props {
 // the early single-image LucidDreamer fixtures are kept below for comparison.
 const FIXTURE_WORLDS: WorldEntry[] = [
   {
+    slug: 'garden',
+    displayName: 'Garden (Mip-NeRF360, Colab SOTA)',
+    plyUrl: '/worlds/garden/output/world/0-world.ply',
+    colliderJsonUrl: '/worlds/garden/output/world/0-world-collider.json',
+  },
+  {
+    slug: 'myroom',
+    displayName: 'My Room (static 3DGS, Colab)',
+    plyUrl: '/worlds/myroom/output/world/0-world.ply',
+    colliderJsonUrl: '/worlds/myroom/output/world/0-world-collider.json',
+  },
+  {
     slug: 'myroom-v2',
     displayName: 'My Room v2 (static 3DGS)',
     plyUrl: '/worlds/myroom-v2/output/world/0-world.ply',

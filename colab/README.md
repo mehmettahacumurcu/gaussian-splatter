@@ -24,11 +24,23 @@ because the local RTX 3060 Ti is the bottleneck.
 - **SOTA (`garden`)** is **downloaded in-notebook** from the Mip-NeRF 360 dataset — no
   Drive needed.
 
+## Outputs — viewing the splats
+
+Each notebook's last step saves to Drive (under `MyDrive/4dgs/`):
+- `results/<scene>_results/` — eval JSON, ply, logs, orbit.mp4.
+- `worlds/<scene>/` — a **walkable world bundle** (`output/world/0-world.ply` + collider),
+  and a standalone `worlds/<scene>.ply`.
+
+To walk it in the project: download `MyDrive/4dgs/worlds/<scene>/` into your local
+`worlds/<scene>/`, run `cd frontend && npm run dev`, open the **Interactive** page, and pick
+the scene in the world dropdown (entries for `garden` and `myroom` are pre-added to
+`WorldSelector.tsx`). The standalone `<scene>.ply` also opens in any 3DGS viewer.
+
 ## Shared pieces
 
 - `bootstrap.sh` — idempotent env setup (deps, gsplat 1.5.3 JIT build, optional COLMAP).
 - `verify_helpers.py` — `check_phase2()`, `read_metrics()`, `gpu_mem_summary()`,
-  `copy_results_to_drive()`.
+  `copy_results_to_drive()`, `wrap_and_save_world()`.
 
 The notebooks call the repo's own scripts (`scripts/static_3dgs.py`,
 `scripts/sota_compare.py`) — the same code paths you run locally, just on a bigger GPU.

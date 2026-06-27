@@ -109,3 +109,50 @@ def copy_results_to_drive(scene: str, drive_dir: str) -> Path:
         shutil.copy2(mp4, dst / mp4.name)
     print(f"  results -> {dst}")
     return dst
+
+
+def wrap_and_save_world(scene: str, drive_dir: str, world_slug: str | None = None) -> Path:
+    """Wrap the trained static splat into a walkable world bundle and save it to Drive.
+
+    Produces worlds/<slug>/output/world/{0-world.ply, 0-world-collider.json, ...} via
+    backend.image_to_scene.wrap_scene_as_world (GPU-free: just reads point positions and
+    derives a collider), then copies worlds/<slug>/ to Drive plus a clean standalone
+    <slug>.ply. The interactive viewer loads the bundle; the .ply opens in any 3DGS viewer.
+    """
+    slug = world_slug or scene
+    ply_dir = Path("data") / scene / "output" / "ply"
+    plys = sorted(ply_dir.glob("frame_*.ply"))
+    if not plys:
+        raise FileNotFoundError(f"no exported ply in {ply_dir} (was export skipped?)")
+    src_ply = plys[0]
+
+    import sys
+    sys.path.insert(0, ".")
+    from backend.image_to_scene.runner import wrap_scene_as_world
+
+    info = wrap_scene_as_world(ply_path=src_ply, world_slug=slug)
+    print(f"  wrapped world '{slug}' | {info['n_points']:,} points")
+
+    # The viewer reads 0-world.ply + collider; keep the envelope complete with a
+    # minimal image.json (matches the bundled fixtures) just in case.
+    world_root = Path("worlds") / slug
+    img_json = world_root / "image.json"
+    if not img_json.exists():
+        img_json.write_text(json.dumps({
+            "schema_version": 1, "world": slug, "source_images": [],
+            "scene_name": slug, "short_caption": "", "literal_description": "",
+            "environment": "", "visual_style": "", "lighting": "",
+            "atmosphere": "", "ambient_sound": "", "objects": [],
+        }, indent=2), encoding="utf-8")
+
+    worlds_dst = Path(drive_dir) / "worlds"
+    worlds_dst.mkdir(parents=True, exist_ok=True)
+    dst = worlds_dst / slug
+    if dst.exists():
+        shutil.rmtree(dst)
+    shutil.copytree(world_root, dst)
+    shutil.copy2(info["ply_path"], worlds_dst / f"{slug}.ply")
+
+    print(f"  walkable world -> {dst}")
+    print(f"  clean splat    -> {worlds_dst / (slug + '.ply')}")
+    return dst
