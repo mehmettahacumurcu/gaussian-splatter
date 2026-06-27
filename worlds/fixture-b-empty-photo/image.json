@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "world": "fixture-b-empty-photo",
+  "source_images": [
+    "worlds\\fixture-b-empty-photo\\source\\0-fixture-b-empty-photo.jpg"
+  ],
+  "scene_name": "Fixture B Empty Photo",
+  "short_caption": "",
+  "literal_description": "",
+  "environment": "",
+  "visual_style": "",
+  "lighting": "",
+  "atmosphere": "",
+  "ambient_sound": "",
+  "objects": []
+}

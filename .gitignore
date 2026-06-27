@@ -57,8 +57,18 @@ build.ninja
 
 # OS
 *~
-COMMIT_MSG*.txt
+COMMIT*.txt
 notebooks/
 
 # Build artifact from scripts/build_cube_fixture.py
 tests/fixtures/cube_scene/
+
+# Cloud run artifacts (large; regenerable / re-downloadable)
+cloud_results/
+
+# Generated walkable-world outputs (kept on disk, out of git; .ply already ignored)
+worlds/*/output/
+
+# Test + misc caches / stray files
+.pytest_cache/
+expandable_segment*
