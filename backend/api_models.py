@@ -74,18 +74,3 @@ class HealthResponse(BaseModel):
     gpu_available: bool
     gpu_name: str | None = None
     active_jobs: int = 0
-
-
-class EditJobRequest(BaseModel):
-    """POST /process body when mode='edit'. Comes through the
-    multipart form path with these fields as form-encoded values."""
-    scene: str = Field(..., description="Scene directory under data/")
-    source_ckpt: str = Field(
-        ...,
-        description="Source checkpoint, relative to data/<scene>/ "
-                    "(e.g. 'output/ckpt/ckpt_final.pt')",
-    )
-    frame_idx: int = Field(..., ge=0, description="Frame index user clicked on")
-    click_x: float = Field(..., ge=0.0, le=1.0, description="Normalized x click")
-    click_y: float = Field(..., ge=0.0, le=1.0, description="Normalized y click")
-    quality_mode: str = Field(..., description="'A' (LaMa preview) or 'B' (SD quality)")
