@@ -111,6 +111,25 @@ def copy_results_to_drive(scene: str, drive_dir: str) -> Path:
     return dst
 
 
+def save_splat_to_drive(scene: str, drive_dir: str, name: str | None = None) -> Path:
+    """Copy just the trained splat .ply to Drive (`<drive_dir>/splats/<name>.ply`).
+
+    Standalone — stdlib only, no backend import, no world wrapping. Call this FIRST so you
+    always have the raw splat even if the walkable-world step fails. The .ply opens in any
+    3DGS viewer (e.g. https://superspl.at/editor).
+    """
+    ply_dir = Path("data") / scene / "output" / "ply"
+    plys = sorted(ply_dir.glob("frame_*.ply"))
+    if not plys:
+        raise FileNotFoundError(f"no exported ply in {ply_dir} (was export skipped?)")
+    splats_dir = Path(drive_dir) / "splats"
+    splats_dir.mkdir(parents=True, exist_ok=True)
+    dst = splats_dir / f"{name or scene}.ply"
+    shutil.copy2(plys[0], dst)
+    print(f"  splat -> {dst}  ({dst.stat().st_size / 1e6:.1f} MB, {len(plys)} frame(s))")
+    return dst
+
+
 def wrap_and_save_world(scene: str, drive_dir: str, world_slug: str | None = None) -> Path:
     """Wrap the trained static splat into a walkable world bundle and save it to Drive.
 
