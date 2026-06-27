@@ -47,6 +47,13 @@ const PRESETS: PresetSpec[] = [
     desc: "30k iter · 640×360 · 60 ts · 3060 Ti default",
   },
   {
+    id: "safe_4d_8gb",
+    name: "Safe 4D (8GB)",
+    badge: "🛡",
+    duration: "30-60 dk",
+    desc: "Full ile esit sure. Stabil deformation: lr_deform/fourier 1e-3, fourier_reg 5x, dpos cap 0.08. LPIPS off → RAM paging yok. PSNR collapse fix.",
+  },
+  {
     id: "high",
     name: "High",
     badge: "⭐",

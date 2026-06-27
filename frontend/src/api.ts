@@ -149,6 +149,7 @@ export type DynamicPreset =
   | "micro"
   | "smoke"
   | "full"
+  | "safe_4d_8gb"
   | "high"
   | "cloud"
   | "ultra"

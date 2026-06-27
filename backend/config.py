@@ -418,6 +418,63 @@ def cloud_config() -> Config:
     return cfg
 
 
+def safe_4d_8gb_config() -> Config:
+    """Stabil 4D config — RTX 3060 Ti 8GB, 30k iter ~30-60 dk.
+
+    Default `default_config()` 4D preset'i ile single-view'da iter ~9k civarinda
+    PSNR collapse + Fourier trajectory patlamasi (DeltaPos max>4) yasayan run'lar
+    icin "safe" alternatif. Asil amac: deformation ozgurlugunu kontrolde tutmak,
+    LPIPS'i kapatip RAM paging'i onlemek, foundation cache'i kuculmek.
+
+    Onemli farklilar (default_config'a gore):
+      - VRAM: lambda_lpips=0 (~500-800 MB tasarruf), cotracker grid+points yari,
+        density_interval 200 (split peak'leri yarilanir).
+      - Divergence: lr_deform/lr_fourier 3e-3 -> 1e-3, lambda_fourier_reg 5x,
+        dpos_total_cap_frac 0.2 -> 0.08, lambda_deform_reg/smoothness/rigidity
+        2-15x guclu, anti-streak (lambda_aniso, prune_max_scale).
+
+    Beklenen: tipik single-view video icin Full preset suresinde stabil PSNR
+    trajectory, 8 GB VRAM icinde sigma (paging yok).
+    """
+    cfg = default_config()
+    # Preprocess — default_config ile ayni
+    # Train budget — Full preset ile ayni sure (~30-60 dk)
+    cfg.train.n_iters = 30_000
+    cfg.train.image_resolution = (640, 360)
+    cfg.train.warmup_iters = 1000
+    cfg.train.max_gaussians = 250_000
+    # Density — biraz daha conservative
+    cfg.train.density_start_iter = 500
+    cfg.train.density_end_iter = 22_000
+    cfg.train.density_interval = 200            # 100 -> 200 (split sıklığı yarı)
+    cfg.train.densify_grad_threshold = 3e-4     # 2e-4 -> 3e-4 (1.5x sıkı)
+    cfg.train.prune_max_scale = 0.012           # 0.02 -> 0.012 (anti-streak)
+    # Deformation / Fourier divergence guards
+    cfg.train.lr_deform = 1e-3                  # 3e-3 -> 1e-3
+    cfg.train.lr_fourier = 1e-3                 # 3e-3 -> 1e-3
+    cfg.train.lambda_fourier_reg = 5e-3         # 1e-3 -> 5e-3 (5x guclu low-pass)
+    cfg.train.dpos_total_cap_frac = 0.08        # 0.2 -> 0.08 (motion magnitude cap)
+    cfg.train.lambda_deform_reg = 5e-4          # 3e-5 -> 5e-4
+    cfg.train.lambda_smoothness = 5e-4          # 2e-4 -> 5e-4
+    cfg.train.lambda_rigidity = 8e-4            # 2e-4 -> 8e-4
+    cfg.train.lambda_accel = 2e-4               # 1e-4 -> 2e-4
+    # Anti-streak
+    cfg.train.lambda_aniso = 0.02               # 0.01 -> 0.02
+    cfg.train.aniso_threshold = 5.0
+    # VRAM — LPIPS kapali; 3060 Ti icin paging'i gecikten en buyuk single tasarruf
+    cfg.train.lambda_lpips = 0.0
+    cfg.train.lambda_flow = 0.0
+    # Foundation cache kucult (CoTracker tensor + cache footprint)
+    cfg.foundation.cotracker_grid_size = 22     # 30 -> 22
+    cfg.foundation.cotracker_num_points = 1024  # 2048 -> 1024
+    # Model — default boyutlar (64/32/384/3, K=8) zaten 3060 Ti icin tunelendi.
+    # Eval — single-view'de NVS eval kullanisli ama opsiyonel; user explicit isterse.
+    cfg.train.nvs_eval_enabled = False
+    cfg.train.ckpt_interval = 5000
+    cfg.train.log_interval = 50
+    return cfg
+
+
 def local_max_config() -> Config:
     """Max-quality config for 8GB GPU (RTX 3060 Ti). 14-22h overnight runs.
     Pushes 8GB to its limits: 350k Gaussians, HexPlane 96/40, MLP 512/4,
