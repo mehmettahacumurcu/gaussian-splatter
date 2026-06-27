@@ -2,15 +2,15 @@
  * 4DGS Viewer — ana uygulama (tab navigation).
  *
  * Tab'lar:
- *   - Yeni Job: video seç + hiperparametreler + submit
+ *   - Yeni Job: static 3DGS submit + hiperparametreler
  *   - Jobs: aktif + geçmiş job listesi, auto-refresh
- *   - Viewer: seçilen job'ın 4D splat render'ı + timeline
+ *   - Viewer: seçilen job'ın splat render'ı
+ *   - Analiz / Eval: training metrikleri + held-out NVS
+ *   - Interactive: gezilebilir splat dünyası (D+E)
  */
 import { useCallback, useEffect, useState } from "react";
 import "./App.css";
 import { SplatViewer } from "./components/SplatViewer";
-import { SplatViewerSpark } from "./components/SplatViewerSpark";
-import { TimelineSlider } from "./components/TimelineSlider";
 import { JobSubmitPanel } from "./components/JobSubmitPanel";
 import { JobsList } from "./components/JobsList";
 import { TrainingAnalytics } from "./components/TrainingAnalytics";
@@ -24,7 +24,6 @@ import {
   listDiskScenes,
   type HealthResponse,
   type Job,
-  type JobMode,
   type SceneListItem,
   type SplatInfo,
 } from "./api";
@@ -60,20 +59,6 @@ function formatTime(ts: number): string {
 
 function App() {
   const [tab, setTab] = useState<Tab>("submit");
-  // v6.0 — Pipeline mode (Static 3D / 4D Dynamic). Submit panel mode'a göre
-  // alt component render eder. localStorage'a hatirlatir, refresh'te kalır.
-  const [mode, setMode] = useState<JobMode>(() => {
-    try {
-      const saved = window.localStorage.getItem("4dgs.mode");
-      return saved === "static" || saved === "dynamic" ? saved : "dynamic";
-    } catch {
-      return "dynamic";
-    }
-  });
-  const handleModeChange = useCallback((m: JobMode) => {
-    setMode(m);
-    try { window.localStorage.setItem("4dgs.mode", m); } catch { /* ignore */ }
-  }, []);
   const [health, setHealth] = useState<HealthResponse | null>(null);
 
   // Viewer state
@@ -88,7 +73,6 @@ function App() {
   // Setter not currently exposed in UI (no toggle); retained as state so a
   // future settings popover can flip it without a refactor.
   const [singleFrameMode] = useState(false);
-  const [viewerEngine, setViewerEngine] = useState<"legacy" | "spark">("legacy");
   // Analytics — son/aktif job için
   const [analyticsScene, setAnalyticsScene] = useState<string>("");
   // Connection — backend URL + auth token (apiBase shown in topbar; settings modal toggles)
@@ -265,11 +249,7 @@ function App() {
       {/* İçerik */}
       <main className="app-content">
         {tab === "submit" && (
-          <JobSubmitPanel
-            mode={mode}
-            onModeChange={handleModeChange}
-            onJobSubmitted={handleJobSubmitted}
-          />
+          <JobSubmitPanel onJobSubmitted={handleJobSubmitted} />
         )}
 
         {tab === "jobs" && (
@@ -448,71 +428,26 @@ function App() {
                       ? `Scene'ler yükleniyor: ${sceneProgress.loaded}/${sceneProgress.total}`
                       : `${viewerState.info.num_frames} frame — "${viewerState.info.scene}" (${formatBytes(viewerState.info.total_size_bytes)})`}
                   </span>
-                  <span style={{ marginLeft: 16, display: "inline-flex", gap: 6, alignItems: "center" }}>
-                    <span style={{ fontSize: 11, color: "var(--text-muted)" }}>Engine:</span>
-                    <button
-                      type="button"
-                      onClick={() => setViewerEngine("legacy")}
-                      className={viewerEngine === "legacy" ? "viewer-engine-btn active" : "viewer-engine-btn"}
-                    >
-                      legacy (mkkellogg)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setViewerEngine("spark")}
-                      className={viewerEngine === "spark" ? "viewer-engine-btn active" : "viewer-engine-btn"}
-                    >
-                      Spark (4DGS) ✨
-                    </button>
-                  </span>
                 </div>
                 <div className="viewer-canvas">
-                  {viewerEngine === "spark" ? (
-                    <SplatViewerSpark
-                      key={`spark-${viewerState.info.job_id}`}
-                      jobId={viewerState.info.job_id}
-                      numFrames={viewerState.info.num_frames}
-                      currentFrame={currentFrame}
-                      onLoadProgress={(loaded, total) =>
-                        setSceneProgress({ loaded, total, done: false })
-                      }
-                      onReady={() =>
-                        setSceneProgress((prev) =>
-                          prev ? { ...prev, done: true } : prev
-                        )
-                      }
-                      onError={(msg) =>
-                        setViewerState({ kind: "error", message: msg })
-                      }
-                    />
-                  ) : (
-                    <SplatViewer
-                      // key includes singleFrameMode → mode değişince viewer remount
-                      key={`${viewerState.info.job_id}-${singleFrameMode ? "single" : "multi"}`}
-                      jobId={viewerState.info.job_id}
-                      numFrames={viewerState.info.num_frames}
-                      currentFrame={currentFrame}
-                      singleFrameMode={singleFrameMode}
-                      onLoadProgress={(loaded, total) =>
-                        setSceneProgress({ loaded, total, done: false })
-                      }
-                      onReady={() =>
-                        setSceneProgress((prev) =>
-                          prev ? { ...prev, done: true } : prev
-                        )
-                      }
-                      onError={(msg) =>
-                        setViewerState({ kind: "error", message: msg })
-                      }
-                    />
-                  )}
-                </div>
-                <div className="viewer-timeline">
-                  <TimelineSlider
+                  <SplatViewer
+                    // key includes singleFrameMode → mode değişince viewer remount
+                    key={`${viewerState.info.job_id}-${singleFrameMode ? "single" : "multi"}`}
+                    jobId={viewerState.info.job_id}
                     numFrames={viewerState.info.num_frames}
                     currentFrame={currentFrame}
-                    onFrameChange={setCurrentFrame}
-                    baseFps={10}
+                    singleFrameMode={singleFrameMode}
+                    onLoadProgress={(loaded, total) =>
+                      setSceneProgress({ loaded, total, done: false })
+                    }
+                    onReady={() =>
+                      setSceneProgress((prev) =>
+                        prev ? { ...prev, done: true } : prev
+                      )
+                    }
+                    onError={(msg) =>
+                      setViewerState({ kind: "error", message: msg })
+                    }
                   />
                 </div>
               </>

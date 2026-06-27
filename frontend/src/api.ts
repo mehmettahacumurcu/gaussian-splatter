@@ -144,18 +144,6 @@ export type JobMode = "static" | "dynamic";
 /** Static 3DGS preset'leri — scripts/static_3dgs.py PRESETS ile birebir. */
 export type StaticPreset = "fast" | "balanced" | "high" | "premium";
 
-/** 4D Dynamic preset'leri — backend api.py'deki mevcut preset'ler. */
-export type DynamicPreset =
-  | "micro"
-  | "smoke"
-  | "full"
-  | "safe_4d_8gb"
-  | "high"
-  | "cloud"
-  | "ultra"
-  | "ultra_clean"
-  | "static_max"; // legacy 4D static-leaning preset, deprecated → "premium" 3D static öneririz
-
 export interface SubmitJobOptions {
   scene: string;
   /** v6.0: zorunlu — backend bu alana göre static_mode set eder. */
@@ -322,65 +310,6 @@ export function frameUrl(identifier: string, idx: number): string {
 
 export function downloadUrl(jobId: string): string {
   return withTokenParam(`${getApiBase()}/download/${jobId}`);
-}
-
-/** Training-frame URL for the EditPanel framepicker. Bearer token added as
- *  `?token=` query param so plain `<img src>` (which can't set headers) works. */
-export function sceneFrameUrl(scene: string, idx: number): string {
-  return withTokenParam(`${getApiBase()}/scenes/${encodeURIComponent(scene)}/frame/${idx}`);
-}
-
-/** Fetch n_frames for a scene (drives EditPanel's framepicker stride). */
-export async function getSceneInfo(scene: string): Promise<{ scene: string; n_frames: number }> {
-  const res = await fetch(
-    `${getApiBase()}/scenes/${encodeURIComponent(scene)}/info`,
-    { headers: authHeaders() },
-  );
-  if (!res.ok) throw new Error(`HTTP ${res.status}: ${await res.text()}`);
-  return res.json();
-}
-
-// ---------------------------------------------------------------------------
-// Edit mode — object deletion
-// ---------------------------------------------------------------------------
-export interface EditSubmitOptions {
-  scene: string;
-  source_ckpt: string;
-  frame_idx: number;
-  click_x: number;  // [0, 1]
-  click_y: number;  // [0, 1]
-  quality_mode: "A" | "B";
-}
-
-export async function submitEditJob(opts: EditSubmitOptions): Promise<ProcessResponse> {
-  const fd = new FormData();
-  fd.append("scene", opts.scene);
-  fd.append("mode", "edit");
-  fd.append("source_ckpt", opts.source_ckpt);
-  fd.append("frame_idx", String(opts.frame_idx));
-  fd.append("click_x", String(opts.click_x));
-  fd.append("click_y", String(opts.click_y));
-  fd.append("quality_mode", opts.quality_mode);
-
-  console.log("[submitEditJob] target:", `${getApiBase()}/process`);
-  console.log("[submitEditJob] scene:", opts.scene, "frame_idx:", opts.frame_idx, "quality_mode:", opts.quality_mode);
-
-  const res = await fetch(`${getApiBase()}/process`, {
-    method: "POST",
-    body: fd,
-    headers: authHeaders(),
-  }).catch((err) => {
-    console.error("[submitEditJob] fetch threw:", err);
-    throw new Error(`Network error: ${err}. Check connection settings + backend log.`);
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    console.error("[submitEditJob] HTTP error:", res.status, res.statusText, text);
-    throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
-  }
-  const json = (await res.json()) as ProcessResponse;
-  console.log("[submitEditJob] success:", json);
-  return json;
 }
 
 /**
