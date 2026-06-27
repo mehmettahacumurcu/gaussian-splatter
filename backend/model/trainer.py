@@ -2095,7 +2095,7 @@ class Trainer4DGS:
                             pass
                     raise RuntimeError(
                         f"Training diverged at iter {it}: {'+'.join(reason)} non-finite. "
-                        f"Last good checkpoint: run scripts/recover_scene.py <scene>"
+                        f"Last good checkpoint: run scripts/export_from_ckpt.py --scene <scene>"
                     )
 
             # v3.7.4: Hard clamp on log_scale — TIGHTER bound.

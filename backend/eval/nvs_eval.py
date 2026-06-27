@@ -15,6 +15,22 @@ import torch
 import torch.nn.functional as F
 
 
+def _scale_K(K_native: torch.Tensor, w_native: int, h_native: int,
+             w_render: int, h_render: int) -> torch.Tensor:
+    """Rescale camera intrinsics from native (COLMAP) to render resolution.
+
+    K_first comes from COLMAP at the native frame resolution; eval renders
+    at cfg.train.image_resolution. Without this rescale the focal length /
+    principal point are off by (render / native), reprojection collapses,
+    and PSNR floor-pegs at ~8 dB regardless of model quality.
+    """
+    sx, sy = w_render / w_native, h_render / h_native
+    K_s = K_native.clone()
+    K_s[0, 0] *= sx; K_s[0, 2] *= sx
+    K_s[1, 1] *= sy; K_s[1, 2] *= sy
+    return K_s
+
+
 def _psnr(pred: torch.Tensor, gt: torch.Tensor) -> float:
     mse = ((pred - gt) ** 2).mean().item()
     return float("inf") if mse < 1e-12 else -10.0 * math.log10(mse)

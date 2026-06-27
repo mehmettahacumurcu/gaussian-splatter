@@ -828,9 +828,13 @@ def run_pipeline(
                                  max_gaussians=cfg.train.max_gaussians,
                                  mode=mode)
 
+    # Static 3DGS — no temporal Fourier trajectory; force fourier_K=0 so the
+    # per-gaussian (N, K, 2, 3) coeffs and their Adam state are never allocated
+    # (frees real GPU memory on 8 GB cards; these params had LR=0 anyway).
+    _fourier_K = 0 if getattr(cfg.train, "static_mode", False) else cfg.model.fourier_K
     gs = GaussianModel(init_pts, init_colors=init_rgb,
                        sh_degree=cfg.model.sh_degree,
-                       fourier_K=cfg.model.fourier_K)
+                       fourier_K=_fourier_K)
     # Static 3DGS Faz 1 — DeformationField construct skip if static_mode
     if getattr(cfg.train, "static_mode", False):
         print(f"  [Static 3DGS] DeformationField construct atlandi (static_mode=True)")
@@ -1109,18 +1113,23 @@ def run_pipeline(
         return status
 
     print("\n[Faz 6] PLY export")
-    cb("export", 0.0, f"{cfg.export.num_timestamps} timestamp export ediliyor", {})
+    # Static 3DGS — no deformation: export a single clean frame. Passing the
+    # (inert, frozen-random) placeholder deform here would otherwise apply
+    # per-timestamp garbage offsets across num_timestamps frames.
+    _static = getattr(cfg.train, "static_mode", False)
+    _n_ts = 1 if _static else cfg.export.num_timestamps
+    cb("export", 0.0, f"{_n_ts} timestamp export ediliyor", {})
     export_to_ply(
         gs=trainer.gs,
-        deform=trainer.deform,
+        deform=None if _static else trainer.deform,
         output_dir=paths["output"] / "ply",
-        num_timestamps=cfg.export.num_timestamps,
+        num_timestamps=_n_ts,
         scene_extent=extent,
         device=device,
     )
-    status["export"] = f"{cfg.export.num_timestamps} timestamp"
-    cb("export", 1.0, f"{cfg.export.num_timestamps} .ply yazıldı",
-       {"num_timestamps": cfg.export.num_timestamps,
+    status["export"] = f"{_n_ts} timestamp"
+    cb("export", 1.0, f"{_n_ts} .ply yazıldı",
+       {"num_timestamps": _n_ts,
         "ply_dir": str(paths["output"] / "ply")})
 
     # -------- Faz 7: NVS Evaluation (4D Quality v6.1 — Madde 1+8) --------
@@ -1129,25 +1138,17 @@ def run_pipeline(
         cb("eval", 0.0, "NVS evaluation basliyor", {})
         try:
             from .eval.nvs_eval import (
-                eval_held_out_camera, eval_temporal_holdout, save_eval_report,
+                _scale_K, eval_held_out_camera, eval_temporal_holdout,
+                save_eval_report,
             )
             from .eval.orbit_render import render_orbit_video
             eval_dir = paths["output"] / "eval"
             eval_dir.mkdir(parents=True, exist_ok=True)
             report = {"scene": scene_name, "type": "mv" if is_mv else "sv"}
 
-            # K_first comes from COLMAP at the native frame resolution; eval renders
-            # at cfg.train.image_resolution. Without this rescale the focal length /
-            # principal point are off by (render / native), reprojection collapses,
-            # and PSNR floor-pegs at ~8 dB regardless of model quality.
-            def _scale_K(K_native: torch.Tensor, w_native: int, h_native: int,
-                         w_render: int, h_render: int) -> torch.Tensor:
-                sx, sy = w_render / w_native, h_render / h_native
-                K_s = K_native.clone()
-                K_s[0, 0] *= sx; K_s[0, 2] *= sx
-                K_s[1, 1] *= sy; K_s[1, 2] *= sy
-                return K_s
-
+            # _scale_K (hoisted into eval.nvs_eval) rescales COLMAP-native K to
+            # the render resolution; without it reprojection collapses and PSNR
+            # floor-pegs at ~8 dB regardless of model quality.
             _render_w, _render_h = cfg.train.image_resolution
 
             if is_mv and mv_ctx is not None and mv_ctx.get("test_cam"):

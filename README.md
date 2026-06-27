@@ -263,7 +263,6 @@ Pipeline'ı cloud config ile çalıştırmak için: `--cloud` bayrağı.
 │   ├── model/        # Faz 4-5
 │   │   ├── gaussian_model.py
 │   │   ├── deformation.py
-│   │   ├── covariance.py
 │   │   ├── renderer.py
 │   │   ├── density_control.py
 │   │   └── trainer.py

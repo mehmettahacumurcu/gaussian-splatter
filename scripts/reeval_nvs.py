@@ -34,16 +34,7 @@ from backend.config import scene_paths  # noqa: E402
 from backend.preprocess.parse_colmap import parse_cameras  # noqa: E402
 from backend.model.gaussian_model import GaussianModel  # noqa: E402
 from backend.model.deformation import DeformationField  # noqa: E402
-from backend.eval.nvs_eval import eval_temporal_holdout  # noqa: E402
-
-
-def _scale_K(K_native: torch.Tensor, w_native: int, h_native: int,
-             w_render: int, h_render: int) -> torch.Tensor:
-    sx, sy = w_render / w_native, h_render / h_native
-    K = K_native.clone()
-    K[0, 0] *= sx; K[0, 2] *= sx
-    K[1, 1] *= sy; K[1, 2] *= sy
-    return K
+from backend.eval.nvs_eval import _scale_K, eval_temporal_holdout  # noqa: E402
 
 
 def _infer_deform_config(state_dict: dict) -> dict:
