@@ -297,6 +297,12 @@ def main() -> int:
     p.add_argument("--force", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--list-presets", action="store_true")
+    p.add_argument("--nvs-eval", action="store_true",
+                   help="Enable held-out NVS eval (static: every-8 interleaved) → "
+                        "writes output/eval/nvs_eval.json for scripts/sota_compare.py")
+    p.add_argument("--foundation", action="store_true",
+                   help="Run foundation depth (Metric3D) supervision instead of the "
+                        "default skip_foundation=True (needed for max-quality SOTA runs)")
     args = p.parse_args()
 
     if args.list_presets:
@@ -320,6 +326,13 @@ def main() -> int:
     print(f"  lambda_lpips={cfg.train.lambda_lpips}, lambda_aniso={cfg.train.lambda_aniso}, "
           f"densify_thr={cfg.train.densify_grad_threshold}")
 
+    if args.nvs_eval:
+        cfg.train.nvs_eval_enabled = True
+        print("[static_3dgs] NVS eval ON → held-out PSNR/SSIM/LPIPS → output/eval/nvs_eval.json")
+    if args.foundation:
+        print("[static_3dgs] Foundation ON → Metric3D depth supervision active "
+              f"(lambda_depth={cfg.train.lambda_depth})")
+
     if args.dry_run:
         print("\n[dry-run] Calistirilmadi.")
         return 0
@@ -335,7 +348,7 @@ def main() -> int:
         video_path=video_path,
         scene_name=args.scene,
         cfg=cfg,
-        skip_foundation=True,
+        skip_foundation=not args.foundation,
         skip_training=False,
         skip_export=args.no_export,
         force_preprocess=args.force,
