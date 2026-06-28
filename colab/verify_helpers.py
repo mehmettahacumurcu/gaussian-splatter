@@ -6,6 +6,7 @@ Run from the repo root, after the pipeline has produced data/<scene>/output/.
 from __future__ import annotations
 
 import json
+import math
 import shutil
 from pathlib import Path
 
@@ -76,8 +77,8 @@ def check_phase2(scene: str = "myroom", baseline_psnr: float = 29.0,
               f"(local baseline ~{baseline_psnr:.1f} dB, floor {min_psnr:.1f})")
         print(f"  SSIM / LPIPS  : {m['ssim']:.4f} / {m['lpips']:.4f}  "
               f"[{m['kind']}, n={m['n_frames']}]")
-        if m["psnr"] < min_psnr:
-            print("  [FAIL] PSNR below floor - possible regression from fourier_K=0")
+        if not math.isfinite(m["psnr"]) or m["psnr"] < min_psnr:
+            print("  [FAIL] PSNR below floor / non-finite - possible regression from fourier_K=0")
             ok = False
         else:
             print("  [OK] PSNR within no-regression band")
