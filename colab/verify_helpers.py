@@ -62,16 +62,47 @@ def gpu_mem_summary() -> None:
         print(f"  (gpu mem unavailable: {e})")
 
 
+def assert_fresh_eval(scene: str, min_mtime: float) -> Path:
+    """Raise RuntimeError if the scene's nvs_eval.json predates min_mtime.
+
+    min_mtime is a freshness anchor — time.time() captured just before the
+    training cell. A pipeline run that crashes before Faz 7 leaves the previous
+    eval file in place; grading it would silently report the wrong run.
+    """
+    import time as _t
+    ep = _eval_path(scene)
+    if ep.stat().st_mtime < min_mtime:
+        _fmt = "%Y-%m-%d %H:%M:%S"
+        raise RuntimeError(
+            f"stale eval: {ep} predates this run "
+            f"(mtime {_t.strftime(_fmt, _t.localtime(ep.stat().st_mtime))} < "
+            f"run start {_t.strftime(_fmt, _t.localtime(min_mtime))}) - "
+            f"did the training cell crash?")
+    print(f"  [OK] fresh eval: {ep}")
+    return ep
+
+
 def check_phase2(scene: str = "myroom", baseline_psnr: float = 29.0,
-                 min_psnr: float = 27.0) -> bool:
+                 min_psnr: float = 27.0, min_mtime: float | None = None) -> bool:
     """Phase 2 no-regression gate. Returns True only if every check passes.
 
     Confirms the fourier_K=0 change did not drop quality (held-out PSNR stays in
     band) and that the static-export fix writes exactly one clean ply frame.
+
+    min_mtime: optional freshness anchor — pass time.time() captured just before
+    the training cell. An nvs_eval.json older than it FAILs the gate; guards
+    against a stale eval (uploaded alongside the data, or left on Drive by a
+    previous session) silently passing after a crashed training run.
     """
     print(f"=== Phase 2 verification - {scene} ===")
     ok = True
     try:
+        if min_mtime is not None:
+            try:
+                assert_fresh_eval(scene, min_mtime)
+            except RuntimeError as e:
+                print(f"  [FAIL] {e}")
+                ok = False
         m = read_metrics(scene)
         print(f"  held-out PSNR : {m['psnr']:.2f} dB  "
               f"(local baseline ~{baseline_psnr:.1f} dB, floor {min_psnr:.1f})")
@@ -80,8 +111,10 @@ def check_phase2(scene: str = "myroom", baseline_psnr: float = 29.0,
         if not math.isfinite(m["psnr"]) or m["psnr"] < min_psnr:
             print("  [FAIL] PSNR below floor / non-finite - possible regression from fourier_K=0")
             ok = False
-        else:
+        elif ok:
             print("  [OK] PSNR within no-regression band")
+        else:
+            print("  (PSNR in band, but the eval file itself is stale - not counted)")
     except Exception as e:
         print(f"  [FAIL] could not read eval metrics: {e}")
         ok = False

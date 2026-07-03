@@ -6,7 +6,7 @@ because the local RTX 3060 Ti is the bottleneck.
 | Notebook | Purpose | GPU time |
 |----------|---------|----------|
 | `phase2_verify.ipynb` | Confirm the Phase 2 changes (`fourier_K=0`, single-frame static export) did not regress quality on `myroom`. Closes task **P2-V**. | ~10–25 min |
-| `sota_verify.ipynb` | The trust-builder: train static `premium` on a Mip-NeRF 360 scene (`garden`) with foundation depth + NVS eval, then `sota_compare.py` for a baseline-anchored verdict. | ~1–4 h |
+| `sota_verify.ipynb` | The trust-builder: train static `premium` on a Mip-NeRF 360 scene (`garden`) with foundation depth + NVS eval, then `sota_compare.py` for a baseline-anchored verdict. | ~2–6 h |
 
 ## How to open
 
@@ -19,8 +19,12 @@ because the local RTX 3060 Ti is the bottleneck.
 ## Data
 
 - **Phase 2 (`myroom`)** comes from **Google Drive** (you upload it once). The notebook
-  mounts Drive and symlinks it into `data/myroom`. You need `frames/` + `colmap/`
-  (+ `depth/` only if you pass `--foundation`).
+  mounts Drive and symlinks it into `data/myroom`. Upload the **entire** `data/myroom/`
+  folder: `video.mp4` + `frames/` + `colmap/` + `depth/` + the hidden `.cache_markers/`.
+  `video.mp4` is required (`_resolve_input` only accepts `images/` or `video.mp4`; a bare
+  `frames/` is rejected) and `.cache_markers/` is what lets COLMAP + depth cache-hit —
+  without it everything recomputes from scratch. Do **not** upload `output/` (a stale eval
+  could shadow the fresh run's verdict).
 - **SOTA (`garden`)** is **downloaded in-notebook** from the Mip-NeRF 360 dataset — no
   Drive needed.
 
