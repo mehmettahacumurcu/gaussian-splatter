@@ -8,6 +8,13 @@ because the local RTX 3060 Ti is the bottleneck.
 | `phase2_verify.ipynb` | Confirm the Phase 2 changes (`fourier_K=0`, single-frame static export) did not regress quality on `myroom`. Closes task **P2-V**. | ~10–25 min |
 | `sota_verify.ipynb` | The trust-builder: train static `premium` on a Mip-NeRF 360 scene (`garden`) with foundation depth + NVS eval, then `sota_compare.py` for a baseline-anchored verdict. | ~2–6 h |
 
+## Verified results
+
+| Date | Run | Verdict |
+|------|-----|---------|
+| 2026-07-03 | **P2-V** (`myroom`, balanced+foundation+nvs-eval, A100) | **PASS** — held-out PSNR **29.16 dB** (local baseline ~29.0, floor 27.0), SSIM 0.9071, LPIPS 0.1508, n=38; exactly 1 ply frame; final N=267,220. Phase 2 (`fourier_K=0` + static export) confirmed regression-free. |
+| — | SOTA (`garden`) | not yet run |
+
 ## How to open
 
 1. Upload the `.ipynb` to Colab (or open it from GitHub: *File → Open notebook → GitHub →
