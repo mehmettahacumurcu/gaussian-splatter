@@ -19,7 +19,10 @@ because the local RTX 3060 Ti is the bottleneck.
 ## Data
 
 - **Phase 2 (`myroom`)** comes from **Google Drive** (you upload it once). The notebook
-  mounts Drive and symlinks it into `data/myroom`. Upload the **entire** `data/myroom/`
+  mounts Drive, **copies the folder to the local VM disk**, and links `data/myroom` to the
+  local copy — never train through the Drive mount itself: the trainer reads a frame +
+  depth map every iteration and Drive FUSE reads are network round-trips (measured
+  ~0.2 it/s vs GPU-bound from local disk). Upload the **entire** `data/myroom/`
   folder: `video.mp4` + `frames/` + `colmap/` + `depth/` + the hidden `.cache_markers/`.
   `video.mp4` is required (`_resolve_input` only accepts `images/` or `video.mp4`; a bare
   `frames/` is rejected) and `.cache_markers/` is what lets COLMAP + depth cache-hit —
