@@ -49,6 +49,22 @@ def _noop_cb(phase: str, progress: float, message: str = "",
     pass
 
 
+def _static_trainer_overrides(cfg: Config) -> tuple[int, str]:
+    """(fourier_K, deform_pos_mode) — static modda ikisi birlikte degismeli.
+
+    Static 3DGS'te temporal Fourier trajectory yok: fourier_K=0 ile per-gaussian
+    (N, K, 2, 3) coeffs + Adam state hic allocate edilmez (8 GB kartlarda gercek
+    VRAM kazanci; parametrelerin LR'i zaten 0'di). Ama fourier_K=0 iken trainer
+    init'i 'hybrid'/'fourier' deform_pos_mode'u (dogru olarak) ValueError'la
+    reddeder — mod 'mlp' olmali. Static modda deformation train()'de zaten
+    bypass edildigi icin mod inert'tir, sadece validation'i gecmesi gerekir
+    (image_to_scene/runner.py'daki static B trainer ile ayni cozum).
+    """
+    if getattr(cfg.train, "static_mode", False):
+        return 0, "mlp"
+    return cfg.model.fourier_K, cfg.model.deform_pos_mode
+
+
 def run_pipeline(
     video_path: str | Path,
     scene_name: str = "test_scene",
@@ -857,7 +873,9 @@ def run_pipeline(
     # Static 3DGS — no temporal Fourier trajectory; force fourier_K=0 so the
     # per-gaussian (N, K, 2, 3) coeffs and their Adam state are never allocated
     # (frees real GPU memory on 8 GB cards; these params had LR=0 anyway).
-    _fourier_K = 0 if getattr(cfg.train, "static_mode", False) else cfg.model.fourier_K
+    # deform_pos_mode da birlikte 'mlp' olur — trainer init'i fourier_K=0 ile
+    # 'hybrid'i reddediyor (Colab P2-V 2026-07-03 crash'i).
+    _fourier_K, _deform_pos_mode = _static_trainer_overrides(cfg)
     gs = GaussianModel(init_pts, init_colors=init_rgb,
                        sh_degree=cfg.model.sh_degree,
                        fourier_K=_fourier_K)
@@ -971,7 +989,7 @@ def run_pipeline(
         opacity_reset_interval=cfg.train.opacity_reset_interval,
         warmup_iters=cfg.train.warmup_iters,
         # v3.6 / Yol C — Per-gaussian Fourier trajectory
-        deform_pos_mode=cfg.model.deform_pos_mode,
+        deform_pos_mode=_deform_pos_mode,
         lr_fourier=cfg.train.lr_fourier,
         lambda_fourier_reg=cfg.train.lambda_fourier_reg,
         # v3.7.2 — N hard cap
