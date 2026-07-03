@@ -386,6 +386,32 @@ def run_pipeline(
         cb("colmap", 1.0, f"{len(cams)} kamera, {len(xyz)} 3B nokta",
            {"cameras": len(cams), "points": len(xyz)})
 
+        # --native-res: train/eval cozunurlugunu COLMAP'in gordugu kaynak frame
+        # boyutuna cek (photo-set protokol paritesi, orn. Mip-NeRF360 images_4).
+        # Preset'in sabit cozunurlugu kaynaktan buyukse GT upsample + aspect
+        # stretch olur; baseline'larla karsilastirilan metrikler bozulur.
+        if getattr(cfg.train, "native_resolution", False) and cams:
+            _cam0 = cams[sorted(cams.keys())[0]]
+            _nw, _nh = int(_cam0.get("width", 0)), int(_cam0.get("height", 0))
+            if _nw > 0 and _nh > 0:
+                if (_nw, _nh) != tuple(cfg.train.image_resolution):
+                    print(f"[pipeline] native-res: image_resolution "
+                          f"{tuple(cfg.train.image_resolution)} -> ({_nw}, {_nh})")
+                    cfg.train.image_resolution = (_nw, _nh)
+                _long_native = max(_nw, _nh)
+                _sched = [tuple(s) for s in (getattr(cfg.train, "multires_schedule", []) or [])]
+                if _sched:
+                    _clamped: list[tuple[int, int]] = []
+                    for _it, _edge in _sched:
+                        _e = min(int(_edge), _long_native)
+                        if _clamped and _e <= _clamped[-1][1]:
+                            continue  # clamp sonrasi non-increasing step'leri at
+                        _clamped.append((int(_it), _e))
+                    if _clamped != _sched:
+                        print(f"[pipeline] native-res: multires_schedule "
+                              f"{_sched} -> {_clamped}")
+                        cfg.train.multires_schedule = _clamped
+
     # -------- Faz 3: Foundation modeller (opsiyonel, resilient) --------
     # Phase 1.4: Multi-view'da per-cam depth (Metric3D/MiDaS) calisiyor.
     # Tracks/masks per-cam Phase 1.5'te aktif olacak (su an MV'de sadece depth).

@@ -348,6 +348,13 @@ class TrainConfig:
     nvs_eval_enabled: bool = False
     nvs_eval_orbit_frames: int = 60  # orbit mp4 frame count
     nvs_eval_orbit_fps: int = 30
+    # Static photo-set protokol paritesi (orn. Mip-NeRF360 images_4).
+    # True: pipeline, COLMAP kameralarindan native (W,H) okuyup image_resolution'i
+    # override eder ve multires_schedule long-edge'lerini native'e clamp'ler.
+    # Yayinlanan baseline'lar native-res protokolu kullanir; preset'in sabit
+    # cozunurlugu kaynaktan buyukse GT upsample + aspect-stretch olur ve
+    # olculen PSNR karsilastirilabilir olmaz. CLI: static_3dgs.py --native-res
+    native_resolution: bool = False
     # Perf — RAM preload all frames/depth/masks at training start.
     # False (default) keeps the existing lazy disk-read path. True triggers
     # ThreadPoolExecutor(16) parallel preload at master cache resolution

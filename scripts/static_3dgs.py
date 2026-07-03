@@ -27,6 +27,8 @@ Tek argumanlar:
     --no-export   PLY export'u atla (cache test icin)
     --force       Tum cache'leri yoksay, baştan calistir
     --dry-run     Sadece config tablosunu yazdir, calistirma
+    --colmap-cpu  COLMAP CPU SIFT (headless/CUDA'siz build'ler, orn. Colab apt colmap)
+    --native-res  Train/eval cozunurlugu kaynak frame boyutundan (protokol paritesi)
 
 Bagimliliklar: backend.pipeline.run_pipeline (single-view path).
 """
@@ -303,6 +305,13 @@ def main() -> int:
     p.add_argument("--foundation", action="store_true",
                    help="Run foundation depth (Metric3D) supervision instead of the "
                         "default skip_foundation=True (needed for max-quality SOTA runs)")
+    p.add_argument("--colmap-cpu", action="store_true",
+                   help="Force COLMAP CPU SIFT (use_gpu=0). Needed on headless/CUDA-less "
+                        "COLMAP builds (e.g. Colab's apt colmap) where GPU SIFT crashes")
+    p.add_argument("--native-res", action="store_true",
+                   help="Derive train/eval resolution from the source frames instead of "
+                        "the preset's fixed image_resolution (photo-set protocol parity, "
+                        "e.g. Mip-NeRF360 images_4 — required for comparable SOTA metrics)")
     args = p.parse_args()
 
     if args.list_presets:
@@ -332,6 +341,12 @@ def main() -> int:
     if args.foundation:
         print("[static_3dgs] Foundation ON → Metric3D depth supervision active "
               f"(lambda_depth={cfg.train.lambda_depth})")
+    if args.colmap_cpu:
+        cfg.preprocess.colmap_use_gpu = False
+        print("[static_3dgs] COLMAP CPU SIFT ON (use_gpu=0 — headless/CUDA'siz build)")
+    if args.native_res:
+        cfg.train.native_resolution = True
+        print("[static_3dgs] Native-res ON → image_resolution kaynak frame boyutundan turetilecek")
 
     if args.dry_run:
         print("\n[dry-run] Calistirilmadi.")

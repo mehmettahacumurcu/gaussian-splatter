@@ -148,8 +148,11 @@ def run_colmap(
     extra_match: list[str] = list(extra_match_args or [])
     extra_mapper: list[str] = list(extra_mapper_args or [])
     if not use_gpu:
-        extra_feat += ["--SiftExtraction.gpu_index", "-1"]
-        extra_match += ["--SiftMatching.gpu_index", "-1"]
+        # use_gpu=0 gercek CPU switch'i; gpu_index=-1 COLMAP'in "auto-select GPU"
+        # DEFAULT degeri (CPU'ya dusurmez). Headless/CUDA'siz build'lerde
+        # (orn. Colab apt colmap) GPU SIFT OpenGL context bulamayip crash eder.
+        extra_feat += ["--SiftExtraction.use_gpu", "0"]
+        extra_match += ["--SiftMatching.use_gpu", "0"]
 
     # single_camera modu: "yes" → tek K (default), "no" → her image kendi K'si,
     # "per_folder" → her subfolder kendi K'si (multi-cam ideal)
