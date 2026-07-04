@@ -107,8 +107,12 @@ export function Scene({ world, onStateChange }: SceneProps) {
           {world ? (
             <>
               {/* Visual splat — independent of collider, so it renders even
-                  when the collider JSON 404s. */}
-              <SplatBackground url={world.plyUrl} />
+                  when the collider JSON 404s. The worldRotation gravity-aligns
+                  the raw splat frame once the collider JSON arrives. */}
+              <SplatBackground
+                url={world.plyUrl}
+                quaternion={colliderData?.worldRotation?.quaternion}
+              />
               {colliderData ? (
                 <WorldCollider data={colliderData} />
               ) : (

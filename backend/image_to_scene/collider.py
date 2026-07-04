@@ -58,8 +58,18 @@ def derive_minimal_collider(
     )
 
 
-def write_collider_json(path: Path, collider: MinimalCollider) -> None:
-    """Serialize to the JSON shape consumed by the frontend WorldCollider loader."""
+def write_collider_json(
+    path: Path,
+    collider: MinimalCollider,
+    world_rotation=None,
+) -> None:
+    """Serialize to the JSON shape consumed by the frontend WorldCollider loader.
+
+    world_rotation: optional (x, y, z, w) quaternion that maps the raw splat
+    frame into the frame this collider was derived in (viewer space, +Y up).
+    The viewer applies it to the splat object; the collider values here are
+    already in the rotated frame. Additive field — old bundles stay valid.
+    """
     payload = {
         "schema_version": 1,
         "groundPlane": {"y": collider.ground_y},
@@ -75,4 +85,8 @@ def write_collider_json(path: Path, collider: MinimalCollider) -> None:
             "lookDirection": [round(float(v), 6) for v in collider.spawn_look_direction],
         },
     }
+    if world_rotation is not None:
+        payload["worldRotation"] = {
+            "quaternion": [round(float(v), 6) for v in world_rotation],
+        }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")

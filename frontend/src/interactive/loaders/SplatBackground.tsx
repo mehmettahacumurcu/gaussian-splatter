@@ -12,7 +12,13 @@ const ignoreRaycast: THREE.Object3D['raycast'] = () => {}
 interface Props {
   url: string
   visible?: boolean
+  // World rotation (x, y, z, w) from the bundle's collider JSON: maps the raw
+  // splat frame into viewer space (+Y up). The collider is derived in the
+  // rotated frame, so physics only lines up when this is applied to the splat.
+  quaternion?: [number, number, number, number]
 }
+
+const IDENTITY_QUATERNION: [number, number, number, number] = [0, 0, 0, 1]
 
 // Augment JSX intrinsics so TypeScript accepts the extended elements.
 declare module '@react-three/fiber' {
@@ -22,7 +28,7 @@ declare module '@react-three/fiber' {
   }
 }
 
-export function SplatBackground({ url, visible = true }: Props) {
+export function SplatBackground({ url, visible = true, quaternion }: Props) {
   const renderer = useThree((state) => state.gl)
   const sparkRef = useRef<SparkRenderer>(null)
   const meshRef = useRef<SplatMesh>(null)
@@ -45,7 +51,7 @@ export function SplatBackground({ url, visible = true }: Props) {
 
   return (
     <sparkRenderer ref={sparkRef} args={sparkArgs} visible={visible}>
-      <splatMesh ref={meshRef} args={splatArgs} />
+      <splatMesh ref={meshRef} args={splatArgs} quaternion={quaternion ?? IDENTITY_QUATERNION} />
     </sparkRenderer>
   )
 }

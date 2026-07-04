@@ -5,6 +5,10 @@ export interface WorldColliderData {
   groundPlane: { y: number }
   boundingWalls: { xMin: number; xMax: number; zMin: number; zMax: number; yMax: number }
   spawn: { position: [number, number, number]; lookDirection: [number, number, number] }
+  // Rotation (x, y, z, w) that maps the raw splat frame into the frame the
+  // collider values above are expressed in (viewer space, +Y up). The splat
+  // object must be rendered with this quaternion; absent on old bundles.
+  worldRotation?: { quaternion: [number, number, number, number] }
 }
 
 interface Props {

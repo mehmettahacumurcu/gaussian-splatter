@@ -35,6 +35,7 @@ from .seed import image_to_pointcloud, init_gaussian_model_from_seed, normalize_
 from .trajectory import CameraPose, generate_bounded_room_trajectory
 from .outpaint_loop import run_outpaint_loop, render_pose, _w2c_from_pose
 from .collider import derive_minimal_collider, write_collider_json
+from .orientation import estimate_world_orientation, rotate_points
 
 
 # ---------------------------------------------------------------------------
@@ -152,9 +153,37 @@ def wrap_scene_as_world(
     pts_np = np.stack([np.asarray(verts["x"]),
                        np.asarray(verts["y"]),
                        np.asarray(verts["z"])], axis=-1).astype(np.float32)
-    collider = derive_minimal_collider(pts_np, eye_height_m=eye_height_m)
+
+    # Gravity-align: the raw frame is arbitrary (COLMAP gauge / generator
+    # convention). Measure 'up', derive the collider in viewer space (+Y up),
+    # and store the rotation for the viewer to apply to the splat. See
+    # orientation.py for the measured evidence behind this.
+    prop_names = {p.name for p in verts.properties}
+    weights = None
+    if "opacity" in prop_names:
+        weights = 1.0 / (1.0 + np.exp(-np.asarray(verts["opacity"], dtype=np.float64)))
+    colors = None
+    if {"f_dc_0", "f_dc_1", "f_dc_2"} <= prop_names:
+        sh_c0 = 0.2820948
+        colors = np.clip(0.5 + sh_c0 * np.stack(
+            [np.asarray(verts["f_dc_0"]), np.asarray(verts["f_dc_1"]),
+             np.asarray(verts["f_dc_2"])], axis=-1).astype(np.float64), 0.0, 1.0)
+    orientation = estimate_world_orientation(pts_np, weights=weights, colors=colors)
+    print(f"  [orientation] up_raw={np.round(orientation.up_raw, 3).tolist()} "
+          f"tilt={orientation.tilt_deg:.1f}deg "
+          f"inliers={orientation.plane_inlier_frac * 100:.0f}% "
+          f"asym={orientation.above_below_ratio:.1f} "
+          f"sky_agrees={orientation.sky_agrees}")
+    if orientation.plane_inlier_frac < 0.25 or orientation.above_below_ratio < 3.0:
+        print("  [orientation] WARN: low-confidence up estimate (weak plane or "
+              "balanced sides) — inspect this world visually before trusting "
+              "the walk plane")
+
+    pts_aligned = rotate_points(pts_np, orientation.quaternion).astype(np.float32)
+    collider = derive_minimal_collider(pts_aligned, eye_height_m=eye_height_m)
     collider_path = artifact_path(env.output_world, out_index, "world-collider", ".json")
-    write_collider_json(collider_path, collider)
+    write_collider_json(collider_path, collider,
+                        world_rotation=orientation.quaternion)
 
     # Trajectory stub: just the spawn pose. (Multi-image scenes already had
     # their own poses during training; we don't reuse them here.)
@@ -173,6 +202,13 @@ def wrap_scene_as_world(
         "world": env.slug,
         "source_ply": str(ply_path),
         "n_points": int(pts_np.shape[0]),
+        "orientation": {
+            "up_raw": [round(float(v), 4) for v in orientation.up_raw],
+            "tilt_deg": round(orientation.tilt_deg, 1),
+            "plane_inlier_frac": round(orientation.plane_inlier_frac, 3),
+            "above_below_ratio": round(orientation.above_below_ratio, 1),
+            "sky_agrees": orientation.sky_agrees,
+        },
     }, indent=2), encoding="utf-8")
 
     return {
