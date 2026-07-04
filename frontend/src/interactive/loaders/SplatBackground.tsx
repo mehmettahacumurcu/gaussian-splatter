@@ -44,14 +44,32 @@ export function SplatBackground({ url, visible = true, quaternion }: Props) {
     [url],
   )
 
+  // Keyed by url: a url change makes R3F construct a NEW SplatMesh (args
+  // identity), so the new instance needs raycast disabled again.
   useEffect(() => {
     if (meshRef.current) meshRef.current.raycast = ignoreRaycast
     if (sparkRef.current) sparkRef.current.raycast = ignoreRaycast
-  }, [])
+  }, [url])
+
+  // Explicit dispose of the outgoing SplatMesh (GPU buffers) on url change
+  // and on unmount. Capture the instance in the effect body: React detaches
+  // refs before passive cleanup runs, so `meshRef.current` is already null
+  // inside the cleanup. dispose={null} below makes this the single owner.
+  useEffect(() => {
+    const mesh = meshRef.current
+    return () => {
+      mesh?.dispose()
+    }
+  }, [url])
 
   return (
     <sparkRenderer ref={sparkRef} args={sparkArgs} visible={visible}>
-      <splatMesh ref={meshRef} args={splatArgs} quaternion={quaternion ?? IDENTITY_QUATERNION} />
+      <splatMesh
+        ref={meshRef}
+        args={splatArgs}
+        quaternion={quaternion ?? IDENTITY_QUATERNION}
+        dispose={null}
+      />
     </sparkRenderer>
   )
 }

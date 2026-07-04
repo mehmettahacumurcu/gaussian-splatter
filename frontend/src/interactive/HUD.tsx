@@ -2,7 +2,12 @@ import { useEffect, useState } from 'react'
 import { DEFAULTS } from './config'
 import type { PickupState } from './types'
 
-export function HUD({ pickupState }: { pickupState: PickupState }) {
+interface Props {
+  pickupState: PickupState
+  flyMode?: boolean
+}
+
+export function HUD({ pickupState, flyMode = false }: Props) {
   const [locked, setLocked] = useState(false)
 
   useEffect(() => {
@@ -69,6 +74,20 @@ export function HUD({ pickupState }: { pickupState: PickupState }) {
               }}
             >
               [G] drop &nbsp; [LClick] throw
+            </div>
+          )}
+          {flyMode && (
+            <div
+              style={{
+                position: 'absolute', bottom: 8, left: 8,
+                color: '#6f6', fontSize: 13,
+                background: 'rgba(0,0,0,0.55)',
+                padding: '4px 8px', borderRadius: 4,
+                pointerEvents: 'none', zIndex: 10,
+                fontFamily: 'monospace',
+              }}
+            >
+              FLY MODE &nbsp; [F] walk &nbsp; Space/Shift = up/down
             </div>
           )}
         </>

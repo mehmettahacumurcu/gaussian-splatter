@@ -35,7 +35,12 @@ export default defineConfig(async () => ({
               console.warn(
                 `[serve-worlds-dir] miss ${req.url} -> ${filepath} (${err?.code ?? "not a file"})`,
               );
-              return next();
+              // Real 404, NOT next(): falling through hits Vite's SPA fallback,
+              // which answers 200 + index.html — that poisons the world
+              // availability probe and collider fetches for missing worlds.
+              res.statusCode = 404;
+              res.end("world file not found");
+              return;
             }
             const ext = path.extname(filepath).toLowerCase();
             const contentType =

@@ -47,9 +47,10 @@ const TEST_OBJECTS: DynamicObjectSpec[] = [
 interface SceneProps {
   world?: WorldEntry | null
   onStateChange?: (s: PickupState) => void
+  flyMode?: boolean
 }
 
-export function Scene({ world, onStateChange }: SceneProps) {
+export function Scene({ world, onStateChange, flyMode = false }: SceneProps) {
   const bodies = useRef<Map<string, DynamicBodyEntry>>(new Map())
   const [colliderData, setColliderData] = useState<WorldColliderData | null>(null)
 
@@ -92,7 +93,12 @@ export function Scene({ world, onStateChange }: SceneProps) {
 
   // Force-remount the controller when the spawn changes so the rigidbody
   // gets repositioned. Physics RigidBody only reads `position` at mount.
-  const controllerKey = world ? `world:${world.slug}` : 'default'
+  // Including spawn coordinates in the key ensures a remount when the
+  // collider JSON loads and delivers the real spawn (fixes the case where
+  // WORLD_SPAWN_FALLBACK was used until collider data arrived).
+  const controllerKey = world
+    ? `world:${world.slug}:${effectiveSpawn.join(',')}`
+    : 'default'
 
   return (
     <Canvas
@@ -103,7 +109,12 @@ export function Scene({ world, onStateChange }: SceneProps) {
       <directionalLight position={[5, 10, 5]} intensity={1.0} />
       <Suspense fallback={null}>
         <Physics gravity={DEFAULTS.physics.gravity} timeStep={DEFAULTS.physics.fixedTimestep}>
-          <FirstPersonController key={controllerKey} spawn={effectiveSpawn} />
+          <FirstPersonController
+            key={controllerKey}
+            spawn={effectiveSpawn}
+            flyMode={flyMode}
+            groundY={colliderData?.groundPlane.y}
+          />
           {world ? (
             <>
               {/* Visual splat — independent of collider, so it renders even

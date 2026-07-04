@@ -1,3 +1,5 @@
+import { useEffect, useState } from 'react'
+
 export interface WorldEntry {
   slug: string
   displayName: string
@@ -58,25 +60,63 @@ const FIXTURE_WORLDS: WorldEntry[] = [
   },
 ]
 
+// Probe each world's collider JSON (cheap ~400 B HEAD request) to detect
+// which worlds have files on disk. Accepts an injectable fetchFn for testing.
+export async function probeWorldAvailability(
+  worlds: WorldEntry[],
+  fetchFn: (url: string) => Promise<Pick<Response, 'ok'>> = (url) =>
+    fetch(url, { method: 'HEAD' }),
+): Promise<Record<string, boolean>> {
+  const pairs = await Promise.all(
+    worlds.map(async (w) => {
+      try {
+        const r = await fetchFn(w.colliderJsonUrl)
+        return [w.slug, r.ok] as const
+      } catch {
+        return [w.slug, false] as const
+      }
+    }),
+  )
+  return Object.fromEntries(pairs)
+}
+
+// WorldSelector renders just the <select> — positioning is handled by the
+// parent (InteractivePage) so both the selector and the fly-mode toggle can
+// share a single top-right flex row without double absolute positioning.
 export function WorldSelector({ value, onChange }: Props) {
+  const [availability, setAvailability] = useState<Record<string, boolean>>({})
+  const [probesDone, setProbesDone] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    probeWorldAvailability(FIXTURE_WORLDS).then((result) => {
+      if (!cancelled) {
+        setAvailability(result)
+        setProbesDone(true)
+      }
+    })
+    return () => { cancelled = true }
+  }, [])
+
   return (
-    <div style={{ position: 'absolute', top: 8, right: 8, zIndex: 10 }}>
-      <select
-        data-testid="world-selector"
-        value={value ?? ''}
-        onChange={(e) => {
-          const slug = e.target.value
-          onChange(slug ? (FIXTURE_WORLDS.find((w) => w.slug === slug) ?? null) : null)
-        }}
-        style={{ padding: '4px 8px', background: '#222', color: '#eee', border: '1px solid #444' }}
-      >
-        <option value="">— built-in test room —</option>
-        {FIXTURE_WORLDS.map((w) => (
-          <option key={w.slug} value={w.slug}>
-            {w.displayName}
+    <select
+      data-testid="world-selector"
+      value={value ?? ''}
+      onChange={(e) => {
+        const slug = e.target.value
+        onChange(slug ? (FIXTURE_WORLDS.find((w) => w.slug === slug) ?? null) : null)
+      }}
+      style={{ padding: '4px 8px', background: '#222', color: '#eee', border: '1px solid #444' }}
+    >
+      <option value="">— built-in test room —</option>
+      {FIXTURE_WORLDS.map((w) => {
+        const available = !probesDone || (availability[w.slug] ?? true)
+        return (
+          <option key={w.slug} value={w.slug} disabled={!available}>
+            {w.displayName}{!available ? ' (files missing)' : ''}
           </option>
-        ))}
-      </select>
-    </div>
+        )
+      })}
+    </select>
   )
 }

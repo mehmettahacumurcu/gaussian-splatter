@@ -1,6 +1,7 @@
 export const DEFAULTS = {
   player: {
     walkSpeed: 3.0,
+    flySpeed: 6.0,   // noclip flight speed (~2x walkSpeed)
     mouseSensitivity: 0.002,
     eyeHeight: 1.7,
     capsuleRadius: 0.4,
