@@ -6,8 +6,8 @@ because the local RTX 3060 Ti is the bottleneck.
 | Notebook | Purpose | GPU time |
 |----------|---------|----------|
 | `phase2_verify.ipynb` | Confirm the Phase 2 changes (`fourier_K=0`, single-frame static export) did not regress quality on `myroom`. Closes task **P2-V**. | ~10–25 min |
-| `sota_verify.ipynb` | The trust-builder: train static `premium` on a Mip-NeRF 360 scene (`garden`) with foundation depth + NVS eval, then `sota_compare.py` for a baseline-anchored verdict. | ~2–6 h |
-| `colmap_cuda_build.ipynb` | CUDA COLMAP feasibility — install or build a headless GPU-SIFT COLMAP, run a GPU vs CPU timing experiment on a real scene, persist the artifact to Drive. Feeds a future `bootstrap.sh --colmap-cuda`. | ~10–45 min |
+| `sota_verify.ipynb` | The trust-builder: train static `premium` **or** `sota` (selectable `PRESET`) on a Mip-NeRF 360 scene (`garden`) with NVS eval, then `sota_compare.py` for a baseline-anchored verdict. Uses CUDA COLMAP (GPU SIFT) via `--colmap-cuda`. | ~1.5–4 h |
+| `colmap_cuda_build.ipynb` | CUDA COLMAP feasibility — install or build a headless GPU-SIFT COLMAP, run a GPU vs CPU timing experiment on a real scene, persist the artifact to Drive. Feeds `bootstrap.sh --colmap-cuda` (now wired). | ~10–45 min |
 
 ## Verified results
 
@@ -15,6 +15,7 @@ because the local RTX 3060 Ti is the bottleneck.
 |------|-----|---------|
 | 2026-07-03 | **P2-V** (`myroom`, balanced+foundation+nvs-eval, A100) | **PASS** — held-out PSNR **29.16 dB** (local baseline ~29.0, floor 27.0), SSIM 0.9071, LPIPS 0.1508, n=38; exactly 1 ply frame; final N=267,220. Phase 2 (`fourier_K=0` + static export) confirmed regression-free. |
 | 2026-07-04 | **SOTA** (`garden`, premium+foundation+nvs-eval, CPU COLMAP, native `images_4` res, A100) | **Below SOTA** — held-out PSNR **24.94 dB** vs 27.41 dB (3DGS), ΔPSNR **−2.47 dB** (tunable band); SSIM 0.7801 (3DGS 0.868); **LPIPS-VGG 0.0776 beats the published 0.103**; n=23 (every-8). Read: `premium` is a perceptual preset (λ_lpips 0.15, λ_depth 0.15, aniso reg, 1M cap) so it trades PSNR/SSIM for LPIPS vs vanilla 3DGS's pure L1+SSIM at ~5–6M gaussians — part of the gap is by construction. Next lever: PSNR-parity `sota` preset (λ_lpips=0, no depth prior, 6M cap, vanilla densify schedule). |
+| 2026-07-05 | **CUDA COLMAP feasibility** (`colmap_cuda_build.ipynb`, T4) | **PASS** — rung 1 (conda-forge `colmap 3.11.1 cuda` + `ceres-solver 2.2.0`, clean `ldd` closure, headless GPU SIFT exits 0); **33.3x** GPU-vs-CPU extract+match speedup (GPU 1.5 s vs CPU 49.9 s) on the **15-image Unsplash fallback** — matching quality is meaningless there, only the GPU code path is proven. Artifact + report at `MyDrive/4dgs/colmap-cuda/` (`colmap-env.tar.gz` + `colmap_cuda_report.json`). Now wired into `bootstrap.sh --colmap-cuda`. |
 
 ## How to open
 
@@ -64,11 +65,18 @@ exhaustive matching onto the CPU and wastes 1–3 h of A100 credits on a task th
 finish in minutes.
 
 `colmap_cuda_build.ipynb` answers the feasibility question first: it tries to install a
-CUDA-enabled COLMAP via conda-forge (Rung 1, ~5 min), falls back to a source build with
+CUDA-enabled COLMAP via conda-forge (Rung 1, ~1–2 min), falls back to a source build with
 `-DGUI_ENABLED=OFF` and a fat CUDA arch list if that fails (Rung 2, ~20–35 min), then runs
 the real headless crash test — `feature_extractor` + `exhaustive_matcher` with
-`--SiftExtraction.use_gpu 1` on a real scene and records a GPU vs CPU speedup. If the experiment
-passes, a follow-up commit wires the tarball from Drive into `bootstrap.sh --colmap-cuda`.
+`--SiftExtraction.use_gpu 1` on a real scene and records a GPU vs CPU speedup.
+
+**That experiment passed (2026-07-05, T4), so this is no longer hypothetical:
+`bootstrap.sh --colmap-cuda` now exists.** It single-solves a pinned `colmap=3.11.*=*cuda*`
+env with micromamba (or restores the Drive tarball when mounted), gates it (`ldd` closure +
+a headless CUDA-banner check), and installs a `/usr/local/bin/colmap` wrapper that shadows
+apt's binary so the pipeline gets GPU SIFT with no code change. `sota_verify.ipynb` calls
+`--colmap-cuda` and passes `--colmap-cpu` only when the wrapper is absent (automatic
+fallback if the CUDA setup fails).
 
 ## Shared pieces
 
