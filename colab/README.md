@@ -13,7 +13,7 @@ because the local RTX 3060 Ti is the bottleneck.
 | Date | Run | Verdict |
 |------|-----|---------|
 | 2026-07-03 | **P2-V** (`myroom`, balanced+foundation+nvs-eval, A100) | **PASS** — held-out PSNR **29.16 dB** (local baseline ~29.0, floor 27.0), SSIM 0.9071, LPIPS 0.1508, n=38; exactly 1 ply frame; final N=267,220. Phase 2 (`fourier_K=0` + static export) confirmed regression-free. |
-| — | SOTA (`garden`) | not yet run |
+| 2026-07-04 | **SOTA** (`garden`, premium+foundation+nvs-eval, CPU COLMAP, native `images_4` res, A100) | **Below SOTA** — held-out PSNR **24.94 dB** vs 27.41 dB (3DGS), ΔPSNR **−2.47 dB** (tunable band); SSIM 0.7801 (3DGS 0.868); **LPIPS-VGG 0.0776 beats the published 0.103**; n=23 (every-8). Read: `premium` is a perceptual preset (λ_lpips 0.15, λ_depth 0.15, aniso reg, 1M cap) so it trades PSNR/SSIM for LPIPS vs vanilla 3DGS's pure L1+SSIM at ~5–6M gaussians — part of the gap is by construction. Next lever: PSNR-parity `sota` preset (λ_lpips=0, no depth prior, 6M cap, vanilla densify schedule). |
 
 ## How to open
 
