@@ -7,6 +7,7 @@ because the local RTX 3060 Ti is the bottleneck.
 |----------|---------|----------|
 | `phase2_verify.ipynb` | Confirm the Phase 2 changes (`fourier_K=0`, single-frame static export) did not regress quality on `myroom`. Closes task **P2-V**. | ~10–25 min |
 | `sota_verify.ipynb` | The trust-builder: train static `premium` on a Mip-NeRF 360 scene (`garden`) with foundation depth + NVS eval, then `sota_compare.py` for a baseline-anchored verdict. | ~2–6 h |
+| `colmap_cuda_build.ipynb` | CUDA COLMAP feasibility — install or build a headless GPU-SIFT COLMAP, run a GPU vs CPU timing experiment on a real scene, persist the artifact to Drive. Feeds a future `bootstrap.sh --colmap-cuda`. | ~10–45 min |
 
 ## Verified results
 
@@ -20,8 +21,9 @@ because the local RTX 3060 Ti is the bottleneck.
 1. Upload the `.ipynb` to Colab (or open it from GitHub: *File → Open notebook → GitHub →
    `mehmettahacumurcu/gaussian-splatter` → branch `chore/strip-to-core` → `colab/...`).
 2. **Runtime → Change runtime type → A100 GPU** (High-RAM).
-3. Run cells top to bottom. Each notebook clones the repo at branch `chore/strip-to-core`
-   (where the Phase 2 work lives) and runs `colab/bootstrap.sh`.
+3. Run cells top to bottom. The two verification notebooks clone the repo at branch
+   `chore/strip-to-core` (where the Phase 2 work lives) and run `colab/bootstrap.sh`;
+   `colmap_cuda_build.ipynb` is standalone (no clone — pure build experiment).
 
 ## Data
 
@@ -52,6 +54,21 @@ To walk it in the project: download `MyDrive/4dgs/worlds/<scene>/` into your loc
 `worlds/<scene>/`, run `cd frontend && npm run dev`, open the **Interactive** page, and pick
 the scene in the world dropdown (entries for `garden` and `myroom` are pre-added to
 `WorldSelector.tsx`).
+
+## Why a separate CUDA COLMAP notebook?
+
+`bootstrap.sh --colmap` installs COLMAP via `apt-get`. That binary is compiled without CUDA:
+its OpenGL SiftGPU backend requires a display and crashes immediately on Colab's headless VM
+even when a GPU is present. So every pipeline run today passes `--colmap-cpu`, which serialises
+exhaustive matching onto the CPU and wastes 1–3 h of A100 credits on a task that GPU SIFT can
+finish in minutes.
+
+`colmap_cuda_build.ipynb` answers the feasibility question first: it tries to install a
+CUDA-enabled COLMAP via conda-forge (Rung 1, ~5 min), falls back to a source build with
+`-DGUI_ENABLED=OFF` and a fat CUDA arch list if that fails (Rung 2, ~20–35 min), then runs
+the real headless crash test — `feature_extractor` + `exhaustive_matcher` with
+`--SiftExtraction.use_gpu 1` on a real scene and records a GPU vs CPU speedup. If the experiment
+passes, a follow-up commit wires the tarball from Drive into `bootstrap.sh --colmap-cuda`.
 
 ## Shared pieces
 
