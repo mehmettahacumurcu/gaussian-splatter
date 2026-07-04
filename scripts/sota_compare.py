@@ -216,9 +216,11 @@ def main() -> int:
         print("  → Algorithm is in the SOTA band. Compute (longer training, higher")
         print("    resolution, larger N cap) is a reasonable next lever. Cloud will help.")
     elif kind == "warn":
-        print("  → Within the 'tunable' band. Try one more pass at the strongest preset")
-        print("    (ultra / ultra_clean / cloud) on a stronger GPU. If still ≥-1 dB,")
-        print("    revisit foundation-model choices and density-control schedule.")
+        print("  → Within the 'tunable' band. If this was a product preset (premium etc.),")
+        print("    part of the gap is the objective, not the pipeline: LPIPS/depth losses and")
+        print("    the N cap trade PSNR away. Re-run the PSNR-parity preset first:")
+        print("      python scripts/static_3dgs.py --scene <scene> --preset sota --nvs-eval --native-res")
+        print("    (no --foundation). If STILL below -1 dB, investigate density control + COLMAP.")
     else:
         print("  → Gap is too large to be compute-bound. Likely culprits:")
         print("      • mismatched eval protocol (held-out cam, frame count)")

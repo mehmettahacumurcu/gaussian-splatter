@@ -14,14 +14,19 @@ Workflow:
     # Premium overnight (6-10 saat, 4dv.ai-tier):
     python scripts/static_3dgs.py --scene truck --preset premium
 
-Presets (3060 Ti, 8GB VRAM hedefli):
+    # SOTA benchmark paritesi (Mip-NeRF360 protokolu — vanilla-3DGS loss/densify;
+    # --native-res ILE ve --foundation OLMADAN kos, yoksa parite bozulur):
+    python scripts/static_3dgs.py --scene garden --preset sota --nvs-eval --native-res
+
+Presets (3060 Ti, 8GB VRAM hedefli; sota A100/24GB+ ister):
     fast      —  7,000 iter,  720p,  100k cap,  5-8 dk     | preview kalite
     balanced  — 30,000 iter, 1080p,  250k cap,  30-45 dk   | sosyal medya
     high      — 50,000 iter, 1080p,  500k cap,  2-3 saat   | profesyonel
     premium   —100,000 iter, native, 1M cap,    6-10 saat  | 4dv.ai-tier
+    sota      — 30,000 iter, native, 6M cap,    ~1 saat/A100| PSNR paritesi
 
 Tek argumanlar:
-    --preset      fast | balanced | high | premium
+    --preset      fast | balanced | high | premium | sota
     --scene       data/<scene>/ altinda (default: test_scene)
     --video       Photo set yoksa video.mp4 path. Default scene_paths uzerinden bulur.
     --no-export   PLY export'u atla (cache test icin)
@@ -37,6 +42,15 @@ import argparse
 import sys
 import time
 from pathlib import Path
+
+# Windows consoles default to cp1254/cp1252 and choke on the → glyphs below
+# (same guard as scripts/sota_compare.py).
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -159,6 +173,38 @@ PRESETS: dict[str, dict] = {
         "init_subsample_mode": "confidence",
         "multires_schedule": [(0, 720), (25_000, 1_080), (60_000, 1_440)],
         "bg_distance_ratio": 1.5,
+    },
+    # PSNR-parity run against published Mip-NeRF360 numbers. The product presets
+    # above trade PSNR for perceptual quality (LPIPS/depth/aniso losses, low N cap);
+    # this one mirrors vanilla 3DGS so the sota_compare verdict measures the
+    # pipeline, not the preset's objective: pure L1+0.2*D-SSIM, densify until
+    # 15k @ grad 2e-4, opacity reset 3k, 6M cap, no multires warmup.
+    # Run WITH --native-res and WITHOUT --foundation (2026-07-04 garden premium run:
+    # 24.94 dB / LPIPS-VGG 0.0776 vs 3DGS 27.41 dB / 0.103 — the LPIPS win is the
+    # perceptual-loss trade-off, which this preset removes).
+    "sota": {
+        "description": "Mip-NeRF360 PSNR paritesi (--native-res ile, --foundation'siz)",
+        "n_iters": 30_000,
+        "image_resolution": (1920, 1080),   # --native-res kaynaktan turetir; bunu kullanma
+        "max_gaussians": 6_000_000,
+        "ckpt_interval": 10_000,
+        "log_interval": 100,
+        "density_start_iter": 500,
+        "density_end_iter": 15_000,
+        "density_interval": 100,
+        "densify_grad_threshold": 2e-4,
+        "opacity_reset_interval": 3_000,
+        "lambda_ssim": 0.2,
+        "lambda_lpips": 0.0,
+        "lambda_depth": 0.0,
+        "lambda_aniso": 0.0,
+        "aniso_threshold": 5.0,
+        "fps": 30,
+        "resize_long_edge": 1600,
+        "colmap_matching": "exhaustive",
+        "init_subsample_mode": "confidence",
+        "multires_schedule": [],
+        "bg_distance_ratio": 2.0,
     },
 }
 
