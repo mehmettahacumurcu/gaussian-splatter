@@ -1,12 +1,14 @@
-# Colab verification notebooks
+# Colab notebooks
 
-Two notebooks for running the static-3DGS verification on Colab Pro+ (A100 / high-RAM),
-because the local RTX 3060 Ti is the bottleneck.
+Notebooks for running the static-3DGS pipeline on Colab Pro+ (A100 / high-RAM), because
+the local RTX 3060 Ti is the bottleneck: two verification notebooks, a CUDA-COLMAP build
+experiment, and a production video→world runner.
 
 | Notebook | Purpose | GPU time |
 |----------|---------|----------|
 | `phase2_verify.ipynb` | Confirm the Phase 2 changes (`fourier_K=0`, single-frame static export) did not regress quality on `myroom`. Closes task **P2-V**. | ~10–25 min |
 | `sota_verify.ipynb` | The trust-builder: train static `premium` **or** `sota` (selectable `PRESET`) on a Mip-NeRF 360 scene (`garden`) with NVS eval, then `sota_compare.py` for a baseline-anchored verdict. Uses CUDA COLMAP (GPU SIFT) via `--colmap-cuda`. | ~1.5–4 h |
+| `video_to_world.ipynb` | Video on Drive → max-quality splat + gravity-aligned walkable world (`ultra` preset). Extracts frames itself at native res, then runs photo-set mode. | ~5–8 h |
 | `colmap_cuda_build.ipynb` | CUDA COLMAP feasibility — install or build a headless GPU-SIFT COLMAP, run a GPU vs CPU timing experiment on a real scene, persist the artifact to Drive. Feeds `bootstrap.sh --colmap-cuda` (now wired). | ~10–45 min |
 
 ## Verified results
@@ -40,6 +42,12 @@ because the local RTX 3060 Ti is the bottleneck.
   could shadow the fresh run's verdict).
 - **SOTA (`garden`)** is **downloaded in-notebook** from the Mip-NeRF 360 dataset — no
   Drive needed.
+- **`video_to_world` (any video)** takes a raw video from **Drive** and extracts frames
+  **itself** at native resolution — avoiding the two traps of the preset video path: the
+  fps-explosion (premium's `fps=30` makes ~3750 frames from a 2-min clip and kills the CPU
+  COLMAP mapper) and the unconditional upscale (the scale filter forces the long edge up
+  even when the source is smaller). The frames land in `data/<scene>/images/`, so the
+  pipeline runs in **photo-set mode** (used as-is: no fps logic, no resize).
 
 ## Outputs — viewing the splats
 

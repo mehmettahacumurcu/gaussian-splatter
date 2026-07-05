@@ -14,19 +14,26 @@ Workflow:
     # Premium overnight (6-10 saat, 4dv.ai-tier):
     python scripts/static_3dgs.py --scene truck --preset premium
 
+    # Ultra — video/photo-set MAX kalite (~5-8 saat/A100). --foundation VE
+    # --native-res ILE kos: --native-res multires 3840 finalini kaynagin gercek
+    # native uzun kenarina snap eder (yoksa upsample yapar); --foundation Metric3D
+    # derinlik supervizyonu ekler:
+    python scripts/static_3dgs.py --scene myroom --preset ultra --foundation --native-res
+
     # SOTA benchmark paritesi (Mip-NeRF360 protokolu — vanilla-3DGS loss/densify;
     # --native-res ILE ve --foundation OLMADAN kos, yoksa parite bozulur):
     python scripts/static_3dgs.py --scene garden --preset sota --nvs-eval --native-res
 
-Presets (3060 Ti, 8GB VRAM hedefli; sota A100/24GB+ ister):
+Presets (3060 Ti, 8GB VRAM hedefli; sota/ultra A100/24GB+ ister):
     fast      —  7,000 iter,  720p,  100k cap,  5-8 dk     | preview kalite
     balanced  — 30,000 iter, 1080p,  250k cap,  30-45 dk   | sosyal medya
     high      — 50,000 iter, 1080p,  500k cap,  2-3 saat   | profesyonel
     premium   —100,000 iter, native, 1M cap,    6-10 saat  | 4dv.ai-tier
     sota      — 30,000 iter, native, 6M cap,    ~1 saat/A100| PSNR paritesi
+    ultra     —120,000 iter, native, 3M cap,    ~5-8 saat  | max kalite (--native-res)
 
 Tek argumanlar:
-    --preset      fast | balanced | high | premium | sota
+    --preset      fast | balanced | high | premium | sota | ultra
     --scene       data/<scene>/ altinda (default: test_scene)
     --video       Photo set yoksa video.mp4 path. Default scene_paths uzerinden bulur.
     --no-export   PLY export'u atla (cache test icin)
@@ -205,6 +212,57 @@ PRESETS: dict[str, dict] = {
         "init_subsample_mode": "confidence",
         "multires_schedule": [],
         "bg_distance_ratio": 2.0,
+    },
+    # -----------------------------------------------------------------------
+    # ultra: max-quality video / photo-set preset. It is `premium` with FOUR
+    # deliberate deltas -- every OTHER key (lambda_lpips 0.15, lpips vgg + warmup
+    # 3000, lambda_depth 0.15, metric3d_vit_large, lambda_aniso 1e-2 / thr 3.5,
+    # lambda_ssim 0.2, densify_grad_threshold 1e-4, density_start 500,
+    # density_interval 100, opacity_reset 3000, exhaustive matching, confidence
+    # init, bg_distance_ratio 1.5, ckpt 20000, log 200) is IDENTICAL to premium:
+    #   1. LONGER SCHEDULE  n_iters 100k->120k, density_end 70k->80k (more
+    #      refinement iters; densification runs proportionally longer).
+    #   2. 3M GAUSSIAN CAP  1M->3M, deliberately NOT 10M. Published 3DGS indoor
+    #      scenes need ~1-2M gaussians; only outdoor foliage wants 5-6M. 3M is
+    #      headroom-without-bloat: oversized caps densify noise (floaters,
+    #      overfit) that make ROOMS look WORSE, and every 1M gaussians is
+    #      ~250 MB of PLY -- bigger caps break the browser walkable viewer.
+    #   3. NATIVE-RES-FIRST  resize_long_edge None (never upscale) + 1080p
+    #      image_resolution + a multires 3840 finale that --native-res clamps
+    #      down to the true source long edge (see the multires comment below).
+    #   4. FPS GUARDRAIL  30->5. premium's fps=30 turns a ~2 min video into
+    #      ~3750 frames and the CPU COLMAP mapper dies; 5 fps is ~600 frames.
+    # -----------------------------------------------------------------------
+    "ultra": {
+        "description": "5-8 saat max kalite (--native-res ile)",
+        "n_iters": 120_000,
+        "image_resolution": (1920, 1080),
+        "max_gaussians": 3_000_000,
+        "ckpt_interval": 20_000,
+        "log_interval": 200,
+        "density_start_iter": 500,
+        "density_end_iter": 80_000,
+        "density_interval": 100,
+        "densify_grad_threshold": 1e-4,
+        "opacity_reset_interval": 3_000,
+        "lambda_ssim": 0.2,
+        "lambda_lpips": 0.15,
+        "lpips_net": "vgg",
+        "lpips_warmup_iters": 3_000,
+        "lambda_depth": 0.15,
+        "metric3d_model": "metric3d_vit_large",
+        "lambda_aniso": 1e-2,
+        "aniso_threshold": 3.5,
+        "fps": 5,                    # guardrail: 30fps extraction on a 2 min video = ~3750 frames = CPU-mapper death
+        "resize_long_edge": None,    # never upscale; extract at source resolution (extract_frames skips scale when falsy)
+        "colmap_matching": "exhaustive",
+        "init_subsample_mode": "confidence",
+        # the 3_840 finale is INTENTIONALLY above any real source: the --native-res
+        # clamp snaps it down to the actual native long edge (1920 for 1080p, 2560
+        # for 4K), giving a full 60k iterations at true native res. ultra is
+        # designed to run WITH --native-res; without it the 3840 stage would upsample.
+        "multires_schedule": [(0, 720), (25_000, 1_080), (60_000, 3_840)],
+        "bg_distance_ratio": 1.5,
     },
 }
 
