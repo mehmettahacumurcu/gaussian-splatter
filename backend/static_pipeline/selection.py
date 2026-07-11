@@ -406,11 +406,14 @@ def _validate_policy(policy: SelectionPolicy) -> None:
         raise ValueError(f"unsupported selection mode: {policy.mode}")
     if policy.frame_budget <= 0:
         raise ValueError("frame_budget must be positive")
-    if policy.fixed_fps <= 0 or policy.candidate_fps <= 0:
-        raise ValueError("FPS values must be positive")
-    if policy.candidate_long_edge <= 0:
-        raise ValueError("candidate_long_edge must be positive")
-    if policy.mode == "smart":
+    if policy.mode == "fixed_fps":
+        if policy.fixed_fps <= 0:
+            raise ValueError("fixed_fps must be positive")
+    else:
+        if policy.candidate_fps <= 0:
+            raise ValueError("candidate_fps must be positive")
+        if policy.candidate_long_edge <= 0:
+            raise ValueError("candidate_long_edge must be positive")
         if policy.candidate_fps > 12:
             raise ValueError("candidate_fps cannot exceed 12")
         if policy.candidate_long_edge > 320:
@@ -754,6 +757,9 @@ def _smart_records(
         selected_candidate = (
             selected_value[1] if selected_value is not None else candidate
         )
+        reasons = selected_candidate.reasons
+        if not is_selected:
+            reasons = _append_reason(reasons, "not_selected_by_smart_policy")
         records.append(
             FrameRecord(
                 frame_id=candidate.frame_id,
@@ -766,7 +772,7 @@ def _smart_records(
                 selected=is_selected,
                 metrics=candidate.metrics,
                 selection_score=candidate.total_score,
-                reasons=selected_candidate.reasons,
+                reasons=reasons,
             )
         )
     return tuple(records)

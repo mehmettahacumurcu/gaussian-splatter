@@ -201,6 +201,27 @@ def test_smart_selection_materializes_selected_frames_and_records_all_candidates
     assert not list(tmp_path.glob("*.candidates-*"))
 
 
+def test_smart_manifest_records_a_reason_for_every_unselected_candidate(
+    tmp_path: Path,
+    video_inventory: SourceInventory,
+    fake_media_backend: FakeMediaBackend,
+) -> None:
+    manifest = select_frames(
+        video_inventory,
+        tmp_path / "smart",
+        SelectionPolicy(
+            mode="smart",
+            frame_budget=6,
+            resolution_long_edge_cap=1280,
+        ),
+        media=fake_media_backend,
+    )
+    unselected = [frame for frame in manifest.frames if not frame.selected]
+
+    assert unselected
+    assert all("not_selected_by_smart_policy" in frame.reasons for frame in unselected)
+
+
 def test_smart_video_materialization_preserves_timestamp_record_mapping(
     tmp_path: Path,
     video_inventory: SourceInventory,
@@ -714,6 +735,47 @@ def test_fixed_mode_ignores_irrelevant_smart_candidate_caps(
     assert manifest.effective_mode == "fixed_fps"
 
 
+def test_fixed_mode_ignores_nonpositive_smart_candidate_settings(
+    tmp_path: Path,
+    video_inventory: SourceInventory,
+    fake_media_backend: FakeMediaBackend,
+) -> None:
+    manifest = select_frames(
+        video_inventory,
+        tmp_path / "fixed",
+        SelectionPolicy(
+            mode="fixed_fps",
+            frame_budget=3,
+            resolution_long_edge_cap=1280,
+            candidate_fps=0,
+            candidate_long_edge=0,
+        ),
+        media=fake_media_backend,
+    )
+
+    assert manifest.effective_mode == "fixed_fps"
+
+
+def test_smart_mode_ignores_nonpositive_fixed_fps_setting(
+    tmp_path: Path,
+    video_inventory: SourceInventory,
+    fake_media_backend: FakeMediaBackend,
+) -> None:
+    manifest = select_frames(
+        video_inventory,
+        tmp_path / "smart",
+        SelectionPolicy(
+            mode="smart",
+            frame_budget=3,
+            resolution_long_edge_cap=1280,
+            fixed_fps=0,
+        ),
+        media=fake_media_backend,
+    )
+
+    assert manifest.effective_mode == "smart"
+
+
 def test_invalid_selection_mode_is_rejected_before_io(
     tmp_path: Path,
     video_inventory: SourceInventory,
@@ -1035,6 +1097,72 @@ def test_candidate_timeline_uses_anchored_nearest_sampling_at_twelve_fps(
         27,
         30,
     ]
+
+
+@pytest.mark.integration
+def test_smart_selection_runs_end_to_end_with_real_ffmpeg(tmp_path: Path) -> None:
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("FFmpeg binaries are unavailable")
+
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    video = source_root / "capture.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=160x120:rate=12",
+            "-t",
+            "1.25",
+            "-an",
+            "-c:v",
+            "mpeg4",
+            "-q:v",
+            "2",
+            str(video),
+        ],
+        check=True,
+    )
+
+    output = tmp_path / "smart"
+    manifest = select_frames(
+        discover_source(source_root),
+        output,
+        SelectionPolicy(
+            mode="smart",
+            frame_budget=4,
+            resolution_long_edge_cap=1280,
+        ),
+    )
+
+    assert manifest.effective_mode == "smart"
+    assert 1 <= len(manifest.selected_frames) <= 4
+    assert len(manifest.selected_frames) <= len(manifest.frames) <= 15
+    assert all(frame.metrics is not None for frame in manifest.frames)
+    assert all(frame.reasons for frame in manifest.frames if not frame.selected)
+    assert all(frame.source_index is not None for frame in manifest.frames)
+    assert all(frame.timestamp_s is not None for frame in manifest.frames)
+    assert [frame.source_index for frame in manifest.frames] == sorted(
+        frame.source_index
+        for frame in manifest.frames
+        if frame.source_index is not None
+    )
+    assert [frame.timestamp_s for frame in manifest.frames] == sorted(
+        frame.timestamp_s for frame in manifest.frames if frame.timestamp_s is not None
+    )
+    assert sorted(path.name for path in output.glob("*.png")) == [
+        frame.output_name for frame in manifest.selected_frames
+    ]
+    for frame in manifest.selected_frames:
+        selected_path = output / frame.output_name
+        assert frame.sha256 == hashlib.sha256(selected_path.read_bytes()).hexdigest()
+        with Image.open(selected_path) as selected:
+            assert selected.size == (160, 120)
 
 
 @pytest.mark.integration
