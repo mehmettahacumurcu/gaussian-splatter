@@ -142,7 +142,7 @@ export interface HyperParams {
 export type JobMode = "static" | "dynamic";
 
 /** Static 3DGS preset'leri — scripts/static_3dgs.py PRESETS ile birebir. */
-export type StaticPreset = "fast" | "balanced" | "high" | "premium";
+export type StaticPreset = "fast" | "balanced" | "high" | "premium" | "sota" | "ultra";
 
 export interface SubmitJobOptions {
   scene: string;

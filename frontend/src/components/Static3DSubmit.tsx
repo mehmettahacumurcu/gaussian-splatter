@@ -58,6 +58,20 @@ const PRESETS: PresetSpec[] = [
     duration: "6-10 saat",
     desc: "100k iter · 2560×1440 · 1M cap · LPIPS 0.15 · 3-tier multires · 4dv.ai-tier",
   },
+  {
+    id: "sota",
+    name: "SOTA",
+    badge: "PSNR",
+    duration: "benchmark",
+    desc: "30k iter · native res · 6M cap · vanilla 3DGS parity benchmark",
+  },
+  {
+    id: "ultra",
+    name: "Ultra",
+    badge: "MAX",
+    duration: "5-8 saat",
+    desc: "120k iter · native res · 3M cap · A100 80 GB sınıfı",
+  },
 ];
 
 export function Static3DSubmit({ onJobSubmitted }: Props) {

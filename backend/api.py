@@ -34,6 +34,7 @@ from .api_models import (
 from .config import default_config, cloud_config, local_max_config, safe_4d_8gb_config, scene_paths
 from .job_manager import JobManager, get_manager
 from .pipeline import run_pipeline
+from .static_presets import apply_static_preset_for_api, static_preset_names
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +156,7 @@ async def process_video(
     scene: str = Form("unnamed_scene", description="Sahne ismi — data/<scene>/ altında çalışılır"),
     # v6.0 — Mode + preset (single source of truth)
     mode: str = Form("dynamic", description="'static' (Static 3DGS) | 'dynamic' (4D, default)"),
-    preset: str | None = Form(None, description="Mode'a göre preset adı. Static: fast/balanced/high/premium. Dynamic: micro/smoke/full/safe_4d_8gb/high/cloud/ultra/ultra_clean/static_max."),
+    preset: str | None = Form(None, description="Mode'a göre preset adı. Static: fast/balanced/high/premium/sota/ultra. Dynamic: micro/smoke/full/safe_4d_8gb/high/cloud/ultra/ultra_clean/static_max."),
     # Legacy boolean preset flag'leri (geriye uyumluluk — yeni clientlar mode+preset gönderir)
     smoke_test: bool = Form(False, description="[LEGACY] use mode='dynamic' + preset='smoke'"),
     micro_test: bool = Form(False, description="[LEGACY] use mode='dynamic' + preset='micro'"),
@@ -273,7 +274,7 @@ async def process_video(
     if preset:
         preset_lc = preset.strip().lower()
         if static_mode_active:
-            valid_static = {"fast", "balanced", "high", "premium"}
+            valid_static = static_preset_names()
             if preset_lc not in valid_static:
                 raise HTTPException(400, f"static preset '{preset}' invalid — use one of {sorted(valid_static)}")
             # Static preset'leri legacy boolean'a translate ETMIYORUZ;
@@ -365,14 +366,14 @@ async def process_video(
         # mode='static' verildiyse Static 3DGS preset'leri kosulur, sonra
         # dynamic preset blok'lari (smoke_test/...) atlanir.
         if static_mode_active:
-            from scripts.static_3dgs import _apply_preset as _apply_static_preset
-            preset_name = (preset or "balanced").strip().lower()
-            if preset_name not in ("fast", "balanced", "high", "premium"):
-                preset_name = "balanced"
-            _apply_static_preset(cfg, preset_name)
+            try:
+                preset_name = apply_static_preset_for_api(cfg, preset or "balanced")
+            except ValueError as e:
+                raise HTTPException(400, str(e))
             print(f"[api.static] preset={preset_name}, static_mode={cfg.train.static_mode}, "
                   f"n_iters={cfg.train.n_iters}, max_gauss={cfg.train.max_gaussians}, "
-                  f"lambda_depth={cfg.train.lambda_depth}")
+                  f"lambda_depth={cfg.train.lambda_depth}, "
+                  f"native_resolution={cfg.train.native_resolution}")
             # Static modda foundation phase'in DEPTH adimi calisir (Metric3D),
             # tracks/masks/flow ise pipeline tarafinda atlanir. lambda_depth>0
             # oldugu icin skip_foundation=False olmali. User explicit
