@@ -29,6 +29,8 @@ rich>=13.7.0
 
 # Backend API (Faz 7)
 fastapi>=0.110.0
+pydantic>=2.6,<3
+nbformat>=5.10,<6
 uvicorn[standard]>=0.27.0
 python-multipart>=0.0.9
 
@@ -66,3 +68,4 @@ pyyaml>=6.0.1
 # Testing — added 2026-05-19 (sub-project B)
 pytest>=7.4.0
 pytest-mock>=3.12.0
+httpx>=0.27,<1
