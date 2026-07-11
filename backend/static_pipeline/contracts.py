@@ -81,3 +81,21 @@ class UncoveredInterval:
     start_s: float
     end_s: float
     missing_frame_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ColmapPolicy:
+    camera_model: str
+    matcher: Literal["sequential", "exhaustive"]
+    sequential_overlap: int
+    use_gpu: bool
+    version: str = "colmap-policy-v1"
+
+
+@dataclass(frozen=True)
+class ColmapAttempt:
+    root: Path
+    database_path: Path
+    model_dirs: tuple[Path, ...]
+    colmap_version: str
+    fingerprint: str
