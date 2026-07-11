@@ -1040,6 +1040,58 @@ def test_attempt_rechecks_identity_after_progress_callback(
     assert foreign_marker.read_bytes() == b"foreign"
 
 
+def test_attempt_rechecks_identity_after_selection_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frames = _write_selected_frames(tmp_path / "frames")
+    attempt = tmp_path / "attempt"
+    displaced = tmp_path / "displaced-owned-attempt"
+    foreign_marker = attempt / "foreign-marker"
+    original_validator = colmap_module._require_selection_digest
+    replaced = False
+    subprocess_calls = 0
+
+    def replace_after_validation(frames_dir: Path, expected: str) -> None:
+        nonlocal replaced
+        original_validator(frames_dir, expected)
+        if replaced:
+            return
+        attempt.rename(displaced)
+        attempt.mkdir()
+        foreign_marker.write_bytes(b"foreign")
+        replaced = True
+
+    def version_only(
+        command: tuple[str, ...],
+        *,
+        check: bool,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal subprocess_calls
+        assert check is True
+        subprocess_calls += 1
+        return subprocess.CompletedProcess(command, 0, stdout="COLMAP 3.11")
+
+    monkeypatch.setattr(
+        colmap_module,
+        "_require_selection_digest",
+        replace_after_validation,
+    )
+    monkeypatch.setattr(subprocess, "run", version_only)
+
+    with pytest.raises(RuntimeError, match="identity"):
+        run_colmap_attempt(
+            frames,
+            attempt,
+            choose_colmap_policy(use_gpu=True, selected_count=1, attempt_index=0),
+            colmap_exe="colmap",
+        )
+
+    assert subprocess_calls == 1
+    assert foreign_marker.read_bytes() == b"foreign"
+
+
 def test_attempt_revalidates_selected_frames_after_progress_callback(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1204,6 +1256,50 @@ def test_attempt_rejects_in_place_database_overwrite_before_matcher(
     assert (attempt / "colmap.db").read_bytes() == b"stale-database"
 
 
+def test_attempt_revalidates_converted_outputs_after_progress_callback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frames = _write_selected_frames(tmp_path / "frames")
+    attempt = tmp_path / "attempt"
+
+    def successful_run(
+        command: tuple[str, ...],
+        *,
+        check: bool,
+        **_kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        assert check is True
+        if command[1] == "--version":
+            return subprocess.CompletedProcess(command, 0, stdout="COLMAP 3.11")
+        if command[1] == "feature_extractor":
+            (attempt / "colmap.db").write_bytes(b"database")
+        if command[1] == "mapper":
+            (attempt / "sparse" / "0").mkdir()
+        if command[1] == "model_converter":
+            model = Path(command[command.index("--input_path") + 1])
+            for name in ("cameras.txt", "images.txt", "points3D.txt"):
+                (model / name).write_text("# converted\n", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0)
+
+    def remove_required_output(_fraction: float, message: str) -> None:
+        if message.startswith("model_converter:"):
+            (attempt / "sparse" / "0" / "cameras.txt").unlink()
+
+    monkeypatch.setattr(subprocess, "run", successful_run)
+
+    with pytest.raises(RuntimeError, match="cameras.txt|converted"):
+        run_colmap_attempt(
+            frames,
+            attempt,
+            choose_colmap_policy(use_gpu=True, selected_count=1, attempt_index=0),
+            colmap_exe="colmap",
+            on_progress=remove_required_output,
+        )
+
+    assert not (attempt / "sparse" / "0" / "cameras.txt").exists()
+
+
 def test_gpu_probe_falls_back_to_cpu_and_removes_failed_probe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1344,6 +1440,51 @@ def test_gpu_probe_does_not_delete_post_creation_replacement(
 
     assert probe_colmap_gpu_support("colmap", probe) is False
     assert marker.read_bytes() == b"foreign"
+
+
+def test_gpu_probe_does_not_delete_file_replaced_after_identity_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    probe = tmp_path / "probe"
+    checkerboard = probe / "images" / "checkerboard_0.png"
+    displaced = tmp_path / "displaced-owned-checkerboard.png"
+    original_identity = colmap_module._path_identity
+    subprocess_finished = False
+    replaced = False
+
+    def successful_run(
+        command: tuple[str, ...],
+        *,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal subprocess_finished
+        assert check is True
+        database = Path(command[command.index("--database_path") + 1])
+        database.write_bytes(b"database")
+        subprocess_finished = True
+        return subprocess.CompletedProcess(command, 0)
+
+    def replace_after_identity(path: Path) -> tuple[int, int, int] | None:
+        nonlocal replaced
+        identity = original_identity(path)
+        if (
+            subprocess_finished
+            and not replaced
+            and path == checkerboard
+            and identity is not None
+        ):
+            path.rename(displaced)
+            path.write_bytes(b"foreign")
+            replaced = True
+        return identity
+
+    monkeypatch.setattr(subprocess, "run", successful_run)
+    monkeypatch.setattr(colmap_module, "_path_identity", replace_after_identity)
+
+    assert probe_colmap_gpu_support("colmap", probe) is True
+    assert displaced.is_file()
+    assert checkerboard.read_bytes() == b"foreign"
 
 
 def test_gpu_probe_rejects_preexisting_path_without_touching_it(

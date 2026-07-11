@@ -9,6 +9,7 @@ import re
 import shutil
 import stat
 import subprocess
+import uuid
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path, PurePosixPath
@@ -16,6 +17,7 @@ from pathlib import Path, PurePosixPath
 from PIL import Image
 
 from .contracts import ColmapAttempt, ColmapPolicy
+from .sources import _atomic_promote_no_replace
 from .stage_cache import stage_fingerprint
 
 LOGGER = logging.getLogger(__name__)
@@ -133,6 +135,60 @@ def _write_checkerboards(images_dir: Path) -> tuple[Path, ...]:
     return tuple(written)
 
 
+def _restore_quarantined_path(quarantine: Path, original: Path) -> None:
+    try:
+        _atomic_promote_no_replace(quarantine, original)
+    except (OSError, RuntimeError):
+        pass
+
+
+def _claim_owned_path(
+    path: Path,
+    expected: tuple[int, int, int],
+) -> Path | None:
+    if _path_identity(path) != expected:
+        return None
+    quarantine = path.with_name(f".{path.name}.cleanup-{uuid.uuid4().hex}")
+    try:
+        _atomic_promote_no_replace(path, quarantine)
+    except (OSError, RuntimeError):
+        return None
+    if _path_identity(quarantine) != expected:
+        _restore_quarantined_path(quarantine, path)
+        return None
+    return quarantine
+
+
+def _unlink_owned_file(path: Path, expected: tuple[int, int, int]) -> None:
+    quarantine = _claim_owned_path(path, expected)
+    if quarantine is None:
+        return
+    try:
+        if _path_identity(quarantine) == expected:
+            quarantine.unlink()
+    except OSError:
+        pass
+
+
+def _remove_owned_empty_directory(
+    path: Path,
+    expected: _DirectoryIdentity,
+) -> None:
+    expected_path_identity = (expected[0], expected[1], stat.S_IFDIR)
+    try:
+        if next(path.iterdir(), None) is not None:
+            return
+    except OSError:
+        return
+    quarantine = _claim_owned_path(path, expected_path_identity)
+    if quarantine is None:
+        return
+    try:
+        quarantine.rmdir()
+    except OSError:
+        _restore_quarantined_path(quarantine, path)
+
+
 def _cleanup_owned_probe(
     probe: Path,
     probe_identity: _DirectoryIdentity | None,
@@ -149,26 +205,18 @@ def _cleanup_owned_probe(
     for path, expected in owned_files.items():
         try:
             _require_directory_identity(probe, probe_identity, "probe")
+            if path.parent == images and images_identity is not None:
+                _require_directory_identity(images, images_identity, "probe images")
         except RuntimeError:
             return
-        if _path_identity(path) != expected:
-            continue
-        try:
-            path.unlink()
-        except OSError:
-            pass
+        _unlink_owned_file(path, expected)
     if images_identity is not None:
         try:
             _require_directory_identity(probe, probe_identity, "probe")
-            _require_directory_identity(images, images_identity, "probe images")
-            images.rmdir()
-        except (OSError, RuntimeError):
-            pass
-    try:
-        _require_directory_identity(probe, probe_identity, "probe")
-        probe.rmdir()
-    except (OSError, RuntimeError):
-        pass
+        except RuntimeError:
+            return
+        _remove_owned_empty_directory(images, images_identity)
+    _remove_owned_empty_directory(probe, probe_identity)
 
 
 def probe_colmap_gpu_support(
@@ -196,17 +244,25 @@ def probe_colmap_gpu_support(
         checkerboards = tuple(
             images / f"checkerboard_{image_index}.png" for image_index in range(2)
         )
+        for checkerboard in checkerboards:
+            checkerboard.touch(exist_ok=False)
+            identity = _path_identity(checkerboard)
+            if identity is None or identity[2] != stat.S_IFREG:
+                raise RuntimeError("COLMAP GPU probe checkerboard is invalid")
+            owned_files[checkerboard] = identity
+        database.touch(exist_ok=False)
+        database_identity = _path_identity(database)
+        if database_identity is None or database_identity[2] != stat.S_IFREG:
+            raise RuntimeError("COLMAP GPU probe database is invalid")
+        owned_files[database] = database_identity
         try:
             _write_checkerboards(images)
         finally:
             _require_directory_identity(probe, probe_identity, "probe")
             _require_directory_identity(images, images_identity, "probe images")
             for checkerboard in checkerboards:
-                identity = _path_identity(checkerboard)
-                if identity is not None and identity[2] == stat.S_IFREG:
-                    owned_files[checkerboard] = identity
-        if set(owned_files) != set(checkerboards):
-            raise RuntimeError("COLMAP GPU probe checkerboard is invalid")
+                if _path_identity(checkerboard) != owned_files[checkerboard]:
+                    raise RuntimeError("COLMAP GPU probe checkerboard was replaced")
         command = (
             str(colmap_exe),
             "feature_extractor",
@@ -224,27 +280,13 @@ def probe_colmap_gpu_support(
         subprocess.run(command, check=True)
         _require_directory_identity(probe, probe_identity, "probe")
         _require_directory_identity(images, images_identity, "probe images")
-        if not database.is_file():
-            raise RuntimeError("COLMAP GPU probe completed without a database")
         database_identity = _path_identity(database)
-        if database_identity is None or database_identity[2] != stat.S_IFREG:
-            raise RuntimeError("COLMAP GPU probe database is invalid")
-        owned_files[database] = database_identity
+        if database_identity != owned_files[database] or database.stat().st_size <= 0:
+            raise RuntimeError("COLMAP GPU probe completed without a valid database")
         succeeded = True
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
         LOGGER.warning("COLMAP GPU SIFT probe failed: %s", exc)
     finally:
-        if probe_identity is not None:
-            try:
-                _require_directory_identity(probe, probe_identity, "probe")
-                database_identity = _path_identity(database)
-                if (
-                    database_identity is not None
-                    and database_identity[2] == stat.S_IFREG
-                ):
-                    owned_files[database] = database_identity
-            except RuntimeError:
-                pass
         _cleanup_owned_probe(
             probe,
             probe_identity,
@@ -661,6 +703,28 @@ def _require_sparse_model_set(
         raise RuntimeError("COLMAP sparse model set changed during conversion")
 
 
+def _capture_converted_outputs(model_dir: Path) -> dict[Path, _FileSignature]:
+    return {
+        model_dir / name: _regular_file_signature(
+            model_dir / name,
+            f"COLMAP converted output {name}",
+        )
+        for name in _CONVERTED_MODEL_FILES
+    }
+
+
+def _require_converted_outputs(
+    converted: dict[Path, dict[Path, _FileSignature]],
+) -> None:
+    for outputs in converted.values():
+        for path, signature in outputs.items():
+            _require_file_signature(
+                path,
+                signature,
+                f"COLMAP converted output {path.name}",
+            )
+
+
 def run_colmap_attempt(
     frames_dir: str | Path,
     attempt_dir: str | Path,
@@ -745,6 +809,21 @@ def run_colmap_attempt(
             )
         if on_progress is not None or command_index in {0, 2}:
             _require_selection_digest(frames, selection_digest)
+        _require_attempt_layout(
+            attempt,
+            attempt_identity,
+            sparse,
+            sparse_identity,
+            database_path,
+            database_identity,
+            require_empty_sparse=True,
+        )
+        if database_signature is not None:
+            _require_file_signature(
+                database_path,
+                database_signature,
+                "COLMAP database",
+            )
         subprocess.run(command, check=True)
         if command_index in {0, 2}:
             _require_selection_digest(frames, selection_digest)
@@ -782,6 +861,7 @@ def run_colmap_attempt(
     if not model_entries:
         raise RuntimeError("COLMAP produced no sparse model")
     _require_sparse_model_set(sparse, model_entries)
+    converted_outputs: dict[Path, dict[Path, _FileSignature]] = {}
     for model_index, (model_dir, model_identity) in enumerate(model_entries):
         _require_attempt_layout(
             attempt,
@@ -818,17 +898,7 @@ def run_colmap_attempt(
         )
         _require_sparse_model_set(sparse, model_entries)
         _require_directory_identity(model_dir, model_identity, "COLMAP model")
-        missing_outputs = [
-            name
-            for name in _CONVERTED_MODEL_FILES
-            if (identity := _path_identity(model_dir / name)) is None
-            or identity[2] != stat.S_IFREG
-        ]
-        if missing_outputs:
-            raise RuntimeError(
-                f"COLMAP model conversion is incomplete for {model_dir}: "
-                f"{', '.join(missing_outputs)}"
-            )
+        converted_outputs[model_dir] = _capture_converted_outputs(model_dir)
         if on_progress is not None:
             on_progress(
                 0.6 + 0.4 * (model_index + 1) / len(model_entries),
@@ -840,6 +910,7 @@ def run_colmap_attempt(
                 database_signature,
                 "COLMAP database",
             )
+            _require_converted_outputs(converted_outputs)
         _require_attempt_layout(
             attempt,
             attempt_identity,
@@ -867,6 +938,7 @@ def run_colmap_attempt(
         database_signature,
         "COLMAP database",
     )
+    _require_converted_outputs(converted_outputs)
     for model_dir, model_identity in model_entries:
         _require_directory_identity(model_dir, model_identity, "COLMAP model")
     model_dirs = tuple(path for path, _identity in model_entries)
