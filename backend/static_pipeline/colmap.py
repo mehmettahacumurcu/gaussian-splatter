@@ -3,13 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
+import stat
 import subprocess
 from collections.abc import Callable
 from dataclasses import asdict
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from PIL import Image
 
@@ -20,7 +22,47 @@ LOGGER = logging.getLogger(__name__)
 ColmapProgressCallback = Callable[[float, str], None]
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _FRAME_ID_PATTERN = re.compile(r"[0-9a-f]{24}")
+_OUTPUT_NAME_PATTERN = re.compile(r"frame_[0-9]{6}\.png")
 _CONVERTED_MODEL_FILES = ("cameras.txt", "images.txt", "points3D.txt")
+_MANIFEST_KEYS = {
+    "schema_version",
+    "source_digest",
+    "effective_mode",
+    "policy",
+    "frames",
+    "image_set_digest",
+    "reconstruction_guardrail",
+}
+_POLICY_KEYS = {
+    "mode",
+    "frame_budget",
+    "resolution_long_edge_cap",
+    "fixed_fps",
+    "candidate_fps",
+    "candidate_long_edge",
+    "version",
+}
+_FRAME_RECORD_KEYS = {
+    "frame_id",
+    "source_relative_path",
+    "source_index",
+    "source_pts",
+    "timestamp_s",
+    "output_name",
+    "sha256",
+    "selected",
+    "metrics",
+    "selection_score",
+    "reasons",
+}
+_METRIC_KEYS = {
+    "sharpness",
+    "exposure_score",
+    "duplicate_similarity",
+    "overlap_score",
+}
+_DirectoryIdentity = tuple[int, int]
+_FileSignature = tuple[int, int, int, int, int, str]
 
 
 def choose_colmap_policy(
@@ -51,8 +93,33 @@ def _resolve_colmap_executable(colmap_exe: str | Path | None) -> str:
     return resolved
 
 
-def _write_checkerboards(images_dir: Path) -> None:
-    images_dir.mkdir(parents=True)
+def _path_identity(path: Path) -> tuple[int, int, int] | None:
+    try:
+        metadata = os.lstat(path)
+    except OSError:
+        return None
+    return metadata.st_dev, metadata.st_ino, stat.S_IFMT(metadata.st_mode)
+
+
+def _directory_identity(path: Path) -> _DirectoryIdentity:
+    identity = _path_identity(path)
+    if identity is None or identity[2] != stat.S_IFDIR:
+        raise RuntimeError(f"directory identity is invalid: {path}")
+    return identity[0], identity[1]
+
+
+def _require_directory_identity(
+    path: Path,
+    expected: _DirectoryIdentity,
+    label: str,
+) -> None:
+    current = _path_identity(path)
+    if current != (expected[0], expected[1], stat.S_IFDIR):
+        raise RuntimeError(f"{label} directory identity changed: {path}")
+
+
+def _write_checkerboards(images_dir: Path) -> tuple[Path, ...]:
+    written: list[Path] = []
     for image_index, offset in enumerate((0, 1)):
         image = Image.new("RGB", (32, 32))
         pixels = image.load()
@@ -60,7 +127,48 @@ def _write_checkerboards(images_dir: Path) -> None:
             for x in range(32):
                 value = 255 if ((x // 4) + (y // 4) + offset) % 2 else 0
                 pixels[x, y] = (value, value, value)
-        image.save(images_dir / f"checkerboard_{image_index}.png")
+        output = images_dir / f"checkerboard_{image_index}.png"
+        image.save(output)
+        written.append(output)
+    return tuple(written)
+
+
+def _cleanup_owned_probe(
+    probe: Path,
+    probe_identity: _DirectoryIdentity | None,
+    images: Path,
+    images_identity: _DirectoryIdentity | None,
+    owned_files: dict[Path, tuple[int, int, int]],
+) -> None:
+    if probe_identity is None:
+        return
+    try:
+        _require_directory_identity(probe, probe_identity, "probe")
+    except RuntimeError:
+        return
+    for path, expected in owned_files.items():
+        try:
+            _require_directory_identity(probe, probe_identity, "probe")
+        except RuntimeError:
+            return
+        if _path_identity(path) != expected:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    if images_identity is not None:
+        try:
+            _require_directory_identity(probe, probe_identity, "probe")
+            _require_directory_identity(images, images_identity, "probe images")
+            images.rmdir()
+        except (OSError, RuntimeError):
+            pass
+    try:
+        _require_directory_identity(probe, probe_identity, "probe")
+        probe.rmdir()
+    except (OSError, RuntimeError):
+        pass
 
 
 def probe_colmap_gpu_support(
@@ -69,15 +177,36 @@ def probe_colmap_gpu_support(
 ) -> bool:
     probe = Path(probe_root)
     if os.path.lexists(probe):
-        raise FileExistsError(probe)
+        LOGGER.warning("COLMAP GPU SIFT probe path already exists: %s", probe)
+        return False
     images = probe / "images"
     database = probe / "probe.db"
-    created = False
+    probe_identity: _DirectoryIdentity | None = None
+    images_identity: _DirectoryIdentity | None = None
+    owned_files: dict[Path, tuple[int, int, int]] = {}
     succeeded = False
     try:
         probe.mkdir(parents=True, exist_ok=False)
-        created = True
-        _write_checkerboards(images)
+        probe_identity = _directory_identity(probe)
+        _require_directory_identity(probe, probe_identity, "probe")
+        images.mkdir()
+        images_identity = _directory_identity(images)
+        _require_directory_identity(probe, probe_identity, "probe")
+        _require_directory_identity(images, images_identity, "probe images")
+        checkerboards = tuple(
+            images / f"checkerboard_{image_index}.png" for image_index in range(2)
+        )
+        try:
+            _write_checkerboards(images)
+        finally:
+            _require_directory_identity(probe, probe_identity, "probe")
+            _require_directory_identity(images, images_identity, "probe images")
+            for checkerboard in checkerboards:
+                identity = _path_identity(checkerboard)
+                if identity is not None and identity[2] == stat.S_IFREG:
+                    owned_files[checkerboard] = identity
+        if set(owned_files) != set(checkerboards):
+            raise RuntimeError("COLMAP GPU probe checkerboard is invalid")
         command = (
             str(colmap_exe),
             "feature_extractor",
@@ -93,14 +222,36 @@ def probe_colmap_gpu_support(
             "1",
         )
         subprocess.run(command, check=True)
+        _require_directory_identity(probe, probe_identity, "probe")
+        _require_directory_identity(images, images_identity, "probe images")
         if not database.is_file():
             raise RuntimeError("COLMAP GPU probe completed without a database")
+        database_identity = _path_identity(database)
+        if database_identity is None or database_identity[2] != stat.S_IFREG:
+            raise RuntimeError("COLMAP GPU probe database is invalid")
+        owned_files[database] = database_identity
         succeeded = True
     except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
         LOGGER.warning("COLMAP GPU SIFT probe failed: %s", exc)
     finally:
-        if created:
-            shutil.rmtree(probe, ignore_errors=True)
+        if probe_identity is not None:
+            try:
+                _require_directory_identity(probe, probe_identity, "probe")
+                database_identity = _path_identity(database)
+                if (
+                    database_identity is not None
+                    and database_identity[2] == stat.S_IFREG
+                ):
+                    owned_files[database] = database_identity
+            except RuntimeError:
+                pass
+        _cleanup_owned_probe(
+            probe,
+            probe_identity,
+            images,
+            images_identity,
+            owned_files,
+        )
     return succeeded
 
 
@@ -162,8 +313,164 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _regular_file_signature(path: Path, label: str) -> _FileSignature:
+    try:
+        before = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError(f"{label} is missing: {path}") from exc
+    if stat.S_IFMT(before.st_mode) != stat.S_IFREG:
+        raise RuntimeError(f"{label} is not a regular file: {path}")
+    digest = _sha256_file(path)
+    try:
+        after = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeError(f"{label} changed while it was read: {path}") from exc
+    before_metadata = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    after_metadata = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if stat.S_IFMT(after.st_mode) != stat.S_IFREG or after_metadata != before_metadata:
+        raise RuntimeError(f"{label} changed while it was read: {path}")
+    return (*after_metadata, digest)
+
+
+def _require_file_signature(
+    path: Path,
+    expected: _FileSignature,
+    label: str,
+) -> None:
+    if _regular_file_signature(path, label) != expected:
+        raise RuntimeError(f"{label} contents changed during COLMAP execution")
+
+
 def _is_sha256(value: object) -> bool:
     return isinstance(value, str) and _SHA256_PATTERN.fullmatch(value) is not None
+
+
+def _is_exact_int(value: object) -> bool:
+    return type(value) is int
+
+
+def _is_finite_number(value: object) -> bool:
+    return type(value) in {int, float} and math.isfinite(value)
+
+
+def _is_nonempty_text(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and not any(ord(char) < 32 for char in value)
+    )
+
+
+def _safe_relative_path(value: object) -> str | None:
+    if not isinstance(value, str) or not value or value == ".":
+        return None
+    path = PurePosixPath(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        return None
+    if path.as_posix() != value:
+        return None
+    return value
+
+
+def _validate_policy_payload(policy: object, effective_mode: str) -> None:
+    if not isinstance(policy, dict) or set(policy) != _POLICY_KEYS:
+        raise ValueError("selection manifest has an invalid policy schema")
+    mode = policy["mode"]
+    if mode not in ("smart", "fixed_fps"):
+        raise ValueError("selection manifest has an invalid policy mode")
+    expected_mode = "smart" if effective_mode == "smart" else "fixed_fps"
+    if mode != expected_mode:
+        raise ValueError("selection policy mode does not match its effective mode")
+
+    frame_budget = policy["frame_budget"]
+    if not _is_exact_int(frame_budget) or frame_budget <= 0:
+        raise ValueError("selection policy has an invalid frame budget")
+    long_edge_cap = policy["resolution_long_edge_cap"]
+    if long_edge_cap is not None and (
+        not _is_exact_int(long_edge_cap) or long_edge_cap <= 0
+    ):
+        raise ValueError("selection policy has an invalid resolution cap")
+
+    fixed_fps = policy["fixed_fps"]
+    candidate_fps = policy["candidate_fps"]
+    candidate_long_edge = policy["candidate_long_edge"]
+    if not all(
+        _is_exact_int(value)
+        for value in (fixed_fps, candidate_fps, candidate_long_edge)
+    ):
+        raise ValueError("selection policy rates and dimensions must be integers")
+    if mode == "fixed_fps" and fixed_fps <= 0:
+        raise ValueError("selection policy fixed FPS must be positive")
+    if mode == "smart" and (
+        candidate_fps <= 0
+        or candidate_fps > 12
+        or candidate_long_edge <= 0
+        or candidate_long_edge > 320
+    ):
+        raise ValueError("selection policy smart analysis settings are invalid")
+    if not isinstance(policy["version"], str):
+        raise ValueError("selection policy has an invalid version")
+
+
+def _validate_frame_metadata(record: dict[str, object], effective_mode: str) -> None:
+    if set(record) != _FRAME_RECORD_KEYS:
+        raise ValueError("selection manifest has an invalid frame record schema")
+    if _safe_relative_path(record["source_relative_path"]) is None:
+        raise ValueError("selection manifest has an unsafe source path")
+
+    source_index = record["source_index"]
+    source_pts = record["source_pts"]
+    timestamp_s = record["timestamp_s"]
+    if source_index is not None and (
+        not _is_exact_int(source_index) or source_index < 0
+    ):
+        raise ValueError("selection manifest has an invalid source index")
+    if source_pts is not None and not _is_exact_int(source_pts):
+        raise ValueError("selection manifest has an invalid source timestamp")
+    if timestamp_s is not None and not _is_finite_number(timestamp_s):
+        raise ValueError("selection manifest has an invalid frame timestamp")
+    if (source_index is None) != (timestamp_s is None):
+        raise ValueError("selection manifest has inconsistent source metadata")
+    if source_index is None and source_pts is not None:
+        raise ValueError("selection manifest has inconsistent source metadata")
+    if effective_mode == "fixed_fps" and source_index is None:
+        raise ValueError("fixed-FPS frames require video source metadata")
+    if effective_mode == "photo_set_all" and any(
+        value is not None for value in (source_index, source_pts, timestamp_s)
+    ):
+        raise ValueError("photo-set frames cannot contain video source metadata")
+
+    metrics = record["metrics"]
+    selection_score = record["selection_score"]
+    if effective_mode == "smart":
+        if not isinstance(metrics, dict) or set(metrics) != _METRIC_KEYS:
+            raise ValueError("smart frame metrics have an invalid schema")
+        if not all(_is_finite_number(value) for value in metrics.values()):
+            raise ValueError("smart frame metrics must be finite numbers")
+        if not _is_finite_number(selection_score):
+            raise ValueError("smart frame selection score must be finite")
+    elif metrics is not None or selection_score is not None:
+        raise ValueError("non-smart frames cannot contain smart selection metrics")
+
+    reasons = record["reasons"]
+    if (
+        not isinstance(reasons, list)
+        or not all(_is_nonempty_text(reason) for reason in reasons)
+        or len(set(reasons)) != len(reasons)
+    ):
+        raise ValueError("selection manifest has invalid frame reasons")
 
 
 def _safe_output_name(value: object) -> str | None:
@@ -171,30 +478,33 @@ def _safe_output_name(value: object) -> str | None:
         return None
     if "/" in value or "\\" in value or Path(value).name != value:
         return None
-    if not value.endswith(".png"):
+    if _OUTPUT_NAME_PATTERN.fullmatch(value) is None:
         return None
     return value
 
 
 def _read_selection_digest(frames_dir: Path) -> str:
+    if frames_dir.is_symlink() or not frames_dir.is_dir():
+        raise ValueError(f"selected frame directory is missing or unsafe: {frames_dir}")
     manifest_path = frames_dir / "selection_manifest.json"
-    if manifest_path.is_symlink():
-        raise ValueError("selection manifest cannot be a symlink")
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise ValueError("selection manifest is missing or unsafe")
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"Invalid selection manifest: {manifest_path}") from exc
-    if not isinstance(payload, dict):
+    if not isinstance(payload, dict) or set(payload) != _MANIFEST_KEYS:
         raise ValueError(f"Invalid selection manifest: {manifest_path}")
     schema_version = payload.get("schema_version")
     if type(schema_version) is not int or schema_version != 1:
         raise ValueError("selection manifest must use schema version 1")
     if not _is_sha256(payload.get("source_digest")):
         raise ValueError("selection manifest has an invalid source digest")
-    if payload.get("effective_mode") not in {"smart", "fixed_fps", "photo_set_all"}:
+    effective_mode = payload.get("effective_mode")
+    if effective_mode not in ("smart", "fixed_fps", "photo_set_all"):
         raise ValueError("selection manifest has an invalid effective mode")
-    if not isinstance(payload.get("policy"), dict):
-        raise ValueError("selection manifest is missing its policy")
+    policy_payload = payload.get("policy")
+    _validate_policy_payload(policy_payload, effective_mode)
     records = payload.get("frames")
     if not isinstance(records, list):
         raise ValueError("selection manifest is missing frame records")
@@ -202,18 +512,34 @@ def _read_selection_digest(frames_dir: Path) -> str:
     digest = payload.get("image_set_digest")
     if not _is_sha256(digest):
         raise ValueError("selection manifest has an invalid image_set_digest")
+    reconstruction_guardrail = payload.get("reconstruction_guardrail")
+    if reconstruction_guardrail is not None and (
+        reconstruction_guardrail != "uniform_profile_cap"
+        or effective_mode != "photo_set_all"
+    ):
+        raise ValueError("selection manifest has an invalid reconstruction guardrail")
 
     frame_ids: set[str] = set()
     output_names: set[str] = set()
     selected_payload: list[list[str]] = []
-    selected_files: dict[str, Path] = {}
+    unselected_count = 0
+    source_kinds: set[bool] = set()
     for record in records:
         if not isinstance(record, dict):
             raise ValueError("selection manifest contains an invalid frame record")
+        _validate_frame_metadata(record, effective_mode)
+        source_kinds.add(record["source_index"] is not None)
         frame_id = record.get("frame_id")
+        expected_frame_id = hashlib.sha256(
+            (
+                f"{payload['source_digest']}|{record['source_index']}|"
+                f"{record['timestamp_s']}|{record['source_relative_path']}"
+            ).encode("utf-8")
+        ).hexdigest()[:24]
         if (
             not isinstance(frame_id, str)
             or _FRAME_ID_PATTERN.fullmatch(frame_id) is None
+            or frame_id != expected_frame_id
             or frame_id in frame_ids
         ):
             raise ValueError("selection manifest contains an invalid frame ID")
@@ -224,13 +550,15 @@ def _read_selection_digest(frames_dir: Path) -> str:
         output_name = record.get("output_name")
         recorded_sha256 = record.get("sha256")
         if not selected:
+            unselected_count += 1
             if output_name != "" or recorded_sha256 != "":
                 raise ValueError(
                     "unselected frame records cannot reference output bytes"
                 )
             continue
         safe_name = _safe_output_name(output_name)
-        if safe_name is None or safe_name in output_names:
+        expected_name = f"frame_{len(selected_payload):06d}.png"
+        if safe_name is None or safe_name != expected_name or safe_name in output_names:
             raise ValueError(
                 "selection manifest contains an unsafe or duplicate output"
             )
@@ -244,22 +572,34 @@ def _read_selection_digest(frames_dir: Path) -> str:
         if actual_sha256 != recorded_sha256:
             raise ValueError(f"selected frame hash mismatch: {safe_name}")
         selected_payload.append([frame_id, safe_name, actual_sha256])
-        selected_files[safe_name] = output_path
 
     if not 1 <= len(selected_payload) <= 800:
         raise ValueError("selection manifest must contain 1..800 selected frames")
-    discovered_names: set[str] = set()
-    for path in frames_dir.rglob("*"):
-        if path.suffix.casefold() != ".png":
-            continue
-        relative = path.relative_to(frames_dir)
-        if len(relative.parts) != 1 or path.is_symlink() or not path.is_file():
-            raise ValueError(
-                f"selected frame directory contains an unsafe PNG: {relative}"
-            )
-        discovered_names.add(path.name)
-    if discovered_names != set(selected_files):
+    if (
+        effective_mode in {"smart", "fixed_fps"}
+        and len(selected_payload) > policy_payload["frame_budget"]
+    ):
+        raise ValueError("selection manifest exceeds its frame budget")
+    if effective_mode == "smart" and len(source_kinds) != 1:
+        raise ValueError("smart selection cannot mix photo and video frame metadata")
+    if effective_mode == "fixed_fps" and unselected_count:
+        raise ValueError("fixed-FPS selection cannot contain unselected records")
+    if effective_mode == "photo_set_all":
+        if unselected_count and reconstruction_guardrail != "uniform_profile_cap":
+            raise ValueError("bounded photo selection requires its guardrail marker")
+        if not unselected_count and reconstruction_guardrail is not None:
+            raise ValueError("photo guardrail marker requires bounded records")
+
+    expected_entries = {"selection_manifest.json", *output_names}
+    actual_entries = {path.name for path in frames_dir.iterdir()}
+    if actual_entries != expected_entries:
         raise ValueError("selected frame directory does not match its manifest")
+    for entry_name in expected_entries:
+        identity = _path_identity(frames_dir / entry_name)
+        if identity is None or identity[2] != stat.S_IFREG:
+            raise ValueError(
+                f"selected frame directory contains an unsafe entry: {entry_name}"
+            )
 
     recomputed = hashlib.sha256(
         json.dumps(
@@ -271,6 +611,54 @@ def _read_selection_digest(frames_dir: Path) -> str:
     if recomputed != digest:
         raise ValueError("selection manifest image_set_digest mismatch")
     return digest
+
+
+def _require_selection_digest(frames_dir: Path, expected: str) -> None:
+    if _read_selection_digest(frames_dir) != expected:
+        raise RuntimeError("selected frame digest changed during COLMAP execution")
+
+
+def _require_attempt_layout(
+    attempt: Path,
+    attempt_identity: _DirectoryIdentity,
+    sparse: Path,
+    sparse_identity: _DirectoryIdentity,
+    database_path: Path,
+    database_identity: tuple[int, int, int] | None,
+    *,
+    require_empty_sparse: bool,
+) -> None:
+    _require_directory_identity(attempt, attempt_identity, "COLMAP attempt")
+    _require_directory_identity(sparse, sparse_identity, "COLMAP sparse")
+    expected_entries = {"sparse"}
+    if database_identity is not None:
+        expected_entries.add("colmap.db")
+    actual_entries = {path.name for path in attempt.iterdir()}
+    if actual_entries != expected_entries:
+        raise RuntimeError(
+            "fresh COLMAP attempt contains unexpected entries: "
+            f"{sorted(actual_entries)}"
+        )
+    if (
+        database_identity is not None
+        and _path_identity(database_path) != database_identity
+    ):
+        raise RuntimeError("COLMAP database identity changed during execution")
+    if require_empty_sparse and next(sparse.iterdir(), None) is not None:
+        raise RuntimeError("fresh COLMAP sparse directory is not empty")
+
+
+def _require_sparse_model_set(
+    sparse: Path,
+    model_entries: list[tuple[Path, _DirectoryIdentity]],
+) -> None:
+    expected = {
+        path.name: (identity[0], identity[1], stat.S_IFDIR)
+        for path, identity in model_entries
+    }
+    actual = {path.name: _path_identity(path) for path in sparse.iterdir()}
+    if actual != expected:
+        raise RuntimeError("COLMAP sparse model set changed during conversion")
 
 
 def run_colmap_attempt(
@@ -301,25 +689,111 @@ def run_colmap_attempt(
         raise RuntimeError("COLMAP did not report a version")
 
     attempt.mkdir(parents=True, exist_ok=False)
+    attempt_identity = _directory_identity(attempt)
+    _require_directory_identity(attempt, attempt_identity, "COLMAP attempt")
     sparse = attempt / "sparse"
     sparse.mkdir()
+    _require_directory_identity(attempt, attempt_identity, "COLMAP attempt")
+    sparse_identity = _directory_identity(sparse)
     commands = build_colmap_commands(frames, attempt, executable, policy)
-    for command_index, command in enumerate(commands):
-        if on_progress is not None:
-            on_progress(command_index / len(commands), command[1])
-        subprocess.run(command, check=True)
-
-    database_path = attempt / "colmap.db"
-    if database_path.is_symlink() or not database_path.is_file():
-        raise RuntimeError("COLMAP produced no database")
-    model_dirs = tuple(
-        sorted(
-            path for path in sparse.iterdir() if path.is_dir() and not path.is_symlink()
-        )
+    expected_stages = (
+        "feature_extractor",
+        f"{policy.matcher}_matcher",
+        "mapper",
     )
-    if not model_dirs:
+    if (
+        len(commands) != 3
+        or any(len(command) < 2 for command in commands)
+        or tuple(command[1] for command in commands) != expected_stages
+    ):
+        raise RuntimeError("COLMAP attempt requires exactly three core commands")
+    database_path = attempt / "colmap.db"
+    database_identity: tuple[int, int, int] | None = None
+    database_signature: _FileSignature | None = None
+    for command_index, command in enumerate(commands):
+        _require_attempt_layout(
+            attempt,
+            attempt_identity,
+            sparse,
+            sparse_identity,
+            database_path,
+            database_identity,
+            require_empty_sparse=True,
+        )
+        if database_signature is not None:
+            _require_file_signature(
+                database_path,
+                database_signature,
+                "COLMAP database",
+            )
+        if on_progress is not None:
+            on_progress(0.6 * command_index / len(commands), command[1])
+        _require_attempt_layout(
+            attempt,
+            attempt_identity,
+            sparse,
+            sparse_identity,
+            database_path,
+            database_identity,
+            require_empty_sparse=True,
+        )
+        if on_progress is not None and database_signature is not None:
+            _require_file_signature(
+                database_path,
+                database_signature,
+                "COLMAP database",
+            )
+        if on_progress is not None or command_index in {0, 2}:
+            _require_selection_digest(frames, selection_digest)
+        subprocess.run(command, check=True)
+        if command_index in {0, 2}:
+            _require_selection_digest(frames, selection_digest)
+        if command_index == 0:
+            database_identity = _path_identity(database_path)
+            if database_identity is None or database_identity[2] != stat.S_IFREG:
+                raise RuntimeError("COLMAP produced no database")
+        if database_identity is None:
+            raise RuntimeError("COLMAP produced no database")
+        _require_attempt_layout(
+            attempt,
+            attempt_identity,
+            sparse,
+            sparse_identity,
+            database_path,
+            database_identity,
+            require_empty_sparse=command_index < 2,
+        )
+        database_signature = _regular_file_signature(
+            database_path,
+            "COLMAP database",
+        )
+
+    if (
+        database_identity is None or database_signature is None
+    ):  # pragma: no cover - guarded by the loop above
+        raise RuntimeError("COLMAP produced no database")
+    model_entries: list[tuple[Path, _DirectoryIdentity]] = []
+    for path in sparse.iterdir():
+        identity = _path_identity(path)
+        if identity is None or identity[2] != stat.S_IFDIR:
+            raise RuntimeError(f"COLMAP produced an unsafe sparse entry: {path}")
+        model_entries.append((path, (identity[0], identity[1])))
+    model_entries.sort(key=lambda item: item[0].name)
+    if not model_entries:
         raise RuntimeError("COLMAP produced no sparse model")
-    for model_index, model_dir in enumerate(model_dirs):
+    _require_sparse_model_set(sparse, model_entries)
+    for model_index, (model_dir, model_identity) in enumerate(model_entries):
+        _require_attempt_layout(
+            attempt,
+            attempt_identity,
+            sparse,
+            sparse_identity,
+            database_path,
+            database_identity,
+            require_empty_sparse=False,
+        )
+        _require_sparse_model_set(sparse, model_entries)
+        _require_directory_identity(model_dir, model_identity, "COLMAP model")
         subprocess.run(
             (
                 executable,
@@ -333,8 +807,22 @@ def run_colmap_attempt(
             ),
             check=True,
         )
+        _require_attempt_layout(
+            attempt,
+            attempt_identity,
+            sparse,
+            sparse_identity,
+            database_path,
+            database_identity,
+            require_empty_sparse=False,
+        )
+        _require_sparse_model_set(sparse, model_entries)
+        _require_directory_identity(model_dir, model_identity, "COLMAP model")
         missing_outputs = [
-            name for name in _CONVERTED_MODEL_FILES if not (model_dir / name).is_file()
+            name
+            for name in _CONVERTED_MODEL_FILES
+            if (identity := _path_identity(model_dir / name)) is None
+            or identity[2] != stat.S_IFREG
         ]
         if missing_outputs:
             raise RuntimeError(
@@ -343,9 +831,45 @@ def run_colmap_attempt(
             )
         if on_progress is not None:
             on_progress(
-                (len(commands) + model_index + 1) / (len(commands) + len(model_dirs)),
+                0.6 + 0.4 * (model_index + 1) / len(model_entries),
                 f"model_converter:{model_dir.name}",
             )
+            _require_selection_digest(frames, selection_digest)
+            _require_file_signature(
+                database_path,
+                database_signature,
+                "COLMAP database",
+            )
+        _require_attempt_layout(
+            attempt,
+            attempt_identity,
+            sparse,
+            sparse_identity,
+            database_path,
+            database_identity,
+            require_empty_sparse=False,
+        )
+        _require_sparse_model_set(sparse, model_entries)
+        _require_directory_identity(model_dir, model_identity, "COLMAP model")
+
+    _require_attempt_layout(
+        attempt,
+        attempt_identity,
+        sparse,
+        sparse_identity,
+        database_path,
+        database_identity,
+        require_empty_sparse=False,
+    )
+    _require_sparse_model_set(sparse, model_entries)
+    _require_file_signature(
+        database_path,
+        database_signature,
+        "COLMAP database",
+    )
+    for model_dir, model_identity in model_entries:
+        _require_directory_identity(model_dir, model_identity, "COLMAP model")
+    model_dirs = tuple(path for path, _identity in model_entries)
 
     fingerprint = stage_fingerprint(
         "colmap",
