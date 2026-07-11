@@ -272,3 +272,46 @@ def test_atomic_promotion_loses_a_destination_race_without_overwriting(
 
     assert (target / "keep.txt").read_bytes() == b"keep"
     assert not list(tmp_path.glob("local.tmp-*"))
+
+
+def test_descriptor_copy_rejects_swap_between_validation_and_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "input"
+    source.mkdir()
+    frame = source / "frame.jpg"
+    frame.write_bytes(b"pixels")
+    outside = tmp_path / "outside.jpg"
+    outside.write_bytes(b"secret")
+    probe = tmp_path / "symlink-probe"
+    _symlink_or_skip(probe, outside)
+    probe.unlink()
+
+    real_open = source_module.os.open
+    swapped = False
+    read_loop_entered = False
+
+    def swapping_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        if Path(path) == frame and not swapped:
+            frame.unlink()
+            frame.symlink_to(outside)
+            swapped = True
+        return real_open(path, flags, *args, **kwargs)
+
+    real_read = source_module.os.read
+
+    def observe_read(descriptor: int, size: int) -> bytes:
+        nonlocal read_loop_entered
+        read_loop_entered = True
+        return real_read(descriptor, size)
+
+    monkeypatch.setattr(source_module.os, "open", swapping_open)
+    monkeypatch.setattr(source_module.os, "read", observe_read)
+
+    with pytest.raises(ValueError, match="changed|symlink"):
+        copy_input_read_only(source, tmp_path / "local")
+
+    assert swapped
+    assert not read_loop_entered
+    assert not list(tmp_path.glob("local.tmp-*"))

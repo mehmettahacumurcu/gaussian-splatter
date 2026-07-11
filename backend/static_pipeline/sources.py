@@ -6,8 +6,10 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sys
 import uuid
+from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -167,10 +169,51 @@ def _file_identity(files: tuple[SourceFile, ...]) -> tuple[tuple[str, int, str],
     return tuple((item.relative_path, item.size_bytes, item.sha256) for item in files)
 
 
-def _copy_file_no_follow(source: str, destination: str) -> str:
-    """Copy a regular file without dereferencing a last-moment symlink swap."""
+def _copy_file_no_follow(source: str, destination: str, *, source_root: Path) -> str:
+    """Copy from a verified descriptor without following a swapped final link."""
 
-    return shutil.copy2(source, destination, follow_symlinks=False)
+    source_path = Path(source)
+    try:
+        resolved_source = source_path.resolve(strict=True)
+    except (FileNotFoundError, RuntimeError) as exc:
+        raise ValueError(f"source changed while copying: {source_path}") from exc
+    if not _is_within(resolved_source, source_root):
+        raise ValueError(f"symlink resolves outside input root: {source_path}")
+
+    expected = os.stat(source_path, follow_symlinks=False)
+    if not stat.S_ISREG(expected.st_mode):
+        raise ValueError(f"source changed to a symlink while copying: {source_path}")
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(source_path, flags)
+    except OSError as exc:
+        if exc.errno in {errno.ELOOP, errno.ENOENT}:
+            raise ValueError(f"source changed to a symlink while copying: {source_path}") from exc
+        raise
+
+    try:
+        opened = os.fstat(descriptor)
+        expected_identity = (expected.st_dev, expected.st_ino)
+        opened_identity = (opened.st_dev, opened.st_ino)
+        if not stat.S_ISREG(opened.st_mode) or opened_identity != expected_identity:
+            raise ValueError(f"source changed between validation and open: {source_path}")
+
+        destination_path = Path(destination)
+        with destination_path.open("xb") as output:
+            while chunk := os.read(descriptor, _HASH_CHUNK_SIZE):
+                output.write(chunk)
+        os.chmod(destination_path, stat.S_IMODE(opened.st_mode))
+        os.utime(
+            destination_path,
+            ns=(opened.st_atime_ns, opened.st_mtime_ns),
+        )
+        return str(destination_path)
+    finally:
+        os.close(descriptor)
 
 
 def _rebase_absolute_internal_symlinks(staged: Path, source_root: Path) -> None:
@@ -286,7 +329,10 @@ def copy_input_read_only(source: Path, destination: Path) -> SourceInventory:
             source_inventory.root,
             staged,
             symlinks=True,
-            copy_function=_copy_file_no_follow,
+            copy_function=partial(
+                _copy_file_no_follow,
+                source_root=source_inventory.root,
+            ),
         )
         _rebase_absolute_internal_symlinks(staged, source_inventory.root)
         staged_inventory = discover_source(staged)
