@@ -1116,7 +1116,7 @@ def test_smart_selection_runs_end_to_end_with_real_ffmpeg(tmp_path: Path) -> Non
             "-f",
             "lavfi",
             "-i",
-            "testsrc2=size=160x120:rate=12",
+            "testsrc2=size=640x360:rate=24",
             "-t",
             "1.25",
             "-an",
@@ -1128,6 +1128,7 @@ def test_smart_selection_runs_end_to_end_with_real_ffmpeg(tmp_path: Path) -> Non
         ],
         check=True,
     )
+    assert len(FfmpegMediaBackend().video_timeline(video, None)) == 30
 
     output = tmp_path / "smart"
     manifest = select_frames(
@@ -1142,7 +1143,7 @@ def test_smart_selection_runs_end_to_end_with_real_ffmpeg(tmp_path: Path) -> Non
 
     assert manifest.effective_mode == "smart"
     assert 1 <= len(manifest.selected_frames) <= 4
-    assert len(manifest.selected_frames) <= len(manifest.frames) <= 15
+    assert len(manifest.selected_frames) <= len(manifest.frames) == 15
     assert all(frame.metrics is not None for frame in manifest.frames)
     assert all(frame.reasons for frame in manifest.frames if not frame.selected)
     assert all(frame.source_index is not None for frame in manifest.frames)
@@ -1162,7 +1163,33 @@ def test_smart_selection_runs_end_to_end_with_real_ffmpeg(tmp_path: Path) -> Non
         selected_path = output / frame.output_name
         assert frame.sha256 == hashlib.sha256(selected_path.read_bytes()).hexdigest()
         with Image.open(selected_path) as selected:
-            assert selected.size == (160, 120)
+            assert selected.size == (640, 360)
+
+    digest_payload = [
+        [frame.frame_id, frame.output_name, frame.sha256]
+        for frame in manifest.selected_frames
+    ]
+    expected_digest = hashlib.sha256(
+        json.dumps(
+            digest_payload,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert manifest.image_set_digest == expected_digest
+
+    serialized = json.loads(
+        (output / "selection_manifest.json").read_text(encoding="utf-8")
+    )
+    assert serialized["image_set_digest"] == expected_digest
+    serialized_by_id = {frame["frame_id"]: frame for frame in serialized["frames"]}
+    assert len(serialized_by_id) == len(manifest.frames)
+    for frame in manifest.frames:
+        stored = serialized_by_id[frame.frame_id]
+        assert stored["selected"] is frame.selected
+        assert stored["sha256"] == frame.sha256
+        assert stored["output_name"] == frame.output_name
+        assert stored["reasons"] == list(frame.reasons)
 
 
 @pytest.mark.integration
