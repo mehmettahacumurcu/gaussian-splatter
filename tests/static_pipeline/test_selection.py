@@ -4,18 +4,25 @@ import hashlib
 import json
 import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from PIL import Image, ImageChops
+from PIL import ExifTags, Image, ImageChops
 
 from backend.static_pipeline import selection as selection_module
-from backend.static_pipeline.contracts import SelectionPolicy, SourceInventory
+from backend.static_pipeline.contracts import (
+    SelectionPolicy,
+    SourceInventory,
+    UncoveredInterval,
+)
 from backend.static_pipeline.selection import (
     FfmpegMediaBackend,
     TimelineFrame,
+    VideoProbe,
     bound_selection_for_reconstruction,
     make_frame_id,
+    plan_backfill,
     select_frames,
     write_selection_manifest,
 )
@@ -144,20 +151,202 @@ def test_selection_replaces_stale_tail_files(
     ]
 
 
-def test_task_three_rejects_smart_mode_until_smart_selector_exists(
+def test_smart_selection_materializes_selected_frames_and_records_all_candidates(
     tmp_path: Path,
     video_inventory: SourceInventory,
     fake_media_backend: FakeMediaBackend,
 ) -> None:
-    with pytest.raises(ValueError, match="Smart"):
-        select_frames(
+    policy = SelectionPolicy(
+        mode="smart",
+        frame_budget=6,
+        resolution_long_edge_cap=1280,
+        candidate_fps=12,
+        candidate_long_edge=320,
+    )
+    first = select_frames(
+        video_inventory,
+        tmp_path / "smart-frames",
+        policy,
+        media=fake_media_backend,
+    )
+    second = select_frames(
+        video_inventory,
+        tmp_path / "smart-frames-again",
+        policy,
+        media=fake_media_backend,
+    )
+
+    assert first.effective_mode == "smart"
+    assert len(first.frames) > len(first.selected_frames)
+    assert len(first.selected_frames) <= policy.frame_budget
+    assert first.image_set_digest == second.image_set_digest
+    assert [frame.frame_id for frame in first.selected_frames] == [
+        frame.frame_id for frame in second.selected_frames
+    ]
+    assert all(frame.metrics is not None for frame in first.frames)
+    assert all(
+        frame.output_name == "" and frame.sha256 == ""
+        for frame in first.frames
+        if not frame.selected
+    )
+    assert len(list((tmp_path / "smart-frames").glob("*.png"))) == len(
+        first.selected_frames
+    )
+    extraction_caps = [
+        call[4]
+        for call in fake_media_backend.calls
+        if call[0] == "extract_video_indices"
+    ]
+    assert extraction_caps[:2] == [320, 1280]
+    assert not list(tmp_path.glob("*.candidates-*"))
+
+
+def test_smart_video_materialization_preserves_timestamp_record_mapping(
+    tmp_path: Path,
+    video_inventory: SourceInventory,
+) -> None:
+    backend = FakeMediaBackend(
+        timeline=(
+            TimelineFrame(2, 200, 0.0),
+            TimelineFrame(0, 0, 1.0),
+            TimelineFrame(1, 100, 2.0),
+        ),
+        probe=VideoProbe(1920, 1080, 3.0, 0),
+    )
+    manifest = select_frames(
+        video_inventory,
+        tmp_path / "smart",
+        SelectionPolicy(
+            mode="smart",
+            frame_budget=3,
+            resolution_long_edge_cap=1280,
+        ),
+        media=backend,
+    )
+
+    assert [frame.source_index for frame in manifest.selected_frames] == [2, 0, 1]
+    for frame in manifest.selected_frames:
+        with Image.open(tmp_path / "smart" / frame.output_name) as image:
+            assert image.getpixel((0, 0))[0] == frame.source_index
+
+
+def test_backfill_adds_at_most_two_bridges_and_keeps_smart_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    video_inventory: SourceInventory,
+    fake_media_backend: FakeMediaBackend,
+) -> None:
+    policy = SelectionPolicy(
+        mode="smart",
+        frame_budget=6,
+        resolution_long_edge_cap=1280,
+    )
+    original = select_frames(
+        video_inventory,
+        tmp_path / "smart",
+        policy,
+        media=fake_media_backend,
+    )
+    original = replace(
+        original,
+        policy=replace(original.policy, frame_budget=8),
+    )
+    gap = UncoveredInterval(start_s=1.0, end_s=3.0, missing_frame_ids=())
+    gaps = (gap, gap)
+    monkeypatch.setattr(selection_module, "pairwise_overlap", lambda _left, _right: 0.5)
+    backfilled = plan_backfill(
+        video_inventory,
+        original,
+        gaps,
+        tmp_path / "backfill",
+        media=fake_media_backend,
+        max_per_interval=99,
+    )
+    added = {frame.frame_id for frame in backfilled.selected_frames} - {
+        frame.frame_id for frame in original.selected_frames
+    }
+    assert 1 <= len(added) <= 2
+    assert len(backfilled.selected_frames) == len(original.selected_frames)
+    assert all(
+        "colmap_gap_backfill" in frame.reasons
+        for frame in backfilled.selected_frames
+        if frame.frame_id in added
+    )
+    assert len(list((tmp_path / "backfill").glob("*.png"))) == len(
+        backfilled.selected_frames
+    )
+    with pytest.raises(ValueError, match="already"):
+        plan_backfill(
             video_inventory,
-            tmp_path / "frames",
-            SelectionPolicy(
-                mode="smart",
-                frame_budget=300,
-                resolution_long_edge_cap=1280,
-            ),
+            backfilled,
+            gaps,
+            tmp_path / "backfill-again",
+            media=fake_media_backend,
+        )
+
+
+def test_fixed_mode_rejects_backfill_before_touching_output(
+    tmp_path: Path,
+    video_inventory: SourceInventory,
+    fake_media_backend: FakeMediaBackend,
+) -> None:
+    fixed = select_frames(
+        video_inventory,
+        tmp_path / "fixed",
+        SelectionPolicy(
+            mode="fixed_fps",
+            frame_budget=6,
+            resolution_long_edge_cap=1280,
+        ),
+        media=fake_media_backend,
+    )
+    calls_before = len(fake_media_backend.calls)
+    target = tmp_path / "backfill"
+
+    with pytest.raises(ValueError, match="Smart"):
+        plan_backfill(
+            video_inventory,
+            fixed,
+            (),
+            target,
+            media=fake_media_backend,
+        )
+
+    assert not target.exists()
+    assert len(fake_media_backend.calls) == calls_before
+
+
+def test_backfill_rejects_output_ancestor_before_candidate_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    video_inventory: SourceInventory,
+    fake_media_backend: FakeMediaBackend,
+) -> None:
+    original = select_frames(
+        video_inventory,
+        tmp_path / "smart",
+        SelectionPolicy(
+            mode="smart",
+            frame_budget=6,
+            resolution_long_edge_cap=1280,
+        ),
+        media=fake_media_backend,
+    )
+
+    def unexpected_analysis(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("unsafe ancestor triggered candidate analysis")
+
+    monkeypatch.setattr(
+        selection_module,
+        "_analyze_source_candidates",
+        unexpected_analysis,
+    )
+    with pytest.raises(ValueError, match="source input"):
+        plan_backfill(
+            video_inventory,
+            original,
+            (UncoveredInterval(1.0, 2.0, ()),),
+            video_inventory.root.parent,
             media=fake_media_backend,
         )
 
@@ -224,6 +413,75 @@ def test_photo_selection_natural_sorts_and_never_upscales(tmp_path: Path) -> Non
     ]
     with Image.open(tmp_path / "frames" / "frame_000000.png") as image:
         assert image.size == (8, 6)
+
+
+def test_smart_photo_order_uses_exif_only_when_complete(tmp_path: Path) -> None:
+    root = tmp_path / "photos"
+    root.mkdir()
+    rows = (
+        ("IMG_1.JPG", "2026:01:03 10:00:00", 30),
+        ("IMG_2.JPG", "2026:01:01 10:00:00", 60),
+        ("IMG_10.JPG", "2026:01:02 10:00:00", 90),
+    )
+    for filename, captured_at, value in rows:
+        exif = Image.Exif()
+        exif[ExifTags.IFD.Exif] = {36867: captured_at}
+        Image.new("RGB", (32, 24), (value, value, value)).save(
+            root / filename,
+            exif=exif,
+        )
+    inventory = discover_source(root)
+    manifest = select_frames(
+        inventory,
+        tmp_path / "smart-photos",
+        SelectionPolicy(
+            mode="smart",
+            frame_budget=2,
+            resolution_long_edge_cap=1280,
+        ),
+        media=FakeMediaBackend(timeline=()),
+    )
+
+    assert [frame.source_relative_path for frame in manifest.frames] == [
+        "IMG_2.JPG",
+        "IMG_10.JPG",
+        "IMG_1.JPG",
+    ]
+    assert all(frame.source_index is None for frame in manifest.frames)
+    assert all(frame.timestamp_s is None for frame in manifest.frames)
+    assert manifest.frames[0].frame_id == make_frame_id(
+        inventory.digest,
+        None,
+        None,
+        "IMG_2.JPG",
+    )
+
+
+def test_smart_photo_order_falls_back_wholly_when_exif_is_missing(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "photos"
+    root.mkdir()
+    exif = Image.Exif()
+    exif[ExifTags.IFD.Exif] = {36867: "2026:01:01 10:00:00"}
+    Image.new("RGB", (24, 18), (80, 80, 80)).save(root / "IMG_10.JPG", exif=exif)
+    Image.new("RGB", (24, 18), (40, 40, 40)).save(root / "IMG_2.JPG")
+    inventory = discover_source(root)
+    manifest = select_frames(
+        inventory,
+        tmp_path / "smart",
+        SelectionPolicy(
+            mode="smart",
+            frame_budget=2,
+            resolution_long_edge_cap=1280,
+        ),
+        media=FakeMediaBackend(timeline=()),
+    )
+
+    assert [frame.source_relative_path for frame in manifest.frames] == [
+        "IMG_2.JPG",
+        "IMG_10.JPG",
+    ]
 
 
 def test_fixed_vfr_targets_use_nearest_unique_frames_with_stable_ties(
@@ -344,6 +602,32 @@ def test_materialization_failure_preserves_previous_target(
     assert not list(tmp_path.glob("frames.tmp-*"))
 
 
+def test_smart_analysis_failure_preserves_previous_target(
+    tmp_path: Path,
+    photo_inventory: SourceInventory,
+) -> None:
+    target = tmp_path / "smart-frames"
+    target.mkdir()
+    marker = target / "keep.txt"
+    marker.write_bytes(b"keep")
+    backend = FakeMediaBackend(timeline=(), fail_after_writes=1)
+
+    with pytest.raises(RuntimeError, match="injected"):
+        select_frames(
+            photo_inventory,
+            target,
+            SelectionPolicy(
+                mode="smart",
+                frame_budget=2,
+                resolution_long_edge_cap=1280,
+            ),
+            media=backend,
+        )
+
+    assert marker.read_bytes() == b"keep"
+    assert not list(tmp_path.glob("smart-frames.tmp-*"))
+
+
 def test_selection_refuses_to_write_inside_immutable_source(
     photo_inventory: SourceInventory,
 ) -> None:
@@ -362,6 +646,52 @@ def test_selection_refuses_to_write_inside_immutable_source(
         )
 
     assert not target.exists()
+
+
+def test_selection_rejects_output_ancestor_of_immutable_source(
+    monkeypatch: pytest.MonkeyPatch,
+    photo_inventory: SourceInventory,
+) -> None:
+    def unexpected_stage(_target: Path) -> Path:
+        raise AssertionError("unsafe ancestor passed output validation")
+
+    monkeypatch.setattr(selection_module, "_fresh_stage", unexpected_stage)
+    with pytest.raises(ValueError, match="source input"):
+        select_frames(
+            photo_inventory,
+            photo_inventory.root.parent,
+            SelectionPolicy(
+                mode="fixed_fps",
+                frame_budget=2,
+                resolution_long_edge_cap=1280,
+            ),
+            media=FakeMediaBackend(timeline=()),
+        )
+
+
+@pytest.mark.parametrize(
+    ("candidate_fps", "candidate_long_edge"),
+    [(13, 320), (12, 321)],
+)
+def test_smart_analysis_rejects_values_above_quality_contract(
+    tmp_path: Path,
+    video_inventory: SourceInventory,
+    candidate_fps: int,
+    candidate_long_edge: int,
+) -> None:
+    with pytest.raises(ValueError, match="candidate"):
+        select_frames(
+            video_inventory,
+            tmp_path / "smart",
+            SelectionPolicy(
+                mode="smart",
+                frame_budget=2,
+                resolution_long_edge_cap=1280,
+                candidate_fps=candidate_fps,
+                candidate_long_edge=candidate_long_edge,
+            ),
+            media=FakeMediaBackend(timeline=()),
+        )
 
 
 def test_publish_failure_restores_previous_target(

@@ -74,3 +74,10 @@ class SelectionManifest:
     @property
     def selected_frames(self) -> tuple[FrameRecord, ...]:
         return tuple(frame for frame in self.frames if frame.selected)
+
+
+@dataclass(frozen=True)
+class UncoveredInterval:
+    start_s: float
+    end_s: float
+    missing_frame_ids: tuple[str, ...]

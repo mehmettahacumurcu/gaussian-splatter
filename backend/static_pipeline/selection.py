@@ -11,17 +11,28 @@ import tempfile
 import uuid
 from bisect import bisect_left
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
 from typing import Literal, Protocol, Sequence
 
-from PIL import Image, ImageOps
+import cv2
+import numpy as np
+from PIL import ExifTags, Image, ImageOps
 
 from .contracts import (
     FrameRecord,
     SelectionManifest,
     SelectionPolicy,
     SourceInventory,
+    UncoveredInterval,
+)
+from .selection_metrics import (
+    CandidateFrame,
+    ScoredCandidate,
+    choose_smart_candidates,
+    pairwise_overlap,
+    score_candidates,
 )
 from .sources import sha256_file
 
@@ -397,6 +408,10 @@ def _validate_policy(policy: SelectionPolicy) -> None:
         raise ValueError("FPS values must be positive")
     if policy.candidate_long_edge <= 0:
         raise ValueError("candidate_long_edge must be positive")
+    if policy.candidate_fps > 12:
+        raise ValueError("candidate_fps cannot exceed 12")
+    if policy.candidate_long_edge > 320:
+        raise ValueError("candidate_long_edge cannot exceed 320")
     if (
         policy.resolution_long_edge_cap is not None
         and policy.resolution_long_edge_cap <= 0
@@ -509,12 +524,19 @@ def _fresh_stage(target: Path) -> Path:
 
 
 def _ensure_output_outside_source(target: Path, source_root: Path) -> None:
-    resolved_target = target.parent.resolve(strict=False) / target.name
+    resolved_target = target.resolve(strict=False)
+    resolved_source = source_root.resolve(strict=True)
     try:
-        resolved_target.relative_to(source_root.resolve(strict=True))
+        resolved_target.relative_to(resolved_source)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("selection output must not overlap the immutable source input")
+    try:
+        resolved_source.relative_to(resolved_target)
     except ValueError:
         return
-    raise ValueError("selection output must not be inside the immutable source input")
+    raise ValueError("selection output must not overlap the immutable source input")
 
 
 def _verify_png_set(directory: Path, count: int) -> None:
@@ -525,6 +547,226 @@ def _verify_png_set(directory: Path, count: int) -> None:
         raise RuntimeError(
             f"media backend produced unexpected staged entries: {actual}"
         )
+
+
+def _extract_video_frames_ordered(
+    backend: MediaBackend,
+    source_path: Path,
+    source_indices: Sequence[int],
+    destination: Path,
+    long_edge_cap: int | None,
+) -> None:
+    requested = tuple(source_indices)
+    if len(set(requested)) != len(requested):
+        raise ValueError("video source indices must be unique")
+    sorted_indices = tuple(sorted(requested))
+    raw = destination / f".video-raw-{uuid.uuid4().hex}"
+    try:
+        backend.extract_video_indices(
+            source_path,
+            sorted_indices,
+            raw,
+            long_edge_cap,
+        )
+        _verify_png_set(raw, len(sorted_indices))
+        source_position = {
+            source_index: position
+            for position, source_index in enumerate(sorted_indices)
+        }
+        for output_index, source_index in enumerate(requested):
+            shutil.move(
+                raw / f"frame_{source_position[source_index]:06d}.png",
+                destination / f"frame_{output_index:06d}.png",
+            )
+    finally:
+        if os.path.lexists(raw):
+            _remove_path(raw)
+
+
+def _read_rgb(path: Path) -> np.ndarray:
+    bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise RuntimeError(f"failed to decode candidate image: {path}")
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+
+def _smart_photo_order(inventory: SourceInventory) -> tuple[str, ...]:
+    natural = sorted(
+        (item.relative_path for item in inventory.media_files),
+        key=_natural_key,
+    )
+    dated: list[tuple[datetime, str]] = []
+    for relative_path in natural:
+        try:
+            with Image.open(inventory.root / relative_path) as image:
+                exif = image.getexif()
+                raw_value = exif.get(36867)
+                if raw_value is None:
+                    raw_value = exif.get_ifd(ExifTags.IFD.Exif).get(36867)
+            if raw_value is None:
+                return tuple(natural)
+            text_value = (
+                raw_value.decode("utf-8", errors="strict")
+                if isinstance(raw_value, bytes)
+                else str(raw_value)
+            )
+            parsed = datetime.strptime(text_value, "%Y:%m:%d %H:%M:%S")
+        except (AttributeError, KeyError, OSError, TypeError, ValueError):
+            return tuple(natural)
+        dated.append((parsed, relative_path))
+    dated.sort(key=lambda item: (item[0], _natural_key(item[1])))
+    return tuple(relative_path for _, relative_path in dated)
+
+
+def _smart_key(candidate: ScoredCandidate) -> tuple[float, int, str]:
+    coordinate = (
+        candidate.timestamp_s
+        if candidate.timestamp_s is not None
+        else float(candidate.ordinal)
+    )
+    return (coordinate, candidate.ordinal, candidate.frame_id)
+
+
+def _analyze_source_candidates(
+    inventory: SourceInventory,
+    policy: SelectionPolicy,
+    backend: MediaBackend,
+) -> tuple[ScoredCandidate, ...]:
+    with tempfile.TemporaryDirectory(
+        prefix="static-selection-candidates-"
+    ) as temporary:
+        analysis_dir = Path(temporary)
+        candidates: list[CandidateFrame] = []
+        if inventory.kind == "video":
+            source_file = inventory.media_files[0]
+            source_path = inventory.root / source_file.relative_path
+            timeline = backend.video_timeline(source_path, policy.candidate_fps)
+            _extract_video_frames_ordered(
+                backend,
+                source_path,
+                [frame.source_index for frame in timeline],
+                analysis_dir,
+                policy.candidate_long_edge,
+            )
+            _verify_png_set(analysis_dir, len(timeline))
+            for ordinal, frame in enumerate(timeline):
+                candidates.append(
+                    CandidateFrame(
+                        frame_id=make_frame_id(
+                            inventory.digest,
+                            frame.source_index,
+                            frame.timestamp_s,
+                            source_file.relative_path,
+                        ),
+                        source_relative_path=source_file.relative_path,
+                        source_index=frame.source_index,
+                        source_pts=frame.source_pts,
+                        timestamp_s=frame.timestamp_s,
+                        ordinal=ordinal,
+                        rgb=_read_rgb(analysis_dir / f"frame_{ordinal:06d}.png"),
+                    )
+                )
+        else:
+            relative_paths = _smart_photo_order(inventory)
+            for ordinal, relative_path in enumerate(relative_paths):
+                output = analysis_dir / f"frame_{ordinal:06d}.png"
+                backend.copy_photo(
+                    inventory.root / relative_path,
+                    output,
+                    policy.candidate_long_edge,
+                )
+                candidates.append(
+                    CandidateFrame(
+                        frame_id=make_frame_id(
+                            inventory.digest,
+                            None,
+                            None,
+                            relative_path,
+                        ),
+                        source_relative_path=relative_path,
+                        source_index=None,
+                        source_pts=None,
+                        timestamp_s=None,
+                        ordinal=ordinal,
+                        rgb=_read_rgb(output),
+                    )
+                )
+            _verify_png_set(analysis_dir, len(relative_paths))
+
+        scored = score_candidates(candidates)
+        empty_rgb = np.empty((0, 0, 3), dtype=np.uint8)
+        return tuple(
+            replace(item, frame=replace(item.frame, rgb=empty_rgb)) for item in scored
+        )
+
+
+def _materialize_scored_candidates(
+    inventory: SourceInventory,
+    selected: Sequence[ScoredCandidate],
+    stage: Path,
+    backend: MediaBackend,
+    long_edge_cap: int | None,
+) -> tuple[ScoredCandidate, ...]:
+    ordered = tuple(sorted(selected, key=_smart_key))
+    if inventory.kind == "video":
+        source_path = inventory.root / inventory.media_files[0].relative_path
+        indices = [candidate.source_index for candidate in ordered]
+        if any(index is None for index in indices):
+            raise ValueError("video candidates require source indices")
+        _extract_video_frames_ordered(
+            backend,
+            source_path,
+            [int(index) for index in indices],
+            stage,
+            long_edge_cap,
+        )
+    else:
+        for output_index, candidate in enumerate(ordered):
+            backend.copy_photo(
+                inventory.root / candidate.source_relative_path,
+                stage / f"frame_{output_index:06d}.png",
+                long_edge_cap,
+            )
+    _verify_png_set(stage, len(ordered))
+    return ordered
+
+
+def _smart_records(
+    all_candidates: Sequence[ScoredCandidate],
+    selected: Sequence[ScoredCandidate],
+    stage: Path,
+) -> tuple[FrameRecord, ...]:
+    ordered_all = sorted(all_candidates, key=_smart_key)
+    selected_by_id = {
+        candidate.frame_id: (output_index, candidate)
+        for output_index, candidate in enumerate(selected)
+    }
+    records: list[FrameRecord] = []
+    for candidate in ordered_all:
+        selected_value = selected_by_id.get(candidate.frame_id)
+        is_selected = selected_value is not None
+        output_name = (
+            f"frame_{selected_value[0]:06d}.png" if selected_value is not None else ""
+        )
+        selected_candidate = (
+            selected_value[1] if selected_value is not None else candidate
+        )
+        records.append(
+            FrameRecord(
+                frame_id=candidate.frame_id,
+                source_relative_path=candidate.source_relative_path,
+                source_index=candidate.source_index,
+                source_pts=candidate.source_pts,
+                timestamp_s=candidate.timestamp_s,
+                output_name=output_name,
+                sha256=sha256_file(stage / output_name) if is_selected else "",
+                selected=is_selected,
+                metrics=candidate.metrics,
+                selection_score=candidate.total_score,
+                reasons=selected_candidate.reasons,
+            )
+        )
+    return tuple(records)
 
 
 def _video_records(
@@ -597,8 +839,6 @@ def select_frames(
     media: MediaBackend | None = None,
 ) -> SelectionManifest:
     _validate_policy(policy)
-    if policy.mode != "fixed_fps":
-        raise ValueError("Smart selection is implemented by the next pipeline stage")
     if inventory.schema_version != 1:
         raise ValueError("unsupported source inventory schema")
 
@@ -607,7 +847,19 @@ def select_frames(
     _ensure_output_outside_source(target, inventory.root)
     stage = _fresh_stage(target)
     try:
-        if inventory.kind == "video":
+        if policy.mode == "smart":
+            analyzed = _analyze_source_candidates(inventory, policy, backend)
+            chosen = choose_smart_candidates(analyzed, policy.frame_budget)
+            selected_scored = _materialize_scored_candidates(
+                inventory,
+                chosen,
+                stage,
+                backend,
+                policy.resolution_long_edge_cap,
+            )
+            records = _smart_records(analyzed, selected_scored, stage)
+            effective_mode = "smart"
+        elif inventory.kind == "video":
             source_file = inventory.media_files[0]
             source_path = inventory.root / source_file.relative_path
             timeline = backend.video_timeline(source_path, None)
@@ -616,9 +868,10 @@ def select_frames(
                 fixed_fps=policy.fixed_fps,
                 frame_budget=policy.frame_budget,
             )
-            backend.extract_video_indices(
+            _extract_video_frames_ordered(
+                backend,
                 source_path,
-                tuple(frame.source_index for frame in selected),
+                [frame.source_index for frame in selected],
                 stage,
                 policy.resolution_long_edge_cap,
             )
@@ -664,6 +917,229 @@ def select_frames(
 
 def _append_reason(reasons: tuple[str, ...], reason: str) -> tuple[str, ...]:
     return reasons if reason in reasons else reasons + (reason,)
+
+
+def _candidate_in_interval(
+    candidate: ScoredCandidate,
+    interval: UncoveredInterval,
+) -> bool:
+    if candidate.frame_id in interval.missing_frame_ids:
+        return True
+    return (
+        candidate.timestamp_s is not None
+        and interval.start_s <= candidate.timestamp_s <= interval.end_s
+    )
+
+
+def _candidate_in_any_interval(
+    candidate: ScoredCandidate,
+    intervals: Sequence[UncoveredInterval],
+) -> bool:
+    return any(_candidate_in_interval(candidate, interval) for interval in intervals)
+
+
+def _canonicalize_intervals(
+    uncovered: Sequence[UncoveredInterval],
+) -> tuple[UncoveredInterval, ...]:
+    ordered = sorted(
+        uncovered,
+        key=lambda interval: (
+            interval.start_s,
+            interval.end_s,
+            interval.missing_frame_ids,
+        ),
+    )
+    merged: list[UncoveredInterval] = []
+    for interval in ordered:
+        if (
+            not math.isfinite(interval.start_s)
+            or not math.isfinite(interval.end_s)
+            or interval.end_s < interval.start_s
+        ):
+            raise ValueError("uncovered intervals must be finite and ordered")
+        if merged and interval.start_s <= merged[-1].end_s:
+            previous = merged[-1]
+            merged[-1] = UncoveredInterval(
+                start_s=previous.start_s,
+                end_s=max(previous.end_s, interval.end_s),
+                missing_frame_ids=tuple(
+                    sorted(
+                        set(previous.missing_frame_ids)
+                        | set(interval.missing_frame_ids)
+                    )
+                ),
+            )
+        else:
+            merged.append(
+                UncoveredInterval(
+                    start_s=interval.start_s,
+                    end_s=interval.end_s,
+                    missing_frame_ids=tuple(sorted(set(interval.missing_frame_ids))),
+                )
+            )
+    return tuple(merged)
+
+
+def plan_backfill(
+    inventory: SourceInventory,
+    manifest: SelectionManifest,
+    uncovered: Sequence[UncoveredInterval],
+    output_dir: Path,
+    media: MediaBackend | None = None,
+    max_per_interval: int = 2,
+) -> SelectionManifest:
+    if manifest.policy.mode != "smart" or manifest.effective_mode != "smart":
+        raise ValueError("Smart selection is required for gap backfill")
+    if manifest.source_digest != inventory.digest:
+        raise ValueError("selection manifest does not belong to this source inventory")
+    if any(
+        "colmap_gap_backfill_attempted" in frame.reasons for frame in manifest.frames
+    ):
+        raise ValueError("Smart gap backfill has already been attempted")
+    if max_per_interval <= 0:
+        raise ValueError("max_per_interval must be positive")
+    intervals = _canonicalize_intervals(uncovered)
+    if not intervals:
+        return manifest
+
+    target = Path(output_dir)
+    _ensure_output_outside_source(target, inventory.root)
+    backend: MediaBackend = media or FfmpegMediaBackend()
+    analyzed = _analyze_source_candidates(inventory, manifest.policy, backend)
+    scored_by_id = {candidate.frame_id: candidate for candidate in analyzed}
+    records_by_id = {frame.frame_id: frame for frame in manifest.frames}
+    if set(records_by_id) != set(scored_by_id):
+        raise ValueError("Smart candidate inventory changed before backfill")
+
+    selected_ids = {frame.frame_id for frame in manifest.selected_frames}
+    per_interval_limit = min(max_per_interval, 2)
+    planned: list[ScoredCandidate] = []
+    planned_ids: set[str] = set()
+    for interval in intervals:
+        midpoint = (interval.start_s + interval.end_s) / 2.0
+        pool = [
+            candidate
+            for candidate in analyzed
+            if candidate.frame_id not in selected_ids
+            and candidate.frame_id not in planned_ids
+            and _candidate_in_interval(candidate, interval)
+        ]
+        pool.sort(
+            key=lambda candidate: (
+                candidate.metrics.overlap_score,
+                candidate.total_score,
+                -abs(
+                    (
+                        candidate.timestamp_s
+                        if candidate.timestamp_s is not None
+                        else midpoint
+                    )
+                    - midpoint
+                ),
+                -candidate.ordinal,
+                candidate.frame_id,
+            ),
+            reverse=True,
+        )
+        for candidate in pool[:per_interval_limit]:
+            planned.append(candidate)
+            planned_ids.add(candidate.frame_id)
+
+    ordered_original = sorted(
+        (scored_by_id[frame_id] for frame_id in selected_ids),
+        key=_smart_key,
+    )
+    endpoint_ids = (
+        {ordered_original[0].frame_id, ordered_original[-1].frame_id}
+        if ordered_original
+        else set()
+    )
+    accepted_additions: set[str] = set()
+    removed_ids: set[str] = set()
+    for addition in planned:
+        tentative_ids = selected_ids | {addition.frame_id}
+        tentative = sorted(
+            (scored_by_id[frame_id] for frame_id in tentative_ids),
+            key=_smart_key,
+        )
+        removable: list[ScoredCandidate] = []
+        for index in range(1, len(tentative) - 1):
+            candidate = tentative[index]
+            if (
+                candidate.frame_id in endpoint_ids
+                or candidate.frame_id in accepted_additions
+                or candidate.frame_id == addition.frame_id
+                or _candidate_in_any_interval(candidate, intervals)
+            ):
+                continue
+            if pairwise_overlap(tentative[index - 1], tentative[index + 1]) >= 0.20:
+                removable.append(candidate)
+        if not removable:
+            continue
+        victim = min(
+            removable,
+            key=lambda candidate: (
+                candidate.total_score,
+                candidate.ordinal,
+                candidate.frame_id,
+            ),
+        )
+        selected_ids.remove(victim.frame_id)
+        removed_ids.add(victim.frame_id)
+        selected_ids.add(addition.frame_id)
+        accepted_additions.add(addition.frame_id)
+
+    stage = _fresh_stage(target)
+    try:
+        selected_scored = _materialize_scored_candidates(
+            inventory,
+            [scored_by_id[frame_id] for frame_id in selected_ids],
+            stage,
+            backend,
+            manifest.policy.resolution_long_edge_cap,
+        )
+        output_by_id = {
+            candidate.frame_id: output_index
+            for output_index, candidate in enumerate(selected_scored)
+        }
+        updated_records: list[FrameRecord] = []
+        for record in manifest.frames:
+            is_selected = record.frame_id in selected_ids
+            output_index = output_by_id.get(record.frame_id)
+            reasons = record.reasons
+            if record.frame_id in accepted_additions:
+                reasons = _append_reason(reasons, "colmap_gap_backfill")
+            if record.frame_id in removed_ids:
+                reasons = _append_reason(reasons, "colmap_gap_replaced")
+            reasons = _append_reason(reasons, "colmap_gap_backfill_attempted")
+            output_name = (
+                f"frame_{output_index:06d}.png" if output_index is not None else ""
+            )
+            updated_records.append(
+                replace(
+                    record,
+                    output_name=output_name,
+                    sha256=sha256_file(stage / output_name) if is_selected else "",
+                    selected=is_selected,
+                    reasons=reasons,
+                )
+            )
+        records = tuple(updated_records)
+        backfilled = SelectionManifest(
+            schema_version=1,
+            source_digest=inventory.digest,
+            effective_mode="smart",
+            policy=manifest.policy,
+            frames=records,
+            image_set_digest=_image_set_digest(records),
+            reconstruction_guardrail=manifest.reconstruction_guardrail,
+        )
+        write_selection_manifest(stage / "selection_manifest.json", backfilled)
+        _publish_directory(stage, target)
+        return backfilled
+    finally:
+        if os.path.lexists(stage):
+            _remove_path(stage)
 
 
 def bound_selection_for_reconstruction(
