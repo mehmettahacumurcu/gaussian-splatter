@@ -44,7 +44,8 @@ def cache_matches(
         return False
     if not isinstance(payload, dict):
         return False
-    if payload.get("schema_version") != 1:
+    schema_version = payload.get("schema_version")
+    if type(schema_version) is not int or schema_version != 1:
         return False
     if payload.get("fingerprint") != expected_fingerprint:
         return False

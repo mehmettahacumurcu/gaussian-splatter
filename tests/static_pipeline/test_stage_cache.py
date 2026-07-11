@@ -31,8 +31,38 @@ def test_source_or_selection_change_invalidates_stage() -> None:
         settings={"cap": 1280},
         policy_version="v1",
     )
+    changed_policy = stage_fingerprint(
+        "frames",
+        inputs={"source": "a", "selection": "one"},
+        settings={"cap": 1280},
+        policy_version="v2",
+    )
 
-    assert len({first, changed_source, changed_selection}) == 3
+    assert first == "6a2c32714ecd06d125dbda940f0fcc5548c765be8768ff4250a18949ecf9bb18"
+    assert len({first, changed_source, changed_selection, changed_policy}) == 4
+
+
+def test_upstream_fingerprint_changes_invalidate_every_downstream_stage() -> None:
+    def chain(source_digest: str) -> tuple[str, str]:
+        selection = stage_fingerprint(
+            "selection",
+            inputs={"source": source_digest},
+            settings={"mode": "smart"},
+            policy_version="selection-v1",
+        )
+        colmap = stage_fingerprint(
+            "colmap",
+            inputs={"selection": selection},
+            settings={"matcher": "sequential"},
+            policy_version="reconstruction-v1",
+        )
+        return selection, colmap
+
+    first_selection, first_colmap = chain("source-a")
+    changed_selection, changed_colmap = chain("source-b")
+
+    assert first_selection != changed_selection
+    assert first_colmap != changed_colmap
 
 
 def test_stage_fingerprint_is_canonical_and_includes_tools() -> None:
@@ -107,6 +137,22 @@ def test_cache_matches_requires_schema_fingerprint_and_all_paths(
     assert not cache_matches(marker, "expected", (required_file,))
 
     marker.write_text("not-json", encoding="utf-8")
+    assert not cache_matches(marker, "expected", (required_file,))
+
+
+@pytest.mark.parametrize("schema_version", [True, 1.0, "1", None])
+def test_cache_matches_rejects_non_integer_schema_one(
+    tmp_path: Path,
+    schema_version: object,
+) -> None:
+    marker = tmp_path / "marker.json"
+    required_file = tmp_path / "frame.png"
+    required_file.write_bytes(b"frame")
+    marker.write_text(
+        json.dumps({"schema_version": schema_version, "fingerprint": "expected"}),
+        encoding="utf-8",
+    )
+
     assert not cache_matches(marker, "expected", (required_file,))
 
 

@@ -12,7 +12,7 @@ def _capture_colmap_commands(
     tmp_path: Path,
     *,
     sequential: bool,
-    sequential_overlap: int = 10,
+    sequential_overlap: int | None = None,
 ) -> list[list[str]]:
     frames = tmp_path / "frames"
     frames.mkdir()
@@ -43,12 +43,12 @@ def _capture_colmap_commands(
     monkeypatch.setattr(colmap_module, "_stream_subprocess", fake_stream)
     monkeypatch.setattr(colmap_module.subprocess, "run", fake_run)
 
-    colmap_module.run_colmap(
-        frames,
-        output,
-        sequential=sequential,
-        sequential_overlap=sequential_overlap,
+    kwargs = (
+        {"sequential_overlap": sequential_overlap}
+        if sequential_overlap is not None
+        else {}
     )
+    colmap_module.run_colmap(frames, output, sequential=sequential, **kwargs)
     return commands
 
 
@@ -65,6 +65,20 @@ def test_sequential_overlap_reaches_colmap_command(
     matcher = next(command for command in commands if "sequential_matcher" in command)
 
     assert matcher[-2:] == ["--SequentialMatching.overlap", "20"]
+
+
+def test_sequential_matcher_uses_legacy_default_overlap(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    commands = _capture_colmap_commands(
+        monkeypatch,
+        tmp_path,
+        sequential=True,
+    )
+    matcher = next(command for command in commands if "sequential_matcher" in command)
+
+    assert matcher[-2:] == ["--SequentialMatching.overlap", "10"]
 
 
 def test_exhaustive_matcher_does_not_receive_sequential_overlap(
