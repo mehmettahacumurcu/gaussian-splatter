@@ -115,6 +115,7 @@ def run_colmap(
     extra_match_args: list[str] | None = None,     # matcher extra
     extra_mapper_args: list[str] | None = None,    # mapper/BA extra
     glob_pattern: str = "*.png",                   # multi-folder icin "**/*.png"
+    sequential_overlap: int = 10,
 ) -> Path:
     """
     COLMAP pipeline:
@@ -153,6 +154,8 @@ def run_colmap(
         # (orn. Colab apt colmap) GPU SIFT OpenGL context bulamayip crash eder.
         extra_feat += ["--SiftExtraction.use_gpu", "0"]
         extra_match += ["--SiftMatching.use_gpu", "0"]
+    if sequential:
+        extra_match += ["--SequentialMatching.overlap", str(sequential_overlap)]
 
     # single_camera modu: "yes" → tek K (default), "no" → her image kendi K'si,
     # "per_folder" → her subfolder kendi K'si (multi-cam ideal)

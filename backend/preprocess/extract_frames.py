@@ -53,7 +53,8 @@ def extract_frames(
     if resize_long_edge:
         # Uzun kenarı resize_long_edge'e ölçekle, oran koru, çift sayıya yuvarla
         vf_parts.append(
-            f"scale='if(gt(iw,ih),{resize_long_edge},-2)':'if(gt(iw,ih),-2,{resize_long_edge})'"
+            f"scale='if(gt(iw,ih),min(iw,{resize_long_edge}),-2)'"
+            f":'if(gt(iw,ih),-2,min(ih,{resize_long_edge}))'"
         )
     vf = ",".join(vf_parts)
 

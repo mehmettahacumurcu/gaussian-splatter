@@ -283,6 +283,7 @@ def run_pipeline(
                     video_path, frames_dir,
                     fps=cfg.preprocess.fps,
                     resize_long_edge=cfg.preprocess.resize_long_edge,
+                    overwrite=True,
                 )
                 n_frames_done = len(list(frames_dir.glob("frame_*.png")))
                 write_cache_marker(paths["base"], "frames", {
@@ -382,6 +383,7 @@ def run_pipeline(
             camera_model=cfg.preprocess.colmap_camera_model,
             use_gpu=cfg.preprocess.colmap_use_gpu,
             sequential=is_sequential,
+            sequential_overlap=cfg.preprocess.sequential_overlap,
             colmap_exe=cfg.preprocess.colmap_exe,
             on_progress=_colmap_on_progress,
         )
