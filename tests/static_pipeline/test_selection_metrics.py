@@ -185,3 +185,18 @@ def test_bridge_uses_pairwise_overlap_and_stays_within_budget() -> None:
     assert selected[0].source_index == 0
     assert selected[-1].source_index == 4
     assert any("continuity_bridge" in item.reasons for item in selected)
+
+
+def test_sparse_windows_add_endpoint_without_deleting_window_winner() -> None:
+    candidates = (
+        _scored(0, 0.1),
+        _scored(1, 1.0),
+        _scored(10, 0.9),
+    )
+    selected = choose_smart_candidates(
+        candidates,
+        budget=5,
+        pairwise_overlap=lambda _left, _right: 0.5,
+    )
+
+    assert [item.source_index for item in selected] == [0, 1, 10]

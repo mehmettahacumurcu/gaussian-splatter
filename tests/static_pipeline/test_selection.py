@@ -694,6 +694,81 @@ def test_smart_analysis_rejects_values_above_quality_contract(
         )
 
 
+def test_fixed_mode_ignores_irrelevant_smart_candidate_caps(
+    tmp_path: Path,
+    video_inventory: SourceInventory,
+    fake_media_backend: FakeMediaBackend,
+) -> None:
+    manifest = select_frames(
+        video_inventory,
+        tmp_path / "fixed",
+        SelectionPolicy(
+            mode="fixed_fps",
+            frame_budget=3,
+            resolution_long_edge_cap=1280,
+            candidate_fps=30,
+            candidate_long_edge=999,
+        ),
+        media=fake_media_backend,
+    )
+    assert manifest.effective_mode == "fixed_fps"
+
+
+def test_invalid_selection_mode_is_rejected_before_io(
+    tmp_path: Path,
+    video_inventory: SourceInventory,
+    fake_media_backend: FakeMediaBackend,
+) -> None:
+    calls_before = len(fake_media_backend.calls)
+
+    with pytest.raises(ValueError, match="mode"):
+        select_frames(
+            video_inventory,
+            tmp_path / "invalid",
+            SelectionPolicy(
+                mode="unsupported",  # type: ignore[arg-type]
+                frame_budget=3,
+                resolution_long_edge_cap=1280,
+            ),
+            media=fake_media_backend,
+        )
+
+    assert len(fake_media_backend.calls) == calls_before
+
+
+def test_backfill_revalidates_smart_candidate_contract_before_io(
+    tmp_path: Path,
+    video_inventory: SourceInventory,
+    fake_media_backend: FakeMediaBackend,
+) -> None:
+    original = select_frames(
+        video_inventory,
+        tmp_path / "smart",
+        SelectionPolicy(
+            mode="smart",
+            frame_budget=6,
+            resolution_long_edge_cap=1280,
+        ),
+        media=fake_media_backend,
+    )
+    invalid = replace(
+        original,
+        policy=replace(original.policy, candidate_fps=13),
+    )
+    calls_before = len(fake_media_backend.calls)
+
+    with pytest.raises(ValueError, match="candidate_fps"):
+        plan_backfill(
+            video_inventory,
+            invalid,
+            (UncoveredInterval(1.0, 2.0, ()),),
+            tmp_path / "backfill",
+            media=fake_media_backend,
+        )
+
+    assert len(fake_media_backend.calls) == calls_before
+
+
 def test_publish_failure_restores_previous_target(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

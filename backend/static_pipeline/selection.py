@@ -402,16 +402,19 @@ def _nearest_monotonic_frames(
 
 
 def _validate_policy(policy: SelectionPolicy) -> None:
+    if policy.mode not in ("smart", "fixed_fps"):
+        raise ValueError(f"unsupported selection mode: {policy.mode}")
     if policy.frame_budget <= 0:
         raise ValueError("frame_budget must be positive")
     if policy.fixed_fps <= 0 or policy.candidate_fps <= 0:
         raise ValueError("FPS values must be positive")
     if policy.candidate_long_edge <= 0:
         raise ValueError("candidate_long_edge must be positive")
-    if policy.candidate_fps > 12:
-        raise ValueError("candidate_fps cannot exceed 12")
-    if policy.candidate_long_edge > 320:
-        raise ValueError("candidate_long_edge cannot exceed 320")
+    if policy.mode == "smart":
+        if policy.candidate_fps > 12:
+            raise ValueError("candidate_fps cannot exceed 12")
+        if policy.candidate_long_edge > 320:
+            raise ValueError("candidate_long_edge cannot exceed 320")
     if (
         policy.resolution_long_edge_cap is not None
         and policy.resolution_long_edge_cap <= 0
@@ -992,6 +995,7 @@ def plan_backfill(
         raise ValueError("Smart selection is required for gap backfill")
     if manifest.source_digest != inventory.digest:
         raise ValueError("selection manifest does not belong to this source inventory")
+    _validate_policy(manifest.policy)
     if any(
         "colmap_gap_backfill_attempted" in frame.reasons for frame in manifest.frames
     ):

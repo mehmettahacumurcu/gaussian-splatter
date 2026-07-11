@@ -305,14 +305,15 @@ def choose_smart_candidates(
         endpoint_ids.add(endpoint.frame_id)
         if endpoint.frame_id in selected:
             continue
-        window_index = assignments[endpoint.frame_id]
-        current_in_window = [
-            candidate
-            for candidate in selected.values()
-            if assignments[candidate.frame_id] == window_index
-        ]
-        if current_in_window:
-            selected.pop(current_in_window[0].frame_id)
+        if len(selected) >= budget:
+            window_index = assignments[endpoint.frame_id]
+            current_in_window = [
+                candidate
+                for candidate in selected.values()
+                if assignments[candidate.frame_id] == window_index
+            ]
+            if current_in_window:
+                selected.pop(current_in_window[0].frame_id)
         selected[endpoint.frame_id] = endpoint
 
     initial_pairs = list(
