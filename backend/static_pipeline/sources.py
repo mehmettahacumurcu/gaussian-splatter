@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import shutil
+import sys
 import uuid
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -164,6 +167,102 @@ def _file_identity(files: tuple[SourceFile, ...]) -> tuple[tuple[str, int, str],
     return tuple((item.relative_path, item.size_bytes, item.sha256) for item in files)
 
 
+def _copy_file_no_follow(source: str, destination: str) -> str:
+    """Copy a regular file without dereferencing a last-moment symlink swap."""
+
+    return shutil.copy2(source, destination, follow_symlinks=False)
+
+
+def _rebase_absolute_internal_symlinks(staged: Path, source_root: Path) -> None:
+    """Point preserved absolute internal links at their staged counterparts."""
+
+    for current_root, directory_names, file_names in os.walk(staged, followlinks=False):
+        current = Path(current_root)
+        for name in (*directory_names, *file_names):
+            link = current / name
+            if not link.is_symlink():
+                continue
+
+            raw_target = os.readlink(link)
+            if not os.path.isabs(raw_target):
+                continue
+            if os.name == "nt" and raw_target.startswith("\\\\?\\"):
+                raw_target = (
+                    f"\\\\{raw_target[8:]}"
+                    if raw_target.startswith("\\\\?\\UNC\\")
+                    else raw_target[4:]
+                )
+            try:
+                resolved_target = Path(raw_target).resolve(strict=True)
+            except (FileNotFoundError, RuntimeError) as exc:
+                raise ValueError(f"broken or cyclic symlink: {link}") from exc
+            if not _is_within(resolved_target, source_root):
+                raise ValueError(f"symlink resolves outside input root: {link}")
+
+            staged_target = staged / resolved_target.relative_to(source_root)
+            if not os.path.lexists(staged_target):
+                raise ValueError(f"internal symlink target was not staged: {link}")
+            relative_target = os.path.relpath(staged_target, start=link.parent)
+            target_is_directory = resolved_target.is_dir()
+            link.unlink()
+            link.symlink_to(relative_target, target_is_directory=target_is_directory)
+
+
+def _atomic_promote_no_replace(staged: Path, destination: Path) -> None:
+    """Atomically rename a staged directory only when destination is absent."""
+
+    if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
+        try:
+            renameat2 = libc.renameat2
+        except AttributeError as exc:
+            raise RuntimeError(
+                "atomic no-replace directory promotion requires renameat2 on Linux"
+            ) from exc
+
+        renameat2.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        renameat2.restype = ctypes.c_int
+        at_fdcwd = -100
+        rename_noreplace = 1
+        result = renameat2(
+            at_fdcwd,
+            os.fsencode(staged),
+            at_fdcwd,
+            os.fsencode(destination),
+            rename_noreplace,
+        )
+        if result == 0:
+            return
+
+        error_number = ctypes.get_errno()
+        if error_number in {errno.EEXIST, errno.ENOTEMPTY}:
+            raise FileExistsError(
+                error_number, os.strerror(error_number), str(destination)
+            )
+        if error_number == errno.ENOSYS:
+            raise RuntimeError(
+                "the Linux runtime does not support atomic no-replace promotion"
+            )
+        raise OSError(error_number, os.strerror(error_number), str(destination))
+
+    try:
+        # Windows rename is already no-replace. Static notebooks run on Linux;
+        # this branch keeps local development deterministic on Windows as well.
+        os.rename(staged, destination)
+    except OSError as exc:
+        if os.path.lexists(destination):
+            raise FileExistsError(
+                errno.EEXIST, os.strerror(errno.EEXIST), str(destination)
+            ) from exc
+        raise
+
+
 def copy_input_read_only(source: Path, destination: Path) -> SourceInventory:
     """Copy a source tree transactionally and verify every copied byte."""
 
@@ -183,16 +282,20 @@ def copy_input_read_only(source: Path, destination: Path) -> SourceInventory:
         raise FileExistsError(f"staging destination already exists: {staged}")
 
     try:
-        shutil.copytree(source_inventory.root, staged, copy_function=shutil.copy2)
+        shutil.copytree(
+            source_inventory.root,
+            staged,
+            symlinks=True,
+            copy_function=_copy_file_no_follow,
+        )
+        _rebase_absolute_internal_symlinks(staged, source_inventory.root)
         staged_inventory = discover_source(staged)
         if staged_inventory.kind != source_inventory.kind or _file_identity(
             staged_inventory.all_files
         ) != _file_identity(source_inventory.all_files):
             raise ValueError("copied input inventory does not match source inventory")
 
-        if os.path.lexists(target):
-            raise FileExistsError(f"destination appeared while copying: {target}")
-        os.replace(staged, target)
+        _atomic_promote_no_replace(staged, target)
         return discover_source(target)
     finally:
         if os.path.lexists(staged):
