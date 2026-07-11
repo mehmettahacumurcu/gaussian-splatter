@@ -9,10 +9,11 @@ import shutil
 import subprocess
 import tempfile
 import uuid
+from bisect import bisect_left
 from dataclasses import asdict, dataclass, replace
 from fractions import Fraction
 from pathlib import Path
-from typing import Protocol, Sequence
+from typing import Literal, Protocol, Sequence
 
 from PIL import Image, ImageOps
 
@@ -31,6 +32,7 @@ class VideoProbe:
     height: int
     avg_fps: float
     rotation_degrees: int
+    rotation_source: Literal["display_matrix", "tag", "none"] = "none"
 
 
 @dataclass(frozen=True)
@@ -44,7 +46,7 @@ class MediaBackend(Protocol):
     def probe_video(self, path: Path) -> VideoProbe: ...
 
     def video_timeline(
-        self, path: Path, fps_limit: int
+        self, path: Path, fps_limit: int | None
     ) -> tuple[TimelineFrame, ...]: ...
 
     def extract_video_indices(
@@ -91,22 +93,27 @@ def _probe_from_payload(payload: dict[str, object]) -> VideoProbe:
         raise RuntimeError("ffprobe returned invalid video dimensions") from exc
 
     rotation_value: object = None
+    rotation_source: Literal["display_matrix", "tag", "none"] = "none"
     side_data = stream.get("side_data_list")
     if isinstance(side_data, list):
         for entry in side_data:
             if isinstance(entry, dict) and entry.get("rotation") is not None:
                 rotation_value = entry["rotation"]
+                rotation_source = "display_matrix"
                 break
     if rotation_value is None:
         tags = stream.get("tags")
         if isinstance(tags, dict):
             rotation_value = tags.get("rotate")
+            if rotation_value is not None:
+                rotation_source = "tag"
 
     return VideoProbe(
         width=width,
         height=height,
         avg_fps=_parse_fraction(stream.get("avg_frame_rate", "0/1")),
         rotation_degrees=_normalize_rotation(rotation_value),
+        rotation_source=rotation_source,
     )
 
 
@@ -162,9 +169,11 @@ class FfmpegMediaBackend:
     def probe_video(self, path: Path) -> VideoProbe:
         return _probe_from_payload(self._ffprobe(Path(path), frames=False))
 
-    def video_timeline(self, path: Path, fps_limit: int) -> tuple[TimelineFrame, ...]:
-        if fps_limit <= 0:
-            raise ValueError("fps_limit must be positive")
+    def video_timeline(
+        self, path: Path, fps_limit: int | None
+    ) -> tuple[TimelineFrame, ...]:
+        if fps_limit is not None and fps_limit <= 0:
+            raise ValueError("fps_limit must be positive when set")
         payload = self._ffprobe(Path(path), frames=True)
         probe = _probe_from_payload(payload)
         raw_frames = payload.get("frames")
@@ -195,17 +204,15 @@ class FfmpegMediaBackend:
         timeline.sort(key=lambda frame: (frame.timestamp_s, frame.source_index))
         if not timeline:
             raise RuntimeError("ffprobe returned no timestamped video frames")
-        if 0 < probe.avg_fps < fps_limit:
+        if fps_limit is None or (0 < probe.avg_fps < fps_limit):
             return tuple(timeline)
 
-        selected: list[TimelineFrame] = []
-        next_timestamp = timeline[0].timestamp_s
-        step = 1.0 / fps_limit
-        for frame in timeline:
-            if not selected or frame.timestamp_s + 1e-12 >= next_timestamp:
-                selected.append(frame)
-                next_timestamp = frame.timestamp_s + step
-        return tuple(selected)
+        targets = _target_timestamps(
+            timeline[0].timestamp_s,
+            timeline[-1].timestamp_s,
+            fps_limit,
+        )
+        return _nearest_monotonic_frames(timeline, targets)
 
     def extract_video_indices(
         self,
@@ -226,11 +233,19 @@ class FfmpegMediaBackend:
         select_expression = "+".join(f"eq(n,{index})" for index in ordered_indices)
         filters = [f"select='{select_expression}'"]
         if probe.rotation_degrees == 90:
-            filters.append("transpose=clock")
+            filters.append(
+                "transpose=cclock"
+                if probe.rotation_source == "display_matrix"
+                else "transpose=clock"
+            )
         elif probe.rotation_degrees == 180:
             filters.append("rotate=PI:ow=iw:oh=ih")
         elif probe.rotation_degrees == 270:
-            filters.append("transpose=cclock")
+            filters.append(
+                "transpose=clock"
+                if probe.rotation_source == "display_matrix"
+                else "transpose=cclock"
+            )
 
         display_width, display_height = probe.width, probe.height
         if probe.rotation_degrees in {90, 270}:
@@ -335,6 +350,46 @@ def _uniform_indices(count: int, limit: int) -> tuple[int, ...]:
     return tuple(position * (count - 1) // (limit - 1) for position in range(limit))
 
 
+def _target_timestamps(start: float, end: float, fps: int) -> tuple[float, ...]:
+    if fps <= 0:
+        raise ValueError("fps must be positive")
+    target_count = max(1, math.floor((end - start) * fps + 1e-9) + 1)
+    return tuple(start + target_index / fps for target_index in range(target_count))
+
+
+def _nearest_monotonic_frames(
+    timeline: Sequence[TimelineFrame],
+    targets: Sequence[float],
+) -> tuple[TimelineFrame, ...]:
+    ordered = sorted(
+        timeline,
+        key=lambda frame: (frame.timestamp_s, frame.source_index),
+    )
+    timestamps = [frame.timestamp_s for frame in ordered]
+    cursor = 0
+    selected: list[TimelineFrame] = []
+    for target in targets:
+        if cursor >= len(ordered):
+            break
+        right = bisect_left(timestamps, target, lo=cursor)
+        candidate_indices: list[int] = []
+        if right < len(ordered):
+            candidate_indices.append(right)
+        if right - 1 >= cursor:
+            candidate_indices.append(right - 1)
+        winner_index = min(
+            candidate_indices,
+            key=lambda index: (
+                round(abs(ordered[index].timestamp_s - target), 12),
+                ordered[index].timestamp_s,
+                ordered[index].source_index,
+            ),
+        )
+        selected.append(ordered[winner_index])
+        cursor = winner_index + 1
+    return tuple(selected)
+
+
 def _validate_policy(policy: SelectionPolicy) -> None:
     if policy.frame_budget <= 0:
         raise ValueError("frame_budget must be positive")
@@ -355,31 +410,18 @@ def _choose_fixed_frames(
     fixed_fps: int,
     frame_budget: int,
 ) -> tuple[TimelineFrame, ...]:
-    ordered = sorted(
-        timeline, key=lambda frame: (frame.timestamp_s, frame.source_index)
-    )
-    if not ordered:
+    if not timeline:
         raise ValueError("video timeline is empty")
+    ordered = sorted(
+        timeline,
+        key=lambda frame: (frame.timestamp_s, frame.source_index),
+    )
     start = ordered[0].timestamp_s
     end = ordered[-1].timestamp_s
-    target_count = max(1, math.floor((end - start) * fixed_fps + 1e-9) + 1)
-    available = list(ordered)
-    selected: list[TimelineFrame] = []
-    for target_index in range(target_count):
-        if not available:
-            break
-        target = start + target_index / fixed_fps
-        winner = min(
-            available,
-            key=lambda frame: (
-                round(abs(frame.timestamp_s - target), 12),
-                frame.timestamp_s,
-                frame.source_index,
-            ),
-        )
-        selected.append(winner)
-        available.remove(winner)
-    selected.sort(key=lambda frame: (frame.timestamp_s, frame.source_index))
+    selected = _nearest_monotonic_frames(
+        ordered,
+        _target_timestamps(start, end, fixed_fps),
+    )
     bounded = _uniform_indices(len(selected), frame_budget)
     return tuple(selected[index] for index in bounded)
 
@@ -446,7 +488,17 @@ def _publish_directory(staged: Path, target: Path) -> None:
         raise
     else:
         if had_target and os.path.lexists(backup):
-            _remove_path(backup)
+            try:
+                _remove_path(backup)
+            except BaseException:
+                try:
+                    _remove_path(target)
+                    os.rename(backup, target)
+                except BaseException as rollback_error:
+                    raise RuntimeError(
+                        "selection was published but backup cleanup and rollback failed"
+                    ) from rollback_error
+                raise
 
 
 def _fresh_stage(target: Path) -> Path:
@@ -467,9 +519,12 @@ def _ensure_output_outside_source(target: Path, source_root: Path) -> None:
 
 def _verify_png_set(directory: Path, count: int) -> None:
     expected = [f"frame_{index:06d}.png" for index in range(count)]
-    actual = sorted(path.name for path in directory.glob("*.png") if path.is_file())
-    if actual != expected:
-        raise RuntimeError(f"media backend produced unexpected PNG set: {actual}")
+    entries = sorted(directory.iterdir(), key=lambda path: path.name)
+    actual = [path.name for path in entries]
+    if actual != expected or any(not path.is_file() for path in entries):
+        raise RuntimeError(
+            f"media backend produced unexpected staged entries: {actual}"
+        )
 
 
 def _video_records(
@@ -555,7 +610,7 @@ def select_frames(
         if inventory.kind == "video":
             source_file = inventory.media_files[0]
             source_path = inventory.root / source_file.relative_path
-            timeline = backend.video_timeline(source_path, policy.candidate_fps)
+            timeline = backend.video_timeline(source_path, None)
             selected = _choose_fixed_frames(
                 timeline,
                 fixed_fps=policy.fixed_fps,

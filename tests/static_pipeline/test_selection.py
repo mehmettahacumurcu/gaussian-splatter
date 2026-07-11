@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageChops
 
 from backend.static_pipeline import selection as selection_module
 from backend.static_pipeline.contracts import SelectionPolicy, SourceInventory
@@ -178,12 +179,12 @@ def test_unexpected_backend_output_aborts_without_publishing(
         long_edge_cap: int | None,
     ) -> None:
         real_extract(path, indices, destination, long_edge_cap)
-        (destination / "frame_999999.png").write_bytes(b"unexpected")
+        (destination / "unexpected.txt").write_bytes(b"unexpected")
 
     monkeypatch.setattr(backend, "extract_video_indices", extract_with_extra)
     target = tmp_path / "frames"
 
-    with pytest.raises(RuntimeError, match="unexpected PNG"):
+    with pytest.raises(RuntimeError, match="unexpected"):
         select_frames(
             video_inventory,
             target,
@@ -250,6 +251,37 @@ def test_fixed_vfr_targets_use_nearest_unique_frames_with_stable_ties(
         media=backend,
     )
     assert [frame.source_index for frame in manifest.selected_frames] == [0, 3]
+
+
+def test_fixed_fps_matches_targets_against_the_full_source_timeline(
+    tmp_path: Path,
+    video_inventory: SourceInventory,
+) -> None:
+    backend = FakeMediaBackend(
+        timeline=tuple(
+            TimelineFrame(index, index * 1_000, index / 30.0) for index in range(31)
+        )
+    )
+    manifest = select_frames(
+        video_inventory,
+        tmp_path / "frames",
+        SelectionPolicy(
+            mode="fixed_fps",
+            frame_budget=100,
+            resolution_long_edge_cap=1280,
+            fixed_fps=4,
+            candidate_fps=12,
+        ),
+        media=backend,
+    )
+    assert [frame.source_index for frame in manifest.selected_frames] == [
+        0,
+        7,
+        15,
+        22,
+        30,
+    ]
+    assert ("video_timeline", video_inventory.root / "room.mov", None) in backend.calls
 
 
 @pytest.mark.parametrize("count,expects_output", [(3, False), (4, True)])
@@ -368,6 +400,44 @@ def test_publish_failure_restores_previous_target(
 
     assert marker.read_bytes() == b"keep"
     assert not list(tmp_path.glob("frames.tmp-*"))
+    assert not list(tmp_path.glob("frames.backup-*"))
+
+
+def test_backup_cleanup_failure_rolls_back_published_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    photo_inventory: SourceInventory,
+) -> None:
+    target = tmp_path / "frames"
+    target.mkdir()
+    marker = target / "keep.txt"
+    marker.write_bytes(b"keep")
+    backend = FakeMediaBackend(timeline=())
+    real_remove = selection_module._remove_path
+    failed_cleanup = False
+
+    def fail_first_backup_cleanup(path: Path) -> None:
+        nonlocal failed_cleanup
+        if ".backup-" in path.name and not failed_cleanup:
+            failed_cleanup = True
+            raise PermissionError("injected backup cleanup failure")
+        real_remove(path)
+
+    monkeypatch.setattr(selection_module, "_remove_path", fail_first_backup_cleanup)
+
+    with pytest.raises(PermissionError, match="injected backup cleanup"):
+        select_frames(
+            photo_inventory,
+            target,
+            SelectionPolicy(
+                mode="fixed_fps",
+                frame_budget=300,
+                resolution_long_edge_cap=1280,
+            ),
+            media=backend,
+        )
+
+    assert marker.read_bytes() == b"keep"
     assert not list(tmp_path.glob("frames.backup-*"))
 
 
@@ -499,7 +569,9 @@ def test_ffprobe_prefers_display_matrix_rotation_and_scale_does_not_upsize(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     backend = FfmpegMediaBackend()
-    assert backend.probe_video(tmp_path / "room.mov").rotation_degrees == 270
+    probe = backend.probe_video(tmp_path / "room.mov")
+    assert probe.rotation_degrees == 270
+    assert probe.rotation_source == "display_matrix"
     backend.extract_video_indices(
         tmp_path / "room.mov",
         (0,),
@@ -507,3 +579,131 @@ def test_ffprobe_prefers_display_matrix_rotation_and_scale_does_not_upsize(
         1280,
     )
     assert "scale=" not in scripts[-1]
+    assert "transpose=clock" in scripts[-1]
+
+
+def test_candidate_timeline_uses_anchored_nearest_sampling_at_twelve_fps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "streams": [
+            {
+                "width": 640,
+                "height": 480,
+                "avg_frame_rate": "30/1",
+                "tags": {},
+                "side_data_list": [],
+            }
+        ],
+        "frames": [
+            {
+                "best_effort_timestamp": str(index),
+                "best_effort_timestamp_time": str(index / 30.0),
+            }
+            for index in range(31)
+        ],
+    }
+
+    def fake_run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    timeline = FfmpegMediaBackend().video_timeline(tmp_path / "room.mov", 12)
+    assert [frame.source_index for frame in timeline] == [
+        0,
+        2,
+        5,
+        7,
+        10,
+        12,
+        15,
+        17,
+        20,
+        22,
+        25,
+        27,
+        30,
+    ]
+
+
+@pytest.mark.integration
+def test_display_matrix_rotation_matches_ffmpeg_autorotation_pixels(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("FFmpeg binaries are unavailable")
+
+    pattern = tmp_path / "pattern.png"
+    image = Image.new("RGB", (8, 6))
+    pixels = image.load()
+    for y in range(6):
+        for x in range(8):
+            pixels[x, y] = (x * 25, y * 35, (x + y) * 15)
+    image.save(pattern)
+    base = tmp_path / "base.mp4"
+    rotated = tmp_path / "rotated.mov"
+    auto = tmp_path / "auto.png"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-loop",
+            "1",
+            "-i",
+            str(pattern),
+            "-t",
+            "1",
+            "-r",
+            "1",
+            "-pix_fmt",
+            "yuv444p",
+            str(base),
+        ],
+        check=True,
+    )
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-display_rotation:v:0",
+                "90",
+                "-i",
+                str(base),
+                "-c",
+                "copy",
+                str(rotated),
+            ],
+            check=True,
+        )
+    except subprocess.CalledProcessError:
+        pytest.skip("FFmpeg does not support -display_rotation")
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            str(rotated),
+            "-frames:v",
+            "1",
+            str(auto),
+        ],
+        check=True,
+    )
+    manual_dir = tmp_path / "manual"
+    FfmpegMediaBackend().extract_video_indices(rotated, (0,), manual_dir, None)
+    with Image.open(auto).convert("RGB") as auto_image:
+        with Image.open(manual_dir / "frame_000000.png").convert("RGB") as manual:
+            assert ImageChops.difference(auto_image, manual).getbbox() is None

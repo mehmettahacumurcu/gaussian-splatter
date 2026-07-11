@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,9 +36,17 @@ class FakeMediaBackend:
         self.calls.append(("probe_video", path))
         return self.probe
 
-    def video_timeline(self, path: Path, fps_limit: int) -> tuple[TimelineFrame, ...]:
+    def video_timeline(
+        self, path: Path, fps_limit: int | None
+    ) -> tuple[TimelineFrame, ...]:
         self.calls.append(("video_timeline", path, fps_limit))
-        return self.timeline
+        if fps_limit is None or not self.timeline or self.probe.avg_fps < fps_limit:
+            return self.timeline
+        stride = max(1, math.ceil(self.probe.avg_fps / fps_limit))
+        bounded = list(self.timeline[::stride])
+        if bounded[-1] != self.timeline[-1]:
+            bounded.append(self.timeline[-1])
+        return tuple(bounded)
 
     def _before_write(self) -> None:
         if (
