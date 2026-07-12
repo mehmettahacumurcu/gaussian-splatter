@@ -81,6 +81,10 @@ class UncoveredInterval:
     start_s: float
     end_s: float
     missing_frame_ids: tuple[str, ...]
+    coverage_unit: Literal["seconds", "photo_order"] = "seconds"
+    kind: Literal["start", "interior", "end", "all"] = "interior"
+    left_boundary_frame_id: str | None = None
+    right_boundary_frame_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -99,3 +103,41 @@ class ColmapAttempt:
     model_dirs: tuple[Path, ...]
     colmap_version: str
     fingerprint: str
+
+
+@dataclass(frozen=True)
+class ModelMetrics:
+    model_dir: Path
+    registered_names: frozenset[str]
+    registered_count: int
+    registered_ratio: float
+    registered_share: float
+    temporal_coverage_s: float
+    max_interior_gap_s: float
+    start_gap_s: float
+    end_gap_s: float
+    median_reprojection_error_px: float
+    p95_reprojection_error_px: float
+    median_track_length: float
+    sparse_point_count: int
+    valid_names_intrinsics_and_poses: bool
+    coverage_unit: Literal["seconds", "photo_order"] = "seconds"
+
+
+@dataclass(frozen=True)
+class GateDecision:
+    passed: bool
+    dominant: ModelMetrics
+    failures: tuple[str, ...]
+    uncovered_intervals: tuple[UncoveredInterval, ...]
+    retry_recommended: bool
+    warnings: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReconstructionBundle:
+    selected_manifest: SelectionManifest
+    accepted_model_dir: Path
+    decision: GateDecision
+    attempts: tuple[ColmapAttempt, ...]
+    decisions: tuple[GateDecision, ...] = ()

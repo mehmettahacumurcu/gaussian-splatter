@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from backend.static_pipeline import stage_cache as stage_cache_module
+from backend.static_pipeline.sources import _atomic_promote_no_replace
 from backend.static_pipeline.stage_cache import (
     cache_matches,
     promote_directory,
@@ -181,3 +183,31 @@ def test_promote_directory_requires_same_parent_and_absent_target(
 
     with pytest.raises(FileNotFoundError):
         promote_directory(tmp_path / "missing", tmp_path / "new-target")
+
+
+def test_promote_directory_preserves_destination_created_during_promotion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging = tmp_path / "validated.staging"
+    staging.mkdir()
+    (staging / "model.txt").write_bytes(b"new model")
+    target = tmp_path / "validated"
+
+    def race_then_promote(staged: Path, destination: Path) -> None:
+        destination.mkdir()
+        (destination / "model.txt").write_bytes(b"existing model")
+        _atomic_promote_no_replace(staged, destination)
+
+    monkeypatch.setattr(
+        stage_cache_module,
+        "_atomic_promote_no_replace",
+        race_then_promote,
+        raising=False,
+    )
+
+    with pytest.raises(FileExistsError):
+        promote_directory(staging, target)
+
+    assert (target / "model.txt").read_bytes() == b"existing model"
+    assert (staging / "model.txt").read_bytes() == b"new model"

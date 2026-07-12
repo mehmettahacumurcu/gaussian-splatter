@@ -14,7 +14,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from fractions import Fraction
 from pathlib import Path
-from typing import Literal, Protocol, Sequence
+from typing import Literal, Mapping, Protocol, Sequence
 
 import cv2
 import numpy as np
@@ -928,10 +928,124 @@ def _append_reason(reasons: tuple[str, ...], reason: str) -> tuple[str, ...]:
     return reasons if reason in reasons else reasons + (reason,)
 
 
+def _photo_interval_bounds(
+    interval: UncoveredInterval,
+    frame_positions: Mapping[str, int],
+    selected_ids: set[str] | None = None,
+) -> tuple[int, int]:
+    expected_boundary_shape = {
+        "start": (False, True),
+        "interior": (True, True),
+        "end": (True, False),
+        "all": (False, False),
+    }
+    actual_boundary_shape = (
+        interval.left_boundary_frame_id is not None,
+        interval.right_boundary_frame_id is not None,
+    )
+    if actual_boundary_shape != expected_boundary_shape.get(interval.kind):
+        raise ValueError("photo-order interval kind has an invalid boundary shape")
+    if not frame_positions:
+        raise ValueError("photo-order intervals require a non-empty frame inventory")
+
+    boundary_ids = tuple(
+        boundary_id
+        for boundary_id in (
+            interval.left_boundary_frame_id,
+            interval.right_boundary_frame_id,
+        )
+        if boundary_id is not None
+    )
+    if any(boundary_id not in frame_positions for boundary_id in boundary_ids):
+        raise ValueError("photo-order interval has an unknown boundary frame")
+    if selected_ids is not None and any(
+        boundary_id not in selected_ids for boundary_id in boundary_ids
+    ):
+        raise ValueError(
+            "photo-order interval boundaries must reference selected frames"
+        )
+
+    missing_positions = []
+    for frame_id in interval.missing_frame_ids:
+        if frame_id not in frame_positions:
+            raise ValueError("photo-order interval has an unknown missing frame")
+        missing_positions.append(frame_positions[frame_id])
+    if not missing_positions:
+        raise ValueError("photo-order intervals require missing selected frames")
+
+    left_position = (
+        frame_positions[interval.left_boundary_frame_id]
+        if interval.left_boundary_frame_id is not None
+        else min(missing_positions)
+    )
+    right_position = (
+        frame_positions[interval.right_boundary_frame_id]
+        if interval.right_boundary_frame_id is not None
+        else max(missing_positions)
+    )
+    if interval.kind != "all" and left_position >= right_position:
+        raise ValueError("photo-order interval boundaries must be ordered")
+    if selected_ids is not None:
+        selected_positions = [frame_positions[frame_id] for frame_id in selected_ids]
+        if interval.kind in {"start", "all"} and left_position != min(
+            selected_positions
+        ):
+            raise ValueError("photo-order interval must reach the selected-axis start")
+        if interval.kind in {"end", "all"} and right_position != max(
+            selected_positions
+        ):
+            raise ValueError("photo-order interval must reach the selected-axis end")
+    return left_position, right_position
+
+
+def _validate_interval_manifest_metadata(
+    intervals: Sequence[UncoveredInterval],
+    frame_positions: Mapping[str, int],
+    selected_ids: set[str],
+) -> None:
+    for interval in intervals:
+        missing_ids = set(interval.missing_frame_ids)
+        if any(
+            frame_id not in frame_positions or frame_id not in selected_ids
+            for frame_id in missing_ids
+        ):
+            raise ValueError(
+                "uncovered interval missing frame IDs must reference selected frames"
+            )
+        if interval.coverage_unit != "photo_order":
+            continue
+        left_position, right_position = _photo_interval_bounds(
+            interval,
+            frame_positions,
+            selected_ids,
+        )
+        boundary_ids = {
+            interval.left_boundary_frame_id,
+            interval.right_boundary_frame_id,
+        } - {None}
+        if any(
+            frame_id in boundary_ids
+            or not (left_position <= frame_positions[frame_id] <= right_position)
+            for frame_id in missing_ids
+        ):
+            raise ValueError(
+                "photo-order missing frame IDs must lie inside their boundaries"
+            )
+
+
 def _candidate_in_interval(
     candidate: ScoredCandidate,
     interval: UncoveredInterval,
+    frame_positions: Mapping[str, int] | None = None,
 ) -> bool:
+    if interval.coverage_unit == "photo_order":
+        if frame_positions is None or candidate.frame_id not in frame_positions:
+            return False
+        left_position, right_position = _photo_interval_bounds(
+            interval,
+            frame_positions,
+        )
+        return left_position <= frame_positions[candidate.frame_id] <= right_position
     if candidate.frame_id in interval.missing_frame_ids:
         return True
     return (
@@ -943,8 +1057,12 @@ def _candidate_in_interval(
 def _candidate_in_any_interval(
     candidate: ScoredCandidate,
     intervals: Sequence[UncoveredInterval],
+    frame_positions: Mapping[str, int] | None = None,
 ) -> bool:
-    return any(_candidate_in_interval(candidate, interval) for interval in intervals)
+    return any(
+        _candidate_in_interval(candidate, interval, frame_positions)
+        for interval in intervals
+    )
 
 
 def _canonicalize_intervals(
@@ -956,6 +1074,10 @@ def _canonicalize_intervals(
             interval.start_s,
             interval.end_s,
             interval.missing_frame_ids,
+            interval.coverage_unit,
+            interval.kind,
+            interval.left_boundary_frame_id or "",
+            interval.right_boundary_frame_id or "",
         ),
     )
     merged: list[UncoveredInterval] = []
@@ -966,8 +1088,31 @@ def _canonicalize_intervals(
             or interval.end_s < interval.start_s
         ):
             raise ValueError("uncovered intervals must be finite and ordered")
+        if interval.coverage_unit not in {"seconds", "photo_order"}:
+            raise ValueError("uncovered interval has an invalid coverage unit")
+        if interval.kind not in {"start", "interior", "end", "all"}:
+            raise ValueError("uncovered interval has an invalid kind")
+        if merged and interval.coverage_unit != merged[-1].coverage_unit:
+            raise ValueError("uncovered intervals cannot mix coverage units")
         if merged and interval.start_s <= merged[-1].end_s:
             previous = merged[-1]
+            has_start = previous.kind in {"start", "all"} or interval.kind in {
+                "start",
+                "all",
+            }
+            has_end = previous.kind in {"end", "all"} or interval.kind in {
+                "end",
+                "all",
+            }
+            merged_kind: Literal["start", "interior", "end", "all"]
+            if has_start and has_end:
+                merged_kind = "all"
+            elif has_start:
+                merged_kind = "start"
+            elif has_end:
+                merged_kind = "end"
+            else:
+                merged_kind = "interior"
             merged[-1] = UncoveredInterval(
                 start_s=previous.start_s,
                 end_s=max(previous.end_s, interval.end_s),
@@ -977,12 +1122,19 @@ def _canonicalize_intervals(
                         | set(interval.missing_frame_ids)
                     )
                 ),
+                coverage_unit=previous.coverage_unit,
+                kind=merged_kind,
+                left_boundary_frame_id=previous.left_boundary_frame_id,
+                right_boundary_frame_id=(
+                    interval.right_boundary_frame_id
+                    if interval.end_s >= previous.end_s
+                    else previous.right_boundary_frame_id
+                ),
             )
         else:
             merged.append(
-                UncoveredInterval(
-                    start_s=interval.start_s,
-                    end_s=interval.end_s,
+                replace(
+                    interval,
                     missing_frame_ids=tuple(sorted(set(interval.missing_frame_ids))),
                 )
             )
@@ -1008,7 +1160,23 @@ def plan_backfill(
         raise ValueError("Smart gap backfill has already been attempted")
     if max_per_interval <= 0:
         raise ValueError("max_per_interval must be positive")
+    frame_positions = {
+        frame.frame_id: position for position, frame in enumerate(manifest.frames)
+    }
+    if len(frame_positions) != len(manifest.frames):
+        raise ValueError("selection manifest frame IDs must be unique")
+    selected_ids = {frame.frame_id for frame in manifest.selected_frames}
+    _validate_interval_manifest_metadata(
+        uncovered,
+        frame_positions,
+        selected_ids,
+    )
     intervals = _canonicalize_intervals(uncovered)
+    _validate_interval_manifest_metadata(
+        intervals,
+        frame_positions,
+        selected_ids,
+    )
     if not intervals:
         return manifest
 
@@ -1021,18 +1189,21 @@ def plan_backfill(
     if set(records_by_id) != set(scored_by_id):
         raise ValueError("Smart candidate inventory changed before backfill")
 
-    selected_ids = {frame.frame_id for frame in manifest.selected_frames}
     per_interval_limit = min(max_per_interval, 2)
     planned: list[ScoredCandidate] = []
     planned_ids: set[str] = set()
     for interval in intervals:
-        midpoint = (interval.start_s + interval.end_s) / 2.0
+        midpoint = (
+            sum(_photo_interval_bounds(interval, frame_positions)) / 2.0
+            if interval.coverage_unit == "photo_order"
+            else (interval.start_s + interval.end_s) / 2.0
+        )
         pool = [
             candidate
             for candidate in analyzed
             if candidate.frame_id not in selected_ids
             and candidate.frame_id not in planned_ids
-            and _candidate_in_interval(candidate, interval)
+            and _candidate_in_interval(candidate, interval, frame_positions)
         ]
         pool.sort(
             key=lambda candidate: (
@@ -1042,7 +1213,7 @@ def plan_backfill(
                     (
                         candidate.timestamp_s
                         if candidate.timestamp_s is not None
-                        else midpoint
+                        else float(frame_positions[candidate.frame_id])
                     )
                     - midpoint
                 ),
@@ -1079,7 +1250,11 @@ def plan_backfill(
                 candidate.frame_id in endpoint_ids
                 or candidate.frame_id in accepted_additions
                 or candidate.frame_id == addition.frame_id
-                or _candidate_in_any_interval(candidate, intervals)
+                or _candidate_in_any_interval(
+                    candidate,
+                    intervals,
+                    frame_positions,
+                )
             ):
                 continue
             if pairwise_overlap(tentative[index - 1], tentative[index + 1]) >= 0.20:

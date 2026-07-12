@@ -7,6 +7,8 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from .sources import _atomic_promote_no_replace
+
 
 def stage_fingerprint(
     stage: str,
@@ -63,4 +65,4 @@ def promote_directory(staging: str | Path, target: str | Path) -> None:
         raise FileExistsError(f"promotion target already exists: {target_path}")
     if staging_path.parent.resolve() != target_path.parent.resolve():
         raise ValueError("staging and target must have the same parent")
-    os.replace(staging_path, target_path)
+    _atomic_promote_no_replace(staging_path, target_path)

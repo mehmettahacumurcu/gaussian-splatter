@@ -12,6 +12,7 @@ from PIL import ExifTags, Image, ImageChops
 
 from backend.static_pipeline import selection as selection_module
 from backend.static_pipeline.contracts import (
+    SelectionManifest,
     SelectionPolicy,
     SourceInventory,
     UncoveredInterval,
@@ -303,6 +304,254 @@ def test_backfill_adds_at_most_two_bridges_and_keeps_smart_budget(
             gaps,
             tmp_path / "backfill-again",
             media=fake_media_backend,
+        )
+
+
+def _manual_smart_photo_selection(
+    tmp_path: Path,
+    selected_positions: set[int],
+) -> tuple[SourceInventory, FakeMediaBackend, SelectionManifest]:
+    source_root = tmp_path / "photo-source"
+    for index in range(9):
+        _write_image(
+            source_root / f"IMG_{index:04d}.png",
+            size=(16, 12),
+            value=20 + index * 20,
+        )
+    inventory = discover_source(source_root)
+    backend = FakeMediaBackend(timeline=())
+    analyzed = select_frames(
+        inventory,
+        tmp_path / "smart-photo-analysis",
+        SelectionPolicy(
+            mode="smart",
+            frame_budget=len(selected_positions),
+            resolution_long_edge_cap=1280,
+        ),
+        media=backend,
+    )
+
+    staged = tmp_path / "manual-selected"
+    staged.mkdir()
+    selected_index = 0
+    records = []
+    for position, record in enumerate(analyzed.frames):
+        if position in selected_positions:
+            output_name = f"frame_{selected_index:06d}.png"
+            backend.copy_photo(
+                inventory.root / record.source_relative_path,
+                staged / output_name,
+                analyzed.policy.resolution_long_edge_cap,
+            )
+            records.append(
+                replace(
+                    record,
+                    selected=True,
+                    output_name=output_name,
+                    sha256=hashlib.sha256(
+                        (staged / output_name).read_bytes()
+                    ).hexdigest(),
+                )
+            )
+            selected_index += 1
+        else:
+            records.append(replace(record, selected=False, output_name="", sha256=""))
+    original = replace(
+        analyzed,
+        frames=tuple(records),
+        image_set_digest=selection_module._image_set_digest(records),
+    )
+    write_selection_manifest(staged / "selection_manifest.json", original)
+    return inventory, backend, original
+
+
+def test_smart_photo_backfill_uses_full_order_midpoint_and_changes_digest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory, backend, original = _manual_smart_photo_selection(
+        tmp_path,
+        {0, 2, 4, 6, 7, 8},
+    )
+    records = original.frames
+    scored = selection_module._analyze_source_candidates(
+        inventory,
+        original.policy,
+        backend,
+    )
+    tied = tuple(
+        replace(
+            candidate,
+            metrics=replace(candidate.metrics, overlap_score=0.5),
+            total_score=0.5,
+        )
+        for candidate in scored
+    )
+    monkeypatch.setattr(
+        selection_module,
+        "_analyze_source_candidates",
+        lambda *_args, **_kwargs: tied,
+    )
+    interval = UncoveredInterval(
+        start_s=0.0,
+        end_s=3.0,
+        missing_frame_ids=(records[2].frame_id, records[4].frame_id),
+        coverage_unit="photo_order",
+        kind="interior",
+        left_boundary_frame_id=records[0].frame_id,
+        right_boundary_frame_id=records[6].frame_id,
+    )
+    monkeypatch.setattr(selection_module, "pairwise_overlap", lambda _a, _b: 0.5)
+
+    backfilled = plan_backfill(
+        inventory,
+        original,
+        (interval,),
+        tmp_path / "photo-backfill",
+        media=backend,
+        max_per_interval=1,
+    )
+
+    added_ids = {frame.frame_id for frame in backfilled.selected_frames} - {
+        frame.frame_id for frame in original.selected_frames
+    }
+    assert added_ids == {records[3].frame_id}
+    assert backfilled.image_set_digest != original.image_set_digest
+    assert len(backfilled.selected_frames) == len(original.selected_frames)
+
+
+@pytest.mark.parametrize(
+    (
+        "kind",
+        "selected_positions",
+        "left_index",
+        "right_index",
+        "missing_indices",
+        "eligible_index",
+    ),
+    (
+        ("start", {3, 4, 6, 7, 8}, None, 6, (3, 4), 5),
+        ("end", {0, 1, 2, 4, 5}, 2, None, (4, 5), 3),
+    ),
+)
+def test_smart_photo_backfill_anchors_endpoints_to_selected_axis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    selected_positions: set[int],
+    left_index: int | None,
+    right_index: int | None,
+    missing_indices: tuple[int, ...],
+    eligible_index: int,
+) -> None:
+    inventory, backend, original = _manual_smart_photo_selection(
+        tmp_path,
+        selected_positions,
+    )
+    records = original.frames
+    scored = selection_module._analyze_source_candidates(
+        inventory,
+        original.policy,
+        backend,
+    )
+    tied = tuple(
+        replace(
+            candidate,
+            metrics=replace(candidate.metrics, overlap_score=0.5),
+            total_score=0.5,
+        )
+        for candidate in scored
+    )
+    monkeypatch.setattr(
+        selection_module,
+        "_analyze_source_candidates",
+        lambda *_args, **_kwargs: tied,
+    )
+    interval = UncoveredInterval(
+        start_s=0.0 if kind == "start" else 2.0,
+        end_s=2.0 if kind == "start" else 4.0,
+        missing_frame_ids=tuple(records[index].frame_id for index in missing_indices),
+        coverage_unit="photo_order",
+        kind=kind,
+        left_boundary_frame_id=(
+            records[left_index].frame_id if left_index is not None else None
+        ),
+        right_boundary_frame_id=(
+            records[right_index].frame_id if right_index is not None else None
+        ),
+    )
+    monkeypatch.setattr(selection_module, "pairwise_overlap", lambda _a, _b: 0.5)
+
+    backfilled = plan_backfill(
+        inventory,
+        original,
+        (interval,),
+        tmp_path / f"photo-backfill-{kind}",
+        media=backend,
+        max_per_interval=1,
+    )
+
+    added_ids = {frame.frame_id for frame in backfilled.selected_frames} - {
+        frame.frame_id for frame in original.selected_frames
+    }
+    assert added_ids == {records[eligible_index].frame_id}
+
+
+@pytest.mark.parametrize(
+    ("kind", "left_index", "right_index", "missing_index", "message"),
+    (
+        ("interior", None, 4, 2, "boundary shape"),
+        ("start", 0, 4, 2, "boundary shape"),
+        ("interior", 6, 4, 2, "ordered"),
+        ("interior", 1, 4, 2, "selected"),
+        ("start", None, 4, 2, "selected-axis start"),
+        ("end", 4, None, 6, "selected-axis end"),
+    ),
+)
+def test_smart_photo_backfill_rejects_malformed_boundary_metadata_before_analysis(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+    left_index: int | None,
+    right_index: int | None,
+    missing_index: int,
+    message: str,
+) -> None:
+    inventory, backend, original = _manual_smart_photo_selection(
+        tmp_path,
+        {0, 2, 4, 6, 7, 8},
+    )
+    records = original.frames
+    interval = UncoveredInterval(
+        start_s=0.0,
+        end_s=3.0,
+        missing_frame_ids=(records[missing_index].frame_id,),
+        coverage_unit="photo_order",
+        kind=kind,
+        left_boundary_frame_id=(
+            records[left_index].frame_id if left_index is not None else None
+        ),
+        right_boundary_frame_id=(
+            records[right_index].frame_id if right_index is not None else None
+        ),
+    )
+
+    def unexpected_analysis(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("invalid interval reached candidate analysis")
+
+    monkeypatch.setattr(
+        selection_module,
+        "_analyze_source_candidates",
+        unexpected_analysis,
+    )
+
+    with pytest.raises(ValueError, match=message):
+        plan_backfill(
+            inventory,
+            original,
+            (interval,),
+            tmp_path / "invalid-photo-backfill",
+            media=backend,
         )
 
 

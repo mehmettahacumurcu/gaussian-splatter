@@ -19,6 +19,67 @@ def _write_image(
     Image.new("RGB", size, (value, value, value)).save(path)
 
 
+def write_colmap_text_model(
+    root: Path,
+    registered_names: tuple[str, ...] | list[str],
+    point_errors: tuple[float, ...] | list[float],
+    track_lengths: tuple[int, ...] | list[int],
+    invalid_pose: bool = False,
+) -> Path:
+    """Write a deterministic exact-directory COLMAP text model for gate tests."""
+
+    if len(point_errors) != len(track_lengths):
+        raise ValueError("point_errors and track_lengths must have equal length")
+    model = Path(root)
+    model.mkdir(parents=True, exist_ok=False)
+    (model / "cameras.txt").write_text(
+        "# Camera list\n1 PINHOLE 1920 1080 1000 1000 960 540\n",
+        encoding="utf-8",
+    )
+
+    image_lines = [
+        "# Image list",
+        (
+            f"# Number of images: {len(registered_names)}, "
+            "mean observations per image: 0"
+        ),
+    ]
+    for image_id, name in enumerate(registered_names, start=1):
+        translation = "nan 0 0" if invalid_pose and image_id == 1 else "0 0 0"
+        image_lines.extend(
+            (
+                f"{image_id} 1 0 0 0 {translation} 1 {name}",
+                "",
+            )
+        )
+    (model / "images.txt").write_text(
+        "\n".join(image_lines) + "\n",
+        encoding="utf-8",
+    )
+
+    image_count = max(1, len(registered_names))
+    point_lines = ["# 3D point list"]
+    for point_id, (error, track_length) in enumerate(
+        zip(point_errors, track_lengths, strict=True),
+        start=1,
+    ):
+        if track_length < 0:
+            raise ValueError("track lengths must be non-negative")
+        track = " ".join(
+            f"{1 + (track_index % image_count)} {track_index}"
+            for track_index in range(track_length)
+        )
+        suffix = f" {track}" if track else ""
+        point_lines.append(
+            f"{point_id} {point_id * 0.1:.6f} 0 1 128 128 128 {error}{suffix}"
+        )
+    (model / "points3D.txt").write_text(
+        "\n".join(point_lines) + "\n",
+        encoding="utf-8",
+    )
+    return model
+
+
 @dataclass
 class FakeMediaBackend:
     timeline: tuple[TimelineFrame, ...]
