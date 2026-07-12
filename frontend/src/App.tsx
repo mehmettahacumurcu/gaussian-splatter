@@ -17,6 +17,7 @@ import { TrainingAnalytics } from "./components/TrainingAnalytics";
 import { NvsEvalPanel } from "./components/NvsEvalPanel";
 import { ConnectionSettings } from "./components/ConnectionSettings";
 import { InteractivePage } from "./interactive/InteractivePage";
+import { NotebookGeneratorPanel } from "./notebook/NotebookGeneratorPanel";
 import {
   getHealth,
   getSplatInfo,
@@ -29,7 +30,7 @@ import {
 } from "./api";
 import { getConnection, isLocal, onConnectionChange } from "./connection";
 
-type Tab = "submit" | "jobs" | "viewer" | "analytics" | "eval" | "interactive";
+type Tab = "notebook" | "submit" | "jobs" | "viewer" | "analytics" | "eval" | "interactive";
 
 type ViewerState =
   | { kind: "idle" }
@@ -58,7 +59,7 @@ function formatTime(ts: number): string {
 }
 
 function App() {
-  const [tab, setTab] = useState<Tab>("submit");
+  const [tab, setTab] = useState<Tab>("notebook");
   const [health, setHealth] = useState<HealthResponse | null>(null);
 
   // Viewer state
@@ -193,10 +194,16 @@ function App() {
         </div>
         <nav className="app-tabs">
           <button
+            className={`tab-btn ${tab === "notebook" ? "active" : ""}`}
+            onClick={() => setTab("notebook")}
+          >
+            Notebook
+          </button>
+          <button
             className={`tab-btn ${tab === "submit" ? "active" : ""}`}
             onClick={() => setTab("submit")}
           >
-            Yeni Job
+            Local Job
           </button>
           <button
             className={`tab-btn ${tab === "jobs" ? "active" : ""}`}
@@ -248,6 +255,8 @@ function App() {
 
       {/* İçerik */}
       <main className="app-content">
+        {tab === "notebook" && <NotebookGeneratorPanel />}
+
         {tab === "submit" && (
           <JobSubmitPanel onJobSubmitted={handleJobSubmitted} />
         )}

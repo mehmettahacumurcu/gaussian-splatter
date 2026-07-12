@@ -24,7 +24,10 @@ export function resolveDriveFolder(raw: string): DriveFolderResolution {
   }
   const parts = value.split("/");
   if (parts.some((part) => part === "" || part === "." || part === "..")) {
-    return { ok: false, error: "Remove empty, dot, or traversal path segments." };
+    return {
+      ok: false,
+      error: "Enter a relative folder without empty, dot, or traversal segments.",
+    };
   }
   if (parts.at(-1)?.endsWith("_result")) {
     return { ok: false, error: "Choose the input folder, not a result folder." };
