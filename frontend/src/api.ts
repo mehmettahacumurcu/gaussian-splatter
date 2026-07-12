@@ -10,6 +10,11 @@
  */
 
 import { getApiBase, getAuthToken, withTokenParam } from "./connection";
+import type {
+  GeneratedNotebook,
+  StaticNotebookPresetsResponse,
+  StaticNotebookRunSpec,
+} from "./notebook/types";
 
 /** @deprecated Display-only snapshot; runtime fetches use getApiBase(). */
 export const API_BASE = getApiBase();
@@ -367,4 +372,66 @@ export async function submitJob(
   const json = (await res.json()) as ProcessResponse;
   console.log("[submitJob] success:", json);
   return json;
+}
+
+export async function getStaticNotebookPresets(): Promise<StaticNotebookPresetsResponse> {
+  return fetchJson<StaticNotebookPresetsResponse>("/notebooks/static/presets");
+}
+
+function sanitizeAttachmentFilename(value: string): string | null {
+  const cleaned = value
+    .replace(/[\\/]+/g, "_")
+    .replace(/[\u0000-\u001f\u007f]/g, "")
+    .trim();
+  return cleaned && cleaned !== "." && cleaned !== ".." ? cleaned : null;
+}
+
+export function parseAttachmentFilename(header: string | null): string | null {
+  if (!header) return null;
+  const extended = /filename\*\s*=\s*([^;]+)/i.exec(header);
+  if (extended) {
+    try {
+      const encoded = extended[1].trim().replace(/^"|"$/g, "");
+      const rfc5987 = /^[^']*'[^']*'(.*)$/.exec(encoded);
+      const value = decodeURIComponent(rfc5987?.[1] ?? encoded);
+      const safe = sanitizeAttachmentFilename(value);
+      if (safe) return safe;
+    } catch {
+      // Fall through to the plain filename parameter.
+    }
+  }
+  const plain = /(?:^|;)\s*filename\s*=\s*("(?:[^"\\]|\\.)*"|[^;]+)/i.exec(
+    header,
+  );
+  if (!plain) return null;
+  let value = plain[1].trim();
+  if (value.startsWith('"') && value.endsWith('"')) {
+    value = value.slice(1, -1).replace(/\\(["\\])/g, "$1");
+  }
+  return sanitizeAttachmentFilename(value);
+}
+
+export async function generateStaticNotebook(
+  spec: StaticNotebookRunSpec,
+): Promise<GeneratedNotebook> {
+  const response = await fetch(`${getApiBase()}/notebooks/static`, {
+    method: "POST",
+    headers: authHeaders({
+      "Content-Type": "application/json",
+      Accept: "application/x-ipynb+json",
+    }),
+    body: JSON.stringify(spec),
+  });
+  if (!response.ok) {
+    const body = await response.text().catch(() => "");
+    throw new Error(
+      `HTTP ${response.status} ${response.statusText}: ${body || response.url}`,
+    );
+  }
+  return {
+    blob: await response.blob(),
+    filename:
+      parseAttachmentFilename(response.headers.get("Content-Disposition")) ??
+      "static_splat.ipynb",
+  };
 }
