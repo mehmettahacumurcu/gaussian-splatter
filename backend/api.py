@@ -34,6 +34,7 @@ from .api_models import (
 from .config import default_config, cloud_config, local_max_config, safe_4d_8gb_config, scene_paths
 from .job_manager import JobManager, get_manager
 from .pipeline import run_pipeline
+from .notebooks.routes import static_notebook_router
 from .static_presets import apply_static_preset_for_api, static_preset_names
 
 
@@ -59,6 +60,7 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.include_router(static_notebook_router)
 
 
 # CORS — Tauri / localhost client'ları için.
