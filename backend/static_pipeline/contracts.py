@@ -8,6 +8,22 @@ from typing import Literal
 
 
 @dataclass(frozen=True)
+class ArtifactRecord:
+    relative_path: str
+    size_bytes: int
+    sha256: str
+
+
+@dataclass(frozen=True)
+class PublishReceipt:
+    run_id: str
+    final_path: Path
+    artifacts: tuple[ArtifactRecord, ...]
+    manifest_sha256: str
+    replaced_previous: bool
+
+
+@dataclass(frozen=True)
 class SourceFile:
     relative_path: str
     size_bytes: int
