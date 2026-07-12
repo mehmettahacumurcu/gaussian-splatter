@@ -26,6 +26,7 @@ from .preprocess.multiview_pipeline import prepare_multiview_scene
 from .preprocess.extract_frames import extract_frames
 from .preprocess.run_colmap     import run_colmap
 from .preprocess.parse_colmap   import parse_cameras, load_points3d, scene_extent as compute_scene_extent
+from .preprocess.frame_alignment import join_registered_frames
 # Phase 1.1 + 1.3: heavy preprocessing cache utilities
 from .preprocess.cache_utils    import (
     is_step_cached, log_cache, write_cache_marker,
@@ -624,27 +625,27 @@ def run_pipeline(
             try:
                 print("\n[Faz 3a.5] Depth → COLMAP scale alignment")
                 from .preprocess.align_depth import align_depth_to_colmap
-                # cams = Dict[image_name, {K, w2c, width, height}]
-                # Sıralı isim listesi al, frame_paths ile uyumlu sırada w2c topla
-                frame_paths_all = sorted(paths["frames"].glob("frame_*.png"))
-                cam_names_sorted = sorted(cams.keys())
-                first_cam = cams[cam_names_sorted[0]]
+                # Kamera, frame ve depth ilişkisini exact image name ile kur.
+                registered_frames = join_registered_frames(
+                    paths["frames"], cams, depth_dir=paths["depth"]
+                )
+                first_registered = registered_frames[0]
+                first_cam = cams[first_registered.image_name]
+                frame_paths_all = [frame.image_path for frame in registered_frames]
                 w2c_list = [
-                    torch.from_numpy(cams[n]["w2c"]).float()
-                    for n in cam_names_sorted
+                    torch.from_numpy(frame.w2c).float()
+                    for frame in registered_frames
                 ]
-                K_first = torch.from_numpy(first_cam["K"]).float()
+                K_first = torch.from_numpy(first_registered.K).float()
                 W_frame = int(first_cam["width"])
                 H_frame = int(first_cam["height"])
                 xyz_t = torch.from_numpy(xyz).float()
 
-                # Frame sayısı eşleşmesini garantile (bazen COLMAP az register edebilir)
-                n = min(len(frame_paths_all), len(w2c_list))
                 align_stats = align_depth_to_colmap(
                     depth_dir=paths["depth"],
-                    frame_paths=frame_paths_all[:n],
+                    frame_paths=frame_paths_all,
                     cam_K=K_first,
-                    cam_w2c_per_frame=w2c_list[:n],
+                    cam_w2c_per_frame=w2c_list,
                     colmap_xyz=xyz_t,
                     frame_size=(W_frame, H_frame),
                     overwrite=True,
@@ -942,19 +943,13 @@ def run_pipeline(
         w2c_list = mv_ctx["primary_w2c_per_frame"]
         print(f"  Multi-view: {len(mv_ctx['train_cams'])} train cam x {len(frame_paths)} frame")
     else:
-        # COLMAP'in kullandığı isim sırasına göre
-        frame_paths, w2c_list, K_first = [], [], None
-        for name in sorted(cams.keys()):
-            cam = cams[name]
-            fp = Path(paths["frames"]) / name
-            if not fp.exists():
-                continue
-            frame_paths.append(fp)
-            w2c_list.append(torch.from_numpy(cam["w2c"]).float())
-            if K_first is None:
-                K_first = torch.from_numpy(cam["K"]).float()
-        if not frame_paths:
-            raise RuntimeError("COLMAP kameraları ile frame dosyaları eşleşmedi")
+        # Fiziksel frame ve COLMAP kamerasını exact image name ile eşleştir.
+        registered_frames = join_registered_frames(paths["frames"], cams)
+        frame_paths = [frame.image_path for frame in registered_frames]
+        w2c_list = [
+            torch.from_numpy(frame.w2c).float() for frame in registered_frames
+        ]
+        K_first = torch.from_numpy(registered_frames[0].K).float()
         print(f"  Eğitim için {len(frame_paths)} frame eşleşti")
 
     print("\n[Faz 5] Training loop")
