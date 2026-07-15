@@ -1481,7 +1481,11 @@ class _VerifyRunner:
                     self.worker_stdout
                     if self.worker_stdout is not None
                     else json.dumps(
-                        {"modules": list(_LEARNED_IMPORT_MODULES), "ok": True},
+                        {
+                            "modules": list(_LEARNED_IMPORT_MODULES),
+                            "ok": True,
+                            "prefix": str(self.environment.root),
+                        },
                         sort_keys=True,
                         separators=(",", ":"),
                     )
@@ -1534,12 +1538,20 @@ def test_verify_writes_deterministic_manifest_with_safe_exact_worker_argv(
         if argv[0] == str(environment.python_exe) and "-c" in argv
     ]
     assert len(worker_calls) == 2
-    assert worker_calls[0][1:3] == ["-I", "-c"]
-    assert len(worker_calls[0]) == 5
-    assert worker_calls[0][3] == worker_calls[1][3]
-    assert all(module in worker_calls[0][3] for module in _LEARNED_IMPORT_MODULES)
-    assert all(str(source.path) not in worker_calls[0][3] for source in assets.sources)
-    assert json.loads(worker_calls[0][4]) == {
+    assert worker_calls[0][1:4] == ["-I", "-B", "-c"]
+    assert len(worker_calls[0]) == 6
+    assert worker_calls[0][4] == worker_calls[1][4]
+    assert all(module in worker_calls[0][4] for module in _LEARNED_IMPORT_MODULES)
+    assert all(str(source.path) not in worker_calls[0][4] for source in assets.sources)
+    assert """da3 = Path(paths["da3"])
+sea_raft = Path(paths["sea-raft"])
+sys.path[:0] = [
+    str(da3 / "src"),
+    paths["sam2"],
+    str(sea_raft),
+    str(sea_raft / "core"),
+]""" in worker_calls[0][4]
+    assert json.loads(worker_calls[0][5]) == {
         source.name: str(source.path) for source in assets.sources
     }
     assert all(
@@ -1555,6 +1567,62 @@ def test_verify_writes_deterministic_manifest_with_safe_exact_worker_argv(
     assert list(environment.root.glob(".model_manifest.*.tmp")) == []
     with pytest.raises(FrozenInstanceError):
         first.sha256 = "0" * 64  # type: ignore[misc]
+
+
+def test_verify_accepts_standard_venv_python_symlink_and_checks_worker_prefix(
+    tmp_path: Path,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    worker_python = environment.python_exe
+    worker_target = worker_python.with_name("python3")
+    worker_python.unlink()
+    worker_target.write_text("worker", encoding="utf-8")
+    worker_python.symlink_to(worker_target.name)
+    runner = _VerifyRunner(environment)
+
+    manifest = verify_learned_environment(environment, assets, runner=runner)
+
+    assert worker_python.is_symlink()
+    assert worker_python.is_file()
+    assert manifest.path.is_file()
+
+
+def test_verify_rejects_usable_worker_outside_exact_installer_path(
+    tmp_path: Path,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    outside_worker = tmp_path / "outside-python"
+    outside_worker.write_text("worker", encoding="utf-8")
+    environment = replace(environment, python_exe=outside_worker)
+    runner = _VerifyRunner(environment)
+
+    with pytest.raises(ValueError, match="installer path"):
+        verify_learned_environment(environment, assets, runner=runner)
+
+    assert runner.calls == []
+
+
+def test_verify_rejects_worker_prefix_mismatch_after_protected_host_check(
+    tmp_path: Path,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    stdout = json.dumps(
+        {
+            "modules": list(_LEARNED_IMPORT_MODULES),
+            "ok": True,
+            "prefix": str(tmp_path / "other-env"),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    runner = _VerifyRunner(environment, worker_stdout=stdout)
+
+    with pytest.raises(ProtectedRuntimeError, match="prefix"):
+        verify_learned_environment(environment, assets, runner=runner)
+
+    assert runner.calls[-1][0][0] == str(
+        environment.main_runtime_before.python_exe
+    )
 
 
 @pytest.mark.parametrize(
@@ -1625,6 +1693,39 @@ def test_verify_rejects_malformed_or_duplicate_freeze_entries(
     assert not (environment.root / "model_manifest.json").exists()
 
 
+def test_verify_accepts_pep503_distinct_freeze_names(tmp_path: Path) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    runner = _VerifyRunner(
+        environment,
+        freeze_stdout="foo-bar==1\nfoobar==2\n",
+    )
+
+    manifest = verify_learned_environment(environment, assets, runner=runner)
+
+    assert manifest.worker_pip_freeze == ("foo-bar==1", "foobar==2")
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "-foo==1",
+        ".foo==1",
+        "foo-==1",
+        "foo_==1",
+        "foo.==1",
+    ],
+)
+def test_verify_rejects_freeze_names_without_alphanumeric_boundaries(
+    tmp_path: Path,
+    entry: str,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    runner = _VerifyRunner(environment, freeze_stdout=f"{entry}\n")
+
+    with pytest.raises(ProtectedRuntimeError, match="pip freeze entry"):
+        verify_learned_environment(environment, assets, runner=runner)
+
+
 def test_host_drift_has_precedence_over_worker_failure(tmp_path: Path) -> None:
     environment, assets = _verified_assets(tmp_path)
     rows = _runtime_rows()
@@ -1664,6 +1765,43 @@ def test_verify_requires_before_and_after_snapshots_from_same_main_python(
         )
 
     assert calls == []
+
+
+@pytest.mark.parametrize("snapshot_kind", ["before", "after", "verified"])
+def test_verify_rejects_relative_protected_module_paths(
+    tmp_path: Path,
+    snapshot_kind: str,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    relative_snapshot = _snapshot(
+        paths={"torch": "relative/torch/__init__.py"},
+    )
+    if snapshot_kind == "before":
+        environment = replace(
+            environment,
+            main_runtime_before=relative_snapshot,
+        )
+        runner = _VerifyRunner(environment)
+    elif snapshot_kind == "after":
+        environment = replace(
+            environment,
+            main_runtime_after=relative_snapshot,
+        )
+        runner = _VerifyRunner(environment)
+    else:
+        rows = _runtime_rows()
+        rows[0] = {
+            **rows[0],
+            "module_path": "relative/torch/__init__.py",
+        }
+        runner = _VerifyRunner(environment, host_stdout=_runtime_stdout(rows))
+
+    with pytest.raises(ProtectedRuntimeError, match="absolute"):
+        verify_learned_environment(environment, assets, runner=runner)
+
+    if snapshot_kind in {"before", "after"}:
+        assert runner.calls == []
+    assert not (environment.root / "model_manifest.json").exists()
 
 
 @pytest.mark.parametrize(

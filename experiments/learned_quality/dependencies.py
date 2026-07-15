@@ -9,7 +9,7 @@ import unicodedata
 from hashlib import sha256
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from subprocess import CompletedProcess
 
 from .contracts import ModelRef
@@ -169,9 +169,10 @@ if set(paths) != {"da3", "sam2", "sea-raft"}:
     raise ValueError("source path payload is malformed")
 if any(not isinstance(value, str) or not value for value in paths.values()):
     raise ValueError("source path payload is malformed")
+da3 = Path(paths["da3"])
 sea_raft = Path(paths["sea-raft"])
 sys.path[:0] = [
-    paths["da3"],
+    str(da3 / "src"),
     paths["sam2"],
     str(sea_raft),
     str(sea_raft / "core"),
@@ -198,7 +199,11 @@ for module in modules:
     importlib.import_module(module)
 print(
     json.dumps(
-        {"modules": modules, "ok": True},
+        {
+            "modules": modules,
+            "ok": True,
+            "prefix": str(Path(sys.prefix).resolve()),
+        },
         allow_nan=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -241,6 +246,13 @@ def _canonical_package_name(name: str) -> str:
         .replace("-", "")
         .replace("_", "")
         .replace(".", "")
+    )
+
+
+def _is_absolute_module_path(value: str) -> bool:
+    return (
+        PurePosixPath(value).is_absolute()
+        or PureWindowsPath(value).is_absolute()
     )
 
 
@@ -299,6 +311,10 @@ def _parse_runtime_payload(stdout: str) -> Mapping[str, RuntimePackage]:
             or not module_path.strip()
         ):
             raise ProtectedRuntimeError("protected runtime package data is malformed")
+        if not _is_absolute_module_path(module_path):
+            raise ProtectedRuntimeError(
+                f"protected runtime package {name} module path must be absolute"
+            )
         canonical = _canonical_package_name(name)
         protected_name = _PROTECTED_BY_CANONICAL.get(canonical)
         if protected_name is None or protected_name in captured:
@@ -393,6 +409,11 @@ def _validated_snapshot_packages(
             named = protected_name or key
             raise ProtectedRuntimeError(
                 f"{label} protected runtime package {named} is malformed"
+            )
+        if not _is_absolute_module_path(package.module_path):
+            raise ProtectedRuntimeError(
+                f"{label} protected runtime package {protected_name} "
+                "module path must be absolute"
             )
         captured[protected_name] = package
 
@@ -906,8 +927,10 @@ def _validate_assets_for_verification(
         environment.python_exe,
         "environment python",
     )
-    if worker_python.is_symlink() or not worker_python.is_file():
-        raise ValueError("environment python must be a non-symlink file")
+    if worker_python != environment_root / "bin" / "python":
+        raise ValueError("environment python must match the exact installer path")
+    if not worker_python.is_file():
+        raise ValueError("environment python must be a usable file")
     lock_path = _require_absolute_path(environment.lock_path, "environment lock")
     if lock_path.is_symlink() or not lock_path.is_file():
         raise ValueError("environment lock must be a non-symlink file")
@@ -1040,7 +1063,7 @@ def _validate_assets_for_verification(
     return source_root, checkpoint_root
 
 
-def _parse_worker_verification(stdout: object) -> None:
+def _parse_worker_verification(stdout: object, expected_prefix: Path) -> None:
     if not isinstance(stdout, str) or not stdout:
         raise ProtectedRuntimeError("worker verification output is missing")
     try:
@@ -1055,16 +1078,26 @@ def _parse_worker_verification(stdout: object) -> None:
         ) from exc
     if (
         not isinstance(payload, Mapping)
-        or set(payload) != {"modules", "ok"}
+        or set(payload) != {"modules", "ok", "prefix"}
         or payload["ok"] is not True
         or payload["modules"] != list(LEARNED_IMPORT_MODULES)
     ):
         raise ProtectedRuntimeError("worker verification was unsuccessful")
+    prefix = payload["prefix"]
+    if not isinstance(prefix, str) or Path(prefix) != expected_prefix:
+        raise ProtectedRuntimeError(
+            "worker prefix does not match the learned environment root"
+        )
 
 
 _FREEZE_NAME_PATTERN = re.compile(
-    r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:===|==|\s+@\s+).+$"
+    r"^([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
+    r"(?:===|==|\s+@\s+).+$"
 )
+
+
+def _canonical_freeze_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).casefold()
 
 
 def _parse_worker_freeze(stdout: object) -> tuple[str, ...]:
@@ -1082,7 +1115,7 @@ def _parse_worker_freeze(stdout: object) -> tuple[str, ...]:
         match = _FREEZE_NAME_PATTERN.fullmatch(line)
         if match is None:
             raise ProtectedRuntimeError("worker pip freeze entry is malformed")
-        canonical = _canonical_package_name(match.group(1))
+        canonical = _canonical_freeze_name(match.group(1))
         if canonical in seen:
             raise ProtectedRuntimeError(
                 f"worker pip freeze contains duplicate package {match.group(1)}"
@@ -1244,12 +1277,13 @@ def verify_learned_environment(
             [
                 str(environment.python_exe),
                 "-I",
+                "-B",
                 "-c",
                 _VERIFY_SCRIPT,
                 source_payload,
             ],
         )
-        _parse_worker_verification(completed.stdout)
+        _parse_worker_verification(completed.stdout, environment.root)
         freeze = _parse_worker_freeze(
             _run_checked(
                 runner,
