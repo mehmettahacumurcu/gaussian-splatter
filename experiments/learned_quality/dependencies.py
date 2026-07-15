@@ -12,6 +12,24 @@ from .contracts import ModelRef
 
 
 PROTECTED_PACKAGES = ("torch", "torchvision", "numpy", "gsplat")
+DEFAULT_ENV_ROOT = Path("/content/learned-env")
+DEFAULT_LOCK_PATH = Path(__file__).with_name("requirements-lock.txt")
+
+_EXPECTED_LOCK_LINES = (
+    "transformers==4.57.6",
+    "huggingface-hub==0.36.2",
+    "tokenizers==0.22.1",
+    "safetensors==0.6.2",
+    "pycolmap==3.12.6",
+    "omegaconf==2.3.0",
+    "hydra-core==1.3.2",
+    "iopath==0.1.10",
+    "portalocker==3.2.0",
+    "addict==2.4.0",
+    "moviepy==1.0.3",
+    "trimesh==4.7.4",
+    "evo==1.36.5",
+)
 
 _DA3_COMMIT = "3fe327a6abe2e5db95b54444ea95463dbfef5610"
 _SAM2_COMMIT = "2b90b9f5ceec907a1c18123530e92e794ad901a4"
@@ -112,6 +130,16 @@ class RuntimePackage:
 class ProtectedRuntimeSnapshot:
     python_exe: Path
     packages: Mapping[str, RuntimePackage]
+
+
+@dataclass(frozen=True)
+class LearnedEnvironment:
+    root: Path
+    python_exe: Path
+    lock_path: Path
+    pip_report_path: Path
+    main_runtime_before: ProtectedRuntimeSnapshot
+    main_runtime_after: ProtectedRuntimeSnapshot
 
 
 class ProtectedRuntimeError(RuntimeError):
@@ -327,6 +355,162 @@ def assert_no_protected_changes(
             raise ProtectedRuntimeError(
                 f"protected package {protected_name} module path changed"
             )
+
+
+def _require_absolute_path(value: Path, label: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError(f"{label} must be an absolute path")
+    return path
+
+
+def _validate_lock(lock_path: Path) -> None:
+    if lock_path.is_symlink() or not lock_path.is_file():
+        raise ProtectedRuntimeError(
+            "learned dependency lock must be a regular non-symlink file"
+        )
+    try:
+        text = lock_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ProtectedRuntimeError("learned dependency lock is unreadable") from exc
+    if tuple(text.splitlines()) != _EXPECTED_LOCK_LINES:
+        raise ProtectedRuntimeError(
+            "learned dependency lock does not match the approved exact lock"
+        )
+
+
+def _run_checked(
+    runner: Callable[..., CompletedProcess[str]],
+    argv: list[str],
+) -> CompletedProcess[str]:
+    return runner(
+        argv,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _prepare_report_path(report_path: Path) -> None:
+    if report_path.is_symlink():
+        raise ProtectedRuntimeError("pip report path cannot be a symlink")
+    if report_path.exists():
+        if not report_path.is_file():
+            raise ProtectedRuntimeError("pip report path must be a regular file")
+        report_path.unlink()
+
+
+def _load_strict_pip_report(report_path: Path) -> Mapping[str, object]:
+    if report_path.is_symlink() or not report_path.is_file():
+        raise ProtectedRuntimeError(
+            "pip report was not created as a regular non-symlink file"
+        )
+    try:
+        text = report_path.read_text(encoding="utf-8")
+        report = json.loads(
+            text,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, UnicodeError, TypeError, ValueError) as exc:
+        raise ProtectedRuntimeError("pip report is not strict JSON") from exc
+    if not isinstance(report, Mapping):
+        raise ProtectedRuntimeError("pip report root must be a mapping")
+    return report
+
+
+def _capture_and_compare_runtime(
+    main_python: Path,
+    before: ProtectedRuntimeSnapshot,
+    runner: Callable[..., CompletedProcess[str]],
+) -> ProtectedRuntimeSnapshot:
+    try:
+        after = capture_protected_runtime(main_python, runner=runner)
+        assert_no_protected_changes({}, before=before, after=after)
+    except ProtectedRuntimeError:
+        raise
+    except Exception as exc:
+        raise ProtectedRuntimeError(
+            "protected runtime after-snapshot comparison failed"
+        ) from exc
+    return after
+
+
+def install_learned_environment(
+    main_python: Path,
+    *,
+    root: Path = DEFAULT_ENV_ROOT,
+    lock_path: Path = DEFAULT_LOCK_PATH,
+    runner: Callable[..., CompletedProcess[str]] = subprocess.run,
+) -> LearnedEnvironment:
+    main_python_path = _require_absolute_path(main_python, "main_python")
+    root_path = _require_absolute_path(root, "root")
+    approved_lock_path = _require_absolute_path(lock_path, "lock_path")
+    _validate_lock(approved_lock_path)
+
+    before = capture_protected_runtime(main_python_path, runner=runner)
+    worker_python = root_path / "bin" / "python"
+    report_path = root_path / "pip-dry-run-report.json"
+
+    try:
+        if root_path.is_symlink():
+            raise ProtectedRuntimeError("learned environment root cannot be a symlink")
+        _run_checked(
+            runner,
+            [
+                str(main_python_path),
+                "-m",
+                "venv",
+                "--system-site-packages",
+                "--clear",
+                str(root_path),
+            ],
+        )
+        _prepare_report_path(report_path)
+        _run_checked(
+            runner,
+            [
+                str(worker_python),
+                "-m",
+                "pip",
+                "install",
+                "--dry-run",
+                "--report",
+                str(report_path),
+                "-r",
+                str(approved_lock_path),
+            ],
+        )
+        report = _load_strict_pip_report(report_path)
+        assert_no_protected_changes(report)
+        _run_checked(
+            runner,
+            [
+                str(worker_python),
+                "-m",
+                "pip",
+                "install",
+                "--no-deps",
+                "-r",
+                str(approved_lock_path),
+            ],
+        )
+    except Exception as primary_error:
+        try:
+            _capture_and_compare_runtime(main_python_path, before, runner)
+        except ProtectedRuntimeError as drift_error:
+            raise drift_error from primary_error
+        raise
+
+    after = _capture_and_compare_runtime(main_python_path, before, runner)
+    return LearnedEnvironment(
+        root=root_path,
+        python_exe=worker_python,
+        lock_path=approved_lock_path,
+        pip_report_path=report_path,
+        main_runtime_before=before,
+        main_runtime_after=after,
+    )
 
 
 @dataclass(frozen=True)

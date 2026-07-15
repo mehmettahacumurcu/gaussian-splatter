@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from subprocess import CompletedProcess
+from subprocess import CalledProcessError, CompletedProcess
 from typing import Mapping, cast
 
 import pytest
@@ -11,14 +11,18 @@ import pytest
 from experiments.learned_quality.contracts import ModelRef
 from experiments.learned_quality.dependencies import (
     CHECKPOINT_MODEL_REFS,
+    DEFAULT_ENV_ROOT,
+    DEFAULT_LOCK_PATH,
     PROTECTED_PACKAGES,
     SOURCE_REPOSITORY_REFS,
+    LearnedEnvironment,
     PinnedModelSnapshot,
     ProtectedRuntimeError,
     ProtectedRuntimeSnapshot,
     RuntimePackage,
     assert_no_protected_changes,
     capture_protected_runtime,
+    install_learned_environment,
     snapshot_pinned_model,
 )
 
@@ -73,6 +77,83 @@ def _snapshot(
             for index, name in enumerate(PROTECTED_PACKAGES)
         },
     )
+
+
+def _write_lock(root: Path, lines: tuple[str, ...] = LOCK_LINES) -> Path:
+    lock_path = root / "requirements-lock.txt"
+    lock_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return lock_path
+
+
+class _InstallRunner:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        report_payload: str = '{"install":[]}',
+        report_mode: str = "write",
+        venv_report_kind: str | None = None,
+        fail_stage: str | None = None,
+        before_stdout: str | None = None,
+        after_stdout: str | None = None,
+    ) -> None:
+        self.root = root
+        self.report_payload = report_payload
+        self.report_mode = report_mode
+        self.venv_report_kind = venv_report_kind
+        self.fail_stage = fail_stage
+        self.before_stdout = before_stdout or _runtime_stdout()
+        self.after_stdout = after_stdout or self.before_stdout
+        self.calls: list[tuple[list[str], dict[str, object]]] = []
+        self.capture_count = 0
+        self.report_existed_before_dry_run: bool | None = None
+
+    def __call__(
+        self,
+        argv: list[str],
+        **kwargs: object,
+    ) -> CompletedProcess[str]:
+        self.calls.append((list(argv), dict(kwargs)))
+        if len(argv) >= 4 and argv[1:3] == ["-I", "-c"]:
+            stdout = (
+                self.before_stdout if self.capture_count == 0 else self.after_stdout
+            )
+            self.capture_count += 1
+            return CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+        if argv[1:5] == ["-m", "venv", "--system-site-packages", "--clear"]:
+            if self.fail_stage == "venv":
+                raise CalledProcessError(1, argv, stderr="venv failed")
+            self.root.mkdir(parents=True, exist_ok=True)
+            worker_bin = self.root / "bin"
+            worker_bin.mkdir(exist_ok=True)
+            (worker_bin / "python").write_text("worker", encoding="utf-8")
+            report = self.root / "pip-dry-run-report.json"
+            if self.venv_report_kind == "regular":
+                report.write_text("stale", encoding="utf-8")
+            elif self.venv_report_kind == "directory":
+                report.mkdir()
+            elif self.venv_report_kind == "symlink":
+                target = self.root / "report-target.json"
+                target.write_text("target", encoding="utf-8")
+                report.symlink_to(target)
+            return CompletedProcess(argv, 0, stdout="", stderr="")
+
+        if "--dry-run" in argv:
+            if self.fail_stage == "dry-run":
+                raise CalledProcessError(1, argv, stderr="dry-run failed")
+            report = Path(argv[argv.index("--report") + 1])
+            self.report_existed_before_dry_run = report.exists()
+            if self.report_mode == "write":
+                report.write_text(self.report_payload, encoding="utf-8")
+            return CompletedProcess(argv, 0, stdout="", stderr="")
+
+        if "--no-deps" in argv:
+            if self.fail_stage == "install":
+                raise CalledProcessError(1, argv, stderr="install failed")
+            return CompletedProcess(argv, 0, stdout="", stderr="")
+
+        raise AssertionError(f"unexpected subprocess argv: {argv!r}")
 
 
 def test_dependency_lock_is_exact_and_has_no_extra_entries() -> None:
@@ -416,3 +497,318 @@ def test_non_mapping_report_is_rejected() -> None:
 
     with pytest.raises(ProtectedRuntimeError, match="report"):
         assert_no_protected_changes(report)
+
+
+def test_learned_environment_defaults_are_exact() -> None:
+    assert DEFAULT_ENV_ROOT == Path("/content/learned-env")
+    assert DEFAULT_LOCK_PATH == Path(
+        __file__
+    ).parents[3] / "experiments" / "learned_quality" / "requirements-lock.txt"
+
+
+@pytest.mark.parametrize("relative_field", ["main_python", "root", "lock_path"])
+def test_install_rejects_relative_paths_before_subprocess(
+    tmp_path: Path,
+    relative_field: str,
+) -> None:
+    main_python = tmp_path / "main-python"
+    root = tmp_path / "worker"
+    lock_path = _write_lock(tmp_path)
+    if relative_field == "main_python":
+        main_python = Path("main-python")
+    elif relative_field == "root":
+        root = Path("worker")
+    else:
+        lock_path = Path("requirements-lock.txt")
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        calls.append(argv)
+        return CompletedProcess(argv, 0, stdout="", stderr="")
+
+    with pytest.raises(ValueError, match="absolute"):
+        install_learned_environment(
+            main_python,
+            root=root,
+            lock_path=lock_path,
+            runner=runner,
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        pytest.param(LOCK_LINES + ("",), id="blank"),
+        pytest.param(("# comment", *LOCK_LINES), id="comment"),
+        pytest.param((*LOCK_LINES, LOCK_LINES[0]), id="duplicate"),
+        pytest.param((*LOCK_LINES, "extra==1.0"), id="extra"),
+        pytest.param((*LOCK_LINES, "torch==2.7.0"), id="protected"),
+        pytest.param((*LOCK_LINES, "xformers==0.0.30"), id="xformers"),
+        pytest.param(
+            (LOCK_LINES[1], LOCK_LINES[0], *LOCK_LINES[2:]),
+            id="reordered",
+        ),
+    ],
+)
+def test_install_rejects_tampered_lock_before_subprocess(
+    tmp_path: Path,
+    lines: tuple[str, ...],
+) -> None:
+    lock_path = _write_lock(tmp_path, lines)
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        calls.append(argv)
+        return CompletedProcess(argv, 0, stdout="", stderr="")
+
+    with pytest.raises(ProtectedRuntimeError, match="lock"):
+        install_learned_environment(
+            tmp_path / "main-python",
+            root=tmp_path / "worker",
+            lock_path=lock_path,
+            runner=runner,
+        )
+    assert calls == []
+
+
+def test_install_rejects_symlink_or_non_file_lock(tmp_path: Path) -> None:
+    target = _write_lock(tmp_path)
+    symlink = tmp_path / "lock-link.txt"
+    symlink.symlink_to(target)
+
+    with pytest.raises(ProtectedRuntimeError, match="lock"):
+        install_learned_environment(
+            tmp_path / "main-python",
+            root=tmp_path / "worker",
+            lock_path=symlink,
+            runner=lambda *_args, **_kwargs: pytest.fail("runner must not execute"),
+        )
+
+    directory = tmp_path / "lock-directory"
+    directory.mkdir()
+    with pytest.raises(ProtectedRuntimeError, match="lock"):
+        install_learned_environment(
+            tmp_path / "main-python",
+            root=tmp_path / "worker",
+            lock_path=directory,
+            runner=lambda *_args, **_kwargs: pytest.fail("runner must not execute"),
+        )
+
+
+def test_install_rejects_symlink_environment_root_after_runtime_capture(
+    tmp_path: Path,
+) -> None:
+    lock_path = _write_lock(tmp_path)
+    target = tmp_path / "worker-target"
+    target.mkdir()
+    root = tmp_path / "worker-link"
+    root.symlink_to(target, target_is_directory=True)
+    runner = _InstallRunner(root)
+
+    with pytest.raises(ProtectedRuntimeError, match="environment root"):
+        install_learned_environment(
+            tmp_path / "main-python",
+            root=root,
+            lock_path=lock_path,
+            runner=runner,
+        )
+
+    assert runner.capture_count == 2
+    assert all(call[0][1:3] == ["-I", "-c"] for call in runner.calls)
+
+
+def test_install_success_uses_exact_safe_argv_and_returns_frozen_record(
+    tmp_path: Path,
+) -> None:
+    main_python = tmp_path / "main-python"
+    root = tmp_path / "worker"
+    lock_path = _write_lock(tmp_path)
+    original_lock = lock_path.read_bytes()
+    outside = tmp_path / "outside-sentinel"
+    outside.write_text("keep", encoding="utf-8")
+    runner = _InstallRunner(root, venv_report_kind="regular")
+
+    environment = install_learned_environment(
+        main_python,
+        root=root,
+        lock_path=lock_path,
+        runner=runner,
+    )
+
+    worker_python = root / "bin" / "python"
+    report_path = root / "pip-dry-run-report.json"
+    assert len(runner.calls) == 5
+    assert runner.calls[0][0][0:3] == [str(main_python), "-I", "-c"]
+    assert runner.calls[1][0] == [
+        str(main_python),
+        "-m",
+        "venv",
+        "--system-site-packages",
+        "--clear",
+        str(root),
+    ]
+    assert runner.calls[2][0] == [
+        str(worker_python),
+        "-m",
+        "pip",
+        "install",
+        "--dry-run",
+        "--report",
+        str(report_path),
+        "-r",
+        str(lock_path),
+    ]
+    assert runner.calls[3][0] == [
+        str(worker_python),
+        "-m",
+        "pip",
+        "install",
+        "--no-deps",
+        "-r",
+        str(lock_path),
+    ]
+    assert runner.calls[4][0][0:3] == [str(main_python), "-I", "-c"]
+    assert all(
+        kwargs == {"check": True, "capture_output": True, "text": True}
+        for _argv, kwargs in runner.calls
+    )
+    assert all(isinstance(argv, list) for argv, _kwargs in runner.calls)
+    assert all("shell" not in kwargs for _argv, kwargs in runner.calls)
+    assert runner.report_existed_before_dry_run is False
+    assert environment == LearnedEnvironment(
+        root=root,
+        python_exe=worker_python,
+        lock_path=lock_path,
+        pip_report_path=report_path,
+        main_runtime_before=environment.main_runtime_before,
+        main_runtime_after=environment.main_runtime_after,
+    )
+    assert environment.main_runtime_before == environment.main_runtime_after
+    assert report_path.is_file()
+    assert lock_path.read_bytes() == original_lock
+    assert outside.read_text(encoding="utf-8") == "keep"
+    with pytest.raises(FrozenInstanceError):
+        environment.root = tmp_path / "other"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("report_kind", ["symlink", "directory"])
+def test_install_rejects_unsafe_preexisting_worker_report(
+    tmp_path: Path,
+    report_kind: str,
+) -> None:
+    root = tmp_path / "worker"
+    runner = _InstallRunner(root, venv_report_kind=report_kind)
+
+    with pytest.raises(ProtectedRuntimeError, match="pip report"):
+        install_learned_environment(
+            tmp_path / "main-python",
+            root=root,
+            lock_path=_write_lock(tmp_path),
+            runner=runner,
+        )
+
+    assert runner.capture_count == 2
+    assert not any("--dry-run" in argv for argv, _kwargs in runner.calls)
+    assert not any("--no-deps" in argv for argv, _kwargs in runner.calls)
+
+
+@pytest.mark.parametrize(
+    ("report_mode", "report_payload"),
+    [
+        pytest.param("missing", "", id="missing"),
+        pytest.param("write", "not-json", id="malformed"),
+        pytest.param(
+            "write",
+            '{"install":[],"install":[]}',
+            id="duplicate-key",
+        ),
+        pytest.param("write", '{"install":[],"value":NaN}', id="nan"),
+        pytest.param("write", '{"install":[],"value":Infinity}', id="infinity"),
+    ],
+)
+def test_install_rejects_missing_or_non_strict_pip_report(
+    tmp_path: Path,
+    report_mode: str,
+    report_payload: str,
+) -> None:
+    root = tmp_path / "worker"
+    runner = _InstallRunner(
+        root,
+        report_mode=report_mode,
+        report_payload=report_payload,
+    )
+
+    with pytest.raises(ProtectedRuntimeError, match="pip report"):
+        install_learned_environment(
+            tmp_path / "main-python",
+            root=root,
+            lock_path=_write_lock(tmp_path),
+            runner=runner,
+        )
+
+    assert runner.capture_count == 2
+    assert not any("--no-deps" in argv for argv, _kwargs in runner.calls)
+
+
+def test_protected_dry_run_plan_stops_before_install(tmp_path: Path) -> None:
+    root = tmp_path / "worker"
+    runner = _InstallRunner(
+        root,
+        report_payload='{ "install": [{"metadata": {"name": "torch"}}] }',
+    )
+
+    with pytest.raises(ProtectedRuntimeError, match="torch"):
+        install_learned_environment(
+            tmp_path / "main-python",
+            root=root,
+            lock_path=_write_lock(tmp_path),
+            runner=runner,
+        )
+
+    assert runner.capture_count == 2
+    assert not any("--no-deps" in argv for argv, _kwargs in runner.calls)
+
+
+@pytest.mark.parametrize("fail_stage", ["venv", "dry-run", "install"])
+def test_subprocess_failure_still_runs_mandatory_after_snapshot(
+    tmp_path: Path,
+    fail_stage: str,
+) -> None:
+    root = tmp_path / "worker"
+    runner = _InstallRunner(root, fail_stage=fail_stage)
+
+    with pytest.raises(CalledProcessError):
+        install_learned_environment(
+            tmp_path / "main-python",
+            root=root,
+            lock_path=_write_lock(tmp_path),
+            runner=runner,
+        )
+
+    assert runner.capture_count == 2
+    assert runner.calls[-1][0][1:3] == ["-I", "-c"]
+
+
+def test_protected_runtime_drift_takes_precedence_over_install_failure(
+    tmp_path: Path,
+) -> None:
+    rows = _runtime_rows()
+    rows[0]["version"] = "9.9.9"
+    root = tmp_path / "worker"
+    runner = _InstallRunner(
+        root,
+        fail_stage="install",
+        after_stdout=_runtime_stdout(rows),
+    )
+
+    with pytest.raises(ProtectedRuntimeError, match="torch") as error:
+        install_learned_environment(
+            tmp_path / "main-python",
+            root=root,
+            lock_path=_write_lock(tmp_path),
+            runner=runner,
+        )
+
+    assert isinstance(error.value.__cause__, CalledProcessError)
+    assert runner.capture_count == 2
