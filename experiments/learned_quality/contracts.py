@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,6 +47,8 @@ class LearnedQualityRunSpec(StrictModel):
     @field_validator("input_folder")
     @classmethod
     def normalize_folder(cls, value: str) -> str:
+        if any(unicodedata.category(character) == "Cc" for character in value):
+            raise ValueError("Input folder cannot contain control characters")
         canonical = normalize_input_folder(value)
         if canonical.endswith((RESULT_SUFFIX, DIAGNOSTICS_SUFFIX)):
             raise ValueError("Choose the input folder, not an experiment output")

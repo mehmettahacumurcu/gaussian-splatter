@@ -98,6 +98,29 @@ def test_learned_spec_rejects_unsafe_or_output_folders(input_folder: str) -> Non
         LearnedQualityRunSpec(input_folder=input_folder)
 
 
+@pytest.mark.parametrize(
+    "control",
+    [
+        pytest.param("\t", id="tab"),
+        pytest.param("\n", id="lf"),
+        pytest.param("\r", id="cr"),
+    ],
+)
+@pytest.mark.parametrize(
+    "template",
+    [
+        pytest.param("{}captures/room", id="leading"),
+        pytest.param("captures/room{}", id="trailing"),
+    ],
+)
+def test_learned_spec_rejects_boundary_control_characters(
+    control: str,
+    template: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        LearnedQualityRunSpec(input_folder=template.format(control))
+
+
 def test_paths_are_exact_siblings(tmp_path: Path) -> None:
     source = tmp_path / "2026-11-room"
 
