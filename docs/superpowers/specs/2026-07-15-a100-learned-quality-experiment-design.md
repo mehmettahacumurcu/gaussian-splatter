@@ -1,7 +1,7 @@
 # Isolated A100 Learned-Quality Notebook Experiment Design
 
 **Date:** 2026-07-15
-**Status:** Architecture approved in conversation; awaiting written-spec review
+**Status:** Approved for implementation
 **Target:** Maximum-quality static room reconstruction on an NVIDIA A100
 **Output:** `<input_folder_name>_learned_test_result`
 
@@ -143,13 +143,18 @@ colab/learned_quality_a100_experiment.ipynb
   thin pinned Run-All orchestration
 ```
 
-The only permitted shared-code edit is one generic, default-off `validity_mask`
-parameter in the trainer. No production runner or configuration passes it. When
-the argument is absent or `None`, execution takes the exact legacy loss/logging
-path and must match legacy outputs and logs. All mask loading, validation, and
-configuration remain experiment-local. The experiment must not reuse
-`lambda_mask_motion`: that field upweights masked pixels and has the wrong
-semantics for transient/sky exclusion.
+The permitted shared-code edits are narrow, default-off trainer seams:
+
+1. a `validity_mask` argument whose absent/`None` path executes the exact legacy
+   loss and logging expressions; and
+2. an optional trainer-extension boundary plus feature-detected density methods
+   that provide iteration/view context to an injected experiment controller.
+
+No production runner or configuration enables either seam, and regression tests
+must demonstrate unchanged legacy outputs and logs. All mask loading, adaptive
+density policy, model lifecycle, and experiment configuration remain
+experiment-local. The experiment must not reuse `lambda_mask_motion`: that field
+upweights masked pixels and has the wrong semantics for transient/sky exclusion.
 
 ## 6. End-to-End Data Flow
 
