@@ -7,15 +7,19 @@ import re
 import shutil
 import tempfile
 import unicodedata
+import weakref
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from hashlib import sha256
-from pathlib import Path, PurePosixPath
+from io import BytesIO
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from types import MappingProxyType
 from typing import Final, Protocol, TypeVar, cast
 
 import numpy as np
 from PIL import Image
+
+from backend.static_pipeline.stage_cache import promote_directory
 
 from .contracts import FrameArtifact, ModelRef, StageRecord
 from .dependencies import CHECKPOINT_MODEL_REFS
@@ -123,6 +127,24 @@ class SamAdapter(Protocol):
 
 _SAFE_ID = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_WINDOWS_FORBIDDEN = frozenset('<>:"\\|?*')
+_WINDOWS_RESERVED = frozenset(
+    {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{index}" for index in range(1, 10)),
+        *(f"LPT{index}" for index in range(1, 10)),
+    }
+)
+
+
+@dataclass(frozen=True)
+class _FrameSnapshot:
+    size_bytes: int
+    sha256: str
+    shape: tuple[int, int]
 
 
 def _validate_policy(policy: SemanticPolicy) -> None:
@@ -153,7 +175,7 @@ def _validate_policy(policy: SemanticPolicy) -> None:
         )
 
 
-def _validate_relative_image_name(value: str) -> None:
+def _validate_relative_image_name(value: str) -> tuple[str, ...]:
     if (
         not isinstance(value, str)
         or not value
@@ -162,51 +184,101 @@ def _validate_relative_image_name(value: str) -> None:
     ):
         raise ValueError("frame image_name must be a safe relative POSIX path")
     path = PurePosixPath(value)
-    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+    if (
+        path.is_absolute()
+        or PureWindowsPath(value).is_absolute()
+        or path.as_posix() != value
+        or any(part in {"", ".", ".."} for part in path.parts)
+    ):
         raise ValueError("frame image_name must be a safe relative POSIX path")
-
-
-def _frame_digest(frame: FrameArtifact) -> str:
-    return sha256(frame.path.read_bytes()).hexdigest()
+    for part in path.parts:
+        reserved_stem = part.split(".", 1)[0].upper()
+        if (
+            part != part.strip()
+            or part.endswith(".")
+            or any(character in _WINDOWS_FORBIDDEN for character in part)
+            or reserved_stem in _WINDOWS_RESERVED
+        ):
+            raise ValueError("frame image_name must be a portable relative POSIX path")
+    return tuple(part.casefold() for part in path.parts)
 
 
 def _validate_frames(
     frames: tuple[FrameArtifact, ...],
-) -> tuple[tuple[int, int], ...]:
+    *,
+    expected: tuple[_FrameSnapshot, ...] | None = None,
+) -> tuple[_FrameSnapshot, ...]:
     if not isinstance(frames, tuple) or not frames:
         raise ValueError("frames must be a non-empty immutable tuple")
+    if expected is not None and len(expected) != len(frames):
+        raise ValueError("frame snapshot count changed")
     frame_ids: set[str] = set()
-    image_names: set[str] = set()
-    shapes: list[tuple[int, int]] = []
-    for frame in frames:
+    image_name_keys: set[tuple[str, ...]] = set()
+    resolved_paths: set[Path] = set()
+    snapshots: list[_FrameSnapshot] = []
+    for index, frame in enumerate(frames):
         if not isinstance(frame, FrameArtifact):
             raise ValueError("frame record is malformed")
         if not isinstance(frame.frame_id, str) or _SAFE_ID.fullmatch(frame.frame_id) is None:
             raise ValueError("frame_id must be a safe plain identifier")
-        _validate_relative_image_name(frame.image_name)
-        if frame.frame_id in frame_ids or frame.image_name in image_names:
+        image_name_key = _validate_relative_image_name(frame.image_name)
+        if frame.frame_id in frame_ids or image_name_key in image_name_keys:
             raise ValueError("frame identities and image names must be unique")
         frame_ids.add(frame.frame_id)
-        image_names.add(frame.image_name)
+        image_name_keys.add(image_name_key)
         if not isinstance(frame.path, Path) or not frame.path.is_absolute():
             raise ValueError("frame path must be absolute")
+        try:
+            resolved_path = frame.path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("frame path must resolve to a regular file") from exc
+        if resolved_path != frame.path:
+            raise ValueError("frame path must not contain symlink or lexical aliases")
+        if resolved_path in resolved_paths:
+            raise ValueError("frame paths must resolve uniquely")
+        resolved_paths.add(resolved_path)
         if frame.path.is_symlink() or not frame.path.is_file():
             raise ValueError("frame path must be a regular non-symlink file")
         if not isinstance(frame.sha256, str) or _SHA256.fullmatch(frame.sha256) is None:
             raise ValueError("frame sha256 is malformed")
-        if _frame_digest(frame) != frame.sha256:
+        try:
+            data = frame.path.read_bytes()
+        except OSError as exc:
+            raise ValueError(f"frame image is unreadable for {frame.frame_id}") from exc
+        size_bytes = len(data)
+        digest = sha256(data).hexdigest()
+        prior = None if expected is None else expected[index]
+        if prior is not None and size_bytes != prior.size_bytes:
+            raise ValueError(f"frame size changed for {frame.frame_id}")
+        if prior is not None and digest != prior.sha256:
+            raise ValueError(f"frame digest changed for {frame.frame_id}")
+        if digest != frame.sha256:
             raise ValueError(f"frame digest changed for {frame.frame_id}")
         try:
-            with Image.open(frame.path) as image:
+            with Image.open(BytesIO(data)) as image:
                 image.verify()
-            with Image.open(frame.path) as image:
+            with Image.open(BytesIO(data)) as image:
                 width, height = image.size
         except (OSError, ValueError) as exc:
             raise ValueError(f"frame image is unreadable for {frame.frame_id}") from exc
         if width <= 0 or height <= 0:
             raise ValueError(f"frame dimensions are invalid for {frame.frame_id}")
-        shapes.append((height, width))
-    return tuple(shapes)
+        shape = (height, width)
+        if prior is not None and shape != prior.shape:
+            raise ValueError(f"frame dimensions changed for {frame.frame_id}")
+        try:
+            if frame.path.stat().st_size != size_bytes:
+                raise ValueError(f"frame size changed for {frame.frame_id}")
+        except OSError as exc:
+            raise ValueError(f"frame image is unreadable for {frame.frame_id}") from exc
+        snapshots.append(
+            _FrameSnapshot(
+                size_bytes=size_bytes,
+                sha256=digest,
+                shape=shape,
+            )
+        )
+    return tuple(snapshots)
 
 
 def _validate_output_dir(output_dir: Path) -> Path:
@@ -221,7 +293,13 @@ def _validate_output_dir(output_dir: Path) -> Path:
     return path
 
 
-def _chunks(values: tuple[object, ...], size: int) -> tuple[tuple[object, ...], ...]:
+_ChunkValueT = TypeVar("_ChunkValueT")
+
+
+def _chunks(
+    values: tuple[_ChunkValueT, ...],
+    size: int,
+) -> tuple[tuple[_ChunkValueT, ...], ...]:
     if type(size) is not int or size <= 0:
         raise ValueError("batch size must be a positive plain integer")
     return tuple(values[index : index + size] for index in range(0, len(values), size))
@@ -300,8 +378,7 @@ def _run_detector(
     _validate_model_ref(detector.model_ref, GROUNDING_DINO_MODEL_REF, "detector")
     frame_index = {frame.frame_id: index for index, frame in enumerate(frames)}
     detected: list[tuple[DetectionBox, ...] | None] = [None] * len(frames)
-    for raw_batch in _chunks(tuple(frames), batch_size):
-        batch = tuple(cast_frame for cast_frame in raw_batch if isinstance(cast_frame, FrameArtifact))
+    for batch in _chunks(frames, batch_size):
         result = detector.detect_batch(
             batch,
             prompt=TRANSIENT_PROMPT,
@@ -350,10 +427,7 @@ def _run_sam(
         for frame, boxes in zip(frames, detections, strict=True)
         for box in boxes
     )
-    for raw_batch in _chunks(tuple(prompts), batch_size) if prompts else ():
-        batch = tuple(
-            cast_prompt for cast_prompt in raw_batch if isinstance(cast_prompt, SamBoxPrompt)
-        )
+    for batch in _chunks(prompts, batch_size) if prompts else ():
         refined = sam.refine_batch(batch)
         expected_keys = tuple(
             (prompt.frame.frame_id, prompt.box.box_id) for prompt in batch
@@ -369,54 +443,83 @@ def _run_sam(
                 label=f"SAM direct mask {key}",
             )
 
-    direct_by_id = MappingProxyType(
-        {frame.frame_id: mask for frame, mask in zip(frames, direct, strict=True)}
-    )
-    propagated_result = sam.propagate(
-        frames,
-        direct_by_id,
-        clip_frames=policy.propagation_clip_frames,
-    )
-    expected_frame_ids = tuple(frame.frame_id for frame in frames)
-    if (
-        not isinstance(propagated_result, Mapping)
-        or tuple(propagated_result) != expected_frame_ids
-    ):
-        raise ValueError("SAM propagation frame join does not match selected frames")
-
-    propagated: list[np.ndarray] = []
-    direct_support: list[np.ndarray] = []
-    for index, frame in enumerate(frames):
-        item = propagated_result[frame.frame_id]
+    clips = _chunks(frames, policy.propagation_clip_frames)
+    clip_index_by_frame_id = {
+        frame.frame_id: clip_index
+        for clip_index, clip in enumerate(clips)
+        for frame in clip
+    }
+    propagated: list[np.ndarray | None] = [None] * len(frames)
+    direct_support: list[np.ndarray | None] = [None] * len(frames)
+    for clip_batch in _chunks(clips, batch_size):
+        batch_frames = tuple(frame for clip in clip_batch for frame in clip)
+        batch_direct = MappingProxyType(
+            {
+                frame.frame_id: np.array(direct[frame_index[frame.frame_id]], copy=True)
+                for frame in batch_frames
+            }
+        )
+        propagated_result = sam.propagate(
+            batch_frames,
+            batch_direct,
+            clip_frames=policy.propagation_clip_frames,
+        )
+        expected_frame_ids = tuple(frame.frame_id for frame in batch_frames)
         if (
-            not isinstance(item, tuple)
-            or len(item) != 2
-            or not isinstance(item[1], tuple)
+            not isinstance(propagated_result, Mapping)
+            or tuple(propagated_result) != expected_frame_ids
         ):
-            raise ValueError("SAM propagation result is malformed")
-        candidate = _as_binary_mask(
-            item[0],
-            shape=shapes[index],
-            label=f"SAM propagated candidate {frame.frame_id}",
+            raise ValueError("SAM propagation frame join does not match exact clips")
+
+        for frame in batch_frames:
+            index = frame_index[frame.frame_id]
+            item = propagated_result[frame.frame_id]
+            if (
+                not isinstance(item, tuple)
+                or len(item) != 2
+                or not isinstance(item[1], tuple)
+            ):
+                raise ValueError("SAM propagation result is malformed")
+            candidate = _as_binary_mask(
+                item[0],
+                shape=shapes[index],
+                label=f"SAM propagated candidate {frame.frame_id}",
+            )
+            supporting_ids = item[1]
+            if len(set(supporting_ids)) != len(supporting_ids):
+                raise ValueError("SAM propagation support ids must be unique")
+            has_nearby_direct = False
+            for supporting_id in supporting_ids:
+                source_index = frame_index.get(supporting_id)
+                if source_index is None:
+                    raise ValueError("SAM propagation references an unknown source frame")
+                if (
+                    clip_index_by_frame_id[supporting_id]
+                    != clip_index_by_frame_id[frame.frame_id]
+                ):
+                    raise ValueError("SAM propagation support crosses an exact clip boundary")
+                if not bool(np.any(direct[source_index])):
+                    raise ValueError("SAM propagation source has no direct evidence")
+                if abs(source_index - index) > policy.propagation_neighbor_frames:
+                    raise ValueError("SAM propagation source is outside the neighbor policy")
+                has_nearby_direct = True
+            propagated[index] = candidate
+            direct_support[index] = np.array(
+                candidate if has_nearby_direct else np.zeros_like(candidate),
+                copy=True,
+            )
+    if any(mask is None for mask in propagated) or any(
+        mask is None for mask in direct_support
+    ):
+        raise ValueError("SAM propagation omitted an exact clip frame")
+    return tuple(
+        (
+            np.array(direct[index], copy=True),
+            cast(np.ndarray, propagated[index]),
+            cast(np.ndarray, direct_support[index]),
         )
-        supporting_ids = item[1]
-        if len(set(supporting_ids)) != len(supporting_ids):
-            raise ValueError("SAM propagation support ids must be unique")
-        has_nearby_direct = False
-        for supporting_id in supporting_ids:
-            source_index = frame_index.get(supporting_id)
-            if source_index is None:
-                raise ValueError("SAM propagation references an unknown source frame")
-            if not bool(np.any(direct[source_index])):
-                raise ValueError("SAM propagation source has no direct evidence")
-            if abs(source_index - index) > policy.propagation_neighbor_frames:
-                raise ValueError("SAM propagation source is outside the neighbor policy")
-            has_nearby_direct = True
-        propagated.append(candidate)
-        direct_support.append(
-            np.array(candidate if has_nearby_direct else np.zeros_like(candidate), copy=True)
-        )
-    return tuple(zip(direct, propagated, direct_support, strict=True))
+        for index in range(len(frames))
+    )
 
 
 def _sha256_path(path: Path) -> str:
@@ -455,6 +558,35 @@ def _write_bytes(path: Path, data: bytes) -> None:
         os.fsync(stream.fileno())
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        if os.name == "nt":
+            return
+        raise
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            if os.name != "nt":
+                raise
+    finally:
+        os.close(descriptor)
+
+
+def _fsync_directory_tree(root: Path) -> None:
+    directories = [root]
+    directories.extend(path for path in root.rglob("*") if path.is_dir())
+    for directory in sorted(
+        directories,
+        key=lambda path: len(path.relative_to(root).parts),
+        reverse=True,
+    ):
+        _fsync_directory(directory)
+
+
 def _model_payload(model: ModelRef) -> dict[str, object]:
     return {
         "code_commit": model.code_commit,
@@ -472,9 +604,43 @@ def _release_payload(release: VramReleaseRecord) -> dict[str, object]:
     return asdict(release)
 
 
+def _freeze_record_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {str(key): _freeze_record_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_record_value(item) for item in value)
+    return value
+
+
+def _json_record_value(value: object) -> object:
+    if isinstance(value, Mapping):
+        return {str(key): _json_record_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_json_record_value(item) for item in value]
+    return value
+
+
 _AdapterT = TypeVar("_AdapterT")
 _StageValueT = TypeVar("_StageValueT")
 _UNSET_MODEL = object()
+
+
+def _attach_model_release_error(
+    primary: BaseException,
+    cleanup: BaseException,
+) -> None:
+    try:
+        setattr(primary, "model_release_error", cleanup)
+    except BaseException:
+        pass
+    try:
+        add_note = getattr(primary, "add_note", None)
+        if callable(add_note):
+            add_note(f"model release also failed: {cleanup!r}")
+    except BaseException:
+        pass
 
 
 def _run_model_stage(
@@ -487,11 +653,29 @@ def _run_model_stage(
     release_model: Callable[[object], VramReleaseRecord],
 ) -> tuple[BatchRetryResult[_StageValueT], VramReleaseRecord]:
     current: _AdapterT | object = _UNSET_MODEL
+    released_refs: list[weakref.ReferenceType[object]] = []
+    non_weakref_released_ids: set[int] = set()
+
+    def was_released(candidate: object) -> bool:
+        if id(candidate) in non_weakref_released_ids:
+            return True
+        return any(reference() is candidate for reference in released_refs)
+
+    def remember_released(model: object) -> None:
+        try:
+            released_refs.append(weakref.ref(model))
+        except TypeError:
+            non_weakref_released_ids.add(id(model))
 
     def run(batch_size: int) -> _StageValueT:
         nonlocal current
         if current is _UNSET_MODEL:
-            current = factory()
+            candidate = factory()
+            if was_released(candidate):
+                raise RuntimeError(
+                    f"{stage_id} factory returned a previously released adapter"
+                )
+            current = candidate
         return operation(cast(_AdapterT, current), batch_size)
 
     def release_current() -> VramReleaseRecord:
@@ -500,6 +684,7 @@ def _run_model_stage(
             raise RuntimeError(f"{stage_id} has no model instance to release")
         model = current
         current = _UNSET_MODEL
+        remember_released(model)
         record = release_model(model)
         if not isinstance(record, VramReleaseRecord):
             raise TypeError("release_model must return VramReleaseRecord")
@@ -516,7 +701,14 @@ def _run_model_stage(
             chunk_independent=True,
             release=release_current,
         )
-    finally:
+    except BaseException as primary:
+        if current is not _UNSET_MODEL:
+            try:
+                release_current()
+            except BaseException as cleanup:
+                _attach_model_release_error(primary, cleanup)
+        raise
+    else:
         if current is not _UNSET_MODEL:
             final_release = release_current()
     if retry_result is None or final_release is None:
@@ -541,13 +733,13 @@ def _stage_record(
     return StageRecord(
         stage_id=stage_id,
         status="fallback" if retry_release is not None else "accepted",
-        details=MappingProxyType(details),
+        details=cast(Mapping[str, object], _freeze_record_value(details)),
     )
 
 
 def _stage_payload(record: StageRecord) -> dict[str, object]:
     return {
-        "details": dict(record.details),
+        "details": _json_record_value(record.details),
         "peak_vram_bytes": record.peak_vram_bytes,
         "stage_id": record.stage_id,
         "status": record.status,
@@ -655,7 +847,10 @@ def _publish(
         manifest_data = _json_bytes(manifest_payload)
         staged_manifest = staging / "semantic_manifest.json"
         _write_bytes(staged_manifest, manifest_data)
-        staging.replace(output_dir)
+        _fsync_directory_tree(staging)
+        _validate_output_dir(output_dir)
+        promote_directory(staging, output_dir)
+        _fsync_directory(output_dir.parent)
         manifest_path = output_dir / "semantic_manifest.json"
         return SemanticEvidence(
             policy=policy,
@@ -682,7 +877,8 @@ def run_semantic_evidence(
     release_model: Callable[[object], VramReleaseRecord],
 ) -> SemanticEvidence:
     _validate_policy(policy)
-    shapes = _validate_frames(frames)
+    frame_snapshots = _validate_frames(frames)
+    shapes = tuple(snapshot.shape for snapshot in frame_snapshots)
     final_output = _validate_output_dir(output_dir)
     if type(initial_batch_size) is not int or initial_batch_size <= 0:
         raise ValueError("initial_batch_size must be a positive plain integer")
@@ -727,6 +923,7 @@ def run_semantic_evidence(
         release_model=release_model,
     )
     maps = sam_retry.value
+    _validate_frames(frames, expected=frame_snapshots)
 
     return _publish(
         final_output,

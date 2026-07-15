@@ -12,6 +12,8 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from backend.static_pipeline.stage_cache import promote_directory as real_promote_directory
+from experiments.learned_quality import segmentation as segmentation_module
 from experiments.learned_quality.contracts import FrameArtifact
 from experiments.learned_quality.lifecycle import VramReleaseRecord
 from experiments.learned_quality.segmentation import (
@@ -145,7 +147,7 @@ class FakeSam:
         *,
         clip_frames: int,
     ) -> Mapping[str, tuple[object, tuple[str, ...]]]:
-        assert clip_frames == 3
+        assert clip_frames > 0
         assert tuple(direct_masks) == tuple(frame.frame_id for frame in frames)
         self.propagate_calls.append(tuple(frame.frame_id for frame in frames))
         return {
@@ -857,14 +859,17 @@ def test_failed_atomic_promotion_removes_staging_and_partial_output(
     frames = (_write_frame(frames_dir, 0), _write_frame(frames_dir, 1))
     output = tmp_path / "semantic"
     promotion_error = OSError("atomic promotion failed")
-    original_replace = Path.replace
+    def fail_final_promotion(path: Path, target: Path) -> None:
+        assert Path(target) == output
+        assert path.name.endswith(".staging")
+        raise promotion_error
 
-    def fail_final_promotion(path: Path, target: Path) -> Path:
-        if Path(target) == output and path.name.endswith(".staging"):
-            raise promotion_error
-        return original_replace(path, target)
-
-    monkeypatch.setattr(Path, "replace", fail_final_promotion)
+    monkeypatch.setattr(
+        segmentation_module,
+        "promote_directory",
+        fail_final_promotion,
+        raising=False,
+    )
     with pytest.raises(OSError) as caught:
         run_semantic_evidence(
             frames,
@@ -926,3 +931,493 @@ def test_same_inputs_policy_and_fake_outputs_are_byte_deterministic(
 
     assert second_files == first_files
     assert second.manifest_sha256 == first_manifest_sha256
+
+
+def test_propagation_cannot_mutate_published_direct_evidence(tmp_path: Path) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    frames = (_write_frame(frames_dir, 0), _write_frame(frames_dir, 1))
+
+    class MutatingPropagationSam(FakeSam):
+        def propagate(
+            self,
+            selected_frames: tuple[FrameArtifact, ...],
+            direct_masks: Mapping[str, object],
+            *,
+            clip_frames: int,
+        ) -> Mapping[str, tuple[object, tuple[str, ...]]]:
+            direct = np.asarray(direct_masks["frame-000001"])
+            direct[...] = True
+            return super().propagate(
+                selected_frames,
+                direct_masks,
+                clip_frames=clip_frames,
+            )
+
+    result = run_semantic_evidence(
+        frames,
+        tmp_path / "semantic",
+        policy=SemanticPolicy(0.25, 0.20, 3, 1),
+        detector_factory=FakeDetector,
+        sam_factory=MutatingPropagationSam,
+        initial_batch_size=2,
+        retry_batch_size=1,
+        release_model=lambda model: _release_record(),
+    )
+
+    np.testing.assert_array_equal(
+        _read_mask(result.frames[1].direct_confirmed_path),
+        np.zeros((6, 8), dtype=np.uint8),
+    )
+
+
+def test_propagation_oom_retry_recreates_and_shrinks_exact_clip_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_typed_cuda_oom(monkeypatch)
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    frames = tuple(_write_frame(frames_dir, index) for index in range(8))
+
+    class PropagationOomSam(FakeSam):
+        def propagate(
+            self,
+            selected_frames: tuple[FrameArtifact, ...],
+            direct_masks: Mapping[str, object],
+            *,
+            clip_frames: int,
+        ) -> Mapping[str, tuple[object, tuple[str, ...]]]:
+            self.propagate_calls.append(
+                tuple(frame.frame_id for frame in selected_frames)
+            )
+            raise FakeCudaOOM("propagation clip batch OOM")
+
+    failed = PropagationOomSam()
+    recreated = FakeSam()
+    detector = FakeDetector()
+    sam_models = [failed, recreated]
+    factory_calls: list[object] = []
+    releases: list[object] = []
+
+    def sam_factory() -> FakeSam:
+        model = sam_models[len(factory_calls)]
+        factory_calls.append(model)
+        return model
+
+    result = run_semantic_evidence(
+        frames,
+        tmp_path / "semantic",
+        policy=SemanticPolicy(0.25, 0.20, 2, 1),
+        detector_factory=lambda: detector,
+        sam_factory=sam_factory,
+        initial_batch_size=2,
+        retry_batch_size=1,
+        release_model=lambda model: releases.append(model) or _release_record(),
+    )
+
+    assert factory_calls == [failed, recreated]
+    assert releases == [detector, failed, recreated]
+    assert failed.propagate_calls == [
+        ("frame-000000", "frame-000001", "frame-000002", "frame-000003")
+    ]
+    assert recreated.propagate_calls == [
+        ("frame-000000", "frame-000001"),
+        ("frame-000002", "frame-000003"),
+        ("frame-000004", "frame-000005"),
+        ("frame-000006", "frame-000007"),
+    ]
+    assert [
+        (attempt["size"], attempt["outcome"])
+        for attempt in result.stage_records[1].details["attempts"]  # type: ignore[index, union-attr]
+    ] == [(2, "cuda_oom"), (1, "succeeded")]
+
+
+def test_propagation_support_cannot_cross_exact_clip_boundary(tmp_path: Path) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    frames = tuple(_write_frame(frames_dir, index) for index in range(4))
+
+    class SecondFrameDetector(EmptyDetector):
+        def detect_batch(
+            self,
+            selected_frames: tuple[FrameArtifact, ...],
+            *,
+            prompt: str,
+            box_threshold: float,
+            text_threshold: float,
+        ) -> Mapping[str, tuple[DetectionBox, ...]]:
+            result = dict(
+                super().detect_batch(
+                    selected_frames,
+                    prompt=prompt,
+                    box_threshold=box_threshold,
+                    text_threshold=text_threshold,
+                )
+            )
+            for frame in selected_frames:
+                if frame.frame_id == "frame-000001":
+                    result[frame.frame_id] = (
+                        DetectionBox(
+                            box_id="person-0",
+                            xyxy=(1.0, 1.0, 4.0, 4.0),
+                            score=0.95,
+                            phrase="person",
+                        ),
+                    )
+            return result
+
+    class CrossClipSupportSam(FakeSam):
+        def propagate(
+            self,
+            selected_frames: tuple[FrameArtifact, ...],
+            direct_masks: Mapping[str, object],
+            *,
+            clip_frames: int,
+        ) -> Mapping[str, tuple[object, tuple[str, ...]]]:
+            result = dict(
+                super().propagate(
+                    selected_frames,
+                    direct_masks,
+                    clip_frames=clip_frames,
+                )
+            )
+            if "frame-000002" in result:
+                candidate = np.zeros((self.height, self.width), dtype=np.bool_)
+                candidate[1:3, 2:5] = True
+                result["frame-000002"] = (candidate, ("frame-000001",))
+            return result
+
+    output = tmp_path / "semantic"
+    with pytest.raises(ValueError, match="clip"):
+        run_semantic_evidence(
+            frames,
+            output,
+            policy=SemanticPolicy(0.25, 0.20, 2, 1),
+            detector_factory=SecondFrameDetector,
+            sam_factory=CrossClipSupportSam,
+            initial_batch_size=2,
+            retry_batch_size=1,
+            release_model=lambda model: _release_record(),
+        )
+
+    assert not output.exists()
+
+
+def test_oom_retry_rejects_same_released_adapter_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_fake_typed_cuda_oom(monkeypatch)
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    frames = (_write_frame(frames_dir, 0), _write_frame(frames_dir, 1))
+
+    class OneShotOomDetector(FakeDetector):
+        def detect_batch(
+            self,
+            selected_frames: tuple[FrameArtifact, ...],
+            *,
+            prompt: str,
+            box_threshold: float,
+            text_threshold: float,
+        ) -> Mapping[str, tuple[DetectionBox, ...]]:
+            if not self.calls:
+                self.calls.append(
+                    (
+                        tuple(frame.frame_id for frame in selected_frames),
+                        prompt,
+                        box_threshold,
+                        text_threshold,
+                    )
+                )
+                raise FakeCudaOOM("first detector OOM")
+            return super().detect_batch(
+                selected_frames,
+                prompt=prompt,
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
+            )
+
+    detector = OneShotOomDetector()
+    releases: list[object] = []
+    sam_calls: list[bool] = []
+    output = tmp_path / "semantic"
+
+    with pytest.raises(RuntimeError, match="released adapter"):
+        run_semantic_evidence(
+            frames,
+            output,
+            policy=SemanticPolicy(0.25, 0.20, 3, 1),
+            detector_factory=lambda: detector,
+            sam_factory=lambda: sam_calls.append(True) or FakeSam(),
+            initial_batch_size=2,
+            retry_batch_size=1,
+            release_model=lambda model: releases.append(model) or _release_record(),
+        )
+
+    assert releases == [detector]
+    assert sam_calls == []
+    assert not output.exists()
+
+
+def test_non_oom_error_identity_survives_release_failure(tmp_path: Path) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    frames = (_write_frame(frames_dir, 0), _write_frame(frames_dir, 1))
+    primary = ValueError("detector shape failure")
+    cleanup = RuntimeError("release cleanup failure")
+    detector = FailingDetector(primary)
+    output = tmp_path / "semantic"
+
+    with pytest.raises(ValueError) as caught:
+        run_semantic_evidence(
+            frames,
+            output,
+            policy=SemanticPolicy(0.25, 0.20, 3, 1),
+            detector_factory=lambda: detector,
+            sam_factory=FakeSam,
+            initial_batch_size=2,
+            retry_batch_size=1,
+            release_model=lambda model: (_ for _ in ()).throw(cleanup),
+        )
+
+    assert caught.value is primary
+    assert getattr(primary, "model_release_error") is cleanup
+    assert not output.exists()
+
+
+def test_stage_record_details_are_recursively_immutable(tmp_path: Path) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    frames = (_write_frame(frames_dir, 0), _write_frame(frames_dir, 1))
+    result = run_semantic_evidence(
+        frames,
+        tmp_path / "semantic",
+        policy=SemanticPolicy(0.25, 0.20, 3, 1),
+        detector_factory=FakeDetector,
+        sam_factory=FakeSam,
+        initial_batch_size=2,
+        retry_batch_size=1,
+        release_model=lambda model: _release_record(),
+    )
+    details = result.stage_records[0].details
+
+    with pytest.raises(TypeError):
+        details["model"]["repo_id"] = "mutated"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        details["attempts"][0]["outcome"] = "failed"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("mode", "message"),
+    (("same-size", "digest changed"), ("different-size", "size changed")),
+)
+def test_source_hash_and_size_are_rechecked_after_model_callbacks(
+    tmp_path: Path,
+    mode: str,
+    message: str,
+) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    frames = (_write_frame(frames_dir, 0), _write_frame(frames_dir, 1))
+
+    class SourceMutatingDetector(FakeDetector):
+        def detect_batch(
+            self,
+            selected_frames: tuple[FrameArtifact, ...],
+            *,
+            prompt: str,
+            box_threshold: float,
+            text_threshold: float,
+        ) -> Mapping[str, tuple[DetectionBox, ...]]:
+            result = super().detect_batch(
+                selected_frames,
+                prompt=prompt,
+                box_threshold=box_threshold,
+                text_threshold=text_threshold,
+            )
+            path = selected_frames[0].path
+            original = path.read_bytes()
+            if mode == "same-size":
+                path.write_bytes(original[:-1] + bytes((original[-1] ^ 1,)))
+            else:
+                path.write_bytes(original + b"x")
+            return result
+
+    releases: list[object] = []
+    output = tmp_path / "semantic"
+    with pytest.raises(ValueError, match=message):
+        run_semantic_evidence(
+            frames,
+            output,
+            policy=SemanticPolicy(0.25, 0.20, 3, 1),
+            detector_factory=SourceMutatingDetector,
+            sam_factory=FakeSam,
+            initial_batch_size=2,
+            retry_batch_size=1,
+            release_model=lambda model: releases.append(model) or _release_record(),
+        )
+
+    assert len(releases) == 2
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "image_name",
+    (
+        "./frame.png",
+        "nested//frame.png",
+        "nested/./frame.png",
+        "folder/",
+        "C:/frame.png",
+        "NUL.png",
+    ),
+)
+def test_noncanonical_or_nonportable_raw_image_names_fail_before_callbacks(
+    tmp_path: Path,
+    image_name: str,
+) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    frame = replace(_write_frame(frames_dir, 0), image_name=image_name)
+    calls: list[str] = []
+
+    with pytest.raises(ValueError, match="image_name"):
+        run_semantic_evidence(
+            (frame,),
+            tmp_path / "semantic",
+            policy=SemanticPolicy(0.25, 0.20, 3, 1),
+            detector_factory=lambda: calls.append("detector") or FakeDetector(),
+            sam_factory=lambda: calls.append("sam") or FakeSam(),
+            initial_batch_size=2,
+            retry_batch_size=1,
+            release_model=lambda model: _release_record(),
+        )
+
+    assert calls == []
+
+
+def test_symlinked_parent_and_duplicate_resolved_frame_paths_are_rejected(
+    tmp_path: Path,
+) -> None:
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    first = _write_frame(real_dir, 0)
+    second = _write_frame(real_dir, 1)
+    linked_dir = tmp_path / "linked"
+    try:
+        linked_dir.symlink_to(real_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlink unavailable: {exc}")
+
+    linked = replace(first, path=linked_dir / first.path.name)
+    duplicate = replace(second, path=first.path, sha256=first.sha256)
+    calls: list[str] = []
+    for index, selected in enumerate(((linked,), (first, duplicate))):
+        with pytest.raises(ValueError, match="frame path"):
+            run_semantic_evidence(
+                selected,
+                tmp_path / f"semantic-{index}",
+                policy=SemanticPolicy(0.25, 0.20, 3, 1),
+                detector_factory=lambda: calls.append("detector") or FakeDetector(),
+                sam_factory=lambda: calls.append("sam") or FakeSam(),
+                initial_batch_size=2,
+                retry_batch_size=1,
+                release_model=lambda model: _release_record(),
+            )
+
+    assert calls == []
+
+
+def test_case_insensitive_image_name_collisions_are_rejected(tmp_path: Path) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    first = replace(_write_frame(frames_dir, 0), image_name="nested/frame.png")
+    second = replace(_write_frame(frames_dir, 1), image_name="NESTED/FRAME.PNG")
+    calls: list[str] = []
+
+    with pytest.raises(ValueError, match="image names must be unique"):
+        run_semantic_evidence(
+            (first, second),
+            tmp_path / "semantic",
+            policy=SemanticPolicy(0.25, 0.20, 3, 1),
+            detector_factory=lambda: calls.append("detector") or FakeDetector(),
+            sam_factory=lambda: calls.append("sam") or FakeSam(),
+            initial_batch_size=2,
+            retry_batch_size=1,
+            release_model=lambda model: _release_record(),
+        )
+
+    assert calls == []
+
+
+def test_atomic_promotion_never_replaces_a_race_created_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    frames = (_write_frame(frames_dir, 0), _write_frame(frames_dir, 1))
+    output = tmp_path / "semantic"
+
+    def lose_race(staging: Path, target: Path) -> None:
+        target.mkdir()
+        (target / "owner.txt").write_text("other writer", encoding="utf-8")
+        real_promote_directory(staging, target)
+
+    monkeypatch.setattr(
+        segmentation_module,
+        "promote_directory",
+        lose_race,
+        raising=False,
+    )
+    with pytest.raises(FileExistsError):
+        run_semantic_evidence(
+            frames,
+            output,
+            policy=SemanticPolicy(0.25, 0.20, 3, 1),
+            detector_factory=FakeDetector,
+            sam_factory=FakeSam,
+            initial_batch_size=2,
+            retry_batch_size=1,
+            release_model=lambda model: _release_record(),
+        )
+
+    assert (output / "owner.txt").read_text(encoding="utf-8") == "other writer"
+    assert not (output / "semantic_manifest.json").exists()
+    assert tuple(tmp_path.glob(".semantic.*.staging")) == ()
+
+
+def test_publication_fsyncs_staging_directories_and_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fsync_directory = getattr(segmentation_module, "_fsync_directory", None)
+    assert callable(fsync_directory), "directory fsync helper is required"
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        segmentation_module,
+        "_fsync_directory",
+        lambda path: calls.append(Path(path)),
+    )
+    frames_dir = tmp_path / "frames"
+    frames_dir.mkdir()
+    frames = (_write_frame(frames_dir, 0), _write_frame(frames_dir, 1))
+
+    run_semantic_evidence(
+        frames,
+        tmp_path / "semantic",
+        policy=SemanticPolicy(0.25, 0.20, 3, 1),
+        detector_factory=FakeDetector,
+        sam_factory=FakeSam,
+        initial_batch_size=2,
+        retry_batch_size=1,
+        release_model=lambda model: _release_record(),
+    )
+
+    assert calls[-1] == tmp_path
+    staging_calls = [path for path in calls[:-1] if path.name.endswith(".staging")]
+    assert len(staging_calls) == 1
+    assert sum(path.name == "maps" for path in calls) == 1
+    assert sum(path.name.startswith("00000") for path in calls) == len(frames)
