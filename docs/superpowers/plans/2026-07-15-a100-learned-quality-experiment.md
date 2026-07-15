@@ -330,10 +330,12 @@ prediction = model.inference(
 
 Normalize to finite 4x4 OpenCV/COLMAP W2C, use a robust shared `PINHOLE` K,
 save depth/confidence plus JSON atomically, use DA3Metric only for sky/metric
-diagnostics, and run final-pose depth in 48-frame chunks with 24-frame stride
-and `align_to_input_ext_scale=True`. DA3Metric per-frame work and final-pose
-depth chunks use the one-time smaller-batch/chunk helper; DA3 anchor inference
-explicitly does not and aborts on OOM at the locked 96/120 anchors and 504 px.
+diagnostics, and run final-pose depth in fixed 48-frame windows with 24-frame
+stride and `align_to_input_ext_scale=True`. DA3Metric per-frame work uses the
+one-time smaller-batch helper. DA3-Base cross-view windows are not
+chunk-independent, so both anchor inference and final-pose inference abort on
+OOM rather than reducing the locked 96/120 anchors, 504 px process resolution,
+or 48-frame cross-view context.
 
 - [ ] **Step 4: Add marked GPU shape tests**
 

@@ -343,11 +343,15 @@ gate fails; the geometry branch name does not accept or reject it implicitly.
 
 ### 6.7 Final-pose depth and dense initialization
 
-After a winner exists, DA3-Base reruns pose-conditioned depth in overlapping
-24-48-frame chunks using the final COLMAP W2C poses and intrinsics with
-`align_to_input_ext_scale=True`. This ties every chunk to one COLMAP coordinate
-system. DA3Metric depth is a diagnostic/cross-check, not an independently mixed
-scale.
+After a winner exists, DA3-Base reruns pose-conditioned depth in fixed
+48-frame windows with a 24-frame stride (shorter only when the sequence or a
+terminal boundary contains fewer than 48 frames), using the final COLMAP W2C
+poses and intrinsics with `align_to_input_ext_scale=True`. This ties every
+window to one COLMAP coordinate system. DA3-Base uses cross-view attention, so
+reducing a 48-frame window to 24 after OOM would change its context and output;
+the final-pose stage aborts with diagnostics instead of making that hidden
+quality reduction. DA3Metric depth is a diagnostic/cross-check, not an
+independently mixed scale.
 
 Depth values are zeroed on excluded/uncertain boundaries, rejected on low DA3
 confidence, and required to agree after reprojection in at least two neighboring
@@ -449,11 +453,13 @@ density event.
 - A failed photometric validation uses original RGB frames.
 - Adaptive density stops growth before the VRAM reserve; it does not lower image
   resolution silently.
-- CUDA OOM during a batch/chunk-independent learned stage releases that model
-  and retries once with a smaller batch/chunk recorded in the report. The DA3
-  anchor-camera stage does not reduce its locked anchors or resolution. Training
-  OOM stops and publishes diagnostics rather than changing the approved quality
-  policy invisibly.
+- CUDA OOM during a genuinely batch/chunk-independent learned stage releases
+  that model and retries once with a smaller batch/chunk recorded in the
+  report. DA3Metric per-frame inference is eligible. The DA3 anchor-camera
+  stage does not reduce its locked anchors or resolution, and pose-conditioned
+  DA3-Base does not shrink its cross-view window. Training OOM stops and
+  publishes diagnostics rather than changing the approved quality policy
+  invisibly.
 - Local stages publish atomically inside the workspace and include content
   digests.
 - Failure may publish only to
