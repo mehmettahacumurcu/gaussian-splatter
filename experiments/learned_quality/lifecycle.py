@@ -131,8 +131,11 @@ def _validate_retry_request(
         raise ValueError("retry_size must be a positive plain integer")
     if retry_size >= initial_size:
         raise ValueError("retry_size must be smaller than initial_size")
-    if stage.strip() == "da3_anchor":
-        raise ValueError("da3_anchor cannot use a quality-reducing retry")
+    locked_da3_stage = stage.strip()
+    if locked_da3_stage in {"da3_anchor", "da3_final_pose"}:
+        raise ValueError(
+            f"{locked_da3_stage} cannot use a quality-reducing retry"
+        )
     if chunk_independent is not True:
         raise ValueError("stage must explicitly declare chunk-independent output")
 

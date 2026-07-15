@@ -142,16 +142,24 @@ def test_retry_validation_rejects_before_callbacks(
     assert calls == []
 
 
-def test_da3_anchor_retry_is_forbidden_without_mutating_quality_locks() -> None:
-    anchor_count = 120
+@pytest.mark.parametrize(
+    ("stage", "initial_size", "retry_size"),
+    (("da3_anchor", 120, 96), ("da3_final_pose", 48, 24)),
+)
+def test_da3_context_retry_is_forbidden_without_mutating_quality_locks(
+    stage: str,
+    initial_size: int,
+    retry_size: int,
+) -> None:
+    locked_size = initial_size
     process_resolution = 504
     calls: list[str] = []
 
-    with pytest.raises(ValueError, match="da3_anchor"):
+    with pytest.raises(ValueError, match=stage):
         run_with_smaller_batch_retry(
-            "da3_anchor",
-            anchor_count,
-            96,
+            stage,
+            initial_size,
+            retry_size,
             lambda _size: calls.append("operation"),
             chunk_independent=True,
             release=lambda: calls.append("release"),  # type: ignore[arg-type]
@@ -159,7 +167,7 @@ def test_da3_anchor_retry_is_forbidden_without_mutating_quality_locks() -> None:
         )
 
     assert calls == []
-    assert anchor_count == 120
+    assert initial_size == locked_size
     assert process_resolution == 504
 
 
