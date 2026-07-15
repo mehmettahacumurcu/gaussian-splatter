@@ -170,11 +170,15 @@ def _failed_attempt(
     outcome: AttemptOutcome,
     error: BaseException,
 ) -> BatchAttemptRecord:
+    try:
+        error_message = str(error)
+    except BaseException:
+        error_message = None
     return BatchAttemptRecord(
         size=size,
         outcome=outcome,
         error_type=type(error).__name__,
-        error_message=str(error),
+        error_message=error_message,
     )
 
 

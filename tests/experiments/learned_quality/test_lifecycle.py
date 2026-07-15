@@ -74,6 +74,16 @@ class DiagnosticAttachmentError(RuntimeError):
         super().__setattr__(name, value)
 
 
+class HostileStringCudaOutOfMemoryError(FakeCudaOutOfMemoryError):
+    def __str__(self) -> str:
+        raise LookupError("error stringification blocked")
+
+
+class HostileStringRetryError(ValueError):
+    def __str__(self) -> str:
+        raise LookupError("error stringification blocked")
+
+
 def _fake_torch(cuda: FakeCuda) -> object:
     return SimpleNamespace(
         cuda=cuda,
@@ -333,6 +343,38 @@ def test_cuda_oom_releases_once_before_one_smaller_retry() -> None:
     )
 
 
+def test_typed_initial_cuda_oom_with_hostile_str_still_retries_once() -> None:
+    initial_error = HostileStringCudaOutOfMemoryError()
+    release_record = _release_record()
+    events: list[str] = []
+
+    def operation(size: int) -> str:
+        events.append(f"operation:{size}")
+        if size == 8:
+            raise initial_error
+        return "artifact"
+
+    result = run_with_smaller_batch_retry(
+        "semantic",
+        8,
+        4,
+        operation,
+        chunk_independent=True,
+        release=lambda: events.append("release") or release_record,
+        torch_module=_fake_torch(FakeCuda([], available=True)),
+    )
+
+    assert events == ["operation:8", "release", "operation:4"]
+    assert result.value == "artifact"
+    assert result.attempts[0] == BatchAttemptRecord(
+        size=8,
+        outcome="cuda_oom",
+        error_type="HostileStringCudaOutOfMemoryError",
+        error_message=None,
+    )
+    assert result.attempts[1] == BatchAttemptRecord(size=4, outcome="succeeded")
+
+
 @pytest.mark.parametrize(
     "error",
     [
@@ -574,3 +616,43 @@ def test_diagnostic_attachment_failure_never_masks_second_operation_error() -> N
     assert caught.value is retry_error
     assert operation_sizes == [8, 4]
     assert release_calls == ["release"]
+
+
+def test_hostile_retry_error_str_never_masks_exact_second_failure() -> None:
+    initial_error = FakeCudaOutOfMemoryError("initial oom")
+    retry_error = HostileStringRetryError()
+    operation_sizes: list[int] = []
+    release_record = _release_record()
+    release_calls: list[str] = []
+
+    def operation(size: int) -> None:
+        operation_sizes.append(size)
+        if size == 8:
+            raise initial_error
+        raise retry_error
+
+    def release() -> VramReleaseRecord:
+        release_calls.append("release")
+        return release_record
+
+    with pytest.raises(HostileStringRetryError) as caught:
+        run_with_smaller_batch_retry(
+            "semantic",
+            8,
+            4,
+            operation,
+            chunk_independent=True,
+            release=release,
+            torch_module=_fake_torch(FakeCuda([], available=True)),
+        )
+
+    assert caught.value is retry_error
+    assert operation_sizes == [8, 4]
+    assert release_calls == ["release"]
+    attempts = caught.value.batch_retry_attempts  # type: ignore[attr-defined]
+    assert attempts[1] == BatchAttemptRecord(
+        size=4,
+        outcome="failed",
+        error_type="HostileStringRetryError",
+        error_message=None,
+    )
