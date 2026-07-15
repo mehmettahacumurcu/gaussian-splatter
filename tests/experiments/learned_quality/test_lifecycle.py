@@ -67,6 +67,13 @@ class FailingModel(FakeModel):
         raise self.error
 
 
+class DiagnosticAttachmentError(RuntimeError):
+    def __setattr__(self, name: str, value: object) -> None:
+        if name.startswith("batch_retry_"):
+            raise RuntimeError("diagnostic attachment blocked")
+        super().__setattr__(name, value)
+
+
 def _fake_torch(cuda: FakeCuda) -> object:
     return SimpleNamespace(
         cuda=cuda,
@@ -366,6 +373,47 @@ def test_non_cuda_oom_failure_escapes_without_release_or_retry(
     assert release_calls == []
 
 
+@pytest.mark.parametrize(
+    "operation_error",
+    [
+        pytest.param(ValueError("non-finite output"), id="value-error"),
+        pytest.param(RuntimeError("shape mismatch"), id="ordinary-runtime"),
+    ],
+)
+def test_non_oom_identity_survives_default_torch_resolution_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    operation_error: Exception,
+) -> None:
+    resolution_error = ImportError("torch unavailable")
+    operation_sizes: list[int] = []
+    release_calls: list[str] = []
+
+    def fail_torch_import(_name: str) -> object:
+        raise resolution_error
+
+    def operation(size: int) -> None:
+        operation_sizes.append(size)
+        raise operation_error
+
+    monkeypatch.setattr(
+        "experiments.learned_quality.lifecycle.importlib.import_module",
+        fail_torch_import,
+    )
+    with pytest.raises(type(operation_error)) as caught:
+        run_with_smaller_batch_retry(
+            "semantic",
+            8,
+            4,
+            operation,
+            chunk_independent=True,
+            release=lambda: release_calls.append("release"),  # type: ignore[arg-type]
+        )
+
+    assert caught.value is operation_error
+    assert operation_sizes == [8]
+    assert release_calls == []
+
+
 def test_legacy_cuda_message_fallback_is_narrow_and_retries_once() -> None:
     events: list[str] = []
     torch_without_oom_type = SimpleNamespace(
@@ -493,3 +541,36 @@ def test_second_failure_is_reraised_with_two_attempts_and_no_third_call(
         retry_outcome,
     )
     assert caught.value.batch_retry_release_record is release_record  # type: ignore[attr-defined]
+
+
+def test_diagnostic_attachment_failure_never_masks_second_operation_error() -> None:
+    initial_error = FakeCudaOutOfMemoryError("initial oom")
+    retry_error = DiagnosticAttachmentError("retry failed")
+    operation_sizes: list[int] = []
+    release_record = _release_record()
+    release_calls: list[str] = []
+
+    def operation(size: int) -> None:
+        operation_sizes.append(size)
+        if size == 8:
+            raise initial_error
+        raise retry_error
+
+    def release() -> VramReleaseRecord:
+        release_calls.append("release")
+        return release_record
+
+    with pytest.raises(DiagnosticAttachmentError, match="retry failed") as caught:
+        run_with_smaller_batch_retry(
+            "semantic",
+            8,
+            4,
+            operation,
+            chunk_independent=True,
+            release=release,
+            torch_module=_fake_torch(FakeCuda([], available=True)),
+        )
+
+    assert caught.value is retry_error
+    assert operation_sizes == [8, 4]
+    assert release_calls == ["release"]

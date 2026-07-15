@@ -186,14 +186,18 @@ def _attach_retry_failure(
     try:
         setattr(error, "batch_retry_attempts", attempts)
         setattr(error, "batch_retry_release_record", release_record)
-    except (AttributeError, TypeError):
-        if hasattr(error, "add_note"):
-            error.add_note(
-                "batch retry attempts: "
-                + ", ".join(
-                    f"{attempt.size}:{attempt.outcome}" for attempt in attempts
+    except BaseException:
+        try:
+            add_note = getattr(error, "add_note", None)
+            if callable(add_note):
+                add_note(
+                    "batch retry attempts: "
+                    + ", ".join(
+                        f"{attempt.size}:{attempt.outcome}" for attempt in attempts
+                    )
                 )
-            )
+        except BaseException:
+            pass
 
 
 def run_with_smaller_batch_retry(
@@ -210,7 +214,12 @@ def run_with_smaller_batch_retry(
     try:
         value = operation(initial_size)
     except Exception as initial_error:
-        torch_api = _resolve_torch(torch_module)
+        if not isinstance(initial_error, RuntimeError):
+            raise
+        try:
+            torch_api = _resolve_torch(torch_module)
+        except Exception as resolution_error:
+            raise initial_error from resolution_error
         if not _is_cuda_oom(initial_error, torch_api):
             raise
         initial_attempt = _failed_attempt(
