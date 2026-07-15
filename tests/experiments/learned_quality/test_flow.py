@@ -13,6 +13,7 @@ import pytest
 from PIL import Image
 
 from experiments.learned_quality.contracts import FrameArtifact
+from experiments.learned_quality.dependencies import CHECKPOINT_MODEL_REFS
 from experiments.learned_quality.flow import (
     FlowPairRequest,
     FlowGatePolicy,
@@ -31,6 +32,13 @@ from experiments.learned_quality.flow import (
     run_motion_evidence,
 )
 from experiments.learned_quality.lifecycle import VramReleaseRecord
+
+
+_SEA_RAFT_REF = next(
+    model
+    for model in CHECKPOINT_MODEL_REFS
+    if model.repo_id == "MemorySlices/Tartan-C-T-TSKH-spring540x960-M"
+)
 
 
 def _policy(**overrides: object) -> FlowGatePolicy:
@@ -187,7 +195,7 @@ def test_static_track_calibration_is_robust_and_reports_insufficiency(
     observations = tuple(
         TrackObservation(
             frame_id=rigid.frame.frame_id,
-            x=1.1 if index < 3 else 11.0,
+            x=1.1,
             y=1.0,
         )
         for index, rigid in enumerate(rigid_frames)
@@ -204,13 +212,42 @@ def test_static_track_calibration_is_robust_and_reports_insufficiency(
         geometry_digest="c" * 64,
         depth_digest="d" * 64,
     )
+    directional_residuals = {
+        (rigid_frames[0].frame.frame_id, rigid_frames[1].frame.frame_id): np.full(
+            (3, 3), 0.2, dtype=np.float64
+        ),
+        (rigid_frames[1].frame.frame_id, rigid_frames[0].frame.frame_id): np.full(
+            (3, 3), 0.4, dtype=np.float64
+        ),
+        (rigid_frames[1].frame.frame_id, rigid_frames[2].frame.frame_id): np.full(
+            (3, 3), 0.6, dtype=np.float64
+        ),
+        (rigid_frames[2].frame.frame_id, rigid_frames[1].frame.frame_id): np.full(
+            (3, 3), 0.8, dtype=np.float64
+        ),
+        (rigid_frames[2].frame.frame_id, rigid_frames[3].frame.frame_id): np.full(
+            (3, 3), 1.0, dtype=np.float64
+        ),
+        (rigid_frames[3].frame.frame_id, rigid_frames[2].frame.frame_id): np.full(
+            (3, 3), 1.2, dtype=np.float64
+        ),
+    }
 
-    assert calibrate_residual_threshold(scene, _policy()) == pytest.approx(0.1)
+    assert calibrate_residual_threshold(
+        scene,
+        _policy(residual_mad_multiplier=1.0),
+        directional_residuals,
+    ) == pytest.approx(0.7 + 1.4826 * 0.3)
+    assert calibrate_residual_threshold(scene, _policy()) is None
     insufficient = replace(
         scene,
         static_tracks=(replace(long_track, observations=observations[:2]),),
     )
-    assert calibrate_residual_threshold(insufficient, _policy()) is None
+    assert calibrate_residual_threshold(
+        insufficient,
+        _policy(),
+        directional_residuals,
+    ) is None
 
 
 def _gate_inputs(tmp_path: Path) -> tuple[
@@ -435,9 +472,9 @@ class FakeCudaOutOfMemoryError(RuntimeError):
 
 
 class FakeSeaRaft:
-    model_id = "facebook/sea-raft"
-    revision = "1" * 40
-    code_commit = "2" * 40
+    model_id = _SEA_RAFT_REF.repo_id
+    revision = _SEA_RAFT_REF.revision
+    code_commit = _SEA_RAFT_REF.code_commit
 
     def __init__(
         self,
@@ -446,11 +483,22 @@ class FakeSeaRaft:
         *,
         error: Exception | None = None,
         reverse_predictions: bool = False,
+        flow_x: float = 0.5,
+        flow_dtype: object = np.float32,
+        static_sample_x: float | None = 0.2,
+        after_infer: Callable[[], None] | None = None,
+        provenance_overrides: dict[str, object] | None = None,
     ) -> None:
         self.name = name
         self.events = events
         self.error = error
         self.reverse_predictions = reverse_predictions
+        self.flow_x = flow_x
+        self.flow_dtype = flow_dtype
+        self.static_sample_x = static_sample_x
+        self.after_infer = after_infer
+        for field_name, value in (provenance_overrides or {}).items():
+            setattr(self, field_name, value)
 
     def infer_bidirectional(
         self,
@@ -461,20 +509,25 @@ class FakeSeaRaft:
         self.events.append(f"infer:{self.name}:{batch_size}")
         if self.error is not None:
             raise self.error
+        forward_x = np.full((3, 3), self.flow_x, dtype=self.flow_dtype)
+        backward_x = np.full((3, 3), -self.flow_x, dtype=self.flow_dtype)
+        if self.static_sample_x is not None:
+            forward_x[1, :] = self.static_sample_x
+            backward_x[1, :] = -self.static_sample_x
         predictions = tuple(
             SeaRaftPairPrediction(
                 source_frame_id=pair.source_frame_id,
                 target_frame_id=pair.target_frame_id,
                 forward_flow=np.dstack(
                     (
-                        np.full((3, 3), 0.5, dtype=np.float32),
-                        np.zeros((3, 3), dtype=np.float32),
+                        forward_x.copy(),
+                        np.zeros((3, 3), dtype=self.flow_dtype),
                     )
                 ),
                 backward_flow=np.dstack(
                     (
-                        np.full((3, 3), -0.5, dtype=np.float32),
-                        np.zeros((3, 3), dtype=np.float32),
+                        backward_x.copy(),
+                        np.zeros((3, 3), dtype=self.flow_dtype),
                     )
                 ),
                 forward_uncertainty=np.zeros((3, 3), dtype=np.float32),
@@ -482,6 +535,8 @@ class FakeSeaRaft:
             )
             for pair in pairs
         )
+        if self.after_infer is not None:
+            self.after_infer()
         return tuple(reversed(predictions)) if self.reverse_predictions else predictions
 
 
@@ -520,6 +575,26 @@ def _release(events: list[str]) -> Callable[[object], VramReleaseRecord]:
     return release
 
 
+def _run_motion_case(
+    frames: tuple[FrameArtifact, ...],
+    scene: RigidSceneEvidence,
+    output_dir: Path,
+    events: list[str],
+    *,
+    factory: FakeFactory | None = None,
+) -> MotionEvidence:
+    return run_motion_evidence(
+        frames,
+        scene,
+        output_dir,
+        policy=_policy(),
+        model_factory=FakeFactory(events) if factory is None else factory,
+        initial_pair_batch_size=4,
+        retry_pair_batch_size=2,
+        release_model=_release(events),
+    )
+
+
 def test_motion_producer_publishes_exact_pairs_maps_and_deterministic_manifests(
     tmp_path: Path,
 ) -> None:
@@ -544,15 +619,33 @@ def test_motion_producer_publishes_exact_pairs_maps_and_deterministic_manifests(
         frame.uncertain_path,
         frame.strength_path,
     ))
-    for frame in first.frames:
-        confirmed = np.load(frame.confirmed_without_semantic_path, allow_pickle=False)
-        required = np.load(frame.requires_semantic_path, allow_pickle=False)
-        uncertain = np.load(frame.uncertain_path, allow_pickle=False)
+    for index, frame in enumerate(first.frames):
+        binary_paths = (
+            frame.confirmed_without_semantic_path,
+            frame.requires_semantic_path,
+            frame.uncertain_path,
+        )
+        assert all(path.suffix == ".png" for path in binary_paths)
+        binary_maps: list[np.ndarray] = []
+        for path in binary_paths:
+            with Image.open(path) as image:
+                assert image.format == "PNG"
+                assert image.mode == "L"
+                assert image.info == {}
+                binary_maps.append(np.asarray(image).copy())
+        confirmed, required, uncertain = binary_maps
         strength = np.load(frame.strength_path, allow_pickle=False)
         assert confirmed.dtype == np.uint8
-        assert confirmed[1, 1] == 255
+        assert set(np.unique(confirmed)).issubset({0, 255})
+        assert set(np.unique(required)).issubset({0, 255})
+        assert set(np.unique(uncertain)).issubset({0, 255})
+        if index == 0:
+            assert confirmed[0, 0] == 255
+        assert confirmed[1, 1] == 0
         assert required[1, 1] == 0
         assert uncertain[1, 1] == 0
+        assert frame.strength_path.suffix == ".npy"
+        assert strength.dtype == np.float32
         assert np.isfinite(strength).all()
     pair_payload = json.loads(first.pair_manifest_path.read_text(encoding="utf-8"))
     assert [(pair["source_frame_id"], pair["target_frame_id"]) for pair in pair_payload["pairs"]] == [
@@ -567,6 +660,7 @@ def test_motion_producer_publishes_exact_pairs_maps_and_deterministic_manifests(
     assert pair_payload["geometry_digest"] == scene.geometry_digest
     assert pair_payload["depth_digest"] == scene.depth_digest
     assert pair_payload["scene_digest"] == first.scene_digest
+    assert pair_payload["residual_threshold_pixels"] == pytest.approx(0.2)
     manifest_payload = json.loads(first.manifest_path.read_text(encoding="utf-8"))
     assert manifest_payload["geometry_digest"] == scene.geometry_digest
     assert manifest_payload["depth_digest"] == scene.depth_digest
@@ -587,6 +681,390 @@ def test_motion_producer_publishes_exact_pairs_maps_and_deterministic_manifests(
     assert first.manifest_sha256 == second.manifest_sha256
     assert first.pair_manifest_path.read_bytes() == second.pair_manifest_path.read_bytes()
     assert first.manifest_path.read_bytes() == second.manifest_path.read_bytes()
+    for first_frame, second_frame in zip(first.frames, second.frames):
+        assert first_frame.confirmed_without_semantic_path.read_bytes() == (
+            second_frame.confirmed_without_semantic_path.read_bytes()
+        )
+        assert first_frame.requires_semantic_path.read_bytes() == (
+            second_frame.requires_semantic_path.read_bytes()
+        )
+        assert first_frame.uncertain_path.read_bytes() == (
+            second_frame.uncertain_path.read_bytes()
+        )
+
+
+def test_motion_manifest_serializes_unavailable_uncertainty_threshold_as_null(
+    tmp_path: Path,
+) -> None:
+    frames, scene = _motion_fixture(tmp_path)
+    events: list[str] = []
+    factory = FakeFactory(
+        events,
+        adapters=(
+            lambda name, log: FakeSeaRaft(
+                name,
+                log,
+                flow_x=10.0,
+                static_sample_x=None,
+            ),
+        ),
+    )
+
+    result = _run_motion_case(
+        frames,
+        scene,
+        (tmp_path / "motion").resolve(),
+        events,
+        factory=factory,
+    )
+
+    payload = json.loads(result.pair_manifest_path.read_text(encoding="utf-8"))
+    assert payload["residual_threshold_pixels"] == pytest.approx(10.0)
+    assert all(
+        pair[direction] is None
+        for pair in payload["pairs"]
+        for direction in (
+            "forward_uncertainty_threshold",
+            "backward_uncertainty_threshold",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "wrong_value"),
+    (
+        ("model_id", "unapproved/sea-raft"),
+        ("revision", "0" * 40),
+        ("code_commit", None),
+    ),
+)
+def test_motion_producer_rejects_unpinned_initial_model_before_inference(
+    tmp_path: Path,
+    field_name: str,
+    wrong_value: object,
+) -> None:
+    frames, scene = _motion_fixture(tmp_path)
+    events: list[str] = []
+    factory = FakeFactory(
+        events,
+        adapters=(
+            lambda name, log: FakeSeaRaft(
+                name,
+                log,
+                provenance_overrides={field_name: wrong_value},
+            ),
+        ),
+    )
+    output_dir = (tmp_path / "motion").resolve()
+
+    with pytest.raises(ValueError, match="pinned"):
+        _run_motion_case(frames, scene, output_dir, events, factory=factory)
+
+    assert events == ["factory:model-1", "release:model-1"]
+    assert not os.path.lexists(output_dir)
+
+
+def test_motion_producer_rejects_unpinned_retry_model_before_inference(
+    tmp_path: Path,
+) -> None:
+    frames, scene = _motion_fixture(tmp_path)
+    events: list[str] = []
+    oom = FakeCudaOutOfMemoryError("typed oom")
+    factory = FakeFactory(
+        events,
+        adapters=(
+            lambda name, log: FakeSeaRaft(name, log, error=oom),
+            lambda name, log: FakeSeaRaft(
+                name,
+                log,
+                provenance_overrides={"revision": "0" * 40},
+            ),
+        ),
+    )
+    output_dir = (tmp_path / "motion").resolve()
+
+    with pytest.raises(ValueError, match="pinned"):
+        _run_motion_case(frames, scene, output_dir, events, factory=factory)
+
+    assert events == [
+        "factory:model-1",
+        "infer:model-1:4",
+        "release:model-1",
+        "factory:model-2",
+        "release:model-2",
+    ]
+    assert not os.path.lexists(output_dir)
+
+
+@pytest.mark.parametrize(
+    "component",
+    (
+        "w2c",
+        "intrinsics",
+        "registered",
+        "depth_hash",
+        "static_tracks",
+        "geometry_digest",
+        "depth_digest",
+    ),
+)
+def test_scene_digest_binds_actual_ordered_scene_evidence(
+    tmp_path: Path,
+    component: str,
+) -> None:
+    frames, scene = _motion_fixture(tmp_path)
+    baseline_events: list[str] = []
+    baseline = _run_motion_case(
+        frames,
+        scene,
+        (tmp_path / "baseline").resolve(),
+        baseline_events,
+    )
+    first = scene.frames[0]
+    if component == "w2c":
+        w2c = list(first.w2c_4x4 or ())
+        w2c[3] = 0.25
+        changed = replace(
+            scene,
+            frames=(replace(first, w2c_4x4=tuple(w2c)), *scene.frames[1:]),
+        )
+    elif component == "intrinsics":
+        changed = replace(
+            scene,
+            frames=(
+                replace(first, pinhole_fx_fy_cx_cy=(2.5, 2.0, 1.0, 1.0)),
+                *scene.frames[1:],
+            ),
+        )
+    elif component == "registered":
+        changed = replace(
+            scene,
+            frames=(
+                replace(
+                    first,
+                    registered=False,
+                    w2c_4x4=None,
+                    pinhole_fx_fy_cx_cy=None,
+                    depth_path=None,
+                    depth_sha256=None,
+                ),
+                *scene.frames[1:],
+            ),
+        )
+    elif component == "depth_hash":
+        assert first.depth_path is not None
+        with first.depth_path.open("wb") as handle:
+            np.save(handle, np.full((3, 3), 2.5, dtype=np.float32), allow_pickle=False)
+        changed = replace(
+            scene,
+            frames=(
+                replace(first, depth_sha256=_sha256(first.depth_path)),
+                *scene.frames[1:],
+            ),
+        )
+    elif component == "static_tracks":
+        track = scene.static_tracks[0]
+        changed_observations = (
+            replace(track.observations[0], x=0.9),
+            *track.observations[1:],
+        )
+        changed = replace(
+            scene,
+            static_tracks=(replace(track, observations=changed_observations),),
+        )
+    elif component == "geometry_digest":
+        changed = replace(scene, geometry_digest="e" * 64)
+    else:
+        changed = replace(scene, depth_digest="f" * 64)
+
+    changed_events: list[str] = []
+    result = _run_motion_case(
+        frames,
+        changed,
+        (tmp_path / "changed").resolve(),
+        changed_events,
+    )
+
+    assert result.scene_digest != baseline.scene_digest
+
+
+def test_scene_digest_is_portable_across_identical_depth_artifact_locations(
+    tmp_path: Path,
+) -> None:
+    frames, scene = _motion_fixture(tmp_path)
+    baseline_events: list[str] = []
+    baseline = _run_motion_case(
+        frames,
+        scene,
+        (tmp_path / "baseline").resolve(),
+        baseline_events,
+    )
+    relocated_depth_dir = (tmp_path / "relocated-depths").resolve()
+    relocated_depth_dir.mkdir()
+    relocated_rigid_frames: list[RigidFrameEvidence] = []
+    for index, rigid in enumerate(scene.frames):
+        assert rigid.depth_path is not None
+        relocated_path = relocated_depth_dir / f"depth-{index}.npy"
+        relocated_path.write_bytes(rigid.depth_path.read_bytes())
+        relocated_rigid_frames.append(replace(rigid, depth_path=relocated_path))
+    relocated_scene = replace(scene, frames=tuple(relocated_rigid_frames))
+    relocated_events: list[str] = []
+
+    relocated = _run_motion_case(
+        frames,
+        relocated_scene,
+        (tmp_path / "relocated").resolve(),
+        relocated_events,
+    )
+
+    assert relocated.scene_digest == baseline.scene_digest
+
+
+@pytest.mark.parametrize("value", (1.0e40, 1.0e-50))
+def test_prediction_narrowing_rejects_float32_overflow_and_semantic_underflow(
+    tmp_path: Path,
+    value: float,
+) -> None:
+    frames, scene = _motion_fixture(tmp_path)
+    events: list[str] = []
+    factory = FakeFactory(
+        events,
+        adapters=(
+            lambda name, log: FakeSeaRaft(
+                name,
+                log,
+                flow_x=value,
+                flow_dtype=np.float64,
+                static_sample_x=None,
+            ),
+        ),
+    )
+    output_dir = (tmp_path / "motion").resolve()
+
+    with pytest.raises(ValueError, match="float32"):
+        _run_motion_case(frames, scene, output_dir, events, factory=factory)
+
+    assert events == ["factory:model-1", "infer:model-1:4", "release:model-1"]
+    assert not os.path.lexists(output_dir)
+
+
+@pytest.mark.parametrize("value", (3.0e38, 1.0e-50, 1.0e-300))
+def test_strength_conversion_rejects_float32_overflow_and_semantic_underflow(
+    tmp_path: Path,
+    value: float,
+) -> None:
+    values = list(_gate_inputs(tmp_path))
+    forward = np.zeros((3, 3, 2), dtype=np.float64)
+    forward[..., 0] = value
+    forward[..., 1] = value
+    backward = -forward
+    values[4] = forward
+    values[5] = backward
+
+    with pytest.raises(ValueError, match="strength.*float32"):
+        evaluate_flow_pair(
+            *values,
+            policy=_policy(),
+            residual_threshold=0.0,
+        )
+
+
+def test_motion_producer_rejects_noncanonical_traversal_output_before_factory(
+    tmp_path: Path,
+) -> None:
+    frames, scene = _motion_fixture(tmp_path)
+    holder = tmp_path / "holder"
+    holder.mkdir()
+    output_dir = holder / ".." / "escaped"
+    events: list[str] = []
+
+    with pytest.raises(ValueError, match="canonical"):
+        _run_motion_case(frames, scene, output_dir, events)
+
+    assert events == []
+    assert not os.path.lexists(output_dir)
+
+
+def test_motion_producer_rejects_symlinked_output_ancestor_before_factory(
+    tmp_path: Path,
+) -> None:
+    frames, scene = _motion_fixture(tmp_path)
+    real_parent = tmp_path / "real-parent"
+    (real_parent / "nested").mkdir(parents=True)
+    linked_parent = tmp_path / "linked-parent"
+    try:
+        linked_parent.symlink_to(real_parent, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"directory symlinks are unavailable: {error}")
+    output_dir = linked_parent / "nested" / "motion"
+    events: list[str] = []
+
+    with pytest.raises(ValueError, match="canonical"):
+        _run_motion_case(frames, scene, output_dir, events)
+
+    assert events == []
+    assert not os.path.lexists(output_dir)
+
+
+def test_motion_producer_rejects_fewer_than_two_frames_before_callbacks(
+    tmp_path: Path,
+) -> None:
+    frames, scene = _motion_fixture(tmp_path)
+    one_frame = frames[:1]
+    one_scene = replace(
+        scene,
+        frames=scene.frames[:1],
+        static_tracks=(
+            replace(
+                scene.static_tracks[0],
+                observations=scene.static_tracks[0].observations[:1],
+            ),
+        ),
+    )
+    output_dir = (tmp_path / "motion").resolve()
+    events: list[str] = []
+
+    with pytest.raises(ValueError, match="at least two frames"):
+        _run_motion_case(one_frame, one_scene, output_dir, events)
+
+    assert events == []
+    assert not os.path.lexists(output_dir)
+
+
+@pytest.mark.parametrize("artifact", ("source_image", "depth"))
+def test_motion_producer_revalidates_inputs_after_inference_before_staging(
+    tmp_path: Path,
+    artifact: str,
+) -> None:
+    frames, scene = _motion_fixture(tmp_path)
+
+    def mutate_input() -> None:
+        if artifact == "source_image":
+            frames[0].path.write_bytes(b"changed-during-inference")
+            return
+        depth_path = scene.frames[0].depth_path
+        assert depth_path is not None
+        with depth_path.open("wb") as handle:
+            np.save(handle, np.ones((2, 2), dtype=np.float32), allow_pickle=False)
+
+    events: list[str] = []
+    factory = FakeFactory(
+        events,
+        adapters=(
+            lambda name, log: FakeSeaRaft(
+                name,
+                log,
+                after_infer=mutate_input,
+            ),
+        ),
+    )
+    output_dir = (tmp_path / "motion").resolve()
+
+    with pytest.raises(ValueError, match="changed during SEA-RAFT inference"):
+        _run_motion_case(frames, scene, output_dir, events, factory=factory)
+
+    assert events == ["factory:model-1", "infer:model-1:4", "release:model-1"]
+    assert not os.path.lexists(output_dir)
 
 
 def test_motion_producer_rejects_scene_reorder_before_factory_or_filesystem(

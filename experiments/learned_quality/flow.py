@@ -5,9 +5,11 @@ import json
 import math
 import os
 import shutil
+import struct
 import tempfile
 import unicodedata
-from collections.abc import Callable
+import zlib
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from numbers import Real
 from pathlib import Path
@@ -18,13 +20,24 @@ import numpy as np
 
 from backend.static_pipeline.stage_cache import promote_directory
 
-from .contracts import FrameArtifact, StageRecord
+from .contracts import FrameArtifact, ModelRef, StageRecord
+from .dependencies import CHECKPOINT_MODEL_REFS
 from .lifecycle import (
     BatchAttemptRecord,
     BatchRetryResult,
     VramReleaseRecord,
     run_with_smaller_batch_retry,
 )
+
+
+def _model_ref(repo_id: str) -> ModelRef:
+    matches = tuple(model for model in CHECKPOINT_MODEL_REFS if model.repo_id == repo_id)
+    if len(matches) != 1:
+        raise RuntimeError(f"expected one pinned model ref for {repo_id}")
+    return matches[0]
+
+
+SEA_RAFT_MODEL_REF = _model_ref("MemorySlices/Tartan-C-T-TSKH-spring540x960-M")
 
 
 @dataclass(frozen=True)
@@ -155,7 +168,7 @@ class PairGateResult:
     motion: np.ndarray
     uncertain: np.ndarray
     strength: np.ndarray
-    uncertainty_threshold: float
+    uncertainty_threshold: float | None
 
 
 @dataclass(frozen=True)
@@ -308,6 +321,17 @@ def _readonly(array: np.ndarray) -> np.ndarray:
     return result
 
 
+def _narrow_float32(array: np.ndarray, label: str) -> np.ndarray:
+    source = np.asarray(array, dtype=np.float64)
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        narrowed = source.astype(np.float32)
+    if not np.isfinite(narrowed).all():
+        raise ValueError(f"{label} cannot be represented as finite float32")
+    if np.any((source != 0.0) & (narrowed == 0.0)):
+        raise ValueError(f"{label} has nonzero values that underflow float32")
+    return _readonly(narrowed)
+
+
 def project_rigid_flow(
     source: RigidFrameEvidence,
     target: RigidFrameEvidence,
@@ -349,8 +373,8 @@ def project_rigid_flow(
     )
     flow = np.where(positive_in_bounds[..., None], flow, 0.0)
     return (
-        _readonly(flow.astype(np.float32)),
-        _readonly(target_z.astype(np.float32)),
+        _narrow_float32(flow, "rigid flow"),
+        _narrow_float32(target_z, "projected target depth"),
         _readonly(positive_in_bounds),
     )
 
@@ -377,28 +401,21 @@ def _project_track_point(
     return x, y
 
 
-def calibrate_residual_threshold(
+def _validated_static_tracks_payload(
     scene: RigidSceneEvidence,
-    policy: FlowGatePolicy,
-) -> float | None:
-    """Calibrate a robust pixel residual threshold from eligible static tracks."""
-
-    if not isinstance(scene, RigidSceneEvidence):
-        raise ValueError("scene must be a RigidSceneEvidence")
-    if not isinstance(policy, FlowGatePolicy):
-        raise ValueError("policy must be a FlowGatePolicy")
-    frame_by_id: dict[str, RigidFrameEvidence] = {}
-    for frame in scene.frames:
-        if not isinstance(frame, RigidFrameEvidence):
-            raise ValueError("scene frames must contain RigidFrameEvidence records")
-        frame_id = frame.frame.frame_id
-        if frame_id in frame_by_id:
-            raise ValueError("scene frame_id values must be unique")
-        frame_by_id[frame_id] = frame
-
-    residuals: list[float] = []
-    eligible_track_count = 0
+) -> tuple[dict[str, object], ...]:
+    if type(scene.frames) is not tuple or any(
+        not isinstance(frame, RigidFrameEvidence) for frame in scene.frames
+    ):
+        raise ValueError("scene frames must be an immutable tuple of rigid evidence")
+    if type(scene.static_tracks) is not tuple:
+        raise ValueError("static_tracks must be an immutable tuple")
+    frame_ids = tuple(frame.frame.frame_id for frame in scene.frames)
+    if len(set(frame_ids)) != len(frame_ids):
+        raise ValueError("scene frame_id values must be unique")
+    known_frame_ids = set(frame_ids)
     seen_track_ids: set[int] = set()
+    payload: list[dict[str, object]] = []
     for track in scene.static_tracks:
         if not isinstance(track, StaticTrack):
             raise ValueError("static_tracks must contain StaticTrack records")
@@ -407,56 +424,152 @@ def calibrate_residual_threshold(
         if track.track_id in seen_track_ids:
             raise ValueError("static track_id values must be unique")
         seen_track_ids.add(track.track_id)
+        if type(track.xyz) is not tuple or len(track.xyz) != 3:
+            raise ValueError("static track xyz must be an immutable three-value tuple")
+        xyz = tuple(
+            _require_finite_number(value, "static track xyz") for value in track.xyz
+        )
         reprojection_error = _require_finite_number(
             track.mean_reprojection_error,
             "mean_reprojection_error",
             minimum=0.0,
         )
-        observations = tuple(track.observations)
-        observation_frame_ids: set[str] = set()
-        for observation in observations:
+        if type(track.observations) is not tuple:
+            raise ValueError("track observations must be an immutable tuple")
+        seen_observation_frames: set[str] = set()
+        observation_payload: list[dict[str, object]] = []
+        for observation in track.observations:
             if not isinstance(observation, TrackObservation):
                 raise ValueError("track observations must be TrackObservation records")
-            if observation.frame_id not in frame_by_id:
+            if observation.frame_id not in known_frame_ids:
                 raise ValueError("track observation frame_id is missing from the scene")
-            if observation.frame_id in observation_frame_ids:
+            if observation.frame_id in seen_observation_frames:
                 raise ValueError("a static track cannot observe one frame more than once")
-            observation_frame_ids.add(observation.frame_id)
-            _require_finite_number(observation.x, "track observation x")
-            _require_finite_number(observation.y, "track observation y")
+            seen_observation_frames.add(observation.frame_id)
+            observation_payload.append(
+                {
+                    "frame_id": observation.frame_id,
+                    "x": _require_finite_number(observation.x, "track observation x"),
+                    "y": _require_finite_number(observation.y, "track observation y"),
+                }
+            )
+        payload.append(
+            {
+                "mean_reprojection_error": reprojection_error,
+                "observations": observation_payload,
+                "track_id": track.track_id,
+                "xyz": list(xyz),
+            }
+        )
+    return tuple(payload)
+
+
+def calibrate_residual_threshold(
+    scene: RigidSceneEvidence,
+    policy: FlowGatePolicy,
+    directional_residuals: Mapping[tuple[str, str], object] | None = None,
+) -> float | None:
+    """Calibrate from measured rigid-compensated residuals at static tracks."""
+
+    if not isinstance(scene, RigidSceneEvidence):
+        raise ValueError("scene must be a RigidSceneEvidence")
+    if not isinstance(policy, FlowGatePolicy):
+        raise ValueError("policy must be a FlowGatePolicy")
+    if directional_residuals is None:
+        _validated_static_tracks_payload(scene)
+        return None
+    if not isinstance(directional_residuals, Mapping):
+        raise ValueError("directional_residuals must be a mapping")
+    _validated_static_tracks_payload(scene)
+    frame_by_id = {frame.frame.frame_id: frame for frame in scene.frames}
+    frame_index = {
+        frame.frame.frame_id: index for index, frame in enumerate(scene.frames)
+    }
+    fields: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]] = {}
+    for key, raw_value in directional_residuals.items():
         if (
-            len(observations) < policy.static_track_min_length
-            or reprojection_error > policy.static_track_max_reprojection_error
+            type(key) is not tuple
+            or len(key) != 2
+            or key[0] not in frame_by_id
+            or key[1] not in frame_by_id
+            or abs(frame_index[key[0]] - frame_index[key[1]]) != 1
+        ):
+            raise ValueError("directional residual keys must join adjacent scene frames")
+        source = frame_by_id[key[0]]
+        raw_field = raw_value
+        raw_valid: object | None = None
+        if type(raw_value) is tuple and len(raw_value) == 2:
+            raw_field, raw_valid = raw_value
+        field = _scalar_map(
+            raw_field,
+            source.width,
+            source.height,
+            f"directional residual {key[0]}->{key[1]}",
+        )
+        if raw_valid is None:
+            valid = np.ones(field.shape, dtype=bool)
+        else:
+            valid = np.asarray(raw_valid)
+            if valid.shape != field.shape or valid.dtype.kind != "b":
+                raise ValueError("directional residual validity must be a boolean HxW map")
+        fields[key] = (field, valid)
+
+    residual_samples: list[float] = []
+    sampled_track_count = 0
+    for track in scene.static_tracks:
+        if (
+            len(track.observations) < policy.static_track_min_length
+            or float(track.mean_reprojection_error)
+            > policy.static_track_max_reprojection_error
         ):
             continue
-
-        track_residuals: list[float] = []
-        for observation in observations:
-            rigid_frame = frame_by_id[observation.frame_id]
-            if not rigid_frame.registered:
-                track_residuals = []
-                break
-            projection = _project_track_point(track.xyz, rigid_frame)
-            if projection is None:
-                track_residuals = []
-                break
-            projected_x, projected_y = projection
-            track_residuals.append(
-                math.hypot(
-                    float(observation.x) - projected_x,
-                    float(observation.y) - projected_y,
+        observations = {
+            observation.frame_id: observation for observation in track.observations
+        }
+        track_samples: list[float] = []
+        for source, target in zip(scene.frames, scene.frames[1:]):
+            source_id = source.frame.frame_id
+            target_id = target.frame.frame_id
+            source_observation = observations.get(source_id)
+            target_observation = observations.get(target_id)
+            forward_field = fields.get((source_id, target_id))
+            backward_field = fields.get((target_id, source_id))
+            if (
+                source_observation is None
+                or target_observation is None
+                or forward_field is None
+                or backward_field is None
+                or not source.registered
+                or not target.registered
+            ):
+                continue
+            pair_samples: list[float] = []
+            for observation, (field, valid_field) in (
+                (source_observation, forward_field),
+                (target_observation, backward_field),
+            ):
+                x = np.asarray(float(observation.x), dtype=np.float64)
+                y = np.asarray(float(observation.y), dtype=np.float64)
+                sampled, inside = _bilinear_sample(field, x, y)
+                sampled_valid, valid_inside = _bilinear_sample(
+                    valid_field.astype(np.float64), x, y
                 )
-            )
-        if len(track_residuals) == len(observations):
-            eligible_track_count += 1
-            residuals.extend(track_residuals)
+                if not bool(inside) or not bool(valid_inside) or float(sampled_valid) < 1.0:
+                    pair_samples = []
+                    break
+                pair_samples.append(float(sampled))
+            if len(pair_samples) == 2:
+                track_samples.extend(pair_samples)
+        if track_samples:
+            sampled_track_count += 1
+            residual_samples.extend(track_samples)
 
     if (
-        eligible_track_count == 0
-        or len(residuals) < policy.static_track_min_length
+        sampled_track_count == 0
+        or len(residual_samples) < policy.static_track_min_length
     ):
         return None
-    residual_array = np.asarray(residuals, dtype=np.float64)
+    residual_array = np.asarray(residual_samples, dtype=np.float64)
     median = float(np.median(residual_array))
     mad = float(np.median(np.abs(residual_array - median)))
     return median + policy.residual_mad_multiplier * 1.4826 * mad
@@ -681,7 +794,7 @@ def evaluate_flow_pair(
         np.isfinite(combined_uncertainty) & backward_unc_inside
     ]
     if uncertainty_population.size == 0:
-        uncertainty_threshold = math.nan
+        uncertainty_threshold = None
         uncertainty_ok = np.zeros((source.height, source.width), dtype=bool)
     else:
         uncertainty_median = float(np.median(uncertainty_population))
@@ -703,14 +816,15 @@ def evaluate_flow_pair(
         & cycle_consistent
         & uncertainty_ok
     )
-    residual = np.linalg.norm(forward - rigid_flow, axis=-1)
+    residual_delta = forward - np.asarray(rigid_flow, dtype=np.float64)
+    residual = np.hypot(residual_delta[..., 0], residual_delta[..., 1])
     motion = valid & (residual > threshold)
     uncertain = ~valid
     return PairGateResult(
         valid=_readonly(valid),
         motion=_readonly(motion),
         uncertain=_readonly(uncertain),
-        strength=_readonly(residual.astype(np.float32)),
+        strength=_narrow_float32(residual, "strength map"),
         uncertainty_threshold=uncertainty_threshold,
     )
 
@@ -732,6 +846,13 @@ def _validated_pair_result(value: PairGateResult, label: str) -> PairGateResult:
         raise ValueError(f"{label}.strength must be a finite HxW map")
     if not np.isfinite(strength).all() or np.any(strength < 0.0):
         raise ValueError(f"{label}.strength must be finite and nonnegative")
+    _narrow_float32(np.asarray(strength, dtype=np.float64), f"{label}.strength")
+    if value.uncertainty_threshold is not None:
+        _require_finite_number(
+            value.uncertainty_threshold,
+            f"{label}.uncertainty_threshold",
+            minimum=0.0,
+        )
     if np.any(motion & ~valid) or not np.array_equal(uncertain, ~valid):
         raise ValueError(f"{label} contains inconsistent gate masks")
     return value
@@ -945,7 +1066,7 @@ def _load_depth(evidence: RigidFrameEvidence) -> np.ndarray:
     depth = _depth_array(raw, evidence.width, evidence.height, "depth artifact")
     if np.any(depth < 0.0):
         raise ValueError("depth artifact must be nonnegative")
-    return _readonly(depth.astype(np.float32))
+    return _narrow_float32(depth, "depth artifact")
 
 
 def _validated_scene_inputs(
@@ -953,15 +1074,18 @@ def _validated_scene_inputs(
     scene: RigidSceneEvidence,
 ) -> _SceneInputs:
     validated_frames, dimensions, input_frame_digest = _validated_input_frames(frames)
+    if len(validated_frames) < 2:
+        raise ValueError("motion evidence requires at least two frames")
     if not isinstance(scene, RigidSceneEvidence):
         raise ValueError("scene must be a RigidSceneEvidence")
-    _require_sha256(scene.geometry_digest, "geometry_digest")
-    _require_sha256(scene.depth_digest, "depth_digest")
+    geometry_digest = _require_sha256(scene.geometry_digest, "geometry_digest")
+    depth_digest = _require_sha256(scene.depth_digest, "depth_digest")
     if type(scene.frames) is not tuple or len(scene.frames) != len(validated_frames):
         raise ValueError("scene must contain the exact frame order")
     if tuple(rigid.frame for rigid in scene.frames) != validated_frames:
         raise ValueError("scene must contain the exact frame order and frame joins")
     depths: list[np.ndarray | None] = []
+    rigid_payload: list[dict[str, object]] = []
     for frame, rigid, (width, height) in zip(
         validated_frames,
         scene.frames,
@@ -971,6 +1095,8 @@ def _validated_scene_inputs(
             raise ValueError("scene frames must contain RigidFrameEvidence records")
         if rigid.frame != frame:
             raise ValueError("scene must contain the exact frame order and frame joins")
+        if type(rigid.registered) is not bool:
+            raise ValueError("rigid registered flag must be a plain boolean")
         if (rigid.width, rigid.height) != (width, height):
             raise ValueError("rigid frame dimensions must exactly match source images")
         if rigid.registered:
@@ -988,15 +1114,43 @@ def _validated_scene_inputs(
             ):
                 raise ValueError("unregistered rigid frame must not claim geometry")
             depths.append(None)
+        rigid_payload.append(
+            {
+                "depth_sha256": rigid.depth_sha256,
+                "depth_size_bytes": (
+                    None
+                    if rigid.depth_path is None
+                    else rigid.depth_path.stat().st_size
+                ),
+                "frame_id": frame.frame_id,
+                "height": rigid.height,
+                "image_name": frame.image_name,
+                "pinhole_fx_fy_cx_cy": (
+                    None
+                    if rigid.pinhole_fx_fy_cx_cy is None
+                    else [float(value) for value in rigid.pinhole_fx_fy_cx_cy]
+                ),
+                "registered": rigid.registered,
+                "w2c_4x4": (
+                    None
+                    if rigid.w2c_4x4 is None
+                    else [float(value) for value in rigid.w2c_4x4]
+                ),
+                "width": rigid.width,
+            }
+        )
     for source, target in zip(scene.frames, scene.frames[1:]):
         if (source.width, source.height) != (target.width, target.height):
             raise ValueError("adjacent flow frames must have equal dimensions")
+    static_tracks_payload = _validated_static_tracks_payload(scene)
     scene_digest = hashlib.sha256(
         _strict_json_bytes(
             {
-                "depth_digest": scene.depth_digest,
-                "geometry_digest": scene.geometry_digest,
+                "depth_digest": depth_digest,
+                "frames": rigid_payload,
+                "geometry_digest": geometry_digest,
                 "input_frame_digest": input_frame_digest,
+                "static_tracks": static_tracks_payload,
             }
         )
     ).hexdigest()
@@ -1005,8 +1159,8 @@ def _validated_scene_inputs(
         rigid_frames=scene.frames,
         depths=tuple(depths),
         input_frame_digest=input_frame_digest,
-        geometry_digest=scene.geometry_digest,
-        depth_digest=scene.depth_digest,
+        geometry_digest=geometry_digest,
+        depth_digest=depth_digest,
         scene_digest=scene_digest,
     )
 
@@ -1018,11 +1172,16 @@ def _validated_output_dir(output_dir: Path) -> Path:
         unicodedata.category(character) == "Cc" for character in output_dir.name
     ):
         raise ValueError("output_dir must have a safe final component")
+    resolved_output = output_dir.resolve(strict=False)
+    if output_dir != resolved_output:
+        raise ValueError("output_dir must be canonical and contain no symlink or traversal")
     if os.path.lexists(output_dir):
         raise FileExistsError("motion output_dir must be previously absent")
     parent = output_dir.parent
     if not os.path.lexists(parent) or parent.is_symlink() or not parent.is_dir():
         raise ValueError("output_dir parent must be an existing non-symlink directory")
+    if parent.resolve(strict=True) != parent:
+        raise ValueError("output_dir must be canonical and contain no symlink or traversal")
     return output_dir
 
 
@@ -1037,19 +1196,29 @@ def _text_provenance(value: object, label: str) -> str:
 
 
 def _model_provenance(model: object) -> _ModelProvenance:
-    model_id = _text_provenance(getattr(model, "model_id", None), "model_id")
-    revision = _text_provenance(getattr(model, "revision", None), "revision")
-    code_commit_value = getattr(model, "code_commit", None)
-    code_commit = (
-        None
-        if code_commit_value is None
-        else _text_provenance(code_commit_value, "code_commit")
-    )
-    return _ModelProvenance(
+    try:
+        model_id = _text_provenance(getattr(model, "model_id", None), "model_id")
+        revision = _text_provenance(getattr(model, "revision", None), "revision")
+        code_commit = _text_provenance(
+            getattr(model, "code_commit", None), "code_commit"
+        )
+    except ValueError as error:
+        raise ValueError(
+            "SEA-RAFT provenance must match the exact pinned model ref"
+        ) from error
+    provenance = _ModelProvenance(
         model_id=model_id,
         revision=revision,
         code_commit=code_commit,
     )
+    expected = _ModelProvenance(
+        model_id=SEA_RAFT_MODEL_REF.repo_id,
+        revision=SEA_RAFT_MODEL_REF.revision,
+        code_commit=SEA_RAFT_MODEL_REF.code_commit,
+    )
+    if provenance != expected:
+        raise ValueError("SEA-RAFT provenance must match the exact pinned model ref")
+    return provenance
 
 
 def _pair_requests(inputs: _SceneInputs) -> tuple[FlowPairRequest, ...]:
@@ -1085,37 +1254,41 @@ def _validated_pair_predictions(
             raise ValueError("SEA-RAFT predictions must preserve exact pair order and joins")
         source = inputs.rigid_frames[request.pair_index]
         target = inputs.rigid_frames[request.pair_index + 1]
-        forward = _readonly(
+        forward = _narrow_float32(
             _flow_array(
                 raw.forward_flow,
                 source.width,
                 source.height,
                 "forward_flow",
-            ).astype(np.float32)
+            ),
+            "forward_flow",
         )
-        backward = _readonly(
+        backward = _narrow_float32(
             _flow_array(
                 raw.backward_flow,
                 target.width,
                 target.height,
                 "backward_flow",
-            ).astype(np.float32)
+            ),
+            "backward_flow",
         )
-        forward_uncertainty = _readonly(
+        forward_uncertainty = _narrow_float32(
             _scalar_map(
                 raw.forward_uncertainty,
                 source.width,
                 source.height,
                 "forward_uncertainty",
-            ).astype(np.float32)
+            ),
+            "forward_uncertainty",
         )
-        backward_uncertainty = _readonly(
+        backward_uncertainty = _narrow_float32(
             _scalar_map(
                 raw.backward_uncertainty,
                 target.width,
                 target.height,
                 "backward_uncertainty",
-            ).astype(np.float32)
+            ),
+            "backward_uncertainty",
         )
         validated.append(
             _ValidatedPairPrediction(
@@ -1136,6 +1309,84 @@ def _unknown_maps(width: int, height: int) -> FrameMotionMaps:
         uncertain=_readonly(np.ones((height, width), dtype=bool)),
         strength=_readonly(np.zeros((height, width), dtype=np.float32)),
     )
+
+
+def _directional_rigid_residuals(
+    inputs: _SceneInputs,
+    predictions: tuple[_ValidatedPairPrediction, ...],
+) -> dict[tuple[str, str], object]:
+    fields: dict[tuple[str, str], object] = {}
+    for prediction in predictions:
+        index = prediction.request.pair_index
+        source = inputs.rigid_frames[index]
+        target = inputs.rigid_frames[index + 1]
+        source_depth = inputs.depths[index]
+        target_depth = inputs.depths[index + 1]
+        if (
+            not source.registered
+            or not target.registered
+            or source_depth is None
+            or target_depth is None
+        ):
+            continue
+        rigid_forward, _, forward_valid = project_rigid_flow(
+            source, target, source_depth
+        )
+        rigid_backward, _, backward_valid = project_rigid_flow(
+            target, source, target_depth
+        )
+        forward_delta = np.asarray(prediction.forward_flow, dtype=np.float64) - np.asarray(
+            rigid_forward, dtype=np.float64
+        )
+        backward_delta = np.asarray(
+            prediction.backward_flow, dtype=np.float64
+        ) - np.asarray(rigid_backward, dtype=np.float64)
+        forward_residual = np.hypot(
+            forward_delta[..., 0], forward_delta[..., 1]
+        )
+        backward_residual = np.hypot(
+            backward_delta[..., 0], backward_delta[..., 1]
+        )
+        if not np.isfinite(forward_residual).all() or not np.isfinite(
+            backward_residual
+        ).all():
+            raise ValueError("rigid-compensated SEA-RAFT residuals must be finite")
+        source_id = prediction.request.source_frame_id
+        target_id = prediction.request.target_frame_id
+        fields[(source_id, target_id)] = (
+            _readonly(forward_residual),
+            forward_valid,
+        )
+        fields[(target_id, source_id)] = (
+            _readonly(backward_residual),
+            backward_valid,
+        )
+    return fields
+
+
+def _revalidate_source_inputs(inputs: _SceneInputs) -> None:
+    try:
+        _, dimensions, input_frame_digest = _validated_input_frames(inputs.frames)
+        expected_dimensions = tuple(
+            (rigid.width, rigid.height) for rigid in inputs.rigid_frames
+        )
+        if (
+            input_frame_digest != inputs.input_frame_digest
+            or dimensions != expected_dimensions
+        ):
+            raise ValueError("source image digest or dimensions changed")
+        for rigid, expected_depth in zip(inputs.rigid_frames, inputs.depths):
+            if not rigid.registered:
+                continue
+            current_depth = _load_depth(rigid)
+            if expected_depth is None or not np.array_equal(
+                current_depth, expected_depth
+            ):
+                raise ValueError("depth content or dimensions changed")
+    except Exception as error:
+        raise ValueError(
+            "source image or depth artifact changed during SEA-RAFT inference"
+        ) from error
 
 
 def _evaluate_predictions(
@@ -1296,6 +1547,35 @@ def _write_npy_fsync(path: Path, array: np.ndarray) -> str:
     return _sha256_path(path)
 
 
+def _png_chunk(chunk_type: bytes, payload: bytes) -> bytes:
+    checksum = zlib.crc32(chunk_type + payload) & 0xFFFFFFFF
+    return (
+        struct.pack(">I", len(payload))
+        + chunk_type
+        + payload
+        + struct.pack(">I", checksum)
+    )
+
+
+def _write_binary_png_fsync(path: Path, mask: np.ndarray) -> str:
+    array = np.asarray(mask)
+    if array.ndim != 2 or array.dtype.kind != "b":
+        raise ValueError("binary evidence map must be a boolean HxW array")
+    height, width = array.shape
+    pixels = np.where(array, 255, 0).astype(np.uint8)
+    scanlines = b"".join(
+        b"\x00" + np.ascontiguousarray(row).tobytes() for row in pixels
+    )
+    header = struct.pack(">IIBBBBB", width, height, 8, 0, 0, 0, 0)
+    payload = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", header)
+        + _png_chunk(b"IDAT", zlib.compress(scanlines, level=9))
+        + _png_chunk(b"IEND", b"")
+    )
+    return _write_bytes_fsync(path, payload)
+
+
 def _artifact_token(index: int, frame: FrameArtifact) -> str:
     suffix = hashlib.sha256(
         f"{frame.frame_id}\0{frame.image_name}".encode("utf-8")
@@ -1329,20 +1609,31 @@ def _publish_motion_evidence(
         ):
             token = _artifact_token(index, frame)
             names = {
-                "confirmed_without_semantic": f"{token}.confirmed_without_semantic.npy",
-                "requires_semantic": f"{token}.requires_semantic.npy",
-                "uncertain": f"{token}.uncertain.npy",
+                "confirmed_without_semantic": f"{token}.confirmed_without_semantic.png",
+                "requires_semantic": f"{token}.requires_semantic.png",
+                "uncertain": f"{token}.uncertain.png",
                 "strength": f"{token}.strength.npy",
             }
-            arrays = {
-                "confirmed_without_semantic": frame_maps.confirmed_without_semantic.astype(np.uint8) * 255,
-                "requires_semantic": frame_maps.requires_semantic.astype(np.uint8) * 255,
-                "uncertain": frame_maps.uncertain.astype(np.uint8) * 255,
-                "strength": frame_maps.strength.astype(np.float32),
-            }
             digests = {
-                label: _write_npy_fsync(staging / name, arrays[label])
-                for label, name in names.items()
+                "confirmed_without_semantic": _write_binary_png_fsync(
+                    staging / names["confirmed_without_semantic"],
+                    frame_maps.confirmed_without_semantic,
+                ),
+                "requires_semantic": _write_binary_png_fsync(
+                    staging / names["requires_semantic"],
+                    frame_maps.requires_semantic,
+                ),
+                "uncertain": _write_binary_png_fsync(
+                    staging / names["uncertain"],
+                    frame_maps.uncertain,
+                ),
+                "strength": _write_npy_fsync(
+                    staging / names["strength"],
+                    _narrow_float32(
+                        np.asarray(frame_maps.strength, dtype=np.float64),
+                        "published strength map",
+                    ),
+                ),
             }
             artifacts.append(
                 MotionFrameEvidence(
@@ -1454,7 +1745,6 @@ def run_motion_evidence(
         raise TypeError("model_factory and release_model must be callable")
     inputs = _validated_scene_inputs(frames, scene)
     output_dir = _validated_output_dir(output_dir)
-    residual_threshold = calibrate_residual_threshold(scene, policy)
     requests = _pair_requests(inputs)
     active_model: object | None = None
     expected_provenance: _ModelProvenance | None = None
@@ -1518,12 +1808,18 @@ def run_motion_evidence(
     )
     if expected_provenance is None:
         raise AssertionError("SEA-RAFT provenance was not established")
+    residual_threshold = calibrate_residual_threshold(
+        scene,
+        policy,
+        _directional_rigid_residuals(inputs, retry_result.value),
+    )
     maps, pair_payloads = _evaluate_predictions(
         inputs,
         retry_result.value,
         policy,
         residual_threshold,
     )
+    _revalidate_source_inputs(inputs)
     status = (
         "skipped"
         if residual_threshold is None
