@@ -112,6 +112,7 @@ class MetricSkyResult:
     chunks: tuple[ChunkProvenance, ...]
     attempts: tuple[BatchAttemptRecord, ...]
     release_record: VramReleaseRecord | None
+    retry_model_release_record: VramReleaseRecord | None
     metadata_path: Path
 
 
@@ -456,6 +457,14 @@ def _prediction_array(
     return values
 
 
+def _finite_float32(values: object, label: str) -> np.ndarray:
+    with np.errstate(over="ignore", invalid="ignore"):
+        converted = np.ascontiguousarray(values, dtype=np.float32)
+    if not np.isfinite(converted).all():
+        raise ValueError(f"{label} must be representable as finite float32")
+    return converted
+
+
 def _validated_prediction(
     prediction: object,
     expected_count: int,
@@ -526,11 +535,11 @@ def _validated_prediction(
         if intrinsic_count != expected_count:
             raise ValueError("prediction intrinsics count must exactly match frames")
 
-    depth_output = np.ascontiguousarray(depth, dtype=np.float32)
+    depth_output = _finite_float32(depth, "prediction depth")
     confidence_output = (
         None
         if confidence is None
-        else np.ascontiguousarray(confidence, dtype=np.float32)
+        else _finite_float32(confidence, "prediction conf")
     )
     if sky is None:
         sky_output = None
@@ -835,19 +844,19 @@ def _run_metric_batches(
                 requested_size=batch_size,
             )
         )
-    depth = np.ascontiguousarray(
+    depth = _finite_float32(
         np.concatenate([prediction.depth for prediction in predictions], axis=0),
-        dtype=np.float32,
+        "metric batched depth",
     )
     confidence = (
         None
         if not confidence_presence
-        else np.ascontiguousarray(
+        else _finite_float32(
             np.concatenate(
                 [prediction.confidence for prediction in predictions],
                 axis=0,
             ),
-            dtype=np.float32,
+            "metric batched confidence",
         )
     )
     sky = np.ascontiguousarray(
@@ -872,15 +881,16 @@ def _publish_metric_artifacts(
     processed_camera: PinholeCamera,
     attempts: tuple[BatchAttemptRecord, ...],
     release_record: VramReleaseRecord | None,
+    retry_model_release_record: VramReleaseRecord | None,
     output_dir: Path,
     promote: Callable[[Path, Path], None],
 ) -> MetricSkyResult:
     if operation.prediction.sky is None:
         raise AssertionError("metric prediction must include sky")
     focal_scale = ((processed_camera.fx + processed_camera.fy) * 0.5) / 300.0
-    metric_depth = np.ascontiguousarray(
+    metric_depth = _finite_float32(
         operation.prediction.depth.astype(np.float64) * focal_scale,
-        dtype=np.float32,
+        "metric depth",
     )
     staging = Path(
         tempfile.mkdtemp(
@@ -945,6 +955,9 @@ def _publish_metric_artifacts(
         "process_resolution": ANCHOR_PROCESS_RESOLUTION,
         "processed_camera": _camera_payload(processed_camera),
         "release_record": _release_payload(release_record),
+        "retry_model_release_record": _release_payload(
+            retry_model_release_record
+        ),
         "schema_version": 1,
         "stage": "da3_metric_sky",
     }
@@ -956,8 +969,45 @@ def _publish_metric_artifacts(
         chunks=operation.chunks,
         attempts=attempts,
         release_record=release_record,
+        retry_model_release_record=retry_model_release_record,
         metadata_path=output_dir / "metadata.json",
     )
+
+
+def _release_metric_model(
+    release_model: Callable[[object], VramReleaseRecord],
+    model: object,
+) -> VramReleaseRecord:
+    record = release_model(model)
+    if not isinstance(record, VramReleaseRecord):
+        raise TypeError("release_model must return VramReleaseRecord")
+    return record
+
+
+def _attach_metric_retry_release(
+    primary_error: BaseException,
+    *,
+    record: VramReleaseRecord | None = None,
+    release_error: BaseException | None = None,
+) -> None:
+    try:
+        if record is not None:
+            setattr(primary_error, "metric_retry_model_release_record", record)
+        if release_error is not None:
+            setattr(primary_error, "metric_retry_model_release_error", release_error)
+    except BaseException:
+        try:
+            add_note = getattr(primary_error, "add_note", None)
+            if callable(add_note):
+                if record is not None:
+                    add_note("metric retry replacement model was released")
+                if release_error is not None:
+                    add_note(
+                        "metric retry replacement release also failed: "
+                        f"{type(release_error).__name__}"
+                    )
+        except BaseException:
+            pass
 
 
 def run_metric_sky(
@@ -979,6 +1029,7 @@ def run_metric_sky(
     if not callable(release_model) or not callable(retry_model_factory):
         raise TypeError("metric retry boundaries must be callable")
     active_model = model
+    retry_model: object | None = None
 
     def operation(batch_size: int) -> _MetricOperationResult:
         return _run_metric_batches(
@@ -989,19 +1040,55 @@ def run_metric_sky(
         )
 
     def release_failed_model() -> VramReleaseRecord:
-        nonlocal active_model
-        release_record = release_model(active_model)
-        active_model = retry_model_factory()
+        nonlocal active_model, retry_model
+        release_record = _release_metric_model(release_model, active_model)
+        replacement_model = retry_model_factory()
+        if replacement_model is active_model:
+            reuse_error = ValueError(
+                "retry_model_factory must return a new model object"
+            )
+            setattr(
+                reuse_error,
+                "metric_initial_model_release_record",
+                release_record,
+            )
+            raise reuse_error
+        retry_model = replacement_model
+        active_model = replacement_model
         return release_record
 
-    retry_result = run_with_smaller_batch_retry(
-        "da3_metric_sky",
-        initial_batch_size,
-        retry_batch_size,
-        operation,
-        chunk_independent=True,
-        release=release_failed_model,
-        torch_module=torch_module,
+    try:
+        retry_result = run_with_smaller_batch_retry(
+            "da3_metric_sky",
+            initial_batch_size,
+            retry_batch_size,
+            operation,
+            chunk_independent=True,
+            release=release_failed_model,
+            torch_module=torch_module,
+        )
+    except Exception as primary_error:
+        if retry_model is not None:
+            try:
+                retry_release_record = _release_metric_model(
+                    release_model,
+                    retry_model,
+                )
+            except Exception as release_error:
+                _attach_metric_retry_release(
+                    primary_error,
+                    release_error=release_error,
+                )
+            else:
+                _attach_metric_retry_release(
+                    primary_error,
+                    record=retry_release_record,
+                )
+        raise
+    retry_model_release_record = (
+        None
+        if retry_model is None
+        else _release_metric_model(release_model, retry_model)
     )
     return _publish_metric_artifacts(
         validated_frames,
@@ -1009,6 +1096,7 @@ def run_metric_sky(
         validated_camera,
         retry_result.attempts,
         retry_result.release_record,
+        retry_model_release_record,
         output_dir,
         promote,
     )
@@ -1079,6 +1167,16 @@ def _final_camera_payload(camera: FinalPoseCamera) -> dict[str, object]:
         "w2c": camera.w2c,
         "width": camera.width,
     }
+
+
+def _matches_pinned_camera_roundtrip(
+    predicted: np.ndarray,
+    expected: np.ndarray,
+) -> bool:
+    if np.allclose(predicted, expected, rtol=0.0, atol=1.0e-6):
+        return True
+    float32_expected = np.asarray(expected, dtype=np.float32).astype(np.float64)
+    return np.array_equal(predicted, float32_expected)
 
 
 def _publish_final_depth_artifacts(
@@ -1238,7 +1336,7 @@ def run_pose_conditioned_depth(
         except ValueError as error:
             raise ValueError(f"final prediction is invalid: {error}") from error
         for predicted, expected in zip(prediction.cameras, input_extrinsics):
-            if not np.allclose(predicted, expected, rtol=0.0, atol=1.0e-6):
+            if not _matches_pinned_camera_roundtrip(predicted, expected):
                 raise ValueError(
                     "final prediction extrinsics drifted from final COLMAP W2C"
                 )
@@ -1310,16 +1408,19 @@ def run_pose_conditioned_depth(
                 out=combined,
                 where=weight_sum > 0.0,
             )
-            fused_depth.append(np.ascontiguousarray(combined, dtype=np.float32))
+            fused_depth.append(_finite_float32(combined, "final fused depth"))
             fused_confidence.append(
-                np.ascontiguousarray(
+                _finite_float32(
                     np.max(confidence_stack, axis=0),
-                    dtype=np.float32,
+                    "final fused confidence",
                 )
             )
         else:
             fused_depth.append(
-                np.ascontiguousarray(np.mean(depth_stack, axis=0), dtype=np.float32)
+                _finite_float32(
+                    np.mean(depth_stack, axis=0),
+                    "final fused depth",
+                )
             )
         contributions.append(
             FrameContribution(
@@ -1328,9 +1429,15 @@ def run_pose_conditioned_depth(
                 chunk_indices=tuple(chunk_indices),
             )
         )
-    depth_output = np.ascontiguousarray(np.stack(fused_depth), dtype=np.float32)
+    depth_output = _finite_float32(
+        np.stack(fused_depth),
+        "final depth artifacts",
+    )
     confidence_output = (
-        np.ascontiguousarray(np.stack(fused_confidence), dtype=np.float32)
+        _finite_float32(
+            np.stack(fused_confidence),
+            "final confidence artifacts",
+        )
         if confidence_presence
         else None
     )

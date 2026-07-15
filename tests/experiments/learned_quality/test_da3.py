@@ -586,6 +586,27 @@ def test_run_anchor_inference_rejects_probability_sky_instead_of_boolean_mask(
         )
 
 
+@pytest.mark.parametrize("field", ("depth", "conf"))
+def test_run_anchor_inference_rejects_float32_artifact_overflow_before_staging(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    frames = _frames(tmp_path / "input", 1)
+    prediction = _prediction(1)
+    setattr(prediction, field, np.full((1, 2, 3), 1.0e40, dtype=np.float64))
+
+    with pytest.raises(ValueError, match=f"prediction {field}.*finite float32"):
+        run_anchor_inference(
+            _RecordingModel(prediction),
+            frames,
+            tmp_path / "output",
+            vram_gb=40,
+        )
+
+    assert not (tmp_path / "output").exists()
+    assert not tuple(tmp_path.glob(".output.staging-*"))
+
+
 @pytest.mark.parametrize(
     ("image_name", "frame_id"),
     (("../image.png", "frame-0"), ("image.png", "../frame-0"), ("image.png", "a/b")),
@@ -852,6 +873,7 @@ def test_run_metric_sky_uses_exact_batches_and_converts_network_depth_to_meters(
     assert result.attempts[0].size == 3
     assert result.attempts[0].outcome == "succeeded"
     assert result.release_record is None
+    assert result.retry_model_release_record is None
     assert tuple(artifact.depth_path.name for artifact in result.artifacts) == (
         "frame-000--image-000.png.metric_depth.npy",
         "frame-001--image-001.png.metric_depth.npy",
@@ -918,13 +940,29 @@ def test_run_metric_sky_releases_and_recreates_model_for_one_cuda_oom_retry(
 
     assert len(failed_model.calls) == 1
     assert [len(call["image"]) for call in retry_model.calls] == [2, 2, 1]
-    assert events == [("release", failed_model), "factory"]
+    assert events == [
+        ("release", failed_model),
+        "factory",
+        ("release", retry_model),
+    ]
     assert tuple((attempt.size, attempt.outcome) for attempt in result.attempts) == (
         (3, "cuda_oom"),
         (2, "succeeded"),
     )
     assert result.release_record == _vram_release_record()
+    assert result.retry_model_release_record == _vram_release_record()
     assert tuple(chunk.requested_size for chunk in result.chunks) == (2, 2, 2)
+    metadata = json.loads(result.metadata_path.read_bytes())
+    assert metadata["retry_model_release_record"] == {
+        "allocated_after_bytes": 0,
+        "allocated_before_bytes": 10,
+        "cache_cleared": True,
+        "cuda_available": True,
+        "gc_ran": True,
+        "moved_to_cpu": True,
+        "reserved_after_bytes": 0,
+        "reserved_before_bytes": 20,
+    }
 
 
 def test_run_metric_sky_propagates_non_oom_without_release_or_recreation(
@@ -962,6 +1000,11 @@ def test_run_metric_sky_performs_at_most_one_smaller_batch_retry(
     first = _MetricModel(error=_FakeCudaOom("first OOM"))
     second_error = _FakeCudaOom("retry OOM")
     second = _MetricModel(error=second_error)
+    released: list[object] = []
+
+    def release_model(model: object) -> VramReleaseRecord:
+        released.append(model)
+        return _vram_release_record()
 
     with pytest.raises(_FakeCudaOom) as raised:
         run_metric_sky(
@@ -971,7 +1014,7 @@ def test_run_metric_sky_performs_at_most_one_smaller_batch_retry(
             tmp_path / "metric",
             initial_batch_size=2,
             retry_batch_size=1,
-            release_model=lambda failed: _vram_release_record(),
+            release_model=release_model,
             retry_model_factory=lambda: second,
             torch_module=_FakeTorch,
         )
@@ -979,10 +1022,109 @@ def test_run_metric_sky_performs_at_most_one_smaller_batch_retry(
     assert raised.value is second_error
     assert len(first.calls) == 1
     assert len(second.calls) == 1
+    assert released == [first, second]
     assert tuple(
         (attempt.size, attempt.outcome)
         for attempt in raised.value.batch_retry_attempts
     ) == ((2, "cuda_oom"), (1, "cuda_oom"))
+    assert raised.value.metric_retry_model_release_record == _vram_release_record()
+
+
+def test_run_metric_sky_releases_replacement_after_ordinary_retry_failure(
+    tmp_path: Path,
+) -> None:
+    frames = _frames(tmp_path / "input", 2)
+    first = _MetricModel(error=_FakeCudaOom("first OOM"))
+    retry_error = ValueError("retry output failed")
+    second = _MetricModel(error=retry_error)
+    released: list[object] = []
+
+    def release_model(model: object) -> VramReleaseRecord:
+        released.append(model)
+        return _vram_release_record()
+
+    with pytest.raises(ValueError) as raised:
+        run_metric_sky(
+            first,
+            frames,
+            _processed_camera(),
+            tmp_path / "metric",
+            initial_batch_size=2,
+            retry_batch_size=1,
+            release_model=release_model,
+            retry_model_factory=lambda: second,
+            torch_module=_FakeTorch,
+        )
+
+    assert raised.value is retry_error
+    assert released == [first, second]
+    assert raised.value.metric_retry_model_release_record == _vram_release_record()
+    assert not (tmp_path / "metric").exists()
+
+
+def test_run_metric_sky_cleanup_failure_never_masks_retry_failure(
+    tmp_path: Path,
+) -> None:
+    frames = _frames(tmp_path / "input", 2)
+    first = _MetricModel(error=_FakeCudaOom("first OOM"))
+    retry_error = ValueError("primary retry failure")
+    cleanup_error = RuntimeError("replacement cleanup failed")
+    second = _MetricModel(error=retry_error)
+    released: list[object] = []
+
+    def release_model(model: object) -> VramReleaseRecord:
+        released.append(model)
+        if model is second:
+            raise cleanup_error
+        return _vram_release_record()
+
+    with pytest.raises(ValueError) as raised:
+        run_metric_sky(
+            first,
+            frames,
+            _processed_camera(),
+            tmp_path / "metric",
+            initial_batch_size=2,
+            retry_batch_size=1,
+            release_model=release_model,
+            retry_model_factory=lambda: second,
+            torch_module=_FakeTorch,
+        )
+
+    assert raised.value is retry_error
+    assert released == [first, second]
+    assert raised.value.metric_retry_model_release_error is cleanup_error
+
+
+def test_run_metric_sky_rejects_factory_reusing_released_initial_model(
+    tmp_path: Path,
+) -> None:
+    frames = _frames(tmp_path / "input", 2)
+    initial_error = _FakeCudaOom("first OOM")
+    model = _MetricModel(error=initial_error)
+    released: list[object] = []
+
+    def release_model(value: object) -> VramReleaseRecord:
+        released.append(value)
+        return _vram_release_record()
+
+    with pytest.raises(ValueError, match="new model object") as raised:
+        run_metric_sky(
+            model,
+            frames,
+            _processed_camera(),
+            tmp_path / "metric",
+            initial_batch_size=2,
+            retry_batch_size=1,
+            release_model=release_model,
+            retry_model_factory=lambda: model,
+            torch_module=_FakeTorch,
+        )
+
+    assert len(model.calls) == 1
+    assert released == [model]
+    assert raised.value.__cause__ is initial_error
+    assert raised.value.metric_initial_model_release_record == _vram_release_record()
 
 
 @pytest.mark.parametrize(
@@ -1052,6 +1194,38 @@ def test_run_metric_sky_requires_physical_processed_pinhole_before_model_call(
     assert model.calls == []
 
 
+def test_run_metric_sky_rejects_focal_scaling_overflow_before_staging(
+    tmp_path: Path,
+) -> None:
+    frames = _frames(tmp_path / "input", 1)
+    prediction = _metric_prediction(1, network_depth=1.0e38)
+    camera = PinholeCamera(
+        model="PINHOLE",
+        width=3,
+        height=2,
+        fx=1.0e9,
+        fy=1.0e9,
+        cx=1.0,
+        cy=1.0,
+    )
+
+    with pytest.raises(ValueError, match="metric depth.*finite float32"):
+        run_metric_sky(
+            _RecordingModel(prediction),
+            frames,
+            camera,
+            tmp_path / "metric",
+            initial_batch_size=2,
+            retry_batch_size=1,
+            release_model=lambda failed: _vram_release_record(),
+            retry_model_factory=lambda: _RecordingModel(prediction),
+            torch_module=_FakeTorch,
+        )
+
+    assert not (tmp_path / "metric").exists()
+    assert not tuple(tmp_path.glob(".metric.staging-*"))
+
+
 def _pose_cameras(frames: tuple[DA3Frame, ...]) -> tuple[FinalPoseCamera, ...]:
     result = []
     for index, frame in enumerate(frames):
@@ -1083,12 +1257,16 @@ class _FinalPoseModel:
         include_confidence: bool = True,
         bad_extrinsics: bool = False,
         bad_intrinsics: bool = False,
+        float32_camera_roundtrip: bool = False,
+        extrinsic_drift: float = 0.0,
     ) -> None:
         self.error_call = error_call
         self.error = error
         self.include_confidence = include_confidence
         self.bad_extrinsics = bad_extrinsics
         self.bad_intrinsics = bad_intrinsics
+        self.float32_camera_roundtrip = float32_camera_roundtrip
+        self.extrinsic_drift = extrinsic_drift
         self.calls: list[dict[str, object]] = []
 
     def inference(self, **kwargs: object) -> object:
@@ -1100,8 +1278,16 @@ class _FinalPoseModel:
         depth_value = float(10 * (call_index + 1))
         attributes: dict[str, object] = {
             "depth": np.full((count, 2, 3), depth_value, dtype=np.float64),
-            "extrinsics": np.array(kwargs["extrinsics"], dtype=np.float64, copy=True),
-            "intrinsics": np.array(kwargs["intrinsics"], dtype=np.float64, copy=True),
+            "extrinsics": np.array(
+                kwargs["extrinsics"],
+                dtype=(np.float32 if self.float32_camera_roundtrip else np.float64),
+                copy=True,
+            ),
+            "intrinsics": np.array(
+                kwargs["intrinsics"],
+                dtype=(np.float32 if self.float32_camera_roundtrip else np.float64),
+                copy=True,
+            ),
         }
         if self.include_confidence:
             attributes["conf"] = np.full(
@@ -1111,6 +1297,8 @@ class _FinalPoseModel:
             )
         if self.bad_extrinsics:
             attributes["extrinsics"][0, 0, 3] += 1.0  # type: ignore[index]
+        if self.extrinsic_drift:
+            attributes["extrinsics"][0, 0, 3] += self.extrinsic_drift  # type: ignore[index]
         if self.bad_intrinsics:
             attributes["intrinsics"][0, 0, 1] = 0.1  # type: ignore[index]
         return SimpleNamespace(**attributes)
@@ -1170,6 +1358,62 @@ def test_run_pose_conditioned_depth_uses_exact_official_conditioning_call(
     assert result.artifacts[0].depth_path.name.endswith(".final_depth.npy")
     assert result.artifacts[0].confidence_path is not None
     assert result.artifacts[0].sky_path is None
+
+
+def test_run_pose_conditioned_depth_accepts_faithful_float32_camera_roundtrip(
+    tmp_path: Path,
+) -> None:
+    frames = _frames(tmp_path / "input", 1)
+    camera = _pose_cameras(frames)[0]
+    w2c = np.asarray(camera.w2c).copy()
+    w2c[0, 3] = 1234.56789
+    camera = FinalPoseCamera(
+        image_name=camera.image_name,
+        frame_id=camera.frame_id,
+        width=camera.width,
+        height=camera.height,
+        w2c=tuple(tuple(float(value) for value in row) for row in w2c),
+        intrinsics=camera.intrinsics,
+    )
+
+    result = run_pose_conditioned_depth(
+        _FinalPoseModel(float32_camera_roundtrip=True),
+        frames,
+        (camera,),
+        tmp_path / "final-depth",
+        torch_module=_FakeTorch,
+    )
+
+    assert result.cameras[0].w2c[0][3] == 1234.56789
+
+
+def test_run_pose_conditioned_depth_rejects_drift_after_float32_roundtrip(
+    tmp_path: Path,
+) -> None:
+    frames = _frames(tmp_path / "input", 1)
+    camera = _pose_cameras(frames)[0]
+    w2c = np.asarray(camera.w2c).copy()
+    w2c[0, 3] = 1234.56789
+    camera = FinalPoseCamera(
+        image_name=camera.image_name,
+        frame_id=camera.frame_id,
+        width=camera.width,
+        height=camera.height,
+        w2c=tuple(tuple(float(value) for value in row) for row in w2c),
+        intrinsics=camera.intrinsics,
+    )
+
+    with pytest.raises(ValueError, match="extrinsics drifted"):
+        run_pose_conditioned_depth(
+            _FinalPoseModel(
+                float32_camera_roundtrip=True,
+                extrinsic_drift=0.01,
+            ),
+            frames,
+            (camera,),
+            tmp_path / "final-depth",
+            torch_module=_FakeTorch,
+        )
 
 
 def test_run_pose_conditioned_depth_fuses_differing_overlap_by_confidence(
