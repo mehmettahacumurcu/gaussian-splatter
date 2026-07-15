@@ -143,19 +143,23 @@ def test_retry_validation_rejects_before_callbacks(
 
 
 @pytest.mark.parametrize(
-    ("stage", "initial_size", "retry_size"),
-    (("da3_anchor", 120, 96), ("da3_final_pose", 48, 24)),
+    ("stage", "expected_stage", "initial_size", "retry_size"),
+    (
+        ("da3_anchor", "da3_anchor", 120, 96),
+        (" da3_anchor ", "da3_anchor", 120, 96),
+        ("da3_final_pose", "da3_final_pose", 48, 24),
+        ("\N{NO-BREAK SPACE}da3_final_pose\N{NO-BREAK SPACE}", "da3_final_pose", 48, 24),
+    ),
 )
-def test_da3_context_retry_is_forbidden_without_mutating_quality_locks(
+def test_da3_context_retry_is_forbidden_before_callbacks(
     stage: str,
+    expected_stage: str,
     initial_size: int,
     retry_size: int,
 ) -> None:
-    locked_size = initial_size
-    process_resolution = 504
     calls: list[str] = []
 
-    with pytest.raises(ValueError, match=stage):
+    with pytest.raises(ValueError, match=expected_stage):
         run_with_smaller_batch_retry(
             stage,
             initial_size,
@@ -167,8 +171,6 @@ def test_da3_context_retry_is_forbidden_without_mutating_quality_locks(
         )
 
     assert calls == []
-    assert initial_size == locked_size
-    assert process_resolution == 504
 
 
 def test_release_cuda_model_on_cpu_moves_model_and_keeps_caller_binding(
