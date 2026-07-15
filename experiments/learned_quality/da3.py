@@ -457,11 +457,22 @@ def _prediction_array(
     return values
 
 
-def _finite_float32(values: object, label: str) -> np.ndarray:
+def _finite_float32(
+    values: object,
+    label: str,
+    *,
+    positive_mask: object | None = None,
+) -> np.ndarray:
     with np.errstate(over="ignore", invalid="ignore"):
         converted = np.ascontiguousarray(values, dtype=np.float32)
     if not np.isfinite(converted).all():
         raise ValueError(f"{label} must be representable as finite float32")
+    if positive_mask is not None:
+        mask = np.asarray(positive_mask, dtype=bool)
+        if mask.shape != converted.shape:
+            raise AssertionError("float32 positive mask must match converted values")
+        if np.any(converted[mask] <= 0.0):
+            raise ValueError(f"{label} must preserve positive values in float32")
     return converted
 
 
@@ -535,11 +546,19 @@ def _validated_prediction(
         if intrinsic_count != expected_count:
             raise ValueError("prediction intrinsics count must exactly match frames")
 
-    depth_output = _finite_float32(depth, "prediction depth")
+    depth_output = _finite_float32(
+        depth,
+        "prediction depth",
+        positive_mask=valid,
+    )
     confidence_output = (
         None
         if confidence is None
-        else _finite_float32(confidence, "prediction conf")
+        else _finite_float32(
+            confidence,
+            "prediction conf",
+            positive_mask=confidence > 0.0,
+        )
     )
     if sky is None:
         sky_output = None
@@ -844,19 +863,35 @@ def _run_metric_batches(
                 requested_size=batch_size,
             )
         )
+    depth_values = np.concatenate(
+        [prediction.depth for prediction in predictions],
+        axis=0,
+    )
+    confidence_values = (
+        None
+        if not confidence_presence
+        else np.concatenate(
+            [prediction.confidence for prediction in predictions],
+            axis=0,
+        )
+    )
+    valid = (
+        np.ones(depth_values.shape, dtype=bool)
+        if confidence_values is None
+        else confidence_values > 0.0
+    )
     depth = _finite_float32(
-        np.concatenate([prediction.depth for prediction in predictions], axis=0),
+        depth_values,
         "metric batched depth",
+        positive_mask=valid,
     )
     confidence = (
         None
-        if not confidence_presence
+        if confidence_values is None
         else _finite_float32(
-            np.concatenate(
-                [prediction.confidence for prediction in predictions],
-                axis=0,
-            ),
+            confidence_values,
             "metric batched confidence",
+            positive_mask=confidence_values > 0.0,
         )
     )
     sky = np.ascontiguousarray(
@@ -888,9 +923,15 @@ def _publish_metric_artifacts(
     if operation.prediction.sky is None:
         raise AssertionError("metric prediction must include sky")
     focal_scale = ((processed_camera.fx + processed_camera.fy) * 0.5) / 300.0
+    valid = (
+        np.ones(operation.prediction.depth.shape, dtype=bool)
+        if operation.prediction.confidence is None
+        else operation.prediction.confidence > 0.0
+    )
     metric_depth = _finite_float32(
         operation.prediction.depth.astype(np.float64) * focal_scale,
         "metric depth",
+        positive_mask=valid,
     )
     staging = Path(
         tempfile.mkdtemp(
@@ -1408,11 +1449,19 @@ def run_pose_conditioned_depth(
                 out=combined,
                 where=weight_sum > 0.0,
             )
-            fused_depth.append(_finite_float32(combined, "final fused depth"))
+            fused_depth.append(
+                _finite_float32(
+                    combined,
+                    "final fused depth",
+                    positive_mask=weight_sum > 0.0,
+                )
+            )
+            maximum_confidence = np.max(confidence_stack, axis=0)
             fused_confidence.append(
                 _finite_float32(
-                    np.max(confidence_stack, axis=0),
+                    maximum_confidence,
                     "final fused confidence",
+                    positive_mask=maximum_confidence > 0.0,
                 )
             )
         else:
@@ -1420,6 +1469,7 @@ def run_pose_conditioned_depth(
                 _finite_float32(
                     np.mean(depth_stack, axis=0),
                     "final fused depth",
+                    positive_mask=np.ones(processed_shape, dtype=bool),
                 )
             )
         contributions.append(
@@ -1429,16 +1479,27 @@ def run_pose_conditioned_depth(
                 chunk_indices=tuple(chunk_indices),
             )
         )
+    depth_values = np.stack(fused_depth)
+    confidence_values = (
+        np.stack(fused_confidence) if confidence_presence else None
+    )
+    valid = (
+        np.ones(depth_values.shape, dtype=bool)
+        if confidence_values is None
+        else confidence_values > 0.0
+    )
     depth_output = _finite_float32(
-        np.stack(fused_depth),
+        depth_values,
         "final depth artifacts",
+        positive_mask=valid,
     )
     confidence_output = (
         _finite_float32(
-            np.stack(fused_confidence),
+            confidence_values,
             "final confidence artifacts",
+            positive_mask=confidence_values > 0.0,
         )
-        if confidence_presence
+        if confidence_values is not None
         else None
     )
     return _publish_final_depth_artifacts(

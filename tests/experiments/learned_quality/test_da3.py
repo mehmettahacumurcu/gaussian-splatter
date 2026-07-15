@@ -607,6 +607,27 @@ def test_run_anchor_inference_rejects_float32_artifact_overflow_before_staging(
     assert not tuple(tmp_path.glob(".output.staging-*"))
 
 
+@pytest.mark.parametrize("field", ("depth", "conf"))
+def test_run_anchor_inference_rejects_positive_float32_underflow_before_staging(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    frames = _frames(tmp_path / "input", 1)
+    prediction = _prediction(1)
+    setattr(prediction, field, np.full((1, 2, 3), 1.0e-50, dtype=np.float64))
+
+    with pytest.raises(ValueError, match=f"prediction {field}.*preserve positive"):
+        run_anchor_inference(
+            _RecordingModel(prediction),
+            frames,
+            tmp_path / "output",
+            vram_gb=40,
+        )
+
+    assert not (tmp_path / "output").exists()
+    assert not tuple(tmp_path.glob(".output.staging-*"))
+
+
 @pytest.mark.parametrize(
     ("image_name", "frame_id"),
     (("../image.png", "frame-0"), ("image.png", "../frame-0"), ("image.png", "a/b")),
@@ -1226,6 +1247,38 @@ def test_run_metric_sky_rejects_focal_scaling_overflow_before_staging(
     assert not tuple(tmp_path.glob(".metric.staging-*"))
 
 
+def test_run_metric_sky_rejects_positive_scaling_underflow_before_staging(
+    tmp_path: Path,
+) -> None:
+    frames = _frames(tmp_path / "input", 1)
+    prediction = _metric_prediction(1, network_depth=1.0)
+    camera = PinholeCamera(
+        model="PINHOLE",
+        width=3,
+        height=2,
+        fx=1.0e-44,
+        fy=1.0e-44,
+        cx=1.0,
+        cy=1.0,
+    )
+
+    with pytest.raises(ValueError, match="metric depth.*preserve positive"):
+        run_metric_sky(
+            _RecordingModel(prediction),
+            frames,
+            camera,
+            tmp_path / "metric",
+            initial_batch_size=2,
+            retry_batch_size=1,
+            release_model=lambda failed: _vram_release_record(),
+            retry_model_factory=lambda: _RecordingModel(prediction),
+            torch_module=_FakeTorch,
+        )
+
+    assert not (tmp_path / "metric").exists()
+    assert not tuple(tmp_path.glob(".metric.staging-*"))
+
+
 def _pose_cameras(frames: tuple[DA3Frame, ...]) -> tuple[FinalPoseCamera, ...]:
     result = []
     for index, frame in enumerate(frames):
@@ -1259,6 +1312,8 @@ class _FinalPoseModel:
         bad_intrinsics: bool = False,
         float32_camera_roundtrip: bool = False,
         extrinsic_drift: float = 0.0,
+        depth_value: float | None = None,
+        confidence_value: float | None = None,
     ) -> None:
         self.error_call = error_call
         self.error = error
@@ -1267,6 +1322,8 @@ class _FinalPoseModel:
         self.bad_intrinsics = bad_intrinsics
         self.float32_camera_roundtrip = float32_camera_roundtrip
         self.extrinsic_drift = extrinsic_drift
+        self.depth_value = depth_value
+        self.confidence_value = confidence_value
         self.calls: list[dict[str, object]] = []
 
     def inference(self, **kwargs: object) -> object:
@@ -1275,7 +1332,11 @@ class _FinalPoseModel:
         if self.error_call == call_index and self.error is not None:
             raise self.error
         count = len(kwargs["image"])  # type: ignore[arg-type]
-        depth_value = float(10 * (call_index + 1))
+        depth_value = (
+            float(10 * (call_index + 1))
+            if self.depth_value is None
+            else self.depth_value
+        )
         attributes: dict[str, object] = {
             "depth": np.full((count, 2, 3), depth_value, dtype=np.float64),
             "extrinsics": np.array(
@@ -1290,9 +1351,14 @@ class _FinalPoseModel:
             ),
         }
         if self.include_confidence:
+            confidence_value = (
+                float(2 * call_index + 1)
+                if self.confidence_value is None
+                else self.confidence_value
+            )
             attributes["conf"] = np.full(
                 (count, 2, 3),
-                float(2 * call_index + 1),
+                confidence_value,
                 dtype=np.float64,
             )
         if self.bad_extrinsics:
@@ -1414,6 +1480,36 @@ def test_run_pose_conditioned_depth_rejects_drift_after_float32_roundtrip(
             tmp_path / "final-depth",
             torch_module=_FakeTorch,
         )
+
+
+@pytest.mark.parametrize(
+    ("model_kwargs", "label"),
+    (
+        ({"depth_value": 1.0e-50}, "prediction depth"),
+        ({"confidence_value": 1.0e-50}, "prediction conf"),
+    ),
+)
+def test_run_pose_conditioned_depth_rejects_positive_float32_underflow(
+    tmp_path: Path,
+    model_kwargs: dict[str, float],
+    label: str,
+) -> None:
+    frames = _frames(tmp_path / "input", 1)
+
+    with pytest.raises(
+        ValueError,
+        match=f"final prediction is invalid: {label}.*preserve positive",
+    ):
+        run_pose_conditioned_depth(
+            _FinalPoseModel(**model_kwargs),
+            frames,
+            _pose_cameras(frames),
+            tmp_path / "final-depth",
+            torch_module=_FakeTorch,
+        )
+
+    assert not (tmp_path / "final-depth").exists()
+    assert not tuple(tmp_path.glob(".final-depth.staging-*"))
 
 
 def test_run_pose_conditioned_depth_fuses_differing_overlap_by_confidence(
