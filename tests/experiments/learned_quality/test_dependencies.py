@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
 from typing import Mapping, cast
@@ -11,18 +11,23 @@ import pytest
 from experiments.learned_quality.contracts import ModelRef
 from experiments.learned_quality.dependencies import (
     CHECKPOINT_MODEL_REFS,
+    DEFAULT_CHECKPOINT_ROOT,
     DEFAULT_ENV_ROOT,
     DEFAULT_LOCK_PATH,
+    DEFAULT_SOURCE_ROOT,
     PROTECTED_PACKAGES,
     SOURCE_REPOSITORY_REFS,
+    LearnedAssets,
     LearnedEnvironment,
     PinnedModelSnapshot,
     ProtectedRuntimeError,
     ProtectedRuntimeSnapshot,
     RuntimePackage,
+    SourceCheckout,
     assert_no_protected_changes,
     capture_protected_runtime,
     install_learned_environment,
+    materialize_pinned_assets,
     snapshot_pinned_model,
 )
 
@@ -83,6 +88,69 @@ def _write_lock(root: Path, lines: tuple[str, ...] = LOCK_LINES) -> Path:
     lock_path = root / "requirements-lock.txt"
     lock_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return lock_path
+
+
+def _learned_environment(root: Path) -> LearnedEnvironment:
+    snapshot = _snapshot()
+    return LearnedEnvironment(
+        root=root,
+        python_exe=root / "bin" / "python",
+        lock_path=root.parent / "requirements-lock.txt",
+        pip_report_path=root / "pip-dry-run-report.json",
+        main_runtime_before=snapshot,
+        main_runtime_after=snapshot,
+    )
+
+
+_SOURCE_NAMES = ("da3", "sam2", "sea-raft")
+_SOURCE_BY_NAME = dict(zip(_SOURCE_NAMES, SOURCE_REPOSITORY_REFS, strict=True))
+
+
+class _GitRunner:
+    def __init__(
+        self,
+        source_root: Path,
+        *,
+        outputs: Mapping[tuple[str, str], object] | None = None,
+        fail_step: str | None = None,
+    ) -> None:
+        self.source_root = source_root
+        self.outputs = dict(outputs or {})
+        self.fail_step = fail_step
+        self.calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def __call__(
+        self,
+        argv: list[str],
+        **kwargs: object,
+    ) -> CompletedProcess[str]:
+        self.calls.append((list(argv), dict(kwargs)))
+        if argv[:4] == ["git", "clone", "--no-checkout", "--filter=blob:none"]:
+            destination = Path(argv[-1])
+            destination.mkdir(parents=False, exist_ok=False)
+            if self.fail_step == "clone":
+                raise CalledProcessError(1, argv, stderr="clone failed")
+            return CompletedProcess(argv, 0, stdout="", stderr="")
+
+        if len(argv) < 5 or argv[:2] != ["git", "-C"]:
+            raise AssertionError(f"unexpected subprocess argv: {argv!r}")
+        destination = Path(argv[2])
+        name = destination.name
+        source = _SOURCE_BY_NAME[name]
+        command = argv[3:]
+        if command[:2] == ["checkout", "--detach"]:
+            if self.fail_step == "checkout":
+                raise CalledProcessError(1, argv, stderr="checkout failed")
+            stdout: object = ""
+        elif command == ["remote", "get-url", "origin"]:
+            stdout = self.outputs.get((name, "remote"), f"{source.repo_id}\n")
+        elif command == ["rev-parse", "HEAD"]:
+            stdout = self.outputs.get((name, "head"), f"{source.revision}\n")
+        elif command == ["status", "--porcelain"]:
+            stdout = self.outputs.get((name, "status"), "")
+        else:
+            raise AssertionError(f"unexpected subprocess argv: {argv!r}")
+        return CompletedProcess(argv, 0, stdout=cast(str, stdout), stderr="")
 
 
 class _InstallRunner:
@@ -837,3 +905,442 @@ def test_protected_runtime_drift_takes_precedence_over_install_failure(
 
     assert isinstance(error.value.__cause__, CalledProcessError)
     assert runner.capture_count == 2
+
+
+def test_learned_asset_defaults_are_exact() -> None:
+    assert DEFAULT_SOURCE_ROOT == Path("/content/learned-sources")
+    assert DEFAULT_CHECKPOINT_ROOT == Path("/content/learned-checkpoints")
+
+
+def test_materialize_missing_assets_uses_exact_pins_and_safe_argv(
+    tmp_path: Path,
+) -> None:
+    environment = _learned_environment(tmp_path / "venv")
+    source_root = tmp_path / "sources"
+    checkpoint_root = tmp_path / "checkpoints"
+    runner = _GitRunner(source_root)
+    download_calls: list[dict[str, object]] = []
+    resolved: dict[Path, str] = {}
+
+    def downloader(**kwargs: object) -> Path:
+        download_calls.append(dict(kwargs))
+        local_dir = Path(cast(Path, kwargs["local_dir"]))
+        local_dir.mkdir()
+        resolved[local_dir] = cast(str, kwargs["revision"])
+        return local_dir
+
+    assets = materialize_pinned_assets(
+        environment,
+        source_root=source_root,
+        checkpoint_root=checkpoint_root,
+        runner=runner,
+        downloader=downloader,
+        resolve_revision=resolved.__getitem__,
+    )
+
+    expected_git_calls: list[list[str]] = []
+    expected_sources: list[SourceCheckout] = []
+    for name, source in zip(_SOURCE_NAMES, SOURCE_REPOSITORY_REFS, strict=True):
+        destination = source_root / name
+        expected_git_calls.extend(
+            [
+                [
+                    "git",
+                    "clone",
+                    "--no-checkout",
+                    "--filter=blob:none",
+                    source.repo_id,
+                    str(destination),
+                ],
+                [
+                    "git",
+                    "-C",
+                    str(destination),
+                    "checkout",
+                    "--detach",
+                    source.revision,
+                ],
+                [
+                    "git",
+                    "-C",
+                    str(destination),
+                    "remote",
+                    "get-url",
+                    "origin",
+                ],
+                ["git", "-C", str(destination), "rev-parse", "HEAD"],
+                ["git", "-C", str(destination), "status", "--porcelain"],
+            ]
+        )
+        expected_sources.append(
+            SourceCheckout(
+                name=name,
+                repo_url=source.repo_id,
+                path=destination,
+                requested_commit=source.revision,
+                resolved_commit=source.revision,
+                license_id=source.license_id,
+            )
+        )
+
+    checkpoint_destinations = tuple(
+        checkpoint_root / model.repo_id.replace("/", "--")
+        for model in CHECKPOINT_MODEL_REFS
+    )
+    assert [argv for argv, _kwargs in runner.calls] == expected_git_calls
+    assert all(
+        kwargs == {"check": True, "capture_output": True, "text": True}
+        for _argv, kwargs in runner.calls
+    )
+    assert all("shell" not in kwargs for _argv, kwargs in runner.calls)
+    assert all(
+        forbidden not in " ".join(argv).casefold()
+        for argv, _kwargs in runner.calls
+        for forbidden in ("pip install", "setup.py", "pyproject.toml")
+    )
+    assert download_calls == [
+        {
+            "repo_id": model.repo_id,
+            "revision": model.revision,
+            "local_dir": destination,
+        }
+        for model, destination in zip(
+            CHECKPOINT_MODEL_REFS,
+            checkpoint_destinations,
+            strict=True,
+        )
+    ]
+    assert assets == LearnedAssets(
+        sources=tuple(expected_sources),
+        checkpoints=tuple(
+            PinnedModelSnapshot(
+                model=model,
+                local_path=destination,
+                resolved_revision=model.revision,
+            )
+            for model, destination in zip(
+                CHECKPOINT_MODEL_REFS,
+                checkpoint_destinations,
+                strict=True,
+            )
+        ),
+    )
+    with pytest.raises(FrozenInstanceError):
+        assets.sources = ()  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        assets.sources[0].resolved_commit = "a" * 40  # type: ignore[misc]
+
+
+def test_materialize_reuses_only_clean_exact_source_directories(
+    tmp_path: Path,
+) -> None:
+    environment = _learned_environment(tmp_path / "venv")
+    source_root = tmp_path / "sources"
+    checkpoint_root = tmp_path / "checkpoints"
+    source_root.mkdir()
+    checkpoint_root.mkdir()
+    for name in _SOURCE_NAMES:
+        (source_root / name).mkdir()
+    for model in CHECKPOINT_MODEL_REFS:
+        (checkpoint_root / model.repo_id.replace("/", "--")).mkdir()
+    runner = _GitRunner(source_root)
+
+    assets = materialize_pinned_assets(
+        environment,
+        source_root=source_root,
+        checkpoint_root=checkpoint_root,
+        runner=runner,
+        downloader=lambda **kwargs: cast(Path, kwargs["local_dir"]),
+        resolve_revision=lambda path: next(
+            model.revision
+            for model in CHECKPOINT_MODEL_REFS
+            if path.name == model.repo_id.replace("/", "--")
+        ),
+    )
+
+    assert len(assets.sources) == len(SOURCE_REPOSITORY_REFS)
+    assert len(runner.calls) == 9
+    assert all("clone" not in argv and "checkout" not in argv for argv, _ in runner.calls)
+    assert [argv[3:] for argv, _kwargs in runner.calls] == [
+        command
+        for _name in _SOURCE_NAMES
+        for command in (
+            ["remote", "get-url", "origin"],
+            ["rev-parse", "HEAD"],
+            ["status", "--porcelain"],
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("remote", "https://example.invalid/wrong.git\n", "remote"),
+        ("head", f"{'b' * 40}\n", "HEAD"),
+        ("status", " M setup.py\n", "dirty"),
+        (
+            "remote",
+            f"{SOURCE_REPOSITORY_REFS[0].repo_id}\nextra\n",
+            "remote",
+        ),
+        ("head", f"{'A' * 40}\n", "HEAD"),
+        ("head", None, "HEAD"),
+    ],
+)
+def test_materialize_rejects_untrusted_or_malformed_existing_source(
+    tmp_path: Path,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    (source_root / "da3").mkdir()
+    runner = _GitRunner(source_root, outputs={("da3", field): value})
+
+    with pytest.raises(ValueError, match=message):
+        materialize_pinned_assets(
+            _learned_environment(tmp_path / "venv"),
+            source_root=source_root,
+            checkpoint_root=tmp_path / "checkpoints",
+            runner=runner,
+            downloader=lambda **_kwargs: pytest.fail("download must not execute"),
+            resolve_revision=lambda _path: pytest.fail("resolver must not execute"),
+        )
+
+    assert all("clone" not in argv for argv, _kwargs in runner.calls)
+
+
+@pytest.mark.parametrize("fail_step", ["clone", "checkout"])
+def test_clone_failure_leaves_destination_but_never_trusts_it_without_checks(
+    tmp_path: Path,
+    fail_step: str,
+) -> None:
+    source_root = tmp_path / "sources"
+    checkpoint_root = tmp_path / "checkpoints"
+    failing_runner = _GitRunner(source_root, fail_step=fail_step)
+
+    with pytest.raises(CalledProcessError):
+        materialize_pinned_assets(
+            _learned_environment(tmp_path / "venv"),
+            source_root=source_root,
+            checkpoint_root=checkpoint_root,
+            runner=failing_runner,
+            downloader=lambda **_kwargs: pytest.fail("download must not execute"),
+            resolve_revision=lambda _path: pytest.fail("resolver must not execute"),
+        )
+
+    destination = source_root / "da3"
+    assert destination.is_dir()
+    reuse_runner = _GitRunner(
+        source_root,
+        outputs={("da3", "head"): f"{'b' * 40}\n"},
+    )
+    with pytest.raises(ValueError, match="HEAD"):
+        materialize_pinned_assets(
+            _learned_environment(tmp_path / "venv"),
+            source_root=source_root,
+            checkpoint_root=checkpoint_root,
+            runner=reuse_runner,
+            downloader=lambda **_kwargs: pytest.fail("download must not execute"),
+            resolve_revision=lambda _path: pytest.fail("resolver must not execute"),
+        )
+    assert all("clone" not in argv and "checkout" not in argv for argv, _ in reuse_runner.calls)
+
+
+@pytest.mark.parametrize(
+    "relative_field",
+    ["environment.root", "environment.python_exe", "source_root", "checkpoint_root"],
+)
+def test_materialize_rejects_relative_paths_before_external_calls(
+    tmp_path: Path,
+    relative_field: str,
+) -> None:
+    environment = _learned_environment(tmp_path / "venv")
+    source_root = tmp_path / "sources"
+    checkpoint_root = tmp_path / "checkpoints"
+    if relative_field == "environment.root":
+        environment = replace(environment, root=Path("venv"))
+    elif relative_field == "environment.python_exe":
+        environment = replace(environment, python_exe=Path("venv/bin/python"))
+    elif relative_field == "source_root":
+        source_root = Path("sources")
+    else:
+        checkpoint_root = Path("checkpoints")
+    calls: list[list[str]] = []
+
+    with pytest.raises(ValueError, match="absolute"):
+        materialize_pinned_assets(
+            environment,
+            source_root=source_root,
+            checkpoint_root=checkpoint_root,
+            runner=lambda argv, **_kwargs: calls.append(argv),  # type: ignore[arg-type]
+            downloader=lambda **_kwargs: pytest.fail("download must not execute"),
+            resolve_revision=lambda _path: pytest.fail("resolver must not execute"),
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "source-in-env",
+        "source-contains-env",
+        "checkpoint-in-env",
+        "checkpoint-contains-env",
+        "same-asset-roots",
+        "source-contains-checkpoint",
+        "checkpoint-contains-source",
+    ],
+)
+def test_materialize_rejects_overlapping_resolved_roots_before_external_calls(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    environment_root = tmp_path / "sandbox" / "venv"
+    source_root = tmp_path / "sources"
+    checkpoint_root = tmp_path / "checkpoints"
+    if case == "source-in-env":
+        source_root = environment_root / "sources"
+    elif case == "source-contains-env":
+        source_root = environment_root.parent
+    elif case == "checkpoint-in-env":
+        checkpoint_root = environment_root / "checkpoints"
+    elif case == "checkpoint-contains-env":
+        checkpoint_root = environment_root.parent
+    elif case == "same-asset-roots":
+        checkpoint_root = source_root
+    elif case == "source-contains-checkpoint":
+        checkpoint_root = source_root / "checkpoints"
+    else:
+        source_root = checkpoint_root / "sources"
+    calls: list[list[str]] = []
+
+    with pytest.raises(ValueError, match="root"):
+        materialize_pinned_assets(
+            _learned_environment(environment_root),
+            source_root=source_root,
+            checkpoint_root=checkpoint_root,
+            runner=lambda argv, **_kwargs: calls.append(argv),  # type: ignore[arg-type]
+            downloader=lambda **_kwargs: pytest.fail("download must not execute"),
+            resolve_revision=lambda _path: pytest.fail("resolver must not execute"),
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("root_kind", ["source", "checkpoint"])
+def test_materialize_rejects_existing_symlink_asset_root(
+    tmp_path: Path,
+    root_kind: str,
+) -> None:
+    target = tmp_path / f"{root_kind}-target"
+    target.mkdir()
+    symlink = tmp_path / f"{root_kind}-link"
+    symlink.symlink_to(target, target_is_directory=True)
+    source_root = symlink if root_kind == "source" else tmp_path / "sources"
+    checkpoint_root = symlink if root_kind == "checkpoint" else tmp_path / "checkpoints"
+
+    with pytest.raises(ValueError, match="symlink"):
+        materialize_pinned_assets(
+            _learned_environment(tmp_path / "venv"),
+            source_root=source_root,
+            checkpoint_root=checkpoint_root,
+            runner=lambda *_args, **_kwargs: pytest.fail("runner must not execute"),
+            downloader=lambda **_kwargs: pytest.fail("download must not execute"),
+            resolve_revision=lambda _path: pytest.fail("resolver must not execute"),
+        )
+
+
+@pytest.mark.parametrize("destination_kind", ["file", "symlink"])
+def test_materialize_rejects_unsafe_existing_source_destination(
+    tmp_path: Path,
+    destination_kind: str,
+) -> None:
+    source_root = tmp_path / "sources"
+    source_root.mkdir()
+    destination = source_root / "da3"
+    target = tmp_path / "source-target"
+    if destination_kind == "file":
+        destination.write_bytes(b"do-not-overwrite")
+    else:
+        target.mkdir()
+        destination.symlink_to(target, target_is_directory=True)
+    original = destination.read_bytes() if destination_kind == "file" else None
+
+    with pytest.raises(ValueError, match="source destination"):
+        materialize_pinned_assets(
+            _learned_environment(tmp_path / "venv"),
+            source_root=source_root,
+            checkpoint_root=tmp_path / "checkpoints",
+            runner=lambda *_args, **_kwargs: pytest.fail("runner must not execute"),
+            downloader=lambda **_kwargs: pytest.fail("download must not execute"),
+            resolve_revision=lambda _path: pytest.fail("resolver must not execute"),
+        )
+    if original is not None:
+        assert destination.read_bytes() == original
+    else:
+        assert destination.is_symlink()
+
+
+@pytest.mark.parametrize("destination_kind", ["file", "symlink"])
+def test_materialize_rejects_unsafe_existing_checkpoint_destination(
+    tmp_path: Path,
+    destination_kind: str,
+) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    checkpoint_root.mkdir()
+    destination = checkpoint_root / CHECKPOINT_MODEL_REFS[0].repo_id.replace("/", "--")
+    target = tmp_path / "checkpoint-target"
+    if destination_kind == "file":
+        destination.write_bytes(b"do-not-overwrite")
+    else:
+        target.mkdir()
+        destination.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="checkpoint destination"):
+        materialize_pinned_assets(
+            _learned_environment(tmp_path / "venv"),
+            source_root=tmp_path / "sources",
+            checkpoint_root=checkpoint_root,
+            runner=lambda *_args, **_kwargs: pytest.fail("runner must not execute"),
+            downloader=lambda **_kwargs: pytest.fail("download must not execute"),
+            resolve_revision=lambda _path: pytest.fail("resolver must not execute"),
+        )
+    if destination_kind == "symlink":
+        assert destination.is_symlink()
+    else:
+        assert destination.read_bytes() == b"do-not-overwrite"
+
+
+def test_materialize_propagates_checkpoint_revision_mismatch(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "sources"
+    checkpoint_root = tmp_path / "checkpoints"
+    runner = _GitRunner(source_root)
+    download_calls: list[dict[str, object]] = []
+
+    def downloader(**kwargs: object) -> Path:
+        download_calls.append(dict(kwargs))
+        local_dir = Path(cast(Path, kwargs["local_dir"]))
+        local_dir.mkdir()
+        return local_dir
+
+    with pytest.raises(ValueError, match="resolved revision"):
+        materialize_pinned_assets(
+            _learned_environment(tmp_path / "venv"),
+            source_root=source_root,
+            checkpoint_root=checkpoint_root,
+            runner=runner,
+            downloader=downloader,
+            resolve_revision=lambda _path: "b" * 40,
+        )
+
+    assert download_calls == [
+        {
+            "repo_id": CHECKPOINT_MODEL_REFS[0].repo_id,
+            "revision": CHECKPOINT_MODEL_REFS[0].revision,
+            "local_dir": checkpoint_root
+            / CHECKPOINT_MODEL_REFS[0].repo_id.replace("/", "--"),
+        }
+    ]

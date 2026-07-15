@@ -14,6 +14,8 @@ from .contracts import ModelRef
 PROTECTED_PACKAGES = ("torch", "torchvision", "numpy", "gsplat")
 DEFAULT_ENV_ROOT = Path("/content/learned-env")
 DEFAULT_LOCK_PATH = Path(__file__).with_name("requirements-lock.txt")
+DEFAULT_SOURCE_ROOT = Path("/content/learned-sources")
+DEFAULT_CHECKPOINT_ROOT = Path("/content/learned-checkpoints")
 
 _EXPECTED_LOCK_LINES = (
     "transformers==4.57.6",
@@ -530,6 +532,22 @@ class PinnedModelSnapshot:
     resolved_revision: str
 
 
+@dataclass(frozen=True)
+class SourceCheckout:
+    name: str
+    repo_url: str
+    path: Path
+    requested_commit: str
+    resolved_commit: str
+    license_id: str
+
+
+@dataclass(frozen=True)
+class LearnedAssets:
+    sources: tuple[SourceCheckout, ...]
+    checkpoints: tuple[PinnedModelSnapshot, ...]
+
+
 def _require_revision(value: object, label: str) -> str:
     if not isinstance(value, str) or _REVISION_PATTERN.fullmatch(value) is None:
         raise ValueError(f"{label} must be a 40-character lowercase hex revision")
@@ -564,4 +582,196 @@ def snapshot_pinned_model(
         model=model,
         local_path=local_path,
         resolved_revision=resolved_revision,
+    )
+
+
+_SOURCE_NAMES = ("da3", "sam2", "sea-raft")
+
+
+def _paths_overlap(first: Path, second: Path) -> bool:
+    return first == second or first in second.parents or second in first.parents
+
+
+def _validate_asset_root(path: Path, label: str) -> None:
+    if path.is_symlink():
+        raise ValueError(f"{label} cannot be a symlink")
+    if path.exists() and not path.is_dir():
+        raise ValueError(f"{label} must be a directory")
+
+
+def _validate_asset_destination(path: Path, label: str) -> None:
+    if path.is_symlink():
+        raise ValueError(f"{label} cannot be a symlink")
+    if path.exists() and not path.is_dir():
+        raise ValueError(f"{label} must be a directory")
+
+
+def _single_git_output(stdout: object, label: str) -> str:
+    if not isinstance(stdout, str):
+        raise ValueError(f"{label} output is malformed")
+    lines = stdout.splitlines()
+    if len(lines) != 1:
+        raise ValueError(f"{label} output is malformed")
+    return lines[0]
+
+
+def _verify_source_checkout(
+    destination: Path,
+    source: ModelRef,
+    runner: Callable[..., CompletedProcess[str]],
+) -> str:
+    remote = _single_git_output(
+        _run_checked(
+            runner,
+            [
+                "git",
+                "-C",
+                str(destination),
+                "remote",
+                "get-url",
+                "origin",
+            ],
+        ).stdout,
+        "source remote",
+    )
+    if remote != source.repo_id:
+        raise ValueError("source remote does not match the approved repository")
+
+    head = _single_git_output(
+        _run_checked(
+            runner,
+            ["git", "-C", str(destination), "rev-parse", "HEAD"],
+        ).stdout,
+        "source HEAD",
+    )
+    _require_revision(head, "source HEAD")
+    if head != source.revision:
+        raise ValueError("source HEAD does not match the requested commit")
+
+    status = _run_checked(
+        runner,
+        ["git", "-C", str(destination), "status", "--porcelain"],
+    ).stdout
+    if not isinstance(status, str):
+        raise ValueError("source status output is malformed")
+    if status != "":
+        raise ValueError("source checkout is dirty")
+    return head
+
+
+def _checkpoint_destination(checkpoint_root: Path, model: ModelRef) -> Path:
+    return checkpoint_root / model.repo_id.replace("/", "--")
+
+
+def materialize_pinned_assets(
+    environment: LearnedEnvironment,
+    *,
+    source_root: Path = DEFAULT_SOURCE_ROOT,
+    checkpoint_root: Path = DEFAULT_CHECKPOINT_ROOT,
+    runner: Callable[..., CompletedProcess[str]] = subprocess.run,
+    downloader: Callable[..., str | Path],
+    resolve_revision: Callable[[Path], str],
+) -> LearnedAssets:
+    environment_root = _require_absolute_path(environment.root, "environment.root")
+    _require_absolute_path(environment.python_exe, "environment.python_exe")
+    source_root_path = _require_absolute_path(source_root, "source_root")
+    checkpoint_root_path = _require_absolute_path(
+        checkpoint_root,
+        "checkpoint_root",
+    )
+
+    _validate_asset_root(environment_root, "environment root")
+    _validate_asset_root(source_root_path, "source root")
+    _validate_asset_root(checkpoint_root_path, "checkpoint root")
+    resolved_environment_root = environment_root.resolve(strict=False)
+    resolved_source_root = source_root_path.resolve(strict=False)
+    resolved_checkpoint_root = checkpoint_root_path.resolve(strict=False)
+    if _paths_overlap(resolved_environment_root, resolved_source_root):
+        raise ValueError("source root must be outside the environment root")
+    if _paths_overlap(resolved_environment_root, resolved_checkpoint_root):
+        raise ValueError("checkpoint root must be outside the environment root")
+    if _paths_overlap(resolved_source_root, resolved_checkpoint_root):
+        raise ValueError("source and checkpoint roots cannot overlap")
+
+    source_destinations = tuple(
+        source_root_path / name for name in _SOURCE_NAMES
+    )
+    checkpoint_destinations = tuple(
+        _checkpoint_destination(checkpoint_root_path, model)
+        for model in CHECKPOINT_MODEL_REFS
+    )
+    for destination in source_destinations:
+        _validate_asset_destination(destination, "source destination")
+    for destination in checkpoint_destinations:
+        _validate_asset_destination(destination, "checkpoint destination")
+
+    source_root_path.mkdir(parents=True, exist_ok=True)
+    checkpoint_root_path.mkdir(parents=True, exist_ok=True)
+    _validate_asset_root(source_root_path, "source root")
+    _validate_asset_root(checkpoint_root_path, "checkpoint root")
+
+    sources: list[SourceCheckout] = []
+    for name, source, destination in zip(
+        _SOURCE_NAMES,
+        SOURCE_REPOSITORY_REFS,
+        source_destinations,
+        strict=True,
+    ):
+        destination_exists = destination.exists()
+        _validate_asset_destination(destination, "source destination")
+        if not destination_exists:
+            _run_checked(
+                runner,
+                [
+                    "git",
+                    "clone",
+                    "--no-checkout",
+                    "--filter=blob:none",
+                    source.repo_id,
+                    str(destination),
+                ],
+            )
+            _validate_asset_destination(destination, "source destination")
+            _run_checked(
+                runner,
+                [
+                    "git",
+                    "-C",
+                    str(destination),
+                    "checkout",
+                    "--detach",
+                    source.revision,
+                ],
+            )
+        resolved_commit = _verify_source_checkout(destination, source, runner)
+        sources.append(
+            SourceCheckout(
+                name=name,
+                repo_url=source.repo_id,
+                path=destination,
+                requested_commit=source.revision,
+                resolved_commit=resolved_commit,
+                license_id=source.license_id,
+            )
+        )
+
+    checkpoints: list[PinnedModelSnapshot] = []
+    for model, destination in zip(
+        CHECKPOINT_MODEL_REFS,
+        checkpoint_destinations,
+        strict=True,
+    ):
+        _validate_asset_destination(destination, "checkpoint destination")
+        checkpoints.append(
+            snapshot_pinned_model(
+                model,
+                destination,
+                downloader=downloader,
+                resolve_revision=resolve_revision,
+            )
+        )
+
+    return LearnedAssets(
+        sources=tuple(sources),
+        checkpoints=tuple(checkpoints),
     )
