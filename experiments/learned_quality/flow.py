@@ -997,7 +997,7 @@ def _validated_input_frames(
     image_names: set[str] = set()
     source_paths: set[Path] = set()
     dimensions: list[tuple[int, int]] = []
-    payload: list[dict[str, object]] = []
+    frame_payload: list[dict[str, object]] = []
     for frame in frames:
         if not isinstance(frame, FrameArtifact):
             raise ValueError("frames must contain only FrameArtifact records")
@@ -1035,15 +1035,22 @@ def _validated_input_frames(
         image_names.add(frame.image_name)
         source_paths.add(resolved_path)
         dimensions.append(_image_dimensions(frame.path))
-        payload.append(
+        frame_payload.append(
             {
                 "frame_id": frame.frame_id,
                 "image_name": frame.image_name,
-                "path": str(frame.path),
                 "sha256": digest,
+                "size_bytes": frame.path.stat().st_size,
             }
         )
-    digest = hashlib.sha256(_strict_json_bytes(payload)).hexdigest()
+    digest = hashlib.sha256(
+        _strict_json_bytes(
+            {
+                "frames": frame_payload,
+                "schema": "learned_quality.input_frames.v1",
+            }
+        )
+    ).hexdigest()
     return frames, tuple(dimensions), digest
 
 

@@ -888,7 +888,7 @@ def test_scene_digest_binds_actual_ordered_scene_evidence(
     assert result.scene_digest != baseline.scene_digest
 
 
-def test_scene_digest_is_portable_across_identical_depth_artifact_locations(
+def test_input_and_scene_digests_are_portable_and_bind_source_content(
     tmp_path: Path,
 ) -> None:
     frames, scene = _motion_fixture(tmp_path)
@@ -899,25 +899,74 @@ def test_scene_digest_is_portable_across_identical_depth_artifact_locations(
         (tmp_path / "baseline").resolve(),
         baseline_events,
     )
-    relocated_depth_dir = (tmp_path / "relocated-depths").resolve()
-    relocated_depth_dir.mkdir()
+    relocated_root = (tmp_path / "relocated-root").resolve()
+    relocated_frames: list[FrameArtifact] = []
     relocated_rigid_frames: list[RigidFrameEvidence] = []
-    for index, rigid in enumerate(scene.frames):
+    for index, (frame, rigid) in enumerate(zip(frames, scene.frames)):
+        relocated_image_path = relocated_root / f"input_{index}" / frame.image_name
+        relocated_image_path.parent.mkdir(parents=True)
+        relocated_image_path.write_bytes(frame.path.read_bytes())
+        relocated_frame = replace(frame, path=relocated_image_path)
+        relocated_frames.append(relocated_frame)
         assert rigid.depth_path is not None
-        relocated_path = relocated_depth_dir / f"depth-{index}.npy"
-        relocated_path.write_bytes(rigid.depth_path.read_bytes())
-        relocated_rigid_frames.append(replace(rigid, depth_path=relocated_path))
+        relocated_depth_path = relocated_root / "depths" / f"depth-{index}.npy"
+        relocated_depth_path.parent.mkdir(parents=True, exist_ok=True)
+        relocated_depth_path.write_bytes(rigid.depth_path.read_bytes())
+        relocated_rigid_frames.append(
+            replace(
+                rigid,
+                frame=relocated_frame,
+                depth_path=relocated_depth_path,
+            )
+        )
     relocated_scene = replace(scene, frames=tuple(relocated_rigid_frames))
     relocated_events: list[str] = []
 
     relocated = _run_motion_case(
-        frames,
+        tuple(relocated_frames),
         relocated_scene,
         (tmp_path / "relocated").resolve(),
         relocated_events,
     )
 
+    baseline_manifest = json.loads(baseline.manifest_path.read_text(encoding="utf-8"))
+    relocated_manifest = json.loads(relocated.manifest_path.read_text(encoding="utf-8"))
+    assert relocated_manifest["input_frame_digest"] == baseline_manifest[
+        "input_frame_digest"
+    ]
     assert relocated.scene_digest == baseline.scene_digest
+
+    original_size = relocated_frames[0].path.stat().st_size
+    Image.new("RGB", (3, 3), color=(201, 17, 83)).save(
+        relocated_frames[0].path,
+        compress_level=0,
+    )
+    assert relocated_frames[0].path.stat().st_size != original_size
+    changed_first = replace(
+        relocated_frames[0],
+        sha256=_sha256(relocated_frames[0].path),
+    )
+    changed_frames = (changed_first, *relocated_frames[1:])
+    changed_scene = replace(
+        relocated_scene,
+        frames=(
+            replace(relocated_scene.frames[0], frame=changed_first),
+            *relocated_scene.frames[1:],
+        ),
+    )
+    changed_events: list[str] = []
+    changed = _run_motion_case(
+        changed_frames,
+        changed_scene,
+        (tmp_path / "changed-source").resolve(),
+        changed_events,
+    )
+    changed_manifest = json.loads(changed.manifest_path.read_text(encoding="utf-8"))
+
+    assert changed_manifest["input_frame_digest"] != relocated_manifest[
+        "input_frame_digest"
+    ]
+    assert changed.scene_digest != relocated.scene_digest
 
 
 @pytest.mark.parametrize("value", (1.0e40, 1.0e-50))
