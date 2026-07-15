@@ -596,6 +596,31 @@ def test_install_rejects_symlink_or_non_file_lock(tmp_path: Path) -> None:
         )
 
 
+def test_install_rejects_lock_beneath_environment_root_before_subprocess(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "worker"
+    root.mkdir()
+    lock_path = _write_lock(root)
+    original_lock = lock_path.read_bytes()
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str], **_kwargs: object) -> CompletedProcess[str]:
+        calls.append(argv)
+        pytest.fail("runner must not execute")
+
+    with pytest.raises(ProtectedRuntimeError, match="lock"):
+        install_learned_environment(
+            tmp_path / "main-python",
+            root=root,
+            lock_path=lock_path,
+            runner=runner,
+        )
+
+    assert calls == []
+    assert lock_path.read_bytes() == original_lock
+
+
 def test_install_rejects_symlink_environment_root_after_runtime_capture(
     tmp_path: Path,
 ) -> None:

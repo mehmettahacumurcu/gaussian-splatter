@@ -379,6 +379,15 @@ def _validate_lock(lock_path: Path) -> None:
         )
 
 
+def _assert_lock_outside_environment_root(root: Path, lock_path: Path) -> None:
+    resolved_root = root.resolve(strict=False)
+    resolved_lock = lock_path.resolve(strict=False)
+    if resolved_lock == resolved_root or resolved_root in resolved_lock.parents:
+        raise ProtectedRuntimeError(
+            "learned dependency lock cannot be inside the environment root"
+        )
+
+
 def _run_checked(
     runner: Callable[..., CompletedProcess[str]],
     argv: list[str],
@@ -447,6 +456,7 @@ def install_learned_environment(
     root_path = _require_absolute_path(root, "root")
     approved_lock_path = _require_absolute_path(lock_path, "lock_path")
     _validate_lock(approved_lock_path)
+    _assert_lock_outside_environment_root(root_path, approved_lock_path)
 
     before = capture_protected_runtime(main_python_path, runner=runner)
     worker_python = root_path / "bin" / "python"
