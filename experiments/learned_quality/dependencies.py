@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import tempfile
+import unicodedata
+from hashlib import sha256
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -120,6 +124,88 @@ for name in ("torch", "torchvision", "numpy", "gsplat"):
 print(json.dumps({"packages": rows}, allow_nan=False, separators=(",", ":")))
 """
 
+LEARNED_IMPORT_MODULES = (
+    "transformers",
+    "huggingface_hub",
+    "tokenizers",
+    "safetensors",
+    "pycolmap",
+    "omegaconf",
+    "hydra",
+    "iopath",
+    "portalocker",
+    "addict",
+    "moviepy.editor",
+    "trimesh",
+    "evo",
+    "depth_anything_3",
+    "sam2",
+    "raft",
+)
+
+_VERIFY_SCRIPT = """\
+import importlib
+import json
+import sys
+from pathlib import Path
+
+def unique_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+def reject_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+paths = json.loads(
+    sys.argv[1],
+    object_pairs_hook=unique_object,
+    parse_constant=reject_constant,
+)
+if set(paths) != {"da3", "sam2", "sea-raft"}:
+    raise ValueError("source path payload is malformed")
+if any(not isinstance(value, str) or not value for value in paths.values()):
+    raise ValueError("source path payload is malformed")
+sea_raft = Path(paths["sea-raft"])
+sys.path[:0] = [
+    paths["da3"],
+    paths["sam2"],
+    str(sea_raft),
+    str(sea_raft / "core"),
+]
+modules = (
+    "transformers",
+    "huggingface_hub",
+    "tokenizers",
+    "safetensors",
+    "pycolmap",
+    "omegaconf",
+    "hydra",
+    "iopath",
+    "portalocker",
+    "addict",
+    "moviepy.editor",
+    "trimesh",
+    "evo",
+    "depth_anything_3",
+    "sam2",
+    "raft",
+)
+for module in modules:
+    importlib.import_module(module)
+print(
+    json.dumps(
+        {"modules": modules, "ok": True},
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+)
+"""
+
 
 @dataclass(frozen=True)
 class RuntimePackage:
@@ -149,7 +235,13 @@ class ProtectedRuntimeError(RuntimeError):
 
 
 def _canonical_package_name(name: str) -> str:
-    return name.strip().casefold().replace("-", "").replace("_", "")
+    return (
+        name.strip()
+        .casefold()
+        .replace("-", "")
+        .replace("_", "")
+        .replace(".", "")
+    )
 
 
 _PROTECTED_BY_CANONICAL = {
@@ -548,6 +640,16 @@ class LearnedAssets:
     checkpoints: tuple[PinnedModelSnapshot, ...]
 
 
+@dataclass(frozen=True)
+class ModelManifest:
+    path: Path
+    sha256: str
+    sources: tuple[SourceCheckout, ...]
+    checkpoints: tuple[PinnedModelSnapshot, ...]
+    worker_pip_freeze: tuple[str, ...]
+    main_runtime: ProtectedRuntimeSnapshot
+
+
 def _require_revision(value: object, label: str) -> str:
     if not isinstance(value, str) or _REVISION_PATTERN.fullmatch(value) is None:
         raise ValueError(f"{label} must be a 40-character lowercase hex revision")
@@ -774,4 +876,428 @@ def materialize_pinned_assets(
     return LearnedAssets(
         sources=tuple(sources),
         checkpoints=tuple(checkpoints),
+    )
+
+
+def _require_plain_directory(path: Path, label: str) -> Path:
+    candidate = _require_absolute_path(path, label)
+    if candidate.is_symlink() or not candidate.is_dir():
+        raise ValueError(f"{label} must be a non-symlink directory")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be resolved") from exc
+    if resolved != candidate:
+        raise ValueError(f"{label} cannot traverse a symlink")
+    return candidate
+
+
+def _validate_assets_for_verification(
+    environment: LearnedEnvironment,
+    assets: LearnedAssets,
+) -> tuple[Path, Path]:
+    if not isinstance(environment, LearnedEnvironment):
+        raise ValueError("learned environment is malformed")
+    environment_root = _require_plain_directory(
+        environment.root,
+        "environment root",
+    )
+    worker_python = _require_absolute_path(
+        environment.python_exe,
+        "environment python",
+    )
+    if worker_python.is_symlink() or not worker_python.is_file():
+        raise ValueError("environment python must be a non-symlink file")
+    lock_path = _require_absolute_path(environment.lock_path, "environment lock")
+    if lock_path.is_symlink() or not lock_path.is_file():
+        raise ValueError("environment lock must be a non-symlink file")
+    if not isinstance(
+        environment.main_runtime_before,
+        ProtectedRuntimeSnapshot,
+    ) or not isinstance(environment.main_runtime_after, ProtectedRuntimeSnapshot):
+        raise ProtectedRuntimeError("protected main runtime snapshots are malformed")
+    before_python = _require_absolute_path(
+        environment.main_runtime_before.python_exe,
+        "protected main Python",
+    )
+    after_python = _require_absolute_path(
+        environment.main_runtime_after.python_exe,
+        "protected main Python",
+    )
+    if before_python != after_python:
+        raise ProtectedRuntimeError(
+            "protected snapshots must use the same main Python"
+        )
+    assert_no_protected_changes(
+        {},
+        before=environment.main_runtime_before,
+        after=environment.main_runtime_after,
+    )
+    if not isinstance(assets, LearnedAssets):
+        raise ValueError("learned assets are malformed")
+    if not isinstance(assets.sources, tuple) or not isinstance(
+        assets.checkpoints,
+        tuple,
+    ):
+        raise ValueError("learned assets must use immutable tuples")
+    if len(assets.sources) != len(SOURCE_REPOSITORY_REFS):
+        raise ValueError("source records must exactly match the approved set")
+    if len(assets.checkpoints) != len(CHECKPOINT_MODEL_REFS):
+        raise ValueError("checkpoint records must exactly match the approved set")
+
+    source_names = [source.name for source in assets.sources]
+    if len(set(source_names)) != len(source_names):
+        raise ValueError("duplicate source record")
+    checkpoint_ids = [checkpoint.model.repo_id for checkpoint in assets.checkpoints]
+    if len(set(checkpoint_ids)) != len(checkpoint_ids):
+        raise ValueError("duplicate checkpoint record")
+
+    first_source = assets.sources[0]
+    if not isinstance(first_source, SourceCheckout):
+        raise ValueError("source record is malformed")
+    source_root = _require_plain_directory(first_source.path.parent, "source root")
+    source_paths: list[Path] = []
+    for name, approved, source in zip(
+        _SOURCE_NAMES,
+        SOURCE_REPOSITORY_REFS,
+        assets.sources,
+        strict=True,
+    ):
+        if not isinstance(source, SourceCheckout):
+            raise ValueError("source record is malformed")
+        if (
+            source.name != name
+            or source.repo_url != approved.repo_id
+            or source.requested_commit != approved.revision
+            or source.resolved_commit != approved.revision
+            or source.license_id != approved.license_id
+        ):
+            raise ValueError(f"source record {name} does not match the approved pin")
+        _require_revision(source.requested_commit, f"source {name} requested commit")
+        _require_revision(source.resolved_commit, f"source {name} resolved commit")
+        expected_path = source_root / name
+        if source.path != expected_path:
+            raise ValueError(f"source path {name} is outside its approved root")
+        source_paths.append(_require_plain_directory(source.path, f"source {name}"))
+
+    first_checkpoint = assets.checkpoints[0]
+    if not isinstance(first_checkpoint, PinnedModelSnapshot):
+        raise ValueError("checkpoint record is malformed")
+    checkpoint_root = _require_plain_directory(
+        first_checkpoint.local_path.parent,
+        "checkpoint root",
+    )
+    checkpoint_paths: list[Path] = []
+    for approved, checkpoint in zip(
+        CHECKPOINT_MODEL_REFS,
+        assets.checkpoints,
+        strict=True,
+    ):
+        if not isinstance(checkpoint, PinnedModelSnapshot):
+            raise ValueError("checkpoint record is malformed")
+        if checkpoint.model != approved:
+            raise ValueError(
+                f"checkpoint record {approved.repo_id} does not match the approved ref"
+            )
+        requested = _require_revision(
+            checkpoint.model.revision,
+            f"checkpoint {approved.repo_id} requested revision",
+        )
+        resolved = _require_revision(
+            checkpoint.resolved_revision,
+            f"checkpoint {approved.repo_id} resolved revision",
+        )
+        if requested != resolved or resolved != approved.revision:
+            raise ValueError(
+                f"checkpoint {approved.repo_id} revision does not match approved ref"
+            )
+        expected_path = _checkpoint_destination(checkpoint_root, approved)
+        if checkpoint.local_path != expected_path:
+            raise ValueError(
+                f"checkpoint path {approved.repo_id} is outside its approved root"
+            )
+        checkpoint_paths.append(
+            _require_plain_directory(
+                checkpoint.local_path,
+                f"checkpoint {approved.repo_id}",
+            )
+        )
+
+    all_paths = source_paths + checkpoint_paths
+    resolved_paths = [path.resolve(strict=True) for path in all_paths]
+    if len(set(resolved_paths)) != len(resolved_paths):
+        raise ValueError("duplicate source or checkpoint path")
+    for index, first in enumerate(resolved_paths):
+        for second in resolved_paths[index + 1 :]:
+            if _paths_overlap(first, second):
+                raise ValueError("source and checkpoint paths cannot overlap")
+    if _paths_overlap(environment_root.resolve(), source_root.resolve()):
+        raise ValueError("source root must not overlap the environment root")
+    if _paths_overlap(environment_root.resolve(), checkpoint_root.resolve()):
+        raise ValueError("checkpoint root must not overlap the environment root")
+    if _paths_overlap(source_root.resolve(), checkpoint_root.resolve()):
+        raise ValueError("source and checkpoint roots cannot overlap")
+    return source_root, checkpoint_root
+
+
+def _parse_worker_verification(stdout: object) -> None:
+    if not isinstance(stdout, str) or not stdout:
+        raise ProtectedRuntimeError("worker verification output is missing")
+    try:
+        payload = json.loads(
+            stdout,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ProtectedRuntimeError(
+            "worker verification output is not strict JSON"
+        ) from exc
+    if (
+        not isinstance(payload, Mapping)
+        or set(payload) != {"modules", "ok"}
+        or payload["ok"] is not True
+        or payload["modules"] != list(LEARNED_IMPORT_MODULES)
+    ):
+        raise ProtectedRuntimeError("worker verification was unsuccessful")
+
+
+_FREEZE_NAME_PATTERN = re.compile(
+    r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:===|==|\s+@\s+).+$"
+)
+
+
+def _parse_worker_freeze(stdout: object) -> tuple[str, ...]:
+    if not isinstance(stdout, str) or not stdout:
+        raise ProtectedRuntimeError("worker pip freeze output is malformed")
+    lines = stdout.split("\n")
+    if lines[-1] == "":
+        lines.pop()
+    if not lines:
+        raise ProtectedRuntimeError("worker pip freeze output is malformed")
+    seen: set[str] = set()
+    for line in lines:
+        if not line or any(unicodedata.category(character) == "Cc" for character in line):
+            raise ProtectedRuntimeError("worker pip freeze entry is malformed")
+        match = _FREEZE_NAME_PATTERN.fullmatch(line)
+        if match is None:
+            raise ProtectedRuntimeError("worker pip freeze entry is malformed")
+        canonical = _canonical_package_name(match.group(1))
+        if canonical in seen:
+            raise ProtectedRuntimeError(
+                f"worker pip freeze contains duplicate package {match.group(1)}"
+            )
+        seen.add(canonical)
+    return tuple(sorted(lines))
+
+
+def _runtime_manifest_payload(
+    snapshot: ProtectedRuntimeSnapshot,
+    label: str,
+) -> dict[str, object]:
+    packages = _validated_snapshot_packages(snapshot, label)
+    return {
+        "python_exe": str(snapshot.python_exe),
+        "packages": [
+            {
+                "name": packages[name].name,
+                "version": packages[name].version,
+                "module_path": packages[name].module_path,
+            }
+            for name in PROTECTED_PACKAGES
+        ],
+    }
+
+
+def _manifest_payload(
+    environment: LearnedEnvironment,
+    assets: LearnedAssets,
+    source_root: Path,
+    checkpoint_root: Path,
+    freeze: tuple[str, ...],
+    verified_runtime: ProtectedRuntimeSnapshot,
+) -> dict[str, object]:
+    return {
+        "asset_roots": {
+            "checkpoints": str(checkpoint_root),
+            "sources": str(source_root),
+        },
+        "checkpoints": [
+            {
+                "code_commit": checkpoint.model.code_commit,
+                "license_id": checkpoint.model.license_id,
+                "local_path": str(checkpoint.local_path),
+                "repo_id": checkpoint.model.repo_id,
+                "requested_revision": checkpoint.model.revision,
+                "resolved_revision": checkpoint.resolved_revision,
+            }
+            for checkpoint in assets.checkpoints
+        ],
+        "lock_path": str(environment.lock_path),
+        "protected_host": {
+            "after_install": _runtime_manifest_payload(
+                environment.main_runtime_after,
+                "after install",
+            ),
+            "before_install": _runtime_manifest_payload(
+                environment.main_runtime_before,
+                "before install",
+            ),
+            "verified": _runtime_manifest_payload(
+                verified_runtime,
+                "verified",
+            ),
+        },
+        "schema_version": 1,
+        "sources": [
+            {
+                "license_id": source.license_id,
+                "name": source.name,
+                "path": str(source.path),
+                "repo_url": source.repo_url,
+                "requested_commit": source.requested_commit,
+                "resolved_commit": source.resolved_commit,
+            }
+            for source in assets.sources
+        ],
+        "worker_pip_freeze": list(freeze),
+        "worker_python": str(environment.python_exe),
+    }
+
+
+def _write_model_manifest(path: Path, payload: Mapping[str, object]) -> str:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise ProtectedRuntimeError(
+            "model manifest path must be a regular non-symlink file"
+        )
+    try:
+        data = (
+            json.dumps(
+                payload,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ProtectedRuntimeError("model manifest is not strict JSON") from exc
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=".model_manifest.",
+        suffix=".tmp",
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary_path.replace(path)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        temporary_path.unlink(missing_ok=True)
+        raise
+    return sha256(data).hexdigest()
+
+
+def verify_learned_environment(
+    environment: LearnedEnvironment,
+    assets: LearnedAssets,
+    *,
+    runner: Callable[..., CompletedProcess[str]] = subprocess.run,
+) -> ModelManifest:
+    source_root, checkpoint_root = _validate_assets_for_verification(
+        environment,
+        assets,
+    )
+    manifest_path = environment.root / "model_manifest.json"
+    if manifest_path.is_symlink() or (
+        manifest_path.exists() and not manifest_path.is_file()
+    ):
+        raise ProtectedRuntimeError(
+            "model manifest path must be a regular non-symlink file"
+        )
+
+    for source, approved in zip(
+        assets.sources,
+        SOURCE_REPOSITORY_REFS,
+        strict=True,
+    ):
+        _verify_source_checkout(source.path, approved, runner)
+
+    worker_error: Exception | None = None
+    freeze: tuple[str, ...] | None = None
+    try:
+        source_payload = json.dumps(
+            {source.name: str(source.path) for source in assets.sources},
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        completed = _run_checked(
+            runner,
+            [
+                str(environment.python_exe),
+                "-I",
+                "-c",
+                _VERIFY_SCRIPT,
+                source_payload,
+            ],
+        )
+        _parse_worker_verification(completed.stdout)
+        freeze = _parse_worker_freeze(
+            _run_checked(
+                runner,
+                [str(environment.python_exe), "-m", "pip", "freeze"],
+            ).stdout
+        )
+    except Exception as exc:
+        worker_error = exc
+
+    try:
+        verified_runtime = _capture_and_compare_runtime(
+            environment.main_runtime_before.python_exe,
+            environment.main_runtime_before,
+            runner,
+        )
+        assert_no_protected_changes(
+            {},
+            before=environment.main_runtime_after,
+            after=verified_runtime,
+        )
+    except Exception as drift_error:
+        if isinstance(drift_error, ProtectedRuntimeError):
+            raise drift_error from worker_error
+        raise ProtectedRuntimeError(
+            "protected host runtime verification failed"
+        ) from drift_error
+
+    if worker_error is not None:
+        raise worker_error
+    if freeze is None:
+        raise ProtectedRuntimeError("worker pip freeze output is missing")
+
+    digest = _write_model_manifest(
+        manifest_path,
+        _manifest_payload(
+            environment,
+            assets,
+            source_root,
+            checkpoint_root,
+            freeze,
+            verified_runtime,
+        ),
+    )
+    return ModelManifest(
+        path=manifest_path,
+        sha256=digest,
+        sources=assets.sources,
+        checkpoints=assets.checkpoints,
+        worker_pip_freeze=freeze,
+        main_runtime=verified_runtime,
     )

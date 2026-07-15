@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+from hashlib import sha256
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
@@ -19,6 +21,7 @@ from experiments.learned_quality.dependencies import (
     SOURCE_REPOSITORY_REFS,
     LearnedAssets,
     LearnedEnvironment,
+    ModelManifest,
     PinnedModelSnapshot,
     ProtectedRuntimeError,
     ProtectedRuntimeSnapshot,
@@ -29,6 +32,7 @@ from experiments.learned_quality.dependencies import (
     install_learned_environment,
     materialize_pinned_assets,
     snapshot_pinned_model,
+    verify_learned_environment,
 )
 
 
@@ -72,7 +76,7 @@ def _snapshot(
     versions = versions or {}
     paths = paths or {}
     return ProtectedRuntimeSnapshot(
-        python_exe=Path("/runtime/python"),
+        python_exe=Path("C:/runtime/python"),
         packages={
             name: RuntimePackage(
                 name=name,
@@ -1344,3 +1348,561 @@ def test_materialize_propagates_checkpoint_revision_mismatch(
             / CHECKPOINT_MODEL_REFS[0].repo_id.replace("/", "--"),
         }
     ]
+
+
+_LEARNED_IMPORT_MODULES = (
+    "transformers",
+    "huggingface_hub",
+    "tokenizers",
+    "safetensors",
+    "pycolmap",
+    "omegaconf",
+    "hydra",
+    "iopath",
+    "portalocker",
+    "addict",
+    "moviepy.editor",
+    "trimesh",
+    "evo",
+    "depth_anything_3",
+    "sam2",
+    "raft",
+)
+
+
+def _verified_assets(tmp_path: Path) -> tuple[LearnedEnvironment, LearnedAssets]:
+    environment = _learned_environment(tmp_path / "venv")
+    environment.root.mkdir()
+    environment.python_exe.parent.mkdir()
+    environment.python_exe.write_text("worker", encoding="utf-8")
+    environment.lock_path.write_text("lock", encoding="utf-8")
+    source_root = tmp_path / "sources"
+    checkpoint_root = tmp_path / "checkpoints"
+    source_root.mkdir()
+    checkpoint_root.mkdir()
+
+    sources = []
+    for name, source in zip(_SOURCE_NAMES, SOURCE_REPOSITORY_REFS, strict=True):
+        path = source_root / name
+        path.mkdir()
+        sources.append(
+            SourceCheckout(
+                name=name,
+                repo_url=source.repo_id,
+                path=path,
+                requested_commit=source.revision,
+                resolved_commit=source.revision,
+                license_id=source.license_id,
+            )
+        )
+
+    checkpoints = []
+    for model in CHECKPOINT_MODEL_REFS:
+        path = checkpoint_root / model.repo_id.replace("/", "--")
+        path.mkdir()
+        checkpoints.append(
+            PinnedModelSnapshot(
+                model=model,
+                local_path=path,
+                resolved_revision=model.revision,
+            )
+        )
+    return environment, LearnedAssets(tuple(sources), tuple(checkpoints))
+
+
+class _VerifyRunner:
+    def __init__(
+        self,
+        environment: LearnedEnvironment,
+        *,
+        worker_stdout: object | None = None,
+        freeze_stdout: object | None = None,
+        host_stdout: str | None = None,
+        git_outputs: Mapping[tuple[str, str], object] | None = None,
+        fail_worker: bool = False,
+    ) -> None:
+        self.environment = environment
+        self.worker_stdout = worker_stdout
+        self.freeze_stdout = freeze_stdout
+        self.host_stdout = host_stdout or _runtime_stdout()
+        self.git_outputs = dict(git_outputs or {})
+        self.fail_worker = fail_worker
+        self.calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def __call__(
+        self,
+        argv: list[str],
+        **kwargs: object,
+    ) -> CompletedProcess[str]:
+        self.calls.append((list(argv), dict(kwargs)))
+        if argv[:2] == ["git", "-C"]:
+            source = _SOURCE_BY_NAME[Path(argv[2]).name]
+            command = argv[3:]
+            if command == ["remote", "get-url", "origin"]:
+                stdout = self.git_outputs.get(
+                    (Path(argv[2]).name, "remote"),
+                    f"{source.repo_id}\n",
+                )
+            elif command == ["rev-parse", "HEAD"]:
+                stdout = self.git_outputs.get(
+                    (Path(argv[2]).name, "head"),
+                    f"{source.revision}\n",
+                )
+            elif command == ["status", "--porcelain"]:
+                stdout = self.git_outputs.get((Path(argv[2]).name, "status"), "")
+            else:
+                raise AssertionError(f"unexpected git argv: {argv!r}")
+            return CompletedProcess(argv, 0, stdout=cast(str, stdout), stderr="")
+        if argv[:4] == [
+            str(self.environment.python_exe),
+            "-m",
+            "pip",
+            "freeze",
+        ]:
+            return CompletedProcess(
+                argv,
+                0,
+                stdout=cast(
+                    str,
+                    self.freeze_stdout
+                    if self.freeze_stdout is not None
+                    else "transformers==4.57.6\nAddict==2.4.0\n",
+                ),
+                stderr="",
+            )
+        if argv[0] == str(self.environment.python_exe) and "-c" in argv:
+            if self.fail_worker:
+                raise CalledProcessError(1, argv, stderr="worker failed")
+            return CompletedProcess(
+                argv,
+                0,
+                stdout=cast(
+                    str,
+                    self.worker_stdout
+                    if self.worker_stdout is not None
+                    else json.dumps(
+                        {"modules": list(_LEARNED_IMPORT_MODULES), "ok": True},
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n",
+                ),
+                stderr="",
+            )
+        if argv[0] == str(self.environment.main_runtime_before.python_exe):
+            return CompletedProcess(argv, 0, stdout=self.host_stdout, stderr="")
+        raise AssertionError(f"unexpected subprocess argv: {argv!r}")
+
+
+def test_verify_writes_deterministic_manifest_with_safe_exact_worker_argv(
+    tmp_path: Path,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    runner = _VerifyRunner(environment)
+
+    first = verify_learned_environment(environment, assets, runner=runner)
+    first_bytes = first.path.read_bytes()
+    second = verify_learned_environment(environment, assets, runner=runner)
+
+    assert isinstance(first, ModelManifest)
+    assert first.path == environment.root / "model_manifest.json"
+    assert first.sha256 == sha256(first_bytes).hexdigest()
+    assert second.path.read_bytes() == first_bytes
+    assert second.sha256 == first.sha256
+    assert first.sources == assets.sources
+    assert first.checkpoints == assets.checkpoints
+    assert first.worker_pip_freeze == ("Addict==2.4.0", "transformers==4.57.6")
+    assert first.main_runtime == environment.main_runtime_before
+
+    payload = json.loads(first_bytes)
+    assert first_bytes.endswith(b"\n")
+    assert payload["schema_version"] == 1
+    assert payload["worker_python"] == str(environment.python_exe)
+    assert payload["lock_path"] == str(environment.lock_path)
+    assert payload["asset_roots"] == {
+        "checkpoints": str(assets.checkpoints[0].local_path.parent),
+        "sources": str(assets.sources[0].path.parent),
+    }
+    assert payload["worker_pip_freeze"] == [
+        "Addict==2.4.0",
+        "transformers==4.57.6",
+    ]
+
+    worker_calls = [
+        argv
+        for argv, _kwargs in runner.calls
+        if argv[0] == str(environment.python_exe) and "-c" in argv
+    ]
+    assert len(worker_calls) == 2
+    assert worker_calls[0][1:3] == ["-I", "-c"]
+    assert len(worker_calls[0]) == 5
+    assert worker_calls[0][3] == worker_calls[1][3]
+    assert all(module in worker_calls[0][3] for module in _LEARNED_IMPORT_MODULES)
+    assert all(str(source.path) not in worker_calls[0][3] for source in assets.sources)
+    assert json.loads(worker_calls[0][4]) == {
+        source.name: str(source.path) for source in assets.sources
+    }
+    assert all(
+        kwargs == {"check": True, "capture_output": True, "text": True}
+        and "shell" not in kwargs
+        for _argv, kwargs in runner.calls
+    )
+    assert all(
+        forbidden not in " ".join(argv).casefold()
+        for argv, _kwargs in runner.calls
+        for forbidden in ("clone", "checkout", "install", "download", "setup")
+    )
+    assert list(environment.root.glob(".model_manifest.*.tmp")) == []
+    with pytest.raises(FrozenInstanceError):
+        first.sha256 = "0" * 64  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "",
+        "not-json",
+        "[]",
+        '{"modules":[],"ok":true,"ok":true}',
+        '{"modules":[],"ok":NaN}',
+        json.dumps({"modules": list(_LEARNED_IMPORT_MODULES), "ok": False}),
+        json.dumps({"modules": [*_LEARNED_IMPORT_MODULES, "extra"], "ok": True}),
+    ],
+)
+def test_verify_rejects_malformed_or_unsuccessful_worker_output_after_host_check(
+    tmp_path: Path,
+    stdout: str,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    runner = _VerifyRunner(environment, worker_stdout=stdout)
+
+    with pytest.raises(ProtectedRuntimeError, match="worker verification"):
+        verify_learned_environment(environment, assets, runner=runner)
+
+    assert any(
+        argv[0] == str(environment.main_runtime_before.python_exe)
+        for argv, _kwargs in runner.calls
+    )
+    assert not (environment.root / "model_manifest.json").exists()
+
+
+def test_verify_propagates_failed_worker_only_after_host_check(tmp_path: Path) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    runner = _VerifyRunner(environment, fail_worker=True)
+
+    with pytest.raises(CalledProcessError) as error:
+        verify_learned_environment(environment, assets, runner=runner)
+
+    assert error.value.stderr == "worker failed"
+    assert runner.calls[-1][0][0] == str(
+        environment.main_runtime_before.python_exe
+    )
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        "",
+        "\n",
+        "transformers==4.57.6\n\nAddict==2.4.0\n",
+        "transformers==4.57.6\r\nAddict==2.4.0\r\n",
+        "transformers==4.57.6\nAddict\t==2.4.0\n",
+        "not a freeze entry\n",
+        "Foo_Bar==1\nfoo-bar==2\n",
+        "Foo.Bar==1\nfoo-bar==2\n",
+    ],
+)
+def test_verify_rejects_malformed_or_duplicate_freeze_entries(
+    tmp_path: Path,
+    stdout: str,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    runner = _VerifyRunner(environment, freeze_stdout=stdout)
+
+    with pytest.raises(ProtectedRuntimeError, match="pip freeze"):
+        verify_learned_environment(environment, assets, runner=runner)
+
+    assert not (environment.root / "model_manifest.json").exists()
+
+
+def test_host_drift_has_precedence_over_worker_failure(tmp_path: Path) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    rows = _runtime_rows()
+    rows[0] = {**rows[0], "version": "9.9.9"}
+    runner = _VerifyRunner(
+        environment,
+        worker_stdout="not-json",
+        host_stdout=_runtime_stdout(rows),
+    )
+
+    with pytest.raises(ProtectedRuntimeError, match="torch") as error:
+        verify_learned_environment(environment, assets, runner=runner)
+
+    assert isinstance(error.value.__cause__, ProtectedRuntimeError)
+    assert "worker verification" in str(error.value.__cause__)
+    assert not (environment.root / "model_manifest.json").exists()
+
+
+def test_verify_requires_before_and_after_snapshots_from_same_main_python(
+    tmp_path: Path,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    environment = replace(
+        environment,
+        main_runtime_after=replace(
+            environment.main_runtime_after,
+            python_exe=Path("C:/different/python"),
+        ),
+    )
+    calls: list[list[str]] = []
+
+    with pytest.raises(ProtectedRuntimeError, match="main Python"):
+        verify_learned_environment(
+            environment,
+            assets,
+            runner=lambda argv, **_kwargs: calls.append(argv),  # type: ignore[arg-type]
+        )
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("git_field", "stdout", "message"),
+    [
+        ("remote", "https://example.invalid/tampered.git\n", "remote"),
+        ("head", f"{'b' * 40}\n", "HEAD"),
+        ("status", " M core/raft.py\n", "dirty"),
+    ],
+)
+def test_verify_freshly_rejects_source_git_tampering_before_worker_imports(
+    tmp_path: Path,
+    git_field: str,
+    stdout: str,
+    message: str,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    runner = _VerifyRunner(
+        environment,
+        git_outputs={("da3", git_field): stdout},
+    )
+
+    with pytest.raises(ValueError, match=message):
+        verify_learned_environment(environment, assets, runner=runner)
+
+    assert all(argv[0] == "git" for argv, _kwargs in runner.calls)
+    assert not (environment.root / "model_manifest.json").exists()
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "source-missing",
+        "source-extra",
+        "source-duplicate",
+        "source-order",
+        "source-url",
+        "source-requested",
+        "source-resolved",
+        "source-license",
+        "source-path-escape",
+        "checkpoint-missing",
+        "checkpoint-extra",
+        "checkpoint-duplicate",
+        "checkpoint-order",
+        "checkpoint-repo",
+        "checkpoint-requested",
+        "checkpoint-resolved",
+        "checkpoint-code",
+        "checkpoint-license",
+        "checkpoint-path-escape",
+        "cross-kind-overlap",
+    ],
+)
+def test_verify_rejects_tampered_asset_records_before_subprocess(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    sources = list(assets.sources)
+    checkpoints = list(assets.checkpoints)
+    escape = tmp_path / "escape"
+    escape.mkdir()
+
+    if tamper == "source-missing":
+        sources.pop()
+    elif tamper == "source-extra":
+        sources.append(sources[-1])
+    elif tamper == "source-duplicate":
+        sources[1] = sources[0]
+    elif tamper == "source-order":
+        sources[0], sources[1] = sources[1], sources[0]
+    elif tamper == "source-url":
+        sources[0] = replace(sources[0], repo_url="https://example.invalid/x.git")
+    elif tamper == "source-requested":
+        sources[0] = replace(sources[0], requested_commit="b" * 40)
+    elif tamper == "source-resolved":
+        sources[0] = replace(sources[0], resolved_commit="b" * 40)
+    elif tamper == "source-license":
+        sources[0] = replace(sources[0], license_id="MIT")
+    elif tamper == "source-path-escape":
+        escaped_path = escape / sources[1].name
+        escaped_path.mkdir()
+        sources[1] = replace(sources[1], path=escaped_path)
+    elif tamper == "checkpoint-missing":
+        checkpoints.pop()
+    elif tamper == "checkpoint-extra":
+        checkpoints.append(checkpoints[-1])
+    elif tamper == "checkpoint-duplicate":
+        checkpoints[1] = checkpoints[0]
+    elif tamper == "checkpoint-order":
+        checkpoints[0], checkpoints[1] = checkpoints[1], checkpoints[0]
+    elif tamper == "checkpoint-repo":
+        checkpoints[0] = replace(
+            checkpoints[0],
+            model=replace(checkpoints[0].model, repo_id="other/model"),
+        )
+    elif tamper == "checkpoint-requested":
+        checkpoints[0] = replace(
+            checkpoints[0],
+            model=replace(checkpoints[0].model, revision="b" * 40),
+        )
+    elif tamper == "checkpoint-resolved":
+        checkpoints[0] = replace(checkpoints[0], resolved_revision="b" * 40)
+    elif tamper == "checkpoint-code":
+        checkpoints[0] = replace(
+            checkpoints[0],
+            model=replace(checkpoints[0].model, code_commit="b" * 40),
+        )
+    elif tamper == "checkpoint-license":
+        checkpoints[0] = replace(
+            checkpoints[0],
+            model=replace(checkpoints[0].model, license_id="MIT"),
+        )
+    elif tamper == "checkpoint-path-escape":
+        escaped_path = escape / checkpoints[1].local_path.name
+        escaped_path.mkdir()
+        checkpoints[1] = replace(checkpoints[1], local_path=escaped_path)
+    else:
+        checkpoints[0] = replace(checkpoints[0], local_path=sources[0].path)
+
+    calls: list[list[str]] = []
+    with pytest.raises(ValueError):
+        verify_learned_environment(
+            environment,
+            LearnedAssets(tuple(sources), tuple(checkpoints)),
+            runner=lambda argv, **_kwargs: calls.append(argv),  # type: ignore[arg-type]
+        )
+    assert calls == []
+    assert not (environment.root / "model_manifest.json").exists()
+
+
+@pytest.mark.parametrize("asset_kind", ["source", "checkpoint"])
+def test_verify_rejects_symlink_asset_directory_before_subprocess(
+    tmp_path: Path,
+    asset_kind: str,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    if asset_kind == "source":
+        original = assets.sources[1].path
+        target = tmp_path / "source-target"
+        target.mkdir()
+        original.rmdir()
+        original.symlink_to(target, target_is_directory=True)
+    else:
+        original = assets.checkpoints[1].local_path
+        target = tmp_path / "checkpoint-target"
+        target.mkdir()
+        original.rmdir()
+        original.symlink_to(target, target_is_directory=True)
+    calls: list[list[str]] = []
+
+    with pytest.raises(ValueError, match="symlink"):
+        verify_learned_environment(
+            environment,
+            assets,
+            runner=lambda argv, **_kwargs: calls.append(argv),  # type: ignore[arg-type]
+        )
+    assert calls == []
+
+
+@pytest.mark.parametrize("existing_kind", ["directory", "symlink"])
+def test_verify_never_overwrites_unsafe_manifest_path(
+    tmp_path: Path,
+    existing_kind: str,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    manifest = environment.root / "model_manifest.json"
+    target = tmp_path / "manifest-target.json"
+    if existing_kind == "directory":
+        manifest.mkdir()
+    else:
+        target.write_bytes(b"preserve")
+        manifest.symlink_to(target)
+    calls: list[list[str]] = []
+
+    with pytest.raises(ProtectedRuntimeError, match="manifest path"):
+        verify_learned_environment(
+            environment,
+            assets,
+            runner=lambda argv, **_kwargs: calls.append(argv),  # type: ignore[arg-type]
+        )
+
+    assert calls == []
+    if existing_kind == "symlink":
+        assert manifest.is_symlink()
+        assert target.read_bytes() == b"preserve"
+
+
+def test_verify_cleans_temporary_file_when_atomic_replace_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    runner = _VerifyRunner(environment)
+    manifest = environment.root / "model_manifest.json"
+
+    def fail_replace(_self: Path, _target: Path) -> Path:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(Path, "replace", fail_replace)
+    with pytest.raises(OSError, match="replace failed"):
+        verify_learned_environment(environment, assets, runner=runner)
+
+    assert not manifest.exists()
+    assert list(environment.root.glob(".model_manifest.*.tmp")) == []
+
+
+def test_verify_cleans_temporary_file_when_manifest_write_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment, assets = _verified_assets(tmp_path)
+    runner = _VerifyRunner(environment)
+    real_fdopen = os.fdopen
+
+    class _FailingStream:
+        def __init__(self, descriptor: int) -> None:
+            self.descriptor = descriptor
+
+        def __enter__(self) -> _FailingStream:
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            os.close(self.descriptor)
+
+        def write(self, _data: bytes) -> int:
+            raise OSError("write failed")
+
+    def fail_fdopen(descriptor: int, mode: str) -> object:
+        assert mode == "wb"
+        return _FailingStream(descriptor)
+
+    monkeypatch.setattr(os, "fdopen", fail_fdopen)
+    try:
+        with pytest.raises(OSError, match="write failed"):
+            verify_learned_environment(environment, assets, runner=runner)
+    finally:
+        monkeypatch.setattr(os, "fdopen", real_fdopen)
+
+    assert not (environment.root / "model_manifest.json").exists()
+    assert list(environment.root.glob(".model_manifest.*.tmp")) == []
