@@ -1057,7 +1057,12 @@ def run_pipeline(
     )
     _apply_trainer_customizer(trainer, trainer_customizer)
     # Foundation çıktıları varsa trainer'a ver (stage 2 loss'lar için)
-    depth_dir_arg = paths["depth"] if (not skip_foundation and paths["depth"].exists()) else None
+    experiment_training = trainer_train_kwargs is not None
+    depth_dir_arg = (
+        paths["depth"]
+        if ((not skip_foundation or experiment_training) and paths["depth"].exists())
+        else None
+    )
     mask_dir_arg  = paths["masks"] if (not skip_foundation and paths["masks"].exists()) else None
     tracks_file = paths["tracks"] / "tracks.pt"
     tracks_path_arg = tracks_file if (not skip_foundation and tracks_file.exists()) else None
