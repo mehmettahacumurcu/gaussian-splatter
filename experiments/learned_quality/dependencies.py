@@ -57,7 +57,7 @@ SOURCE_REPOSITORY_REFS = (
         license_id="Apache-2.0",
     ),
     ModelRef(
-        repo_id="https://github.com/MemorySlices/SEA-RAFT.git",
+        repo_id="https://github.com/princeton-vl/SEA-RAFT.git",
         revision=_SEA_RAFT_COMMIT,
         code_commit=None,
         license_id="BSD-3-Clause",

@@ -254,7 +254,7 @@ def test_source_repository_refs_are_exact_and_immutable() -> None:
             license_id="Apache-2.0",
         ),
         ModelRef(
-            repo_id="https://github.com/MemorySlices/SEA-RAFT.git",
+            repo_id="https://github.com/princeton-vl/SEA-RAFT.git",
             revision="9137517ba24e628442aec097d3afe71d03503b75",
             code_commit=None,
             license_id="BSD-3-Clause",
