@@ -34,8 +34,6 @@ def test_notebook_is_deterministic_run_all_safe_and_pinned() -> None:
         "learned-dependencies",
         "verify",
         "execute",
-        "validate",
-        "summary",
     ]
     sources = "\n".join(cell.source for cell in notebook.cells)
     assert sources.count('# @param {type:"string"}') == 1
@@ -54,16 +52,25 @@ def test_notebook_is_deterministic_run_all_safe_and_pinned() -> None:
     assert '"/content/learned-env/bin/python"' in execute
     assert '"scripts/learned_quality_run.py"' in execute
     assert '"--spec"' in execute
+    assert "check=False" in execute
+    assert "except BaseException" in execute
+    assert "finally:" in execute
+    assert "drive.flush_and_unmount()" in execute
+    assert "runtime.unassign()" in execute
+    assert execute.find("drive.flush_and_unmount()") < execute.find(
+        "runtime.unassign()"
+    )
+    assert "receipt.get('status') == 'success'" in execute
+    assert "_SUCCESS" in execute
+    assert "_learned_test_result" in execute
     assert "shell=True" not in sources
-    assert "_learned_test_result" in notebook.cells[10].source
     for name in (
         "masks_contact_sheet.png",
         "depth_contact_sheet.png",
         "geometry_contact_sheet.png",
         "final_render_contact_sheet.png",
     ):
-        assert name in notebook.cells[10].source
-        assert name in notebook.cells[11].source
+        assert name in execute
     assert not any(suffix in sources for suffix in ("viewer.html", ".wasm", ".js'"))
 
 
