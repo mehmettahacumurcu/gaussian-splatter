@@ -60,6 +60,174 @@ def psnr(rendered: torch.Tensor, gt: torch.Tensor) -> float:
     return float("inf") if mse < 1e-12 else -10.0 * math.log10(mse)
 
 
+def _resize_validity_mask(
+    validity: torch.Tensor,
+    size: tuple[int, int],
+) -> torch.Tensor:
+    """Resize HxW validity without turning excluded pixels back on."""
+    if validity.ndim != 2:
+        raise ValueError("validity mask shape must be HxW")
+    target_h, target_w = size
+    if target_h <= 0 or target_w <= 0:
+        raise ValueError("validity resize dimensions must be positive")
+    if tuple(validity.shape) == (target_h, target_w):
+        return validity
+    source_h, source_w = validity.shape
+    batched = validity.unsqueeze(0).unsqueeze(0)
+    if target_h <= source_h and target_w <= source_w:
+        invalid = 1.0 - batched
+        resized = 1.0 - F.adaptive_max_pool2d(invalid, (target_h, target_w))
+    else:
+        resized = F.interpolate(batched, size=(target_h, target_w), mode="nearest")
+    return resized.squeeze(0).squeeze(0).clamp(0.0, 1.0)
+
+
+def _prepare_validity_masks(
+    validity_mask: Sequence[torch.Tensor],
+    *,
+    frame_paths: Sequence[Path],
+    is_multiview: bool,
+    motion_masks_active: bool,
+) -> tuple[torch.Tensor, ...]:
+    if is_multiview:
+        raise ValueError("learned validity masks do not support multi-view training")
+    if motion_masks_active:
+        raise ValueError("learned validity masks cannot be combined with motion weighting")
+    if len(validity_mask) != len(frame_paths):
+        raise ValueError("validity mask length must match frame_paths")
+    prepared: list[torch.Tensor] = []
+    for index, mask in enumerate(validity_mask):
+        if not isinstance(mask, torch.Tensor) or mask.ndim != 2:
+            raise ValueError(f"validity mask shape at index {index} must be HxW")
+        if mask.numel() == 0:
+            raise ValueError(f"validity mask shape at index {index} is empty")
+        value = mask.detach().to(device="cpu", dtype=torch.float32).clone()
+        if not torch.isfinite(value).all():
+            raise ValueError(f"validity mask at index {index} must be finite")
+        if torch.any(value < 0.0) or torch.any(value > 1.0):
+            raise ValueError(f"validity mask range at index {index} must be [0, 1]")
+        prepared.append(value)
+    return tuple(prepared)
+
+
+def _eroded_validity(validity: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
+    if kernel_size <= 1:
+        return validity
+    batched = validity.unsqueeze(0).unsqueeze(0)
+    eroded = -F.max_pool2d(
+        -batched,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=kernel_size // 2,
+    )
+    return eroded.squeeze(0).squeeze(0).clamp(0.0, 1.0)
+
+
+def _weighted_mean_or_zero(
+    values: torch.Tensor,
+    weights: torch.Tensor,
+) -> tuple[torch.Tensor, bool]:
+    weights = weights.to(device=values.device, dtype=values.dtype)
+    denominator = weights.sum()
+    if not bool(denominator.detach() > 0):
+        return values.sum() * 0.0, False
+    return (values * weights).sum() / denominator, True
+
+
+def _ssim_loss_map(rendered: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
+    pred = rendered.permute(2, 0, 1).unsqueeze(0)
+    target = gt.permute(2, 0, 1).unsqueeze(0)
+    mu_x = F.avg_pool2d(pred, 3, stride=1, padding=1)
+    mu_y = F.avg_pool2d(target, 3, stride=1, padding=1)
+    sigma_x = F.avg_pool2d(pred * pred, 3, stride=1, padding=1) - mu_x.square()
+    sigma_y = F.avg_pool2d(target * target, 3, stride=1, padding=1) - mu_y.square()
+    sigma_xy = F.avg_pool2d(pred * target, 3, stride=1, padding=1) - mu_x * mu_y
+    c1 = 0.01**2
+    c2 = 0.03**2
+    numerator = (2.0 * mu_x * mu_y + c1) * (2.0 * sigma_xy + c2)
+    denominator = (mu_x.square() + mu_y.square() + c1) * (
+        sigma_x + sigma_y + c2
+    )
+    return (1.0 - numerator / denominator.clamp_min(1e-12)).mean(dim=1).squeeze(0)
+
+
+def compute_masked_recon_loss(
+    rendered: torch.Tensor,
+    gt: torch.Tensor,
+    lambda_ssim: float,
+    validity: torch.Tensor,
+) -> tuple[torch.Tensor, tuple[str, ...]]:
+    """Separate learned-evidence branch; the legacy expression stays untouched."""
+    validity = validity.to(device=rendered.device, dtype=rendered.dtype)
+    l1, has_l1 = _weighted_mean_or_zero(
+        (rendered - gt).abs().mean(dim=-1),
+        validity,
+    )
+    skipped: list[str] = []
+    if not has_l1:
+        skipped.append("recon")
+    if lambda_ssim <= 0.0:
+        return l1, tuple(skipped)
+    composited = rendered * validity.unsqueeze(-1) + gt.detach() * (
+        1.0 - validity.unsqueeze(-1)
+    )
+    support = _eroded_validity(validity)
+    ssim_loss, has_ssim = _weighted_mean_or_zero(
+        _ssim_loss_map(composited, gt),
+        support,
+    )
+    if not has_ssim:
+        skipped.append("ssim")
+    return (1.0 - lambda_ssim) * l1 + lambda_ssim * ssim_loss, tuple(skipped)
+
+
+def masked_psnr(
+    rendered: torch.Tensor,
+    gt: torch.Tensor,
+    validity: torch.Tensor,
+) -> float:
+    mse, supported = _weighted_mean_or_zero(
+        ((rendered - gt) ** 2).mean(dim=-1),
+        validity,
+    )
+    if not supported:
+        return float("nan")
+    value = float(mse.detach().item())
+    return float("inf") if value < 1e-12 else -10.0 * math.log10(value)
+
+
+def _masked_depth_loss(
+    rendered_depth: torch.Tensor,
+    gt_depth: torch.Tensor,
+    validity: torch.Tensor,
+    edit_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, bool]:
+    weights = validity.to(device=rendered_depth.device, dtype=rendered_depth.dtype)
+    weights = weights * (gt_depth > 0.01) * (rendered_depth > 0.01)
+    if edit_mask is not None:
+        edit_mask = edit_mask.to(rendered_depth.device).bool()
+        if edit_mask.shape != weights.shape:
+            edit_mask = F.interpolate(
+                edit_mask.float().unsqueeze(0).unsqueeze(0),
+                size=weights.shape,
+                mode="nearest",
+            ).squeeze(0).squeeze(0).bool()
+        weights = weights * (~edit_mask)
+    supported_values = weights > 0.0
+    if not torch.any(supported_values):
+        return rendered_depth.sum() * 0.0, False
+    log_gt = torch.log(gt_depth.clamp(min=0.01, max=100.0))
+    log_rendered = torch.log(rendered_depth.clamp(min=0.01, max=100.0))
+    with torch.no_grad():
+        shift = torch.median(log_rendered[supported_values]) - torch.median(
+            log_gt[supported_values]
+        )
+    return _weighted_mean_or_zero(
+        (log_rendered - (log_gt + shift)).abs().clamp(max=2.0),
+        weights,
+    )
+
+
 # ---------------------------------------------------------------------------
 # 4D Quality v6.1 — Madde 11: Adaptive SH degree schedule
 # ---------------------------------------------------------------------------
@@ -999,6 +1167,8 @@ class Trainer4DGS:
         # is skipped (zeroed) for masked pixels (no GT depth in inpainted
         # regions).  Shape: (T, H, W) bool, on CPU — fetched per-iter.
         edit_mask_stack: torch.Tensor | None = None,
+        # Learned-quality experiment only. None preserves the legacy branch.
+        validity_mask: Sequence[torch.Tensor] | None = None,
     ) -> dict:
         # Static mode — 4D dynamic features bypass (deformation, Fourier, motion regs)
         self.static_mode = bool(static_mode)
@@ -1071,12 +1241,28 @@ class Trainer4DGS:
             cam_K_orig = cam_K.to(self.device)
             w2c_list = [w.to(self.device) for w in cam_w2c_per_frame]
 
+        prepared_validity = None
+        if validity_mask is not None:
+            prepared_validity = _prepare_validity_masks(
+                validity_mask,
+                frame_paths=frame_paths,
+                is_multiview=is_multiview,
+                motion_masks_active=(mask_dir is not None and self.lambda_mask_motion > 0),
+            )
+
         Ws, Hs = image_size
         if is_multiview:
             sample = load_frame_tensor(Path(mv_frame_paths[train_cams[0]][0]))
         else:
             sample = load_frame_tensor(Path(frame_paths[0]))
         H0, W0 = sample.shape[:2]             # original frame resolution
+        if prepared_validity is not None:
+            for index, mask in enumerate(prepared_validity):
+                if tuple(mask.shape) != (H0, W0):
+                    raise ValueError(
+                        "validity mask shape must match source frames: "
+                        f"index {index} is {tuple(mask.shape)}, expected {(H0, W0)}"
+                    )
 
         # Phase 2.2 — Multi-resolution schedule resolver
         # multires_schedule: [(start_iter, long_edge), ...]; bos = single resolution.
@@ -1281,6 +1467,8 @@ class Trainer4DGS:
             print(f"[trainer] Track loss aktif (lambda={self.lambda_track})")
 
         history = {"loss": [], "psnr": [], "n_pts": []}
+        if prepared_validity is not None:
+            history["validity_skips"] = []
         t0 = time.time()
 
         # v3.2: lr_deform için warmup — ilk warmup_iters iter'de 0 → target'a ramp up
@@ -1516,6 +1704,13 @@ class Trainer4DGS:
                 K_active = K_scaled
                 w2c_active = w2c_list[idx]
 
+            frame_validity = None
+            if prepared_validity is not None:
+                frame_validity = _resize_validity_mask(
+                    prepared_validity[idx].to(self.device),
+                    (Hs, Ws),
+                )
+
             # --- Deformation + render ---
             # v5.0: Static phase'de deformation tamamen bypass — MLP init
             # weights nonzero olabilir, sadece lr=0 yapmak yetersiz, forward
@@ -1573,10 +1768,21 @@ class Trainer4DGS:
                 rendered_depth = None
 
             # --- Reconstruction loss ---
-            pixel_weight = None
-            if frame_mask is not None and self.lambda_mask_motion > 0:
-                pixel_weight = 1.0 + self.lambda_mask_motion * frame_mask
-            loss_recon = compute_recon_loss(rgb, gt, self.lambda_ssim, pixel_weight=pixel_weight)
+            if frame_validity is None:
+                pixel_weight = None
+                if frame_mask is not None and self.lambda_mask_motion > 0:
+                    pixel_weight = 1.0 + self.lambda_mask_motion * frame_mask
+                loss_recon = compute_recon_loss(
+                    rgb, gt, self.lambda_ssim, pixel_weight=pixel_weight
+                )
+            else:
+                loss_recon, recon_skips = compute_masked_recon_loss(
+                    rgb, gt, self.lambda_ssim, frame_validity
+                )
+                if recon_skips:
+                    history["validity_skips"].append(
+                        {"iter": it, "terms": list(recon_skips)}
+                    )
             loss = loss_recon
 
             # Perf v2: defer .item() — store detached tensors during accumulation, sync once at log time.
@@ -1589,11 +1795,36 @@ class Trainer4DGS:
             if self.lambda_lpips > 0:
                 if self._lpips_module is None:
                     from .losses_perceptual import LPIPSLoss
-                    self._lpips_module = LPIPSLoss(net=self.lpips_net)
+                    if frame_validity is None:
+                        self._lpips_module = LPIPSLoss(net=self.lpips_net)
+                    else:
+                        self._lpips_module = LPIPSLoss(
+                            net=self.lpips_net, spatial=True
+                        )
                 lpips_warmup = min(1.0, it / max(1, self.lpips_warmup_iters))
-                pred_chw = rgb.permute(2, 0, 1).contiguous()
                 gt_chw = gt.permute(2, 0, 1).contiguous()
-                lpips_val = self._lpips_module(pred_chw, gt_chw)
+                if frame_validity is None:
+                    pred_chw = rgb.permute(2, 0, 1).contiguous()
+                    lpips_val = self._lpips_module(pred_chw, gt_chw)
+                else:
+                    composited = rgb * frame_validity.unsqueeze(-1) + gt.detach() * (
+                        1.0 - frame_validity.unsqueeze(-1)
+                    )
+                    lpips_map = self._lpips_module(
+                        composited.permute(2, 0, 1).contiguous(), gt_chw
+                    ).squeeze(0).squeeze(0)
+                    lpips_support = _eroded_validity(
+                        _resize_validity_mask(
+                            frame_validity, tuple(lpips_map.shape[-2:])
+                        )
+                    )
+                    lpips_val, lpips_supported = _weighted_mean_or_zero(
+                        lpips_map, lpips_support
+                    )
+                    if not lpips_supported:
+                        history["validity_skips"].append(
+                            {"iter": it, "terms": ["lpips"]}
+                        )
                 if torch.isfinite(lpips_val):
                     loss = loss + self.lambda_lpips * lpips_warmup * lpips_val
                     comp_t["lpips"] = lpips_val.detach()
@@ -1753,7 +1984,34 @@ class Trainer4DGS:
             # Log-space L1 scale-invariant ve outlier'a karşı dayanıklı.
             # Warmup gate: ilk 100 iter statik GS otursun, sonra depth devreye.
             # Clamp(2.0): tek frame outlier'ı tüm run'ı batırmasın.
-            if (use_depth or use_depth_mv) and gt_depth is not None and rendered_depth is not None:
+            if (
+                (use_depth or use_depth_mv)
+                and gt_depth is not None
+                and rendered_depth is not None
+                and frame_validity is not None
+            ):
+                inpaint_m = (
+                    edit_mask_stack[idx]
+                    if edit_mask_stack is not None
+                    else None
+                )
+                depth_l1, depth_supported = _masked_depth_loss(
+                    rendered_depth, gt_depth, frame_validity, inpaint_m
+                )
+                if depth_supported:
+                    loss = loss + self.lambda_depth * warmup * depth_l1
+                    comp_t["depth"] = depth_l1.detach()
+                else:
+                    history["validity_skips"].append(
+                        {"iter": it, "terms": ["depth"]}
+                    )
+
+            if (
+                (use_depth or use_depth_mv)
+                and gt_depth is not None
+                and rendered_depth is not None
+                and frame_validity is None
+            ):
                 valid = (gt_depth > 0.01) & (rendered_depth > 0.01)
                 # Edit refit: inpainted pixels have no reliable GT depth —
                 # exclude them from depth supervision.
@@ -2183,7 +2441,10 @@ class Trainer4DGS:
             # --- Log ---
             if it % log_interval == 0:
                 with torch.no_grad():
-                    p = psnr(rgb, gt)
+                    if frame_validity is None:
+                        p = psnr(rgb, gt)
+                    else:
+                        p = masked_psnr(rgb, gt, frame_validity)
                     # v3.7.1 METRIC FIX: Önceden Δpos = raw MLP dpos (pre-clamp, Fourier'sız).
                     # Artık _apply_deformation'un gerçek dpos çıktısını ölçüyor
                     # (MLP clamp + Fourier + total clamp dahil). Bu, PLY export'taki

@@ -32,9 +32,10 @@ class LPIPSLoss(nn.Module):
         device: forward'da otomatik tespit (input device).
     """
 
-    def __init__(self, net: str = "alex"):
+    def __init__(self, net: str = "alex", spatial: bool = False):
         super().__init__()
         self.net = net
+        self.spatial = bool(spatial)
         self._model: Optional[nn.Module] = None
         self._available: Optional[bool] = None  # None = belirsiz, True/False = test edildi
 
@@ -53,7 +54,9 @@ class LPIPSLoss(nn.Module):
             # T8 fix: .eval() ile BN/dropout disabled — comment 'Eval mode' diyor ama
             # eskiden enforce edilmiyordu (alex/vgg LPIPS networklerinde bu
             # pratikte zararsiz ama invariant tutmaliyiz).
-            self._model = lpips.LPIPS(net=self.net, verbose=False).to(device).eval()
+            self._model = lpips.LPIPS(
+                net=self.net, verbose=False, spatial=self.spatial
+            ).to(device).eval()
             for p in self._model.parameters():
                 p.requires_grad_(False)
             self._available = True
@@ -75,6 +78,13 @@ class LPIPSLoss(nn.Module):
             scalar tensor (0 if LPIPS unavailable)
         """
         if not self._try_load(pred.device):
+            if self.spatial:
+                batch = 1 if pred.dim() == 3 else pred.shape[0]
+                return torch.zeros(
+                    (batch, 1, *pred.shape[-2:]),
+                    device=pred.device,
+                    dtype=pred.dtype,
+                )
             return torch.zeros((), device=pred.device, dtype=pred.dtype)
 
         # lpips expects [B, 3, H, W] in [-1, 1]
@@ -103,4 +113,4 @@ class LPIPSLoss(nn.Module):
         # Eval mode (BN/dropout disabled), but allow gradient w.r.t. input
         with torch.amp.autocast(device_type=pred.device.type, enabled=False):
             d = self._model(pred_n.float(), target_n.float())
-        return d.mean()
+        return d if self.spatial else d.mean()
