@@ -16,7 +16,7 @@ GENERATED = ROOT / "colab" / "learned_quality_a100_experiment.ipynb"
 
 def test_notebook_is_deterministic_run_all_safe_and_pinned() -> None:
     commit = subprocess.run(
-        ["git", "rev-parse", "45d8f7a^{commit}"],
+        ["git", "rev-parse", "HEAD^{commit}"],
         cwd=ROOT,
         check=True,
         capture_output=True,

@@ -87,6 +87,29 @@ apt's binary so the pipeline gets GPU SIFT with no code change. `sota_verify.ipy
 `--colmap-cuda` and passes `--colmap-cpu` only when the wrapper is absent (automatic
 fallback if the CUDA setup fails).
 
+## Isolated learned-quality A100 test
+
+`learned_quality_a100_experiment.ipynb` is the experimental maximum-quality room
+runner. Select an **A100 High-RAM** runtime, enter the existing input folder relative
+to `MyDrive` (for example `captures/myroom`), and choose **Runtime -> Run all**.
+
+The notebook deliberately does not replace or modify the production result. It writes
+the learned experiment beside the capture as:
+
+```text
+MyDrive/<input_folder>_learned_test_result/
+```
+
+Compare that folder with the existing `MyDrive/<input_folder>_result/`. Inspect
+`experiment_report.json`, `quality_report.json`, and the four images under
+`diagnostics/`: masks, depth, geometry, and final render contact sheets. The output
+contains `splat.ply` for SuperSplat or the project's existing viewer; the notebook does
+not bundle a web viewer.
+
+Local tests prove the contracts, orchestration, publishing isolation, and notebook
+structure. Whether the learned path improves the room is intentionally undecided until
+the real A100 capture finishes and those reports are reviewed.
+
 ## Shared pieces
 
 - `bootstrap.sh` — idempotent env setup (deps, gsplat 1.5.3 JIT build, optional COLMAP).
