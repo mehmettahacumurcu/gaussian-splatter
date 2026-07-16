@@ -66,6 +66,53 @@ def _static_trainer_overrides(cfg: Config) -> tuple[int, str]:
     return cfg.model.fourier_K, cfg.model.deform_pos_mode
 
 
+_EXPERIMENT_TRAIN_KWARGS = frozenset(
+    {"validity_mask", "density_quality_probe"}
+)
+_EXPLICIT_PIPELINE_TRAIN_KWARGS = frozenset(
+    {
+        "n_iters", "image_size", "ckpt_dir", "ckpt_interval", "log_interval",
+        "progress_callback", "depth_dir", "mask_dir", "tracks_path", "flow_dir",
+        "run_logger", "mv_frame_paths", "mv_cam_K", "mv_w2c", "mv_test_camera",
+        "depth_mv_dir", "masks_mv_dir", "flow_mv_dir", "auto_static_dynamic",
+        "static_dynamic_threshold", "static_mode", "sh_progressive_schedule",
+        "lambda_accel", "cam_grad_clip_norm", "mip_scale_floor_frac",
+        "dynamic_densify_scale", "preload_to_ram", "holdout_indices",
+        "cancel_check", "edit_mask_stack",
+    }
+)
+
+
+def _apply_trainer_customizer(
+    trainer: Trainer4DGS,
+    customizer: Callable[[Trainer4DGS], None] | None,
+) -> None:
+    if customizer is not None:
+        customizer(trainer)
+
+
+def _validated_trainer_train_kwargs(
+    values: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if values is None:
+        return {}
+    if not isinstance(values, dict) or not all(isinstance(key, str) for key in values):
+        raise ValueError("trainer_train_kwargs must be a string-keyed dict")
+    collisions = sorted(set(values) & _EXPLICIT_PIPELINE_TRAIN_KWARGS)
+    if collisions:
+        raise ValueError(
+            "trainer_train_kwargs collides with explicit pipeline arguments: "
+            + ", ".join(collisions)
+        )
+    unknown = sorted(set(values) - _EXPERIMENT_TRAIN_KWARGS)
+    if unknown:
+        raise ValueError(
+            "trainer_train_kwargs contains unknown experiment arguments: "
+            + ", ".join(unknown)
+        )
+    return dict(values)
+
+
 def run_pipeline(
     video_path: str | Path,
     scene_name: str = "test_scene",
@@ -76,6 +123,8 @@ def run_pipeline(
     progress_callback: ProgressCallback | None = None,
     force_preprocess: bool = False,
     cancel_check: Callable[[], bool] | None = None,
+    trainer_customizer: Callable[[Trainer4DGS], None] | None = None,
+    trainer_train_kwargs: dict[str, Any] | None = None,
 ) -> dict:
     """
     Returns: { phase: durum }
@@ -1006,6 +1055,7 @@ def run_pipeline(
         lr_cam_w2c=getattr(cfg.train, "lr_cam_w2c", 0.0),
         cam_refine_start_iter=getattr(cfg.train, "cam_refine_start_iter", 5000),
     )
+    _apply_trainer_customizer(trainer, trainer_customizer)
     # Foundation çıktıları varsa trainer'a ver (stage 2 loss'lar için)
     depth_dir_arg = paths["depth"] if (not skip_foundation and paths["depth"].exists()) else None
     mask_dir_arg  = paths["masks"] if (not skip_foundation and paths["masks"].exists()) else None
@@ -1086,6 +1136,9 @@ def run_pipeline(
         print(f"[pipeline.holdout] SV NVS hold-out: {len(sv_holdout_indices)} of {T_sv} frames "
               f"({'static_interleaved' if cfg.train.static_mode else 'temporal_tail'})")
 
+    experiment_train_kwargs = _validated_trainer_train_kwargs(
+        trainer_train_kwargs
+    )
     history = trainer.train(
         frame_paths, K_first, w2c_list,
         n_iters=cfg.train.n_iters,
@@ -1125,6 +1178,7 @@ def run_pipeline(
         holdout_indices=(sv_holdout_indices if sv_holdout_indices else None),
         # Cooperative cancel — passed through from run_pipeline caller.
         cancel_check=cancel_check,
+        **experiment_train_kwargs,
     )
     run_logger.phase_end(
         "training",

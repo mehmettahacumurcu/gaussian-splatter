@@ -228,6 +228,59 @@ def _masked_depth_loss(
     )
 
 
+def _density_accumulate(density: Any, model: Any, *, view_id: Any) -> None:
+    accumulate_view = getattr(density, "accumulate_view", None)
+    if accumulate_view is None:
+        density.accumulate(model)
+    else:
+        accumulate_view(model, view_id=view_id)
+
+
+def _density_step(
+    density: Any,
+    model: Any,
+    *,
+    optimizer: Any,
+    dynamic_densify_scale: float,
+    iteration: int,
+) -> dict:
+    step_at = getattr(density, "step_at", None)
+    if step_at is None:
+        return density.step(
+            model,
+            optimizer=optimizer,
+            dynamic_densify_scale=dynamic_densify_scale,
+        )
+    return step_at(
+        model,
+        optimizer=optimizer,
+        dynamic_densify_scale=dynamic_densify_scale,
+        iteration=iteration,
+    )
+
+
+def _run_density_quality_probe(
+    probe: Callable[[Any, int, tuple[int, int], int], float] | None,
+    trainer: Any,
+    iteration: int,
+    resolution: tuple[int, int],
+    sh_degree: int,
+) -> float | None:
+    if probe is None or iteration % 5_000 != 0:
+        return None
+    aggregate = float(probe(trainer, iteration, resolution, sh_degree))
+    if not math.isfinite(aggregate):
+        raise ValueError("density quality probe must return a finite value")
+    record_quality = getattr(trainer.density, "record_quality", None)
+    if record_quality is not None:
+        record_quality(
+            iteration=iteration,
+            aggregate_valid_psnr_db=aggregate,
+            resolution=resolution,
+        )
+    return aggregate
+
+
 # ---------------------------------------------------------------------------
 # 4D Quality v6.1 — Madde 11: Adaptive SH degree schedule
 # ---------------------------------------------------------------------------
@@ -1169,6 +1222,9 @@ class Trainer4DGS:
         edit_mask_stack: torch.Tensor | None = None,
         # Learned-quality experiment only. None preserves the legacy branch.
         validity_mask: Sequence[torch.Tensor] | None = None,
+        density_quality_probe: Callable[
+            ["Trainer4DGS", int, tuple[int, int], int], float
+        ] | None = None,
     ) -> dict:
         # Static mode — 4D dynamic features bypass (deformation, Fourier, motion regs)
         self.static_mode = bool(static_mode)
@@ -2296,7 +2352,12 @@ class Trainer4DGS:
                 self.optimizer.zero_grad(set_to_none=False)
                 continue
 
-            self.density.accumulate(self.gs)
+            density_view_id = (cam_id, idx) if is_multiview else idx
+            _density_accumulate(
+                self.density,
+                self.gs,
+                view_id=density_view_id,
+            )
             # Edit refit: zero gradients on out-of-zone (frozen) Gaussians so
             # only Gaussians inside the affected zone are updated this step.
             _fm = getattr(self.gs, "_freeze_mask", None)
@@ -2383,10 +2444,12 @@ class Trainer4DGS:
             # thrash + sync stall sebebiyle stuck'lara yol aciyordu).
             if (self.density_start_iter <= it < self.density_end_iter
                     and it % self.density_interval == 0):
-                stats = self.density.step(
+                stats = _density_step(
+                    self.density,
                     self.gs,
                     optimizer=self.optimizer,
                     dynamic_densify_scale=self.dynamic_densify_scale,
+                    iteration=it,
                 )
                 if it % log_interval == 0:
                     print(f"  ↳ density: clone={stats['cloned']} split={stats['split']} "
@@ -2404,6 +2467,15 @@ class Trainer4DGS:
                         )
                     except Exception:
                         pass
+
+            if density_quality_probe is not None:
+                _run_density_quality_probe(
+                    density_quality_probe,
+                    self,
+                    it,
+                    (Ws, Hs),
+                    active_sh_degree,
+                )
 
             # --- Opacity reset (INRIA 3DGS trick, v3) ---
             # Her N iter'de tüm gaussian'ların opacity'sini low bir değere reset et
