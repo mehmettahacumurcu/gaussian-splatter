@@ -1298,6 +1298,48 @@ def test_ffprobe_prefers_display_matrix_rotation_and_scale_does_not_upsize(
     assert "transpose=clock" in scripts[-1]
 
 
+def test_ffprobe_uses_colab_compatible_stream_side_data_section(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = {
+        "streams": [
+            {
+                "width": 1920,
+                "height": 1080,
+                "avg_frame_rate": "60000/1001",
+                "tags": {},
+                "side_data_list": [{"rotation": 90}],
+            }
+        ]
+    }
+
+    def fake_run(args: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+        entries = args[args.index("-show_entries") + 1]
+        if "stream_side_data=rotation" in entries:
+            raise subprocess.CalledProcessError(
+                1,
+                args,
+                stderr=(
+                    "No match for section 'stream_side_data'\n"
+                    "Failed to set value for option 'show_entries': Invalid argument"
+                ),
+            )
+        assert "stream_side_data_list" in entries
+        return subprocess.CompletedProcess(
+            args,
+            0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    probe = FfmpegMediaBackend().probe_video(tmp_path / "iphone.mov")
+
+    assert probe.rotation_degrees == 90
+    assert probe.rotation_source == "display_matrix"
+
+
 def test_candidate_timeline_uses_anchored_nearest_sampling_at_twelve_fps(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

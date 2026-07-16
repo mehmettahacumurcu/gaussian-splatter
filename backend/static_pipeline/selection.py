@@ -142,7 +142,7 @@ class FfmpegMediaBackend:
         entries = (
             "frame=best_effort_timestamp,best_effort_timestamp_time:"
             "stream=avg_frame_rate,width,height:stream_tags=rotate:"
-            "stream_side_data=rotation"
+            "stream_side_data_list"
         )
         command = [
             self.ffprobe_binary,
