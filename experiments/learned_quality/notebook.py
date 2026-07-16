@@ -147,7 +147,8 @@ def build_learned_quality_notebook(
             "    completed = subprocess.run(\n"
             "        [\n"
             '            "/content/learned-env/bin/python",\n'
-            '            "scripts/learned_quality_run.py",\n'
+            '            "-m",\n'
+            '            "scripts.learned_quality_run",\n'
             '            "--spec",\n'
             '            "/content/learned_spec.json",\n'
             "        ],\n"
