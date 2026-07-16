@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+apt-get -qq update >/dev/null
+apt-get install -y python3.12-venv >/dev/null
+
 bash colab/bootstrap.sh --colmap-cuda
 
 python -c "import numpy; print('numpy', numpy.__version__)"
