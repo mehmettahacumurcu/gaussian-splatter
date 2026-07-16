@@ -12,6 +12,7 @@ from backend.model.trainer import (
 )
 from backend.pipeline import (
     _apply_trainer_customizer,
+    _preserve_experiment_depth,
     _validated_trainer_train_kwargs,
     run_pipeline,
 )
@@ -169,3 +170,9 @@ def test_extra_train_kwargs_reject_explicit_collisions() -> None:
         _validated_trainer_train_kwargs({"n_iters": 1})
     with pytest.raises(ValueError, match="unknown"):
         _validated_trainer_train_kwargs({"unknown": 1})
+
+
+def test_only_explicit_experiment_evidence_preserves_precomputed_depth() -> None:
+    assert not _preserve_experiment_depth(None)
+    assert _preserve_experiment_depth({})
+    assert _preserve_experiment_depth({"validity_mask": ("mask",)})

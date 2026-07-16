@@ -196,6 +196,29 @@ def test_rejected_photometric_evidence_keeps_original_rgb(tmp_path: Path) -> Non
     assert runner.fallbacks == ("photometric_rejected_original_rgb",)
 
 
+def test_validated_depth_may_keep_its_processed_resolution(tmp_path: Path) -> None:
+    artifacts, model, scene, _, _ = _fixture(tmp_path)
+    for depth in artifacts.depth.frames:
+        np.save(depth.depth_path, np.full((2, 3), 1.0, dtype=np.float32))
+        depth.depth_sha256 = _sha(depth.depth_path)
+        depth.width = 3
+        depth.height = 2
+
+    def base_runner(**kwargs: object) -> dict[str, object]:
+        installed = np.load(scene / "depth" / "frame_000000_depth.npy")
+        assert installed.shape == (2, 3)
+        trainer = SimpleNamespace(gs=SimpleNamespace(num_points=3), density=None)
+        kwargs["trainer_customizer"](trainer)
+        return {}
+
+    runner = make_experiment_pipeline_runner(
+        artifacts,
+        accepted_model_dir=model,
+        pipeline_runner=base_runner,
+    )
+    runner(video_path=scene / "video.mp4", scene_name="scene", cfg=SimpleNamespace())
+
+
 def test_join_failure_happens_before_any_training_scene_mutation(
     tmp_path: Path,
 ) -> None:

@@ -113,6 +113,10 @@ def _validated_trainer_train_kwargs(
     return dict(values)
 
 
+def _preserve_experiment_depth(values: dict[str, Any] | None) -> bool:
+    return values is not None
+
+
 def run_pipeline(
     video_path: str | Path,
     scene_name: str = "test_scene",
@@ -152,6 +156,7 @@ def run_pipeline(
     # prior + sparse-view yardimcisi); tracks/masks/flow ise statik sahnede anlamsiz.
     # Bu nedenle skip_foundation FALSE birakilir (depth icin), trainer track/mask/flow
     # lambda'lari 0 oldugu icin onlari kullanmaz.
+    experiment_training = _preserve_experiment_depth(trainer_train_kwargs)
     static_mode_active = bool(getattr(cfg.train, "static_mode", False))
     if static_mode_active:
         # 4D-only loss'larin lambda'larini sifirla. NOT: lambda_depth listede DEGIL —
@@ -174,10 +179,13 @@ def run_pipeline(
         # Eger user explicit skip_foundation=True dediyse, lambda_depth da 0'la
         # (depth dosyasi yok, trainer crash etmesin).
         wants_depth = float(getattr(cfg.train, "lambda_depth", 0.0)) > 0
-        if skip_foundation and wants_depth:
+        if skip_foundation and wants_depth and not experiment_training:
             print("[Static 3DGS] skip_foundation=True ama lambda_depth>0 → "
                   "lambda_depth=0 zorlandi (depth dosyasi yok)")
             cfg.train.lambda_depth = 0.0
+        elif wants_depth and experiment_training:
+            print(f"[Static 3DGS] validated experiment depth aktif "
+                  f"(lambda_depth={cfg.train.lambda_depth})")
         elif wants_depth:
             print(f"[Static 3DGS] depth supervision aktif (lambda_depth="
                   f"{cfg.train.lambda_depth}) — foundation depth phase calisacak, "
@@ -1057,7 +1065,6 @@ def run_pipeline(
     )
     _apply_trainer_customizer(trainer, trainer_customizer)
     # Foundation çıktıları varsa trainer'a ver (stage 2 loss'lar için)
-    experiment_training = trainer_train_kwargs is not None
     depth_dir_arg = (
         paths["depth"]
         if ((not skip_foundation or experiment_training) and paths["depth"].exists())

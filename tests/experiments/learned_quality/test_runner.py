@@ -9,6 +9,7 @@ from backend.static_pipeline.runner import HardwareInfo, NotebookRuntimePaths
 from experiments.learned_quality.contracts import LearnedQualityRunSpec
 from experiments.learned_quality.runner import (
     LearnedQualityContext,
+    _reported_winner,
     make_learned_quality_services,
     preflight_learned_runtime,
     run_learned_quality_notebook,
@@ -118,3 +119,18 @@ def test_late_failure_gets_learned_diagnostics(
 
     assert published == [(source, "fixed-run")]
     assert caught.value.diagnostics_path == tmp_path / "diagnostics" / "fixed-run"
+
+
+def test_reported_winner_is_the_exact_geometry_decision() -> None:
+    classical_decision = SimpleNamespace(passed=True)
+    learned_decision = SimpleNamespace(passed=True)
+    candidates = (
+        SimpleNamespace(candidate_id="classical", decision=classical_decision),
+        SimpleNamespace(candidate_id="learned_hybrid", decision=learned_decision),
+    )
+    reconstruction = SimpleNamespace(
+        decision=learned_decision,
+        geometry_candidates=candidates,
+    )
+
+    assert _reported_winner(reconstruction).candidate_id == "learned_hybrid"

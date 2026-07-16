@@ -187,9 +187,15 @@ def _validate_evidence(
         depth_digest = getattr(validated_depth, "depth_sha256")
         _verify_digest(depth_path, depth_digest, "validated depth")
         depth_array = np.load(depth_path, allow_pickle=False)
+        depth_width = getattr(validated_depth, "width", None)
+        depth_height = getattr(validated_depth, "height", None)
         if (
             depth_array.dtype != np.float32
-            or depth_array.shape != expected_shape
+            or type(depth_width) is not int
+            or type(depth_height) is not int
+            or depth_width <= 0
+            or depth_height <= 0
+            or depth_array.shape != (depth_height, depth_width)
             or not np.isfinite(depth_array).all()
             or np.any(depth_array < 0.0)
         ):

@@ -213,7 +213,17 @@ class SeaRaftTorchAdapter:
 
     def _infer(self, first, second):
         import torch
+        import torch.nn.functional as F
 
+        source_size = first.shape[-2:]
+        scale = float(2 ** int(self.args.scale))
+        if scale != 1.0:
+            first = F.interpolate(
+                first, scale_factor=scale, mode="bilinear", align_corners=False
+            )
+            second = F.interpolate(
+                second, scale_factor=scale, mode="bilinear", align_corners=False
+            )
         with torch.inference_mode(), torch.autocast(
             "cuda", dtype=torch.bfloat16, enabled=self.device.startswith("cuda")
         ):
@@ -235,6 +245,19 @@ class SeaRaftTorchAdapter:
             dim=1,
         )
         uncertainty = torch.exp((log_b * weight).sum(dim=1))
+        if flow.shape[-2:] != source_size:
+            flow = (
+                F.interpolate(
+                    flow, size=source_size, mode="bilinear", align_corners=False
+                )
+                / scale
+            )
+            uncertainty = F.interpolate(
+                uncertainty.unsqueeze(1),
+                size=source_size,
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
         return flow, uncertainty
 
     def infer_bidirectional(

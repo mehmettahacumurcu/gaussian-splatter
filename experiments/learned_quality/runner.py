@@ -208,6 +208,14 @@ def _default_contact_sheets(
     }
 
 
+def _reported_winner(reconstruction: object) -> object:
+    decision = getattr(reconstruction, "decision")
+    for candidate in getattr(reconstruction, "geometry_candidates"):
+        if candidate.decision is decision:
+            return candidate
+    raise ValueError("geometry winner is not present in the candidate report")
+
+
 def make_learned_quality_services(context: LearnedQualityContext) -> RunnerServices:
     if not isinstance(context, LearnedQualityContext):
         raise TypeError("context must be a LearnedQualityContext")
@@ -237,14 +245,7 @@ def make_learned_quality_services(context: LearnedQualityContext) -> RunnerServi
         photometric = artifacts.photometric
         if photometric is None:
             raise ValueError("photometric evidence is required for learned reports")
-        winner = min(
-            (
-                candidate
-                for candidate in reconstruction.geometry_candidates
-                if candidate.decision.passed
-            ),
-            key=lambda candidate: candidate.candidate_id,
-        )
+        winner = _reported_winner(reconstruction)
         experiment_report = {
             "status": "passed",
             "winner": winner.candidate_id,

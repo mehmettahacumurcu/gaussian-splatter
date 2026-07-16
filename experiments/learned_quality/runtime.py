@@ -363,19 +363,22 @@ def _run_evidence_cycle(
     metric_model = load_da3_model(
         _SOURCE_ROOT / "da3", _checkpoint("depth-anything/DA3METRIC-LARGE")
     )
-    metric = run_metric_sky(
-        metric_model,
-        da3_frames,
-        anchors.shared_camera,
-        output_root / "da3-metric",
-        initial_batch_size=12,
-        retry_batch_size=6,
-        release_model=release_cuda_model,
-        retry_model_factory=lambda: load_da3_model(
-            _SOURCE_ROOT / "da3", _checkpoint("depth-anything/DA3METRIC-LARGE")
-        ),
-    )
-    del metric_model
+    try:
+        metric = run_metric_sky(
+            metric_model,
+            da3_frames,
+            anchors.shared_camera,
+            output_root / "da3-metric",
+            initial_batch_size=12,
+            retry_batch_size=6,
+            release_model=release_cuda_model,
+            retry_model_factory=lambda: load_da3_model(
+                _SOURCE_ROOT / "da3", _checkpoint("depth-anything/DA3METRIC-LARGE")
+            ),
+        )
+    finally:
+        release_cuda_model(metric_model)
+        del metric_model
     depths, sky = _materialize_metric(frames, metric, output_root / "metric-native")
     scene = _rigid_scene(frames, pre_model, depths)
 
@@ -402,8 +405,8 @@ def _run_evidence_cycle(
             _SOURCE_ROOT / "sea-raft",
             _checkpoint("MemorySlices/Tartan-C-T-TSKH-spring540x960-M"),
         ),
-        initial_pair_batch_size=8,
-        retry_pair_batch_size=4,
+        initial_pair_batch_size=2,
+        retry_pair_batch_size=1,
         release_model=release_cuda_model,
     )
     masks = fuse_evidence_masks(
