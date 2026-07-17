@@ -16,6 +16,16 @@ _BATCH_COUNTERS = (
     "fnet.layer2.0.downsample.1.num_batches_tracked",
     "fnet.layer3.0.downsample.1.num_batches_tracked",
 )
+_SHARED_BATCH_STATE = tuple(
+    f"{prefix}.{name}"
+    for prefix in (
+        "cnet.layer2.0.downsample.1",
+        "cnet.layer3.0.downsample.1",
+        "fnet.layer2.0.downsample.1",
+        "fnet.layer3.0.downsample.1",
+    )
+    for name in ("weight", "bias", "running_mean", "running_var")
+)
 
 
 def _sea_raft_layout(tmp_path: Path) -> tuple[Path, Path]:
@@ -37,11 +47,13 @@ def _install_fake_dependencies(
     monkeypatch: pytest.MonkeyPatch,
     *,
     missing_keys: tuple[str, ...],
+    load_model_error: BaseException,
 ) -> type[object]:
     class FakeRaft:
         constructed = 0
         loaded_state = None
         strict = None
+        load_model_call = None
 
         def __init__(self, args: object) -> None:
             self.args = args
@@ -77,6 +89,13 @@ def _install_fake_dependencies(
     safetensors_torch.load_file = lambda path, device: {
         "checkpoint": (Path(path), device)
     }
+
+    def load_model(model, path, *, strict, device):
+        FakeRaft.load_model_call = (model, Path(path), strict, device)
+        model.loaded_state = "alias-aware"
+        raise load_model_error
+
+    safetensors_torch.load_model = load_model
     monkeypatch.setitem(sys.modules, "raft", raft_module)
     monkeypatch.setitem(sys.modules, "safetensors", safetensors_package)
     monkeypatch.setitem(sys.modules, "safetensors.torch", safetensors_torch)
@@ -90,16 +109,20 @@ def test_sea_raft_loader_accepts_only_batchnorm_tracking_buffer_mismatch(
     source, checkpoint = _sea_raft_layout(tmp_path)
     fake_raft = _install_fake_dependencies(
         monkeypatch,
-        missing_keys=_BATCH_COUNTERS,
+        missing_keys=_SHARED_BATCH_STATE,
+        load_model_error=AssertionError(f"{set(_BATCH_COUNTERS)} != set()"),
     )
 
     adapter = SeaRaftTorchAdapter(source, checkpoint, device="cuda")
 
     assert fake_raft.constructed == 1
-    assert fake_raft.strict is False
-    assert fake_raft.loaded_state == {
-        "checkpoint": (checkpoint / "model.safetensors", "cpu")
-    }
+    assert fake_raft.load_model_call == (
+        adapter.model,
+        checkpoint / "model.safetensors",
+        True,
+        "cpu",
+    )
+    assert adapter.model.loaded_state == "alias-aware"
     assert adapter.model.device == "cuda"
     assert adapter.model.training is False
 
@@ -112,7 +135,25 @@ def test_sea_raft_loader_rejects_a_missing_learned_weight(
     _install_fake_dependencies(
         monkeypatch,
         missing_keys=("fnet.layer2.0.conv1.weight",),
+        load_model_error=RuntimeError("SEA-RAFT checkpoint is missing learned weight"),
     )
 
     with pytest.raises(RuntimeError, match="learned weight"):
+        SeaRaftTorchAdapter(source, checkpoint, device="cuda")
+
+
+def test_sea_raft_loader_rejects_other_alias_consistency_assertions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source, checkpoint = _sea_raft_layout(tmp_path)
+    _install_fake_dependencies(
+        monkeypatch,
+        missing_keys=(),
+        load_model_error=AssertionError(
+            "{'fnet.layer2.0.downsample.1.weight'} != set()"
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="alias consistency"):
         SeaRaftTorchAdapter(source, checkpoint, device="cuda")

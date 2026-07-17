@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import sys
 from argparse import Namespace
@@ -180,6 +181,25 @@ def _sea_args(source: Path) -> Namespace:
     return Namespace(**payload)
 
 
+def _is_batch_counter_consistency_assertion(error: AssertionError) -> bool:
+    """Recognize safetensors' alias check for non-persistent BN counters only."""
+    left, separator, right = str(error).partition(" != ")
+    if not separator or right != "set()":
+        return False
+    try:
+        keys = ast.literal_eval(left)
+    except (SyntaxError, ValueError):
+        return False
+    return (
+        isinstance(keys, set)
+        and bool(keys)
+        and all(
+            isinstance(key, str) and key.endswith(".num_batches_tracked")
+            for key in keys
+        )
+    )
+
+
 class SeaRaftTorchAdapter:
     model_id = "MemorySlices/Tartan-C-T-TSKH-spring540x960-M"
     revision = _checkpoint_ref(model_id).revision
@@ -198,29 +218,34 @@ class SeaRaftTorchAdapter:
             if entry not in sys.path:
                 sys.path.insert(0, entry)
         from raft import RAFT
-        from safetensors.torch import load_file
+        from safetensors.torch import load_model
 
         self.args = _sea_args(source)
         checkpoint_file = checkpoint / "model.safetensors"
         if not checkpoint_file.is_file():
             raise FileNotFoundError(checkpoint_file)
         self.model = RAFT(self.args)
-        state = load_file(checkpoint_file, device="cpu")
-        incompatible = self.model.load_state_dict(state, strict=False)
-        missing = set(incompatible.missing_keys)
-        unexpected = set(incompatible.unexpected_keys)
-        missing_learned_state = {
-            key for key in missing if not key.endswith(".num_batches_tracked")
-        }
-        if missing_learned_state:
+        try:
+            # load_model restores safetensors shared-tensor aliases that load_file
+            # cannot represent. Strict mode verifies all real state before its
+            # post-load PyTorch consistency assertion is evaluated.
+            load_model(self.model, checkpoint_file, strict=True, device="cpu")
+        except AssertionError as error:
+            if not _is_batch_counter_consistency_assertion(error):
+                raise RuntimeError(
+                    "SEA-RAFT checkpoint failed alias consistency validation: "
+                    f"{error}"
+                ) from error
+            # The checkpoint aliases all learned BatchNorm state correctly. Its
+            # four integer tracking counters are recreated by PyTorch and are not
+            # learned parameters, so this safetensors sanity-check mismatch is safe.
+        except RuntimeError:
+            # Preserve safetensors' strict missing/unexpected/invalid-state error.
+            raise
+        except Exception as error:
             raise RuntimeError(
-                "SEA-RAFT checkpoint is missing learned weight or required buffer: "
-                f"{sorted(missing_learned_state)}"
-            )
-        if unexpected:
-            raise RuntimeError(
-                "SEA-RAFT checkpoint has unexpected state: " f"{sorted(unexpected)}"
-            )
+                f"SEA-RAFT checkpoint could not be loaded: {error}"
+            ) from error
         self.model.to(device)
         self.model.eval()
         self.device = device
