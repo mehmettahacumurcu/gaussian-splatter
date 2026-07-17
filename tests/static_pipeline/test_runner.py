@@ -288,6 +288,77 @@ def test_pretraining_save_failure_publishes_diagnostics_and_prevents_training(
     assert calls[-1] == "publish_diagnostics"
 
 
+def test_training_failure_keeps_pretraining_for_a_fresh_run_resume(
+    tmp_path: Path,
+) -> None:
+    stored: dict[str, object] = {}
+    first_calls: list[str] = []
+    first = _services(first_calls)
+
+    def save_pretraining(**kwargs: object) -> None:
+        first_calls.append("save_pretraining")
+        stored["selection"] = kwargs["selection"]
+        stored["reconstruction"] = kwargs["reconstruction"]
+
+    def fail_training(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        first_calls.append("train")
+        raise RuntimeError("training failed")
+
+    first = RunnerServices(
+        **{
+            **first.__dict__,
+            "save_pretraining": save_pretraining,
+            "train": fail_training,
+        }
+    )
+    spec = StaticNotebookRunSpec(input_folder="captures/room")
+
+    with pytest.raises(RuntimeError, match="training failed"):
+        run_static_notebook(
+            spec,
+            runtime_paths=NotebookRuntimePaths(
+                tmp_path / "drive",
+                tmp_path / "first-work",
+            ),
+            services=first,
+        )
+
+    assert first_calls.index("save_pretraining") < first_calls.index("train")
+
+    second_calls: list[str] = []
+    second = _services(second_calls)
+
+    def restore_pretraining(**kwargs: object) -> PretrainingRestore:
+        assert Path(kwargs["run_root"]).parent == tmp_path / "second-work"
+        second_calls.append("restore_pretraining")
+        return PretrainingRestore(
+            stored["selection"],
+            stored["reconstruction"],
+        )
+
+    second = RunnerServices(
+        **{
+            **second.__dict__,
+            "restore_pretraining": restore_pretraining,
+        }
+    )
+    run_static_notebook(
+        spec,
+        runtime_paths=NotebookRuntimePaths(
+            tmp_path / "drive",
+            tmp_path / "second-work",
+        ),
+        services=second,
+    )
+
+    assert "restore_pretraining" in second_calls
+    assert "copy_input" not in second_calls
+    assert "select" not in second_calls
+    assert "colmap_gate" not in second_calls
+    assert second_calls.index("restore_pretraining") < second_calls.index("train")
+
+
 def test_runner_prints_live_top_level_stages_and_writes_jsonl(tmp_path: Path) -> None:
     output = StringIO()
     reporter = StageReporter(RUNNER_STAGE_DEFINITIONS, stream=output)

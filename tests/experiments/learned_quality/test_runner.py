@@ -6,9 +6,16 @@ from types import SimpleNamespace
 import pytest
 
 from backend.static_pipeline.runner import HardwareInfo, NotebookRuntimePaths
-from experiments.learned_quality.contracts import LearnedQualityRunSpec
+from backend.static_pipeline.progress import StageReporter
+from experiments.learned_quality.contracts import (
+    LearnedQualityRunSpec,
+    to_static_run_spec,
+)
 from experiments.learned_quality.runner import (
+    LEARNED_STAGE_DEFINITIONS,
     LearnedQualityContext,
+    _late_failure_files,
+    _pretraining_cache_fingerprint,
     _reported_winner,
     make_learned_quality_services,
     preflight_learned_runtime,
@@ -78,6 +85,232 @@ def test_service_composition_keeps_production_boundaries_and_replaces_learned_on
     assert services.validate_bundle is not sentinel.validate_bundle
     assert services.publish_result is not sentinel.publish_result
     assert services.publish_diagnostics is not sentinel.publish_diagnostics
+    assert services.restore_pretraining is None
+    assert services.save_pretraining is None
+
+
+def test_cached_service_composition_uses_one_store_for_restore_reconstruct_and_save(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.static_pipeline import runner as static_runner
+
+    production = SimpleNamespace(
+        discover_source=object(),
+        copy_input=object(),
+        select_frames=object(),
+        reconstruct=object(),
+        train=object(),
+        polish=object(),
+        build_metadata_preview=object(),
+        validate_bundle=object(),
+        publish_result=object(),
+        publish_diagnostics=object(),
+        inspect_hardware=object(),
+        preflight=object(),
+        assemble_reports=object(),
+        resolve_input=object(),
+    )
+    monkeypatch.setattr(static_runner, "_production_services", lambda: production)
+    calls: list[tuple[str, object]] = []
+
+    class FakeStore:
+        def __init__(self, cache_root: Path, *, input_identity: str) -> None:
+            self.input_identity = input_identity
+            calls.append(("store", (cache_root, input_identity)))
+
+        def restore_pretraining(self, **kwargs: object) -> None:
+            calls.append(("restore", kwargs["destination"]))
+            return None
+
+        def publish_pretraining(self, **kwargs: object) -> None:
+            calls.append(("save", kwargs["run_root"]))
+
+    monkeypatch.setattr(
+        "experiments.learned_quality.runner.LearnedCheckpointStore",
+        FakeStore,
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.runner._pretraining_cache_fingerprint",
+        lambda *args, **kwargs: "f" * 64,
+    )
+    model_manifest = tmp_path / "model_manifest.json"
+    model_manifest.write_text("{}", encoding="utf-8")
+
+    def reconstruct(*args: object, **kwargs: object) -> object:
+        del args
+        calls.append(("reconstruct", kwargs["checkpoint_store"]))
+        return SimpleNamespace()
+
+    context = LearnedQualityContext(reconstruct, model_manifest)
+    cache_root = tmp_path / "drive" / "room_learned_test_cache"
+    services = make_learned_quality_services(context, cache_root=cache_root)
+    source_inventory = SimpleNamespace(digest="a" * 64)
+    spec = SimpleNamespace()
+    hardware = HardwareInfo("NVIDIA A100", 80.0, True, 120.0)
+    run_root = tmp_path / "work" / "run"
+
+    assert services.restore_pretraining is not None
+    assert services.save_pretraining is not None
+    assert (
+        services.restore_pretraining(
+            source_inventory=source_inventory,
+            spec=spec,
+            hardware=hardware,
+            run_root=run_root,
+        )
+        is None
+    )
+    services.reconstruct(
+        SimpleNamespace(inventory=source_inventory),
+        spec=spec,
+        hardware=hardware,
+        output_root=run_root / "reconstruction",
+    )
+    services.save_pretraining(
+        source_inventory=source_inventory,
+        selection=SimpleNamespace(),
+        reconstruction=SimpleNamespace(),
+        spec=spec,
+        hardware=hardware,
+        run_root=run_root,
+    )
+
+    store = calls[0][1]
+    assert store == (cache_root, "a" * 64)
+    assert calls[1] == ("restore", run_root / "pretraining-restored")
+    assert calls[2][0] == "reconstruct"
+    assert isinstance(calls[2][1], FakeStore)
+    assert calls[3] == ("save", run_root)
+
+
+def test_notebook_run_enables_full_stage_reporter_and_default_drive_cache(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    model_manifest = tmp_path / "model_manifest.json"
+    model_manifest.write_text("{}", encoding="utf-8")
+    context = LearnedQualityContext(lambda *args, **kwargs: None, model_manifest)
+    sentinel = SimpleNamespace(final_path=tmp_path / "result")
+
+    def run(*args: object, **kwargs: object) -> object:
+        del args
+        captured.update(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(
+        "experiments.learned_quality.runner._default_context",
+        lambda: context,
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.runner.run_static_notebook",
+        run,
+    )
+    drive = tmp_path / "drive"
+    work = tmp_path / "work"
+
+    result = run_learned_quality_notebook(
+        LearnedQualityRunSpec(input_folder="myroom_test"),
+        runtime_paths=NotebookRuntimePaths(drive, work),
+    )
+
+    assert result is sentinel
+    assert isinstance(captured["reporter"], StageReporter)
+    assert tuple(row.stage_id for row in LEARNED_STAGE_DEFINITIONS) == (
+        "input_discovery",
+        "runtime_preflight",
+        "cache_restore",
+        "source_copy",
+        "frame_selection",
+        "reconstruction",
+        "da3_anchor",
+        "classical_colmap",
+        "da3_metric_sky",
+        "semantic_masks",
+        "optical_flow",
+        "mask_fusion",
+        "geometry_comparison",
+        "photometric_validation",
+        "final_pose_depth",
+        "dense_seed_fusion",
+        "pretraining_cache_save",
+        "gaussian_training",
+        "polish",
+        "metadata_preview",
+        "report_assembly",
+        "bundle_validation",
+        "result_publication",
+    )
+    services = captured["services"]
+    assert services.restore_pretraining is not None
+    assert services.save_pretraining is not None
+
+
+def test_complete_cache_fingerprint_tracks_selected_geometry_but_not_iterations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from experiments.learned_quality import runtime
+
+    monkeypatch.setattr(
+        "experiments.learned_quality.runner.producer_code_digest",
+        lambda *args, **kwargs: "c" * 64,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "producer_code_digest",
+        lambda *args, **kwargs: "d" * 64,
+    )
+    monkeypatch.setattr(runtime, "_probe_colmap_version", lambda: "COLMAP 3.11.1")
+    manifest = tmp_path / "model_manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    source = SimpleNamespace(digest="a" * 64)
+    selection = SimpleNamespace(
+        inventory=source,
+        manifest=SimpleNamespace(image_set_digest="b" * 64),
+    )
+    hardware = HardwareInfo(
+        "NVIDIA A100",
+        80.0,
+        True,
+        120.0,
+        colmap_gpu_sift=True,
+    )
+    spec = to_static_run_spec(LearnedQualityRunSpec(input_folder="myroom_test"))
+    training_only_change = spec.model_copy(
+        update={
+            "quality": spec.quality.model_copy(update={"n_iters": 1}),
+        }
+    )
+
+    original = _pretraining_cache_fingerprint(
+        source,
+        selection,
+        spec,
+        hardware,
+        manifest,
+    )
+    training_only = _pretraining_cache_fingerprint(
+        source,
+        selection,
+        training_only_change,
+        hardware,
+        manifest,
+    )
+    selected_change = _pretraining_cache_fingerprint(
+        source,
+        SimpleNamespace(
+            inventory=source,
+            manifest=SimpleNamespace(image_set_digest="e" * 64),
+        ),
+        spec,
+        hardware,
+        manifest,
+    )
+
+    assert training_only == original
+    assert selected_change != original
 
 
 def test_late_failure_gets_learned_diagnostics(
@@ -119,6 +352,17 @@ def test_late_failure_gets_learned_diagnostics(
 
     assert published == [(source, "fixed-run")]
     assert caught.value.diagnostics_path == tmp_path / "diagnostics" / "fixed-run"
+
+
+def test_late_failure_diagnostics_include_bound_progress_log(tmp_path: Path) -> None:
+    run_root = tmp_path / "run"
+    progress = run_root / "logs" / "progress.jsonl"
+    progress.parent.mkdir(parents=True)
+    progress.write_text('{"status":"fail"}\n', encoding="utf-8")
+
+    files = _late_failure_files(run_root, RuntimeError("training failed"))
+
+    assert files["logs/progress.jsonl"] == progress
 
 
 def test_reported_winner_is_the_exact_geometry_decision() -> None:

@@ -20,6 +20,18 @@ from .contracts import GENERATOR_ID
 
 _SCHEMA_VERSION = 1
 _SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_PRETRAINING_ROOTS = frozenset(
+    {
+        "selection",
+        "selection-backfill",
+        "learned-evidence-0",
+        "learned-evidence-1",
+        "reconstruction",
+        "photometric",
+        "final-pose-depth",
+        "validated-depth",
+    }
+)
 
 
 class LearnedCacheOwnershipError(RuntimeError):
@@ -279,12 +291,30 @@ def _checkpoint_types() -> dict[str, type[object]]:
     from backend.static_pipeline.runner import SelectionOutput
 
     from .contracts import (
+        FrameArtifact,
         GeometryCandidateReport,
         LearnedArtifacts,
         LearnedReconstructionOutput,
         ModelRef,
         StageRecord,
     )
+    from .da3 import (
+        AnchorInferenceResult,
+        CameraRecord,
+        FramePredictionArtifact,
+        PinholeCamera,
+    )
+    from .depth import (
+        DenseSeedArtifact,
+        DenseSeedPolicy,
+        DepthValidationResult,
+        ValidatedDepthFrame,
+    )
+    from .flow import FlowGatePolicy, MotionEvidence, MotionFrameEvidence
+    from .lifecycle import BatchAttemptRecord
+    from .masks import FusedMaskFrame, MaskFusionEvidence, MaskFusionPolicy
+    from .photometric import PhotometricEvidence, RgbAffineTransform
+    from .segmentation import SemanticEvidence, SemanticFrameEvidence, SemanticPolicy
 
     types = (
         SelectionOutput,
@@ -298,10 +328,31 @@ def _checkpoint_types() -> dict[str, type[object]]:
         GateDecision,
         ReconstructionBundle,
         ModelRef,
+        FrameArtifact,
         StageRecord,
         LearnedArtifacts,
         GeometryCandidateReport,
         LearnedReconstructionOutput,
+        BatchAttemptRecord,
+        PinholeCamera,
+        FramePredictionArtifact,
+        CameraRecord,
+        AnchorInferenceResult,
+        SemanticPolicy,
+        SemanticFrameEvidence,
+        SemanticEvidence,
+        FlowGatePolicy,
+        MotionFrameEvidence,
+        MotionEvidence,
+        MaskFusionPolicy,
+        FusedMaskFrame,
+        MaskFusionEvidence,
+        RgbAffineTransform,
+        PhotometricEvidence,
+        DenseSeedPolicy,
+        ValidatedDepthFrame,
+        DenseSeedArtifact,
+        DepthValidationResult,
     )
     return {f"{item.__module__}.{item.__qualname__}": item for item in types}
 
@@ -462,6 +513,164 @@ class LearnedCheckpointStore:
                 self._remove_restore_tree(target)
             raise
 
+    def publish_pretraining(
+        self,
+        *,
+        source_inventory: object,
+        selection: object,
+        reconstruction: object,
+        fingerprint: str,
+        run_id: str,
+        run_root: Path,
+    ) -> Path:
+        from backend.static_pipeline.runner import SelectionOutput
+
+        from .contracts import LearnedReconstructionOutput
+
+        if not isinstance(selection, SelectionOutput):
+            raise TypeError("selection must be a SelectionOutput")
+        if not isinstance(reconstruction, LearnedReconstructionOutput):
+            raise TypeError("reconstruction must be a LearnedReconstructionOutput")
+        source_digest = getattr(source_inventory, "digest", None)
+        if source_digest != self.input_identity:
+            raise ValueError("source inventory does not match cache input identity")
+        if selection.inventory.digest != source_digest:
+            raise ValueError("selection inventory does not match current source")
+        root = _regular_directory(Path(run_root), "pretraining run root")
+        model_manifest = reconstruction.artifacts.model_manifest_path
+        if model_manifest is None:
+            raise ValueError("learned reconstruction is missing its model manifest")
+        manifest_file = _regular_file(
+            Path(model_manifest),
+            "learned model manifest",
+        )
+        state = {"selection": selection, "reconstruction": reconstruction}
+        referenced_roots = _pretraining_referenced_roots(
+            state,
+            run_root=root,
+            model_manifest=manifest_file,
+        )
+        with tempfile.TemporaryDirectory(
+            prefix="learned-pretraining-checkpoint-",
+            dir=root.parent,
+        ) as temporary:
+            snapshot = Path(temporary).resolve(strict=True)
+            for relative_name in sorted(referenced_roots):
+                source = root / relative_name
+                destination = snapshot / relative_name
+                if source.is_dir():
+                    shutil.copytree(source, destination, copy_function=shutil.copy2)
+                else:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(source, destination)
+            manifest_copy = snapshot / "model-manifest" / "model_manifest.json"
+            manifest_copy.parent.mkdir(parents=True, exist_ok=False)
+            shutil.copy2(manifest_file, manifest_copy)
+            relocated = _relocate_checkpoint_state(
+                state,
+                source_root=root,
+                destination_root=snapshot,
+                model_manifest=manifest_file,
+                model_manifest_copy=manifest_copy,
+            )
+            _write_json(
+                snapshot / "state.json",
+                encode_checkpoint_state(relocated, snapshot_root=snapshot),
+            )
+            return self.publish_generation(
+                CheckpointKind.PRETRAINING,
+                fingerprint=fingerprint,
+                run_id=run_id,
+                source_root=snapshot,
+            )
+
+    def restore_pretraining(
+        self,
+        *,
+        source_inventory: object,
+        destination: Path,
+        expected_fingerprint: object,
+    ) -> object | None:
+        from collections.abc import Callable
+
+        from backend.static_pipeline.runner import PretrainingRestore, SelectionOutput
+
+        from .contracts import LearnedReconstructionOutput
+
+        if not isinstance(expected_fingerprint, Callable):
+            raise TypeError("expected_fingerprint must be callable")
+        if getattr(source_inventory, "digest", None) != self.input_identity:
+            raise ValueError("source inventory does not match cache input identity")
+        candidates = self._valid_pretraining_generations()
+        if not candidates:
+            return None
+        target = Path(destination)
+        if os.path.lexists(target):
+            raise FileExistsError(f"pretraining restore destination exists: {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        for generation in candidates:
+            source = generation / "payload"
+            try:
+                shutil.copytree(source, target, copy_function=shutil.copy2)
+                if _inventory(source) != _inventory(target):
+                    raise ValueError(
+                        "restored pretraining checkpoint differs from Drive"
+                    )
+                payload = json.loads(
+                    (target / "state.json").read_text(encoding="utf-8")
+                )
+                decoded = decode_checkpoint_state(
+                    payload,
+                    restore_root=target,
+                    source_inventory=source_inventory,
+                )
+                if not isinstance(decoded, dict) or set(decoded) != {
+                    "selection",
+                    "reconstruction",
+                }:
+                    raise ValueError("pretraining checkpoint state is malformed")
+                selection = decoded["selection"]
+                reconstruction = decoded["reconstruction"]
+                if not isinstance(selection, SelectionOutput) or not isinstance(
+                    reconstruction,
+                    LearnedReconstructionOutput,
+                ):
+                    raise ValueError("pretraining checkpoint state has the wrong type")
+                expected = _require_digest(
+                    expected_fingerprint(selection),
+                    "expected pretraining fingerprint",
+                )
+                if generation.name != expected:
+                    self._remove_restore_tree(target)
+                    continue
+                _validate_restored_pretraining(selection, reconstruction, target)
+                return PretrainingRestore(selection, reconstruction)
+            except BaseException:
+                if os.path.lexists(target):
+                    self._remove_restore_tree(target)
+                raise
+        return None
+
+    def _valid_pretraining_generations(self) -> tuple[Path, ...]:
+        if not self._ensure_owned_root(create=False):
+            return ()
+        parent = self.cache_root / CheckpointKind.PRETRAINING.value
+        if not parent.is_dir():
+            return ()
+        result = []
+        for candidate in sorted(parent.iterdir(), key=lambda item: item.name):
+            try:
+                fingerprint = _require_digest(candidate.name, "fingerprint")
+            except ValueError:
+                continue
+            if self._valid_generation(
+                candidate,
+                CheckpointKind.PRETRAINING,
+                fingerprint,
+            ):
+                result.append(candidate)
+        return tuple(result)
+
     def find_generation(
         self,
         kind: CheckpointKind,
@@ -583,6 +792,159 @@ class LearnedCheckpointStore:
             shutil.rmtree(candidate)
         elif os.path.lexists(candidate):
             candidate.unlink()
+
+
+def _checkpoint_state_paths(value: object) -> tuple[Path, ...]:
+    from backend.static_pipeline.runner import SelectionOutput
+
+    paths: list[Path] = []
+    visited: set[int] = set()
+
+    def visit(item: object) -> None:
+        if isinstance(item, Path):
+            paths.append(item)
+            return
+        if item is None or isinstance(item, (bool, str, int, float)):
+            return
+        if is_dataclass(item) and not isinstance(item, type):
+            identity = id(item)
+            if identity in visited:
+                return
+            visited.add(identity)
+            for field in fields(item):
+                if isinstance(item, SelectionOutput) and field.name == "inventory":
+                    continue
+                visit(getattr(item, field.name))
+            return
+        if isinstance(item, Mapping):
+            for key, nested in item.items():
+                if not isinstance(key, str):
+                    raise ValueError("checkpoint mappings require string keys")
+                visit(nested)
+            return
+        if isinstance(item, (tuple, frozenset)):
+            for nested in item:
+                visit(nested)
+            return
+        raise ValueError(f"checkpoint value type is not registered: {type(item)!r}")
+
+    visit(value)
+    return tuple(paths)
+
+
+def _pretraining_referenced_roots(
+    state: object,
+    *,
+    run_root: Path,
+    model_manifest: Path,
+) -> frozenset[str]:
+    roots: set[str] = set()
+    for raw_path in _checkpoint_state_paths(state):
+        path = Path(raw_path)
+        if path.is_symlink():
+            raise ValueError("pretraining checkpoint paths cannot be symlinks")
+        resolved = path.resolve(strict=True)
+        if resolved == model_manifest:
+            continue
+        try:
+            relative = resolved.relative_to(run_root)
+        except ValueError as error:
+            raise ValueError("pretraining artifact escapes the run root") from error
+        if not relative.parts or relative.parts[0] not in _PRETRAINING_ROOTS:
+            raise ValueError(
+                f"pretraining artifact is outside an owned stage: {relative}"
+            )
+        roots.add(relative.parts[0])
+    if not roots:
+        raise ValueError("pretraining checkpoint has no run-local artifacts")
+    return frozenset(roots)
+
+
+def _relocate_checkpoint_state(
+    value: object,
+    *,
+    source_root: Path,
+    destination_root: Path,
+    model_manifest: Path,
+    model_manifest_copy: Path,
+) -> object:
+    from backend.static_pipeline.runner import SelectionOutput
+
+    memo: dict[int, object] = {}
+
+    def relocate(item: object) -> object:
+        if item is None or isinstance(item, (bool, str, int, float)):
+            return item
+        if isinstance(item, Path):
+            resolved = item.resolve(strict=True)
+            if resolved == model_manifest:
+                return model_manifest_copy.resolve(strict=True)
+            try:
+                relative = resolved.relative_to(source_root)
+            except ValueError as error:
+                raise ValueError("pretraining artifact escapes the run root") from error
+            return destination_root.joinpath(*relative.parts).resolve(strict=True)
+        if is_dataclass(item) and not isinstance(item, type):
+            identity = id(item)
+            existing = memo.get(identity)
+            if existing is not None:
+                return existing
+            values = {}
+            for field in fields(item):
+                current = getattr(item, field.name)
+                if isinstance(item, SelectionOutput) and field.name == "inventory":
+                    values[field.name] = current
+                else:
+                    values[field.name] = relocate(current)
+            relocated = type(item)(**values)
+            memo[identity] = relocated
+            return relocated
+        if isinstance(item, tuple):
+            return tuple(relocate(nested) for nested in item)
+        if isinstance(item, frozenset):
+            return frozenset(relocate(nested) for nested in item)
+        if isinstance(item, Mapping):
+            if any(not isinstance(key, str) for key in item):
+                raise ValueError("checkpoint mappings require string keys")
+            return {key: relocate(item[key]) for key in sorted(item)}
+        raise ValueError(f"checkpoint value type is not registered: {type(item)!r}")
+
+    return relocate(value)
+
+
+def _validate_restored_pretraining(
+    selection: object,
+    reconstruction: object,
+    restore_root: Path,
+) -> None:
+    root = _regular_directory(restore_root, "restored pretraining root")
+    for path in _checkpoint_state_paths(
+        {"selection": selection, "reconstruction": reconstruction}
+    ):
+        resolved = Path(path).resolve(strict=True)
+        try:
+            resolved.relative_to(root)
+        except ValueError as error:
+            raise ValueError(
+                "restored pretraining artifact escapes the local root"
+            ) from error
+    if reconstruction.selected_manifest is not selection.manifest:
+        raise ValueError("restored selection and reconstruction manifests differ")
+    decision = reconstruction.decision
+    if not decision.passed or decision.failures:
+        raise ValueError("restored reconstruction does not pass its quality gate")
+    _regular_directory(selection.frames_dir, "restored selected frames")
+    _regular_file(selection.source_manifest_path, "restored selection manifest")
+    model_root = _regular_directory(
+        reconstruction.accepted_model_dir,
+        "restored accepted model",
+    )
+    for name in ("cameras.txt", "images.txt", "points3D.txt"):
+        _regular_file(model_root / name, f"restored accepted model {name}")
+    _regular_file(
+        reconstruction.artifacts.model_manifest_path,
+        "restored learned model manifest",
+    )
 
 
 def _require_kind(value: CheckpointKind) -> CheckpointKind:

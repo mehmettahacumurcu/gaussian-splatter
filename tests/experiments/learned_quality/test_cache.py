@@ -20,6 +20,7 @@ from backend.static_pipeline.contracts import (
     SourceInventory,
 )
 from backend.static_pipeline.runner import SelectionOutput
+from backend.static_pipeline.runner import PretrainingRestore
 
 from experiments.learned_quality.cache import (
     CheckpointInputs,
@@ -30,13 +31,47 @@ from experiments.learned_quality.cache import (
     decode_checkpoint_state,
     encode_checkpoint_state,
     producer_code_digest,
+    _checkpoint_types,
 )
 from experiments.learned_quality.contracts import (
+    FrameArtifact,
     GENERATOR_ID,
     GeometryCandidateReport,
     LearnedArtifacts,
     LearnedReconstructionOutput,
     StageRecord,
+)
+from experiments.learned_quality.da3 import (
+    AnchorInferenceResult,
+    CameraRecord,
+    FramePredictionArtifact,
+    PinholeCamera,
+)
+from experiments.learned_quality.depth import (
+    DenseSeedArtifact,
+    DenseSeedPolicy,
+    DepthValidationResult,
+    ValidatedDepthFrame,
+)
+from experiments.learned_quality.flow import (
+    FlowGatePolicy,
+    MotionEvidence,
+    MotionFrameEvidence,
+)
+from experiments.learned_quality.lifecycle import BatchAttemptRecord
+from experiments.learned_quality.masks import (
+    FusedMaskFrame,
+    MaskFusionEvidence,
+    MaskFusionPolicy,
+)
+from experiments.learned_quality.photometric import (
+    PhotometricEvidence,
+    RgbAffineTransform,
+)
+from experiments.learned_quality.segmentation import (
+    SemanticEvidence,
+    SemanticFrameEvidence,
+    SemanticPolicy,
 )
 
 
@@ -445,3 +480,138 @@ def test_colmap_checkpoint_restores_attempt_into_fresh_local_root(
     assert restored.model_dirs == (destination / "attempt" / "sparse" / "0",)
     assert restored.colmap_version == "COLMAP 3.11.1"
     assert restored.fingerprint == "4" * 64
+
+
+def test_complete_pretraining_checkpoint_restores_into_fresh_local_root(
+    tmp_path: Path,
+) -> None:
+    run_root, state, current_inventory = _portable_state(tmp_path)
+    store = LearnedCheckpointStore(tmp_path / "drive-cache", input_identity="a" * 64)
+
+    generation = store.publish_pretraining(
+        source_inventory=current_inventory,
+        selection=state["selection"],
+        reconstruction=state["reconstruction"],
+        fingerprint="6" * 64,
+        run_id="run-1",
+        run_root=run_root,
+    )
+
+    assert not (generation / "payload" / "input").exists()
+    shutil.rmtree(run_root)
+    destination = tmp_path / "second-run" / "pretraining-restored"
+    restored = store.restore_pretraining(
+        source_inventory=current_inventory,
+        destination=destination,
+        expected_fingerprint=lambda selection: "6" * 64,
+    )
+
+    assert isinstance(restored, PretrainingRestore)
+    assert restored.selection.inventory is current_inventory
+    assert restored.selection.frames_dir == destination / "selection" / "selected"
+    assert restored.reconstruction.frames_dir == (
+        destination / "selection" / "selected"
+    )
+    assert restored.reconstruction.accepted_model_dir == (
+        destination / "reconstruction" / "classical" / "sparse" / "0"
+    )
+    assert restored.reconstruction.artifacts.model_manifest_path == (
+        destination / "model-manifest" / "model_manifest.json"
+    )
+
+
+def test_corrupt_complete_checkpoint_is_a_miss_without_local_restore(
+    tmp_path: Path,
+) -> None:
+    run_root, state, current_inventory = _portable_state(tmp_path)
+    store = LearnedCheckpointStore(tmp_path / "drive-cache", input_identity="a" * 64)
+    generation = store.publish_pretraining(
+        source_inventory=current_inventory,
+        selection=state["selection"],
+        reconstruction=state["reconstruction"],
+        fingerprint="6" * 64,
+        run_id="run-1",
+        run_root=run_root,
+    )
+    artifact = generation / "payload" / "selection" / "selected" / "frame_000001.png"
+    artifact.write_bytes(b"corrupt")
+    destination = tmp_path / "restore"
+
+    restored = store.restore_pretraining(
+        source_inventory=current_inventory,
+        destination=destination,
+        expected_fingerprint=lambda selection: "6" * 64,
+    )
+
+    assert restored is None
+    assert not destination.exists()
+
+
+def test_complete_checkpoint_restore_copy_corruption_is_a_hard_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_root, state, current_inventory = _portable_state(tmp_path)
+    store = LearnedCheckpointStore(tmp_path / "drive-cache", input_identity="a" * 64)
+    store.publish_pretraining(
+        source_inventory=current_inventory,
+        selection=state["selection"],
+        reconstruction=state["reconstruction"],
+        fingerprint="6" * 64,
+        run_id="run-1",
+        run_root=run_root,
+    )
+    original_copytree = shutil.copytree
+
+    destination = tmp_path / "restore"
+
+    def corrupt_copy(
+        source: Path,
+        copied_destination: Path,
+        *args: object,
+        **kwargs: object,
+    ) -> Path:
+        copied = original_copytree(source, copied_destination, *args, **kwargs)
+        if Path(copied_destination) == destination:
+            (destination / "state.json").write_text("{}", encoding="utf-8")
+        return copied
+
+    monkeypatch.setattr(shutil, "copytree", corrupt_copy)
+
+    with pytest.raises(ValueError, match="differs from Drive"):
+        store.restore_pretraining(
+            source_inventory=current_inventory,
+            destination=destination,
+            expected_fingerprint=lambda selection: "6" * 64,
+        )
+
+    assert not destination.exists()
+
+
+def test_complete_checkpoint_registry_covers_every_persisted_learned_type() -> None:
+    registered = set(_checkpoint_types().values())
+    persisted = {
+        FrameArtifact,
+        BatchAttemptRecord,
+        PinholeCamera,
+        FramePredictionArtifact,
+        CameraRecord,
+        AnchorInferenceResult,
+        SemanticPolicy,
+        SemanticFrameEvidence,
+        SemanticEvidence,
+        FlowGatePolicy,
+        MotionFrameEvidence,
+        MotionEvidence,
+        MaskFusionPolicy,
+        FusedMaskFrame,
+        MaskFusionEvidence,
+        RgbAffineTransform,
+        PhotometricEvidence,
+        DenseSeedPolicy,
+        ValidatedDepthFrame,
+        DenseSeedArtifact,
+        DepthValidationResult,
+    }
+
+    assert persisted <= registered
