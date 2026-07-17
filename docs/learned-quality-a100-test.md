@@ -51,3 +51,23 @@ and notebook structure. The real A100 room run remains the quality acceptance te
 Do not claim Luma parity or a visual improvement until the learned output is compared
 with the untouched legacy output and the four contact sheets show no systematic
 corruption.
+
+## Resume point: COLMAP startup failure (2026-07-17)
+
+The first corrected A100 room run passed the iPhone MOV compatibility probe, then
+failed before training while validating the installed COLMAP executable:
+
+```text
+Command '('/usr/local/bin/colmap', '--version')' returned non-zero exit status 1.
+```
+
+- Input: `MyDrive/myroom_test/IMG_5624.MOV`
+- Diagnostics:
+  `MyDrive/myroom_test_learned_test_diagnostics/1929fd7d0f2c46d495588b95a9448998/`
+- Receipt status: `failed`
+- Error type: `CalledProcessError`
+- Runtime was flushed, unmounted, and released correctly after the failure.
+
+Resume by inspecting the captured diagnostics and COLMAP's stderr/runtime
+dependencies. Do not rerun the full A100 experiment until `colmap --version` is
+verified inside the same generated Colab environment.
