@@ -206,6 +206,8 @@ def _static_tracks(
         point_id = int(parts[0])
         error = float(parts[7])
         observations = []
+        observed_frame_ids: set[str] = set()
+        ambiguous_track = False
         for offset in range(8, len(parts), 2):
             image_id = int(parts[offset])
             point_index = int(parts[offset + 1])
@@ -215,14 +217,19 @@ def _static_tracks(
             coordinate = image[1].get(point_index)
             if coordinate is None or coordinate[2] != point_id:
                 continue
+            frame_id = by_name[image[0]].frame_id
+            if frame_id in observed_frame_ids:
+                ambiguous_track = True
+                break
+            observed_frame_ids.add(frame_id)
             observations.append(
                 TrackObservation(
-                    frame_id=by_name[image[0]].frame_id,
+                    frame_id=frame_id,
                     x=coordinate[0],
                     y=coordinate[1],
                 )
             )
-        if len(observations) >= 2:
+        if not ambiguous_track and len(observations) >= 2:
             tracks.append(
                 StaticTrack(
                     track_id=point_id,
