@@ -142,11 +142,13 @@ def build_learned_quality_notebook(
             "from google.colab import drive, runtime\n"
             "environment = dict(os.environ)\n"
             "environment['LEARNED_MODEL_MANIFEST'] = str(MODEL_MANIFEST.path)\n"
+            "environment['PYTHONUNBUFFERED'] = '1'\n"
             "failure = None\n"
             "try:\n"
             "    completed = subprocess.run(\n"
             "        [\n"
             '            "/content/learned-env/bin/python",\n'
+            '            "-u",\n'
             '            "-m",\n'
             '            "scripts.learned_quality_run",\n'
             '            "--spec",\n'

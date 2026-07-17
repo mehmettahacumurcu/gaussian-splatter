@@ -50,10 +50,12 @@ def test_notebook_is_deterministic_run_all_safe_and_pinned() -> None:
     assert "verify_learned_environment" in notebook.cells[8].source
     execute = notebook.cells[9].source
     assert '"/content/learned-env/bin/python"' in execute
+    assert '"-u"' in execute
     assert '"-m"' in execute
     assert '"scripts.learned_quality_run"' in execute
     assert '"scripts/learned_quality_run.py"' not in execute
     assert '"--spec"' in execute
+    assert "environment['PYTHONUNBUFFERED'] = '1'" in execute
     assert "check=False" in execute
     assert "except BaseException" in execute
     assert "finally:" in execute
