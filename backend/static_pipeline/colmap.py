@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 from PIL import Image
 
 from .contracts import ColmapAttempt, ColmapPolicy
+from .progress import run_with_heartbeat
 from .sources import _atomic_promote_no_replace
 from .stage_cache import stage_fingerprint
 
@@ -718,7 +719,8 @@ def _require_sparse_model_set(
 
 def _capture_converted_outputs(model_dir: Path) -> dict[Path, _FileSignature]:
     return {
-        model_dir / name: _regular_file_signature(
+        model_dir
+        / name: _regular_file_signature(
             model_dir / name,
             f"COLMAP converted output {name}",
         )
@@ -833,7 +835,7 @@ def run_colmap_attempt(
                 database_signature,
                 "COLMAP database",
             )
-        subprocess.run(command, check=True)
+        run_with_heartbeat(command, stage_id="classical_colmap", check=True)
         if command_index in {0, 2}:
             _require_selection_digest(frames, selection_digest)
         if command_index == 0:
@@ -883,7 +885,7 @@ def run_colmap_attempt(
         )
         _require_sparse_model_set(sparse, model_entries)
         _require_directory_identity(model_dir, model_identity, "COLMAP model")
-        subprocess.run(
+        run_with_heartbeat(
             (
                 executable,
                 "model_converter",
@@ -894,6 +896,7 @@ def run_colmap_attempt(
                 "--output_type",
                 "TXT",
             ),
+            stage_id="classical_colmap",
             check=True,
         )
         _require_attempt_layout(

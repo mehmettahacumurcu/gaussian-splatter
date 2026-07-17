@@ -26,6 +26,22 @@ from backend.static_pipeline.selection import write_selection_manifest
 from backend.static_pipeline.stage_cache import stage_fingerprint
 
 
+@pytest.fixture(autouse=True)
+def _route_heartbeat_commands_through_mocked_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def run(
+        command: tuple[str, ...],
+        *,
+        stage_id: str,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        assert stage_id == "classical_colmap"
+        return subprocess.run(command, check=check)
+
+    monkeypatch.setattr(colmap_module, "run_with_heartbeat", run)
+
+
 @pytest.mark.parametrize(
     ("use_gpu", "count", "attempt", "matcher", "overlap"),
     [
@@ -672,6 +688,77 @@ def test_attempt_runs_fresh_commands_converts_every_model_and_fingerprints_selec
         fraction for fraction, _message in progress
     )
     assert progress[-1][0] == 1.0
+
+
+def test_long_colmap_commands_use_live_heartbeat_executor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frames = _write_selected_frames(tmp_path / "frames")
+    attempt = tmp_path / "attempt"
+    heartbeat_calls: list[tuple[tuple[str, ...], str, bool]] = []
+
+    def materialize(command: tuple[str, ...]) -> None:
+        if command[1] == "feature_extractor":
+            (attempt / "colmap.db").write_bytes(b"database")
+        elif command[1] == "mapper":
+            (attempt / "sparse" / "0").mkdir(parents=True)
+        elif command[1] == "model_converter":
+            model = Path(command[command.index("--input_path") + 1])
+            for name in ("cameras.txt", "images.txt", "points3D.txt"):
+                (model / name).write_text("# converted\n", encoding="utf-8")
+
+    def fake_run(
+        command: tuple[str, ...],
+        *,
+        check: bool,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        assert check is True
+        if command[1] == "-h":
+            assert kwargs == {"capture_output": True, "text": True}
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="COLMAP 3.11.1\n",
+                stderr="",
+            )
+        materialize(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    def fake_heartbeat(
+        command: tuple[str, ...],
+        *,
+        stage_id: str,
+        check: bool,
+    ) -> subprocess.CompletedProcess[str]:
+        heartbeat_calls.append((command, stage_id, check))
+        materialize(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        colmap_module,
+        "run_with_heartbeat",
+        fake_heartbeat,
+        raising=False,
+    )
+
+    run_colmap_attempt(
+        frames,
+        attempt,
+        choose_colmap_policy(use_gpu=True, selected_count=1, attempt_index=0),
+        colmap_exe="colmap",
+    )
+
+    assert [call[0][1] for call in heartbeat_calls] == [
+        "feature_extractor",
+        "exhaustive_matcher",
+        "mapper",
+        "model_converter",
+    ]
+    assert all(stage_id == "classical_colmap" for _, stage_id, _ in heartbeat_calls)
+    assert all(check is True for _, _, check in heartbeat_calls)
 
 
 def test_attempt_fingerprint_changes_with_selection_policy_and_colmap_version(

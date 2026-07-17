@@ -3,6 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import uuid
+from collections.abc import Callable
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
@@ -10,6 +14,11 @@ import numpy as np
 from PIL import Image
 
 from backend.preprocess.parse_colmap import parse_cameras_from_model
+from backend.static_pipeline.colmap import (
+    _colmap_version_from_help,
+    _resolve_colmap_executable,
+)
+from backend.static_pipeline.progress import current_stage_reporter
 from backend.static_pipeline.reconstruction import measure_models
 from backend.static_pipeline.runner import HardwareInfo, SelectionOutput
 from backend.static_pipeline.selection import plan_backfill
@@ -19,6 +28,13 @@ from .contracts import (
     LearnedArtifacts,
     LearnedReconstructionOutput,
     StageRecord,
+)
+from .cache import (
+    CheckpointInputs,
+    CheckpointKind,
+    LearnedCheckpointStore,
+    checkpoint_fingerprint,
+    producer_code_digest,
 )
 from .da3 import (
     DA3Frame,
@@ -57,6 +73,55 @@ from .segmentation import SemanticPolicy, run_semantic_evidence
 
 _SOURCE_ROOT = Path("/content/learned-sources")
 _CHECKPOINT_ROOT = Path("/content/learned-checkpoints")
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+_COLMAP_PRODUCER_PATHS = (
+    "backend/static_pipeline/colmap.py",
+    "experiments/learned_quality/geometry.py",
+    "experiments/learned_quality/runtime.py",
+)
+
+
+def _learned_stage(stage_id: str):
+    reporter = current_stage_reporter()
+    if reporter is None:
+        return nullcontext()
+    return reporter.stage(stage_id)
+
+
+def _probe_colmap_version() -> str:
+    executable = _resolve_colmap_executable(None)
+    completed = subprocess.run(
+        (executable, "-h"),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return _colmap_version_from_help(completed)
+
+
+def _colmap_cache_fingerprint(
+    selection: SelectionOutput,
+    hardware: HardwareInfo,
+    model_manifest_path: Path,
+    *,
+    version_probe: Callable[[], str] = _probe_colmap_version,
+) -> str:
+    return checkpoint_fingerprint(
+        CheckpointKind.COLMAP,
+        CheckpointInputs(
+            source_digest=selection.inventory.digest,
+            settings={
+                "selection_digest": selection.manifest.image_set_digest,
+                "use_gpu": hardware.colmap_gpu_sift is True,
+            },
+            model_manifest_sha256=_sha256(model_manifest_path),
+            tool_versions={"colmap": version_probe()},
+            producer_code_sha256=producer_code_digest(
+                _REPOSITORY_ROOT,
+                _COLMAP_PRODUCER_PATHS,
+            ),
+        ),
+    )
 
 
 def _sha256(path: Path) -> str:
@@ -336,97 +401,151 @@ def _run_evidence_cycle(
     frames: tuple[FrameArtifact, ...],
     hardware: HardwareInfo,
     output_root: Path,
+    *,
+    checkpoint_store: LearnedCheckpointStore | None = None,
 ) -> LearnedArtifacts:
     output_root.mkdir(parents=True, exist_ok=False)
     da3_frames = tuple(
         DA3Frame(frame.image_name, frame.frame_id, frame.path) for frame in frames
     )
-    base = load_da3_model(_SOURCE_ROOT / "da3", _checkpoint("depth-anything/DA3-BASE"))
-    try:
-        anchors = run_anchor_inference(
-            base, da3_frames, output_root / "da3-anchor", vram_gb=hardware.vram_gb
+    with _learned_stage("da3_anchor"):
+        base = load_da3_model(
+            _SOURCE_ROOT / "da3", _checkpoint("depth-anything/DA3-BASE")
         )
-    finally:
-        release_cuda_model(base)
-        del base
+        try:
+            anchors = run_anchor_inference(
+                base,
+                da3_frames,
+                output_root / "da3-anchor",
+                vram_gb=hardware.vram_gb,
+            )
+        finally:
+            release_cuda_model(base)
+            del base
 
-    classical_runner = make_classical_candidate_runner(
-        use_gpu=hardware.colmap_gpu_sift is True
-    )
-    pre_attempt = classical_runner(
-        selection.manifest,
-        frames,
-        output_root / "classical-prepass",
-        0,
-        geometry_frame_set_digest(selection.manifest, frames),
-    )
-    measured = tuple(measure_models(pre_attempt.model_dirs, selection.manifest))
-    if not measured:
-        raise RuntimeError("classical prepass produced no readable geometry")
-    pre_model = max(
-        measured, key=lambda item: (item.registered_count, item.sparse_point_count)
-    ).model_dir
+    model_manifest_path: Path | None = None
+    with _learned_stage("classical_colmap"):
+        cache_fingerprint: str | None = None
+        pre_attempt = None
+        reporter = current_stage_reporter()
+        if checkpoint_store is not None:
+            model_manifest_path = _validate_model_manifest()
+            cache_fingerprint = _colmap_cache_fingerprint(
+                selection,
+                hardware,
+                model_manifest_path,
+            )
+            pre_attempt = checkpoint_store.restore_colmap(
+                cache_fingerprint,
+                destination=output_root / "classical-prepass-restored",
+            )
+            if reporter is not None:
+                reporter.cache_event(
+                    "hit" if pre_attempt is not None else "miss",
+                    "COLMAP checkpoint",
+                    str(checkpoint_store.cache_root),
+                )
+        if pre_attempt is None:
+            classical_runner = make_classical_candidate_runner(
+                use_gpu=hardware.colmap_gpu_sift is True
+            )
+            pre_attempt = classical_runner(
+                selection.manifest,
+                frames,
+                output_root / "classical-prepass",
+                0,
+                geometry_frame_set_digest(selection.manifest, frames),
+            )
+        measured = tuple(measure_models(pre_attempt.model_dirs, selection.manifest))
+        if not measured:
+            raise RuntimeError("classical prepass produced no readable geometry")
+        pre_model = max(
+            measured,
+            key=lambda item: (item.registered_count, item.sparse_point_count),
+        ).model_dir
+        if checkpoint_store is not None and cache_fingerprint is not None:
+            generation = checkpoint_store.find_generation(
+                CheckpointKind.COLMAP,
+                cache_fingerprint,
+            )
+            if generation is None:
+                generation = checkpoint_store.publish_colmap(
+                    pre_attempt,
+                    fingerprint=cache_fingerprint,
+                    run_id=f"colmap-{uuid.uuid4().hex}",
+                )
+                if reporter is not None:
+                    reporter.cache_event(
+                        "save",
+                        "COLMAP checkpoint",
+                        str(generation),
+                    )
 
-    metric_model = load_da3_model(
-        _SOURCE_ROOT / "da3", _checkpoint("depth-anything/DA3METRIC-LARGE")
-    )
-    try:
-        metric = run_metric_sky(
-            metric_model,
-            da3_frames,
-            anchors.shared_camera,
-            output_root / "da3-metric",
-            initial_batch_size=12,
-            retry_batch_size=6,
+    with _learned_stage("da3_metric_sky"):
+        metric_model = load_da3_model(
+            _SOURCE_ROOT / "da3", _checkpoint("depth-anything/DA3METRIC-LARGE")
+        )
+        try:
+            metric = run_metric_sky(
+                metric_model,
+                da3_frames,
+                anchors.shared_camera,
+                output_root / "da3-metric",
+                initial_batch_size=12,
+                retry_batch_size=6,
+                release_model=release_cuda_model,
+                retry_model_factory=lambda: load_da3_model(
+                    _SOURCE_ROOT / "da3",
+                    _checkpoint("depth-anything/DA3METRIC-LARGE"),
+                ),
+            )
+        finally:
+            release_cuda_model(metric_model)
+            del metric_model
+        depths, sky = _materialize_metric(frames, metric, output_root / "metric-native")
+        scene = _rigid_scene(frames, pre_model, depths)
+
+    with _learned_stage("semantic_masks"):
+        semantic = run_semantic_evidence(
+            frames,
+            output_root / "semantic",
+            policy=SemanticPolicy(0.30, 0.25, 32, 3),
+            detector_factory=lambda: TransformersGroundingDinoAdapter(
+                _checkpoint("IDEA-Research/grounding-dino-tiny")
+            ),
+            sam_factory=lambda: Sam2ImageAdapter(
+                _SOURCE_ROOT / "sam2", _checkpoint("facebook/sam2.1-hiera-large")
+            ),
+            initial_batch_size=8,
+            retry_batch_size=4,
             release_model=release_cuda_model,
-            retry_model_factory=lambda: load_da3_model(
-                _SOURCE_ROOT / "da3", _checkpoint("depth-anything/DA3METRIC-LARGE")
+        )
+    with _learned_stage("optical_flow"):
+        flow = run_motion_evidence(
+            frames,
+            scene,
+            output_root / "flow",
+            policy=FlowGatePolicy(0.03, 0.005, 1.5, 0.01, 3.0, 3, 1.5, 3.0),
+            model_factory=lambda: SeaRaftTorchAdapter(
+                _SOURCE_ROOT / "sea-raft",
+                _checkpoint("MemorySlices/Tartan-C-T-TSKH-spring540x960-M"),
+            ),
+            initial_pair_batch_size=2,
+            retry_pair_batch_size=1,
+            release_model=release_cuda_model,
+        )
+    with _learned_stage("mask_fusion"):
+        masks = fuse_evidence_masks(
+            frames,
+            semantic,
+            flow,
+            sky,
+            scene,
+            output_root / "masks",
+            policy=MaskFusionPolicy(
+                0.003, 0.001, 0.0002, 0.20, 0.45, 0.80, 0.003, 0.02, 0.01
             ),
         )
-    finally:
-        release_cuda_model(metric_model)
-        del metric_model
-    depths, sky = _materialize_metric(frames, metric, output_root / "metric-native")
-    scene = _rigid_scene(frames, pre_model, depths)
-
-    semantic = run_semantic_evidence(
-        frames,
-        output_root / "semantic",
-        policy=SemanticPolicy(0.30, 0.25, 32, 3),
-        detector_factory=lambda: TransformersGroundingDinoAdapter(
-            _checkpoint("IDEA-Research/grounding-dino-tiny")
-        ),
-        sam_factory=lambda: Sam2ImageAdapter(
-            _SOURCE_ROOT / "sam2", _checkpoint("facebook/sam2.1-hiera-large")
-        ),
-        initial_batch_size=8,
-        retry_batch_size=4,
-        release_model=release_cuda_model,
-    )
-    flow = run_motion_evidence(
-        frames,
-        scene,
-        output_root / "flow",
-        policy=FlowGatePolicy(0.03, 0.005, 1.5, 0.01, 3.0, 3, 1.5, 3.0),
-        model_factory=lambda: SeaRaftTorchAdapter(
-            _SOURCE_ROOT / "sea-raft",
-            _checkpoint("MemorySlices/Tartan-C-T-TSKH-spring540x960-M"),
-        ),
-        initial_pair_batch_size=2,
-        retry_pair_batch_size=1,
-        release_model=release_cuda_model,
-    )
-    masks = fuse_evidence_masks(
-        frames,
-        semantic,
-        flow,
-        sky,
-        scene,
-        output_root / "masks",
-        policy=MaskFusionPolicy(
-            0.003, 0.001, 0.0002, 0.20, 0.45, 0.80, 0.003, 0.02, 0.01
-        ),
-    )
     stages = (
         StageRecord(
             "da3_anchor", "accepted", details={"anchors": len(anchors.anchor_indices)}
@@ -450,7 +569,7 @@ def _run_evidence_cycle(
         semantic=semantic,
         flow=flow,
         masks=masks,
-        model_manifest_path=_validate_model_manifest(),
+        model_manifest_path=model_manifest_path or _validate_model_manifest(),
         stage_records=stages,
     )
 
@@ -461,6 +580,7 @@ def run_learned_reconstruction(
     spec: object,
     hardware: HardwareInfo,
     output_root: Path,
+    checkpoint_store: LearnedCheckpointStore | None = None,
 ) -> LearnedReconstructionOutput:
     del spec
     _validate_model_manifest()
@@ -469,7 +589,11 @@ def run_learned_reconstruction(
         "selection": selection,
         "frames": frames,
         "artifacts": _run_evidence_cycle(
-            selection, frames, hardware, output_root.parent / "learned-evidence-0"
+            selection,
+            frames,
+            hardware,
+            output_root.parent / "learned-evidence-0",
+            checkpoint_store=checkpoint_store,
         ),
     }
     classical = make_classical_candidate_runner(
@@ -512,19 +636,21 @@ def run_learned_reconstruction(
                 new_frames,
                 hardware,
                 output_root.parent / "learned-evidence-1",
+                checkpoint_store=checkpoint_store,
             ),
         )
         return new_manifest, new_frames
 
-    comparison = run_geometry_comparison(
-        selection.manifest,
-        frames,
-        output_root=output_root,
-        artifacts=active["artifacts"],
-        classical_runner=classical,
-        hybrid_runner=hybrid,
-        materialize_backfill=backfill,
-    )
+    with _learned_stage("geometry_comparison"):
+        comparison = run_geometry_comparison(
+            selection.manifest,
+            frames,
+            output_root=output_root,
+            artifacts=active["artifacts"],
+            classical_runner=classical,
+            hybrid_runner=hybrid,
+            materialize_backfill=backfill,
+        )
     final_frames = active["frames"]
     artifacts = active["artifacts"]
     metric_artifacts = artifacts.da3
@@ -545,37 +671,42 @@ def run_learned_reconstruction(
         for frame in final_frames
     )
     depths = tuple((path, _sha256(path)) for path, _ in depths)
-    final_scene = _rigid_scene(final_frames, comparison.accepted_model_dir, depths)
-    photometric = fit_and_validate_photometric_transforms(
-        final_frames,
-        final_scene,
-        artifacts.masks,
-        output_root.parent / "photometric",
-        reference_frame_id=final_frames[len(final_frames) // 2].frame_id,
-        policy=PhotometricPolicy(0.03, 0.10, 5),
-    )
-    base = load_da3_model(_SOURCE_ROOT / "da3", _checkpoint("depth-anything/DA3-BASE"))
-    try:
-        final_depth = run_pose_conditioned_depth(
-            base,
-            tuple(
-                DA3Frame(frame.image_name, frame.frame_id, frame.path)
-                for frame in final_frames
-            ),
-            _final_cameras(final_frames, comparison.accepted_model_dir),
-            output_root.parent / "final-pose-depth",
+    with _learned_stage("photometric_validation"):
+        final_scene = _rigid_scene(final_frames, comparison.accepted_model_dir, depths)
+        photometric = fit_and_validate_photometric_transforms(
+            final_frames,
+            final_scene,
+            artifacts.masks,
+            output_root.parent / "photometric",
+            reference_frame_id=final_frames[len(final_frames) // 2].frame_id,
+            policy=PhotometricPolicy(0.03, 0.10, 5),
         )
-    finally:
-        release_cuda_model(base)
-        del base
-    validated_depth = validate_depth_and_fuse_seeds(
-        final_frames,
-        final_depth,
-        artifacts.masks,
-        comparison.accepted_model_dir,
-        output_root.parent / "validated-depth",
-        policy=DenseSeedPolicy(0.20, 0.05, 0.003, 0.001, 2),
-    )
+    with _learned_stage("final_pose_depth"):
+        base = load_da3_model(
+            _SOURCE_ROOT / "da3", _checkpoint("depth-anything/DA3-BASE")
+        )
+        try:
+            final_depth = run_pose_conditioned_depth(
+                base,
+                tuple(
+                    DA3Frame(frame.image_name, frame.frame_id, frame.path)
+                    for frame in final_frames
+                ),
+                _final_cameras(final_frames, comparison.accepted_model_dir),
+                output_root.parent / "final-pose-depth",
+            )
+        finally:
+            release_cuda_model(base)
+            del base
+    with _learned_stage("dense_seed_fusion"):
+        validated_depth = validate_depth_and_fuse_seeds(
+            final_frames,
+            final_depth,
+            artifacts.masks,
+            comparison.accepted_model_dir,
+            output_root.parent / "validated-depth",
+            policy=DenseSeedPolicy(0.20, 0.05, 0.003, 0.001, 2),
+        )
     final_artifacts = replace(
         artifacts,
         photometric=photometric,

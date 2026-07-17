@@ -6,6 +6,7 @@ import math
 import os
 import re
 import shutil
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from enum import StrEnum
@@ -373,6 +374,94 @@ class LearnedCheckpointStore:
         self._remove_older_generations(active_kind, keep=target)
         return target
 
+    def publish_colmap(
+        self,
+        attempt: object,
+        *,
+        fingerprint: str,
+        run_id: str,
+    ) -> Path:
+        from backend.static_pipeline.contracts import ColmapAttempt
+
+        if not isinstance(attempt, ColmapAttempt):
+            raise TypeError("attempt must be a ColmapAttempt")
+        attempt_root = _regular_directory(attempt.root, "COLMAP attempt root")
+        with tempfile.TemporaryDirectory(
+            prefix="learned-colmap-checkpoint-",
+            dir=attempt_root.parent,
+        ) as temporary:
+            snapshot = Path(temporary).resolve(strict=True)
+            copied_root = snapshot / "attempt"
+            shutil.copytree(attempt_root, copied_root, copy_function=shutil.copy2)
+            relative_models = tuple(
+                model.resolve(strict=True).relative_to(attempt_root)
+                for model in attempt.model_dirs
+            )
+            state = ColmapAttempt(
+                root=copied_root,
+                database_path=copied_root
+                / attempt.database_path.resolve(strict=True).relative_to(attempt_root),
+                model_dirs=tuple(
+                    copied_root / relative for relative in relative_models
+                ),
+                colmap_version=attempt.colmap_version,
+                fingerprint=attempt.fingerprint,
+            )
+            _write_json(
+                snapshot / "state.json",
+                encode_checkpoint_state(state, snapshot_root=snapshot),
+            )
+            return self.publish_generation(
+                CheckpointKind.COLMAP,
+                fingerprint=fingerprint,
+                run_id=run_id,
+                source_root=snapshot,
+            )
+
+    def restore_colmap(
+        self,
+        fingerprint: str,
+        *,
+        destination: Path,
+    ) -> object | None:
+        from backend.static_pipeline.contracts import ColmapAttempt
+
+        generation = self.find_generation(CheckpointKind.COLMAP, fingerprint)
+        if generation is None:
+            return None
+        target = Path(destination)
+        if os.path.lexists(target):
+            raise FileExistsError(f"COLMAP restore destination exists: {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = generation / "payload"
+        try:
+            shutil.copytree(source, target, copy_function=shutil.copy2)
+            if _inventory(source) != _inventory(target):
+                raise ValueError("restored COLMAP checkpoint differs from Drive")
+            payload = json.loads((target / "state.json").read_text(encoding="utf-8"))
+            restored = decode_checkpoint_state(
+                payload,
+                restore_root=target,
+                source_inventory=object(),
+            )
+            if not isinstance(restored, ColmapAttempt):
+                raise ValueError("COLMAP checkpoint state has the wrong type")
+            expected_root = (target / "attempt").resolve(strict=True)
+            if restored.root != expected_root:
+                raise ValueError("COLMAP checkpoint root is malformed")
+            _regular_file(restored.database_path, "restored COLMAP database")
+            if not restored.model_dirs:
+                raise ValueError("COLMAP checkpoint contains no sparse model")
+            for model in restored.model_dirs:
+                model_root = _regular_directory(model, "restored COLMAP model")
+                for name in ("cameras.txt", "images.txt", "points3D.txt"):
+                    _regular_file(model_root / name, f"restored COLMAP {name}")
+            return restored
+        except BaseException:
+            if os.path.lexists(target):
+                self._remove_restore_tree(target)
+            raise
+
     def find_generation(
         self,
         kind: CheckpointKind,
@@ -474,6 +563,20 @@ class LearnedCheckpointStore:
             raise LearnedCacheOwnershipError(
                 "refusing to remove a path outside the owned cache root"
             ) from error
+        if candidate.is_symlink():
+            candidate.unlink()
+        elif candidate.is_dir():
+            shutil.rmtree(candidate)
+        elif os.path.lexists(candidate):
+            candidate.unlink()
+
+    @staticmethod
+    def _remove_restore_tree(path: Path) -> None:
+        candidate = Path(path)
+        resolved_parent = candidate.parent.resolve(strict=True)
+        resolved_candidate = resolved_parent / candidate.name
+        if resolved_candidate.parent != resolved_parent:
+            raise ValueError("invalid restore cleanup path")
         if candidate.is_symlink():
             candidate.unlink()
         elif candidate.is_dir():

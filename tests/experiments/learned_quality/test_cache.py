@@ -409,3 +409,39 @@ def test_portable_state_rejects_unregistered_types_and_unsafe_values(
                 restore_root=snapshot,
                 source_inventory=object(),
             )
+
+
+def test_colmap_checkpoint_restores_attempt_into_fresh_local_root(
+    tmp_path: Path,
+) -> None:
+    attempt_root = tmp_path / "first-run" / "classical-prepass"
+    model = attempt_root / "sparse" / "0"
+    model.mkdir(parents=True)
+    database = attempt_root / "colmap.db"
+    database.write_bytes(b"database")
+    for name in ("cameras.txt", "images.txt", "points3D.txt"):
+        (model / name).write_text(name, encoding="utf-8")
+    attempt = ColmapAttempt(
+        root=attempt_root,
+        database_path=database,
+        model_dirs=(model,),
+        colmap_version="COLMAP 3.11.1",
+        fingerprint="4" * 64,
+    )
+    store = LearnedCheckpointStore(tmp_path / "drive-cache", input_identity="a" * 64)
+
+    store.publish_colmap(
+        attempt,
+        fingerprint="5" * 64,
+        run_id="run-1",
+    )
+    shutil.rmtree(tmp_path / "first-run")
+    destination = tmp_path / "second-run" / "classical-prepass"
+    restored = store.restore_colmap("5" * 64, destination=destination)
+
+    assert isinstance(restored, ColmapAttempt)
+    assert restored.root == destination / "attempt"
+    assert restored.database_path == destination / "attempt" / "colmap.db"
+    assert restored.model_dirs == (destination / "attempt" / "sparse" / "0",)
+    assert restored.colmap_version == "COLMAP 3.11.1"
+    assert restored.fingerprint == "4" * 64
