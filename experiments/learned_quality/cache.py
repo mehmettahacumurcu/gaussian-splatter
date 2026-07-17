@@ -12,11 +12,16 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields, is_dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 from backend.static_pipeline.sources import _atomic_promote_no_replace
 from backend.static_pipeline.stage_cache import stage_fingerprint
 
 from .contracts import GENERATOR_ID
+
+if TYPE_CHECKING:
+    from .milestones import MilestoneRef, MilestoneState
 
 
 _SCHEMA_VERSION = 1
@@ -44,6 +49,12 @@ class LearnedCacheOwnershipError(RuntimeError):
 
 class CheckpointKind(StrEnum):
     COLMAP = "colmap"
+    SELECTION = "selection"
+    BASE_EVIDENCE = "base_evidence"
+    SEMANTIC = "semantic"
+    MOTION = "motion"
+    MASKS = "masks"
+    GEOMETRY = "geometry"
     PRETRAINING = "pretraining"
 
 
@@ -137,8 +148,13 @@ def decode_checkpoint_state(
 
 
 class _CheckpointEncoder:
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        path_rewrites: tuple[tuple[Path, Path], ...] = (),
+    ) -> None:
         self.root = root
+        self.path_rewrites = path_rewrites
         self._object_ids: dict[int, str] = {}
 
     def encode(self, value: object) -> object:
@@ -149,9 +165,24 @@ class _CheckpointEncoder:
                 raise ValueError("checkpoint floats must be finite")
             return value
         if isinstance(value, Path):
+            active_path = value
+            if self.path_rewrites:
+                resolved = value.resolve(strict=True)
+                matches = []
+                for source_root, destination_root in self.path_rewrites:
+                    try:
+                        relative = resolved.relative_to(source_root)
+                    except ValueError:
+                        continue
+                    matches.append(destination_root.joinpath(*relative.parts))
+                if len(matches) != 1:
+                    raise ValueError(
+                        "milestone artifact paths must belong to exactly one root"
+                    )
+                active_path = matches[0]
             return {
                 "__kind__": "path",
-                "relative_path": _path_relative_to_root(value, self.root),
+                "relative_path": _path_relative_to_root(active_path, self.root),
             }
         if is_dataclass(value) and not isinstance(value, type):
             return self._encode_dataclass(value)
@@ -373,6 +404,8 @@ class LearnedCheckpointStore:
         fingerprint: str,
         run_id: str,
         source_root: Path,
+        upstream: Mapping[CheckpointKind, str] | None = None,
+        artifact_roots: Mapping[str, str] | None = None,
     ) -> Path:
         active_kind = _require_kind(kind)
         active_fingerprint = _require_digest(fingerprint, "fingerprint")
@@ -380,6 +413,7 @@ class LearnedCheckpointStore:
             raise ValueError("run_id must be a safe non-empty identifier")
         source = _regular_directory(Path(source_root), "source_root")
         _inventory(source)
+        metadata = _generation_metadata(upstream, artifact_roots)
         self._ensure_owned_root(create=True)
 
         recovered = self.find_generation(active_kind, active_fingerprint)
@@ -411,16 +445,20 @@ class LearnedCheckpointStore:
                 "fingerprint": active_fingerprint,
                 "files": files,
             }
+            manifest.update(metadata)
             manifest_path = staging / "manifest.json"
             _write_json(manifest_path, manifest)
+            success = {
+                "schema_version": _SCHEMA_VERSION,
+                "kind": active_kind.value,
+                "fingerprint": active_fingerprint,
+                "manifest_sha256": _sha256(manifest_path),
+            }
+            if "upstream" in metadata:
+                success["upstream"] = metadata["upstream"]
             _write_json(
                 staging / "_SUCCESS.json",
-                {
-                    "schema_version": _SCHEMA_VERSION,
-                    "kind": active_kind.value,
-                    "fingerprint": active_fingerprint,
-                    "manifest_sha256": _sha256(manifest_path),
-                },
+                success,
             )
             if not self._valid_generation(
                 staging,
@@ -452,6 +490,206 @@ class LearnedCheckpointStore:
 
         self._remove_older_generations(active_kind, keep=target)
         return target
+
+    def publish_milestone(self, state: MilestoneState, *, run_id: str) -> Path:
+        from .milestones import (
+            MilestoneRef,
+            MilestoneState,
+            validate_upstream_kinds,
+        )
+
+        if not isinstance(state, MilestoneState):
+            raise TypeError("state must be a MilestoneState")
+        upstream = validate_upstream_kinds(state.ref.kind, state.upstream)
+        for upstream_kind, fingerprint in upstream.items():
+            upstream_ref = MilestoneRef(upstream_kind, fingerprint)
+            try:
+                self.validate_milestone_graph(upstream_ref)
+            except ValueError as error:
+                raise ValueError(
+                    f"missing upstream milestone: {upstream_kind.value}/{fingerprint}"
+                ) from error
+        if not state.artifact_roots:
+            raise ValueError("milestone must own at least one direct artifact root")
+        resolved_roots: dict[str, Path] = {}
+        for label, raw_root in state.artifact_roots.items():
+            resolved_roots[label] = _regular_directory(
+                Path(raw_root), f"{label} artifact root"
+            )
+        root_rows = tuple(resolved_roots.items())
+        for index, (left_label, left_root) in enumerate(root_rows):
+            for right_label, right_root in root_rows[index + 1 :]:
+                try:
+                    right_root.relative_to(left_root)
+                except ValueError:
+                    pass
+                else:
+                    raise ValueError(
+                        f"artifact roots overlap: {left_label} and {right_label}"
+                    )
+                try:
+                    left_root.relative_to(right_root)
+                except ValueError:
+                    pass
+                else:
+                    raise ValueError(
+                        f"artifact roots overlap: {left_label} and {right_label}"
+                    )
+
+        with tempfile.TemporaryDirectory(
+            prefix=f"learned-{state.ref.kind.value}-milestone-"
+        ) as temporary:
+            snapshot = Path(temporary).resolve(strict=True)
+            path_rewrites: list[tuple[Path, Path]] = []
+            artifact_manifest: dict[str, str] = {}
+            for label, source in sorted(resolved_roots.items()):
+                destination = snapshot / "artifacts" / label
+                shutil.copytree(source, destination, copy_function=shutil.copy2)
+                path_rewrites.append((source, destination.resolve(strict=True)))
+                artifact_manifest[label] = f"artifacts/{label}"
+            encoded = _CheckpointEncoder(
+                snapshot,
+                tuple(path_rewrites),
+            ).encode(state.value)
+            _write_json(snapshot / "state.json", encoded)
+            return self.publish_generation(
+                state.ref.kind,
+                fingerprint=state.ref.fingerprint,
+                run_id=run_id,
+                source_root=snapshot,
+                upstream=upstream,
+                artifact_roots=artifact_manifest,
+            )
+
+    def restore_milestone(
+        self,
+        ref: MilestoneRef,
+        *,
+        destination: Path,
+        source_inventory: object,
+    ) -> MilestoneState | None:
+        from .milestones import MilestoneRef, MilestoneState
+
+        if not isinstance(ref, MilestoneRef):
+            raise TypeError("ref must be a MilestoneRef")
+        generation = self.find_generation(ref.kind, ref.fingerprint)
+        if generation is None:
+            return None
+        try:
+            self.validate_milestone_graph(ref)
+        except ValueError:
+            return None
+        target = Path(destination)
+        if os.path.lexists(target):
+            raise FileExistsError(f"milestone restore destination exists: {target}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source = generation / "payload"
+        try:
+            shutil.copytree(source, target, copy_function=shutil.copy2)
+            if _inventory(source) != _inventory(target):
+                raise ValueError("restored milestone differs from Drive")
+            manifest = _read_generation_manifest(
+                generation,
+                ref.kind,
+                ref.fingerprint,
+            )
+            upstream, raw_artifact_roots = _manifest_metadata(manifest)
+            payload = json.loads((target / "state.json").read_text(encoding="utf-8"))
+            value = decode_checkpoint_state(
+                payload,
+                restore_root=target,
+                source_inventory=source_inventory,
+            )
+            artifact_roots = {
+                label: _resolved_restore_path(
+                    target,
+                    _safe_relative_path(relative),
+                )
+                for label, relative in raw_artifact_roots.items()
+            }
+            for path in _checkpoint_state_paths(value):
+                resolved = Path(path).resolve(strict=True)
+                if not any(
+                    resolved == artifact_root or resolved.is_relative_to(artifact_root)
+                    for artifact_root in artifact_roots.values()
+                ):
+                    raise ValueError(
+                        "restored milestone state escapes its direct artifact roots"
+                    )
+            return MilestoneState(
+                ref=ref,
+                upstream=upstream,
+                value=value,
+                artifact_roots=artifact_roots,
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            if os.path.lexists(target):
+                self._remove_restore_tree(target)
+            return None
+
+    def validate_milestone_graph(self, root: MilestoneRef) -> tuple[MilestoneRef, ...]:
+        from .milestones import (
+            MilestoneRef,
+            expected_upstream_kinds,
+        )
+
+        if not isinstance(root, MilestoneRef):
+            raise TypeError("root must be a MilestoneRef")
+        visiting: set[MilestoneRef] = set()
+        visited: set[MilestoneRef] = set()
+        result: list[MilestoneRef] = []
+        observed_edges: dict[MilestoneRef, Mapping[CheckpointKind, str]] = {}
+
+        def visit(ref: MilestoneRef) -> None:
+            if ref in visiting:
+                raise ValueError("milestone dependency graph contains a cycle")
+            if ref in visited:
+                return
+            generation = self.find_generation(ref.kind, ref.fingerprint)
+            if generation is None:
+                raise ValueError(
+                    f"missing upstream milestone: {ref.kind.value}/{ref.fingerprint}"
+                )
+            visiting.add(ref)
+            if ref.kind is CheckpointKind.COLMAP:
+                upstream: Mapping[CheckpointKind, str] = {}
+            else:
+                manifest = _read_generation_manifest(
+                    generation,
+                    ref.kind,
+                    ref.fingerprint,
+                )
+                upstream, _ = _manifest_metadata(manifest)
+            observed_edges[ref] = upstream
+            for upstream_kind, fingerprint in sorted(
+                upstream.items(), key=lambda item: item[0].value
+            ):
+                visit(MilestoneRef(upstream_kind, fingerprint))
+            visiting.remove(ref)
+            visited.add(ref)
+            result.append(ref)
+
+        visit(root)
+        for ref, upstream in observed_edges.items():
+            if ref.kind is CheckpointKind.COLMAP:
+                continue
+            expected = expected_upstream_kinds(ref.kind)
+            if frozenset(upstream) != expected:
+                raise ValueError(
+                    f"{ref.kind.value} upstream kinds must be "
+                    f"{sorted(item.value for item in expected)}"
+                )
+        return tuple(result)
+
+    def cleanup_unreferenced_milestones(self, keep: MilestoneRef) -> None:
+        from .milestones import MilestoneRef
+
+        if not isinstance(keep, MilestoneRef):
+            raise TypeError("keep must be a MilestoneRef")
+        generation = self.find_generation(keep.kind, keep.fingerprint)
+        if generation is None:
+            raise ValueError("keep milestone is not a valid generation")
+        self._remove_older_generations(keep.kind, keep=generation)
 
     def probe_drive_publication(self, *, run_id: str) -> None:
         if not isinstance(run_id, str) or not _SAFE_RUN_ID.fullmatch(run_id):
@@ -967,12 +1205,27 @@ class LearnedCheckpointStore:
                 return False
             if manifest.get("fingerprint") != fingerprint:
                 return False
-            if success != {
+            base_keys = {"schema_version", "kind", "fingerprint", "files"}
+            metadata_keys = {"upstream", "artifact_roots"}
+            if set(manifest) == base_keys:
+                upstream_payload = None
+            elif set(manifest) == base_keys | metadata_keys:
+                upstream, _ = _manifest_metadata(manifest)
+                upstream_payload = {
+                    upstream_kind.value: upstream_fingerprint
+                    for upstream_kind, upstream_fingerprint in upstream.items()
+                }
+            else:
+                return False
+            expected_success = {
                 "schema_version": _SCHEMA_VERSION,
                 "kind": kind.value,
                 "fingerprint": fingerprint,
                 "manifest_sha256": _sha256(manifest_path),
-            }:
+            }
+            if upstream_payload is not None:
+                expected_success["upstream"] = upstream_payload
+            if success != expected_success:
                 return False
             expected = manifest.get("files")
             if not isinstance(expected, list):
@@ -982,10 +1235,43 @@ class LearnedCheckpointStore:
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
             return False
 
+    def _referenced_generations(self) -> frozenset[tuple[CheckpointKind, str]]:
+        referenced: set[tuple[CheckpointKind, str]] = set()
+        for owner_kind in CheckpointKind:
+            parent = self.cache_root / owner_kind.value
+            if not parent.is_dir() or parent.is_symlink():
+                continue
+            for candidate in sorted(parent.iterdir(), key=lambda item: item.name):
+                try:
+                    fingerprint = _require_digest(candidate.name, "fingerprint")
+                except ValueError:
+                    continue
+                if not self._valid_generation(candidate, owner_kind, fingerprint):
+                    continue
+                try:
+                    manifest = _read_generation_manifest(
+                        candidate,
+                        owner_kind,
+                        fingerprint,
+                    )
+                    upstream, _ = _manifest_metadata(manifest)
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                    continue
+                referenced.update(upstream.items())
+        return frozenset(referenced)
+
     def _remove_older_generations(self, kind: CheckpointKind, *, keep: Path) -> None:
         parent = self.cache_root / kind.value
+        referenced = self._referenced_generations()
         for candidate in parent.iterdir():
-            if candidate != keep:
+            if candidate == keep:
+                continue
+            try:
+                fingerprint = _require_digest(candidate.name, "fingerprint")
+            except ValueError:
+                self._remove_owned_tree(candidate)
+                continue
+            if (kind, fingerprint) not in referenced:
                 self._remove_owned_tree(candidate)
 
     def _remove_owned_tree(self, path: Path) -> None:
@@ -1177,6 +1463,110 @@ def _require_kind(value: CheckpointKind) -> CheckpointKind:
     if not isinstance(value, CheckpointKind):
         raise TypeError("kind must be a CheckpointKind")
     return value
+
+
+def _generation_metadata(
+    upstream: Mapping[CheckpointKind, str] | None,
+    artifact_roots: Mapping[str, str] | None,
+) -> dict[str, object]:
+    if upstream is None and artifact_roots is None:
+        return {}
+    if upstream is None or artifact_roots is None:
+        raise ValueError("milestone metadata requires upstream and artifact_roots")
+    if not isinstance(upstream, Mapping):
+        raise TypeError("upstream must be a mapping")
+    upstream_payload: dict[str, str] = {}
+    for raw_kind, raw_fingerprint in upstream.items():
+        active_kind = _require_kind(raw_kind)
+        upstream_payload[active_kind.value] = _require_digest(
+            raw_fingerprint,
+            f"{active_kind.value} upstream fingerprint",
+        )
+    if not isinstance(artifact_roots, Mapping):
+        raise TypeError("artifact_roots must be a mapping")
+    roots_payload: dict[str, str] = {}
+    for label, raw_relative in artifact_roots.items():
+        if (
+            not isinstance(label, str)
+            or not label
+            or label in {".", ".."}
+            or any(separator in label for separator in ("/", "\\", ":"))
+        ):
+            raise ValueError("artifact root labels must be safe path components")
+        relative = _safe_relative_path(raw_relative)
+        if relative.parts != ("artifacts", label):
+            raise ValueError("artifact roots must use artifacts/<label>")
+        roots_payload[label] = relative.as_posix()
+    return {
+        "upstream": dict(sorted(upstream_payload.items())),
+        "artifact_roots": dict(sorted(roots_payload.items())),
+    }
+
+
+def _manifest_metadata(
+    manifest: Mapping[str, object],
+) -> tuple[Mapping[CheckpointKind, str], Mapping[str, str]]:
+    has_upstream = "upstream" in manifest
+    has_roots = "artifact_roots" in manifest
+    if not has_upstream and not has_roots:
+        return MappingProxyType({}), MappingProxyType({})
+    if not has_upstream or not has_roots:
+        raise ValueError("milestone manifest metadata is incomplete")
+    raw_upstream = manifest["upstream"]
+    raw_roots = manifest["artifact_roots"]
+    if not isinstance(raw_upstream, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in raw_upstream.items()
+    ):
+        raise ValueError("milestone upstream map is malformed")
+    upstream: dict[CheckpointKind, str] = {}
+    for raw_kind, raw_fingerprint in raw_upstream.items():
+        try:
+            active_kind = CheckpointKind(raw_kind)
+        except ValueError as error:
+            raise ValueError(f"unknown upstream kind: {raw_kind}") from error
+        upstream[active_kind] = _require_digest(
+            raw_fingerprint,
+            f"{active_kind.value} upstream fingerprint",
+        )
+    if not isinstance(raw_roots, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in raw_roots.items()
+    ):
+        raise ValueError("milestone artifact roots are malformed")
+    roots: dict[str, str] = {}
+    for label, raw_relative in raw_roots.items():
+        if (
+            not label
+            or label in {".", ".."}
+            or any(separator in label for separator in ("/", "\\", ":"))
+        ):
+            raise ValueError("milestone artifact root label is malformed")
+        relative = _safe_relative_path(raw_relative)
+        if relative.parts != ("artifacts", label):
+            raise ValueError("milestone artifact root path is malformed")
+        roots[label] = relative.as_posix()
+    return (
+        MappingProxyType(
+            dict(sorted(upstream.items(), key=lambda item: item[0].value))
+        ),
+        MappingProxyType(dict(sorted(roots.items()))),
+    )
+
+
+def _read_generation_manifest(
+    generation: Path,
+    kind: CheckpointKind,
+    fingerprint: str,
+) -> dict[str, object]:
+    root = _regular_directory(generation, "generation")
+    manifest_path = _regular_file(root / "manifest.json", "manifest")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("generation manifest must be an object")
+    if manifest.get("kind") != kind.value or manifest.get("fingerprint") != fingerprint:
+        raise ValueError("generation manifest identity is malformed")
+    return manifest
 
 
 def _require_digest(value: object, label: str) -> str:

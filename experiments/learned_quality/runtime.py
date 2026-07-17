@@ -60,6 +60,10 @@ from .geometry import (
 )
 from .lifecycle import release_cuda_model
 from .masks import MaskFusionPolicy, fuse_evidence_masks
+from .milestones import (
+    LEGACY_COLMAP_PRODUCER_DIGESTS,
+    compatible_colmap_fingerprints,
+)
 from .model_adapters import (
     Sam2ImageAdapter,
     SeaRaftTorchAdapter,
@@ -108,19 +112,52 @@ def _colmap_cache_fingerprint(
 ) -> str:
     return checkpoint_fingerprint(
         CheckpointKind.COLMAP,
-        CheckpointInputs(
-            source_digest=selection.inventory.digest,
-            settings={
-                "selection_digest": selection.manifest.image_set_digest,
-                "use_gpu": hardware.colmap_gpu_sift is True,
-            },
-            model_manifest_sha256=_sha256(model_manifest_path),
-            tool_versions={"colmap": version_probe()},
-            producer_code_sha256=producer_code_digest(
-                _REPOSITORY_ROOT,
-                _COLMAP_PRODUCER_PATHS,
-            ),
+        _colmap_cache_inputs(
+            selection,
+            hardware,
+            model_manifest_path,
+            version_probe=version_probe,
         ),
+    )
+
+
+def _colmap_cache_inputs(
+    selection: SelectionOutput,
+    hardware: HardwareInfo,
+    model_manifest_path: Path,
+    *,
+    version_probe: Callable[[], str] = _probe_colmap_version,
+) -> CheckpointInputs:
+    return CheckpointInputs(
+        source_digest=selection.inventory.digest,
+        settings={
+            "selection_digest": selection.manifest.image_set_digest,
+            "use_gpu": hardware.colmap_gpu_sift is True,
+        },
+        model_manifest_sha256=_sha256(model_manifest_path),
+        tool_versions={"colmap": version_probe()},
+        producer_code_sha256=producer_code_digest(
+            _REPOSITORY_ROOT,
+            _COLMAP_PRODUCER_PATHS,
+        ),
+    )
+
+
+def _colmap_cache_fingerprints(
+    selection: SelectionOutput,
+    hardware: HardwareInfo,
+    model_manifest_path: Path,
+    *,
+    version_probe: Callable[[], str] = _probe_colmap_version,
+) -> tuple[str, ...]:
+    return compatible_colmap_fingerprints(
+        _colmap_cache_inputs(
+            selection,
+            hardware,
+            model_manifest_path,
+            version_probe=version_probe,
+        ),
+        legacy_producer_digests=LEGACY_COLMAP_PRODUCER_DIGESTS,
     )
 
 
@@ -350,25 +387,36 @@ def _run_evidence_cycle(
             del base
 
     model_manifest_path: Path | None = None
+    cache_fingerprint: str | None = None
+    pending_colmap_publish = False
+    reporter = current_stage_reporter()
     with _learned_stage("classical_colmap"):
-        cache_fingerprint: str | None = None
         pre_attempt = None
-        reporter = current_stage_reporter()
         if checkpoint_store is not None:
             model_manifest_path = _validate_model_manifest()
-            cache_fingerprint = _colmap_cache_fingerprint(
+            cache_fingerprints = _colmap_cache_fingerprints(
                 selection,
                 hardware,
                 model_manifest_path,
             )
-            pre_attempt = checkpoint_store.restore_colmap(
-                cache_fingerprint,
-                destination=output_root / "classical-prepass-restored",
-            )
+            cache_fingerprint = cache_fingerprints[0]
+            for index, candidate_fingerprint in enumerate(cache_fingerprints):
+                suffix = "" if index == 0 else f"-legacy-{index}"
+                pre_attempt = checkpoint_store.restore_colmap(
+                    candidate_fingerprint,
+                    destination=output_root / f"classical-prepass-restored{suffix}",
+                )
+                if pre_attempt is not None:
+                    pending_colmap_publish = index > 0
+                    break
             if reporter is not None:
                 reporter.cache_event(
                     "hit" if pre_attempt is not None else "miss",
-                    "COLMAP checkpoint",
+                    (
+                        "COLMAP checkpoint"
+                        if not pending_colmap_publish
+                        else "COLMAP checkpoint (compatible legacy)"
+                    ),
                     str(checkpoint_store.cache_root),
                 )
         if pre_attempt is None:
@@ -382,6 +430,7 @@ def _run_evidence_cycle(
                 0,
                 geometry_frame_set_digest(selection.manifest, frames),
             )
+            pending_colmap_publish = checkpoint_store is not None
         measured = tuple(measure_models(pre_attempt.model_dirs, selection.manifest))
         if not measured:
             raise RuntimeError("classical prepass produced no readable geometry")
@@ -389,23 +438,6 @@ def _run_evidence_cycle(
             measured,
             key=lambda item: (item.registered_count, item.sparse_point_count),
         ).model_dir
-        if checkpoint_store is not None and cache_fingerprint is not None:
-            generation = checkpoint_store.find_generation(
-                CheckpointKind.COLMAP,
-                cache_fingerprint,
-            )
-            if generation is None:
-                generation = checkpoint_store.publish_colmap(
-                    pre_attempt,
-                    fingerprint=cache_fingerprint,
-                    run_id=f"colmap-{uuid.uuid4().hex}",
-                )
-                if reporter is not None:
-                    reporter.cache_event(
-                        "save",
-                        "COLMAP checkpoint",
-                        str(generation),
-                    )
         qualified_tracks = qualify_colmap_static_tracks(
             pre_model,
             frames,
@@ -441,6 +473,22 @@ def _run_evidence_cycle(
             depths,
             static_tracks=qualified_tracks.tracks,
         )
+        if (
+            pending_colmap_publish
+            and checkpoint_store is not None
+            and cache_fingerprint is not None
+        ):
+            generation = checkpoint_store.publish_colmap(
+                pre_attempt,
+                fingerprint=cache_fingerprint,
+                run_id=f"colmap-{uuid.uuid4().hex}",
+            )
+            if reporter is not None:
+                reporter.cache_event(
+                    "save",
+                    "COLMAP checkpoint",
+                    str(generation),
+                )
 
     with _learned_stage("semantic_masks"):
         semantic = run_semantic_evidence(

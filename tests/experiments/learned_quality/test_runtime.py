@@ -449,8 +449,8 @@ def test_evidence_cycle_reuses_drive_colmap_checkpoint_in_fresh_runtime(
     monkeypatch.setattr(runtime_module, "measure_models", measure)
     monkeypatch.setattr(
         runtime_module,
-        "_colmap_cache_fingerprint",
-        lambda *_args, **_kwargs: "e" * 64,
+        "_colmap_cache_fingerprints",
+        lambda *_args, **_kwargs: ("e" * 64,),
     )
     output = StringIO()
     reporter = StageReporter(EVIDENCE_STAGES, stream=output)
@@ -477,3 +477,80 @@ def test_evidence_cycle_reuses_drive_colmap_checkpoint_in_fresh_runtime(
     assert "[CACHE MISS] COLMAP checkpoint" in output.getvalue()
     assert "[CACHE SAVE] COLMAP checkpoint" in output.getvalue()
     assert "[CACHE HIT] COLMAP checkpoint" in output.getvalue()
+
+
+def test_evidence_cycle_migrates_allowlisted_colmap_without_rerunning_colmap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection, frames, hardware = _mock_evidence_cycle(tmp_path, monkeypatch)
+    cache_store = LearnedCheckpointStore(
+        tmp_path / "drive-cache",
+        input_identity="a" * 64,
+    )
+    legacy_fingerprint = "d" * 64
+    current_fingerprint = "e" * 64
+    attempt_root = tmp_path / "legacy-attempt"
+    model = attempt_root / "sparse" / "0"
+    model.mkdir(parents=True)
+    database = attempt_root / "colmap.db"
+    database.write_bytes(b"database")
+    for name in ("cameras.txt", "images.txt", "points3D.txt"):
+        (model / name).write_text(name, encoding="utf-8")
+    cache_store.publish_colmap(
+        ColmapAttempt(
+            root=attempt_root,
+            database_path=database,
+            model_dirs=(model,),
+            colmap_version="COLMAP 3.11.1",
+            fingerprint="c" * 64,
+        ),
+        fingerprint=legacy_fingerprint,
+        run_id="legacy",
+    )
+    validation_calls: list[str] = []
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_colmap_cache_fingerprints",
+        lambda *_args, **_kwargs: (current_fingerprint, legacy_fingerprint),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_colmap_cache_fingerprint",
+        lambda *_args, **_kwargs: current_fingerprint,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "make_classical_candidate_runner",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("COLMAP reran despite a compatible legacy checkpoint")
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "qualify_colmap_static_tracks",
+        lambda *_args, **_kwargs: (
+            validation_calls.append("tracks") or SimpleNamespace(tracks=())
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "_rigid_scene",
+        lambda *_args, **_kwargs: validation_calls.append("scene") or object(),
+    )
+
+    _run_evidence_cycle(
+        selection,
+        frames,
+        hardware,
+        tmp_path / "run" / "evidence",
+        checkpoint_store=cache_store,
+    )
+
+    assert validation_calls == ["tracks", "scene"]
+    assert (
+        cache_store.find_generation(CheckpointKind.COLMAP, current_fingerprint)
+        is not None
+    )
