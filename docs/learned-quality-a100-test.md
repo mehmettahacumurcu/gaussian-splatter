@@ -71,7 +71,26 @@ Command '('/usr/local/bin/colmap', '--version')' returned non-zero exit status 1
 The pinned CUDA build supports `colmap -h` but rejects `colmap --version` with
 exit status 1. Runtime commit `d130d92531be5f805acaaef4c4681f10ca287cd2`
 now probes the supported help command and extracts the version banner from its
-stdout or stderr. The generated notebook is pinned to that runtime commit.
+stdout or stderr. Every later notebook pin includes that repair.
 
-The next acceptance step is a fresh A100 run that confirms COLMAP advances past
-the version probe and begins reconstruction.
+The subsequent A100 run confirmed COLMAP advanced past the version probe and
+completed feature extraction, matching, and mapping.
+
+## Resolved: duplicate static-track observation (2026-07-17)
+
+Run `a2ff823246ad40949a357be7fe1324d5` then failed while converting the
+classical COLMAP model into learned static-track evidence:
+
+```text
+a static track cannot observe one frame more than once
+```
+
+The COLMAP reconstruction itself was usable, but one point track referenced the
+same canonical frame more than once. Runtime commit
+`30e7cd2` now discards only such ambiguous evidence tracks before flow, mask,
+and photometric validation; it does not discard or weaken the accepted geometry.
+
+The notebook launch is also unbuffered as of `04c81d5`, so preprocessing events
+and training iteration logs stream live during the next A100 run. The checked-in
+notebook is pinned to the full `04c81d5480a6772fd7054ca25954808963fea627`
+runtime commit, which includes both repairs.
