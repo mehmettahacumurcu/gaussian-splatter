@@ -23,8 +23,11 @@ from experiments.learned_quality.contracts import FrameArtifact, LearnedArtifact
 from experiments.learned_quality.runtime import (
     _colmap_cache_fingerprint,
     _run_evidence_cycle,
-    _static_tracks,
     run_learned_reconstruction,
+)
+from experiments.learned_quality.tracks import (
+    TrackAuditReport,
+    TrackQualificationError,
 )
 
 
@@ -110,7 +113,14 @@ def _mock_evidence_cycle(
         "_materialize_metric",
         lambda *_args: (((tmp_path / "depth.npy", "d" * 64),), object()),
     )
-    monkeypatch.setattr(runtime_module, "_rigid_scene", lambda *_args: object())
+    monkeypatch.setattr(
+        runtime_module, "_rigid_scene", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "qualify_colmap_static_tracks",
+        lambda *_args, **_kwargs: SimpleNamespace(tracks=()),
+    )
     monkeypatch.setattr(
         runtime_module,
         "run_semantic_evidence",
@@ -132,30 +142,6 @@ def _mock_evidence_cycle(
         lambda: manifest_path,
     )
     return selection, frames, hardware
-
-
-def test_static_tracks_drop_colmap_point_observed_twice_in_one_frame(
-    tmp_path: Path,
-) -> None:
-    model = tmp_path / "model"
-    model.mkdir()
-    (model / "images.txt").write_text(
-        "1 1 0 0 0 0 0 0 1 frame_000000.png\n"
-        "10 20 7 11 21 7\n"
-        "2 1 0 0 0 0 0 0 1 frame_000001.png\n"
-        "30 40 7\n",
-        encoding="utf-8",
-    )
-    (model / "points3D.txt").write_text(
-        "7 0 0 1 255 255 255 0.1 1 0 1 1 2 0\n",
-        encoding="utf-8",
-    )
-    frames = (
-        FrameArtifact("frame_000000.png", "frame-a", tmp_path / "a.png", "a" * 64),
-        FrameArtifact("frame_000001.png", "frame-b", tmp_path / "b.png", "b" * 64),
-    )
-
-    assert _static_tracks(model, frames) == ()
 
 
 def test_colmap_cache_fingerprint_binds_preprocessing_dependencies(
@@ -240,6 +226,54 @@ def test_evidence_cycle_reports_failure_and_preserves_exception(
     assert any("FAIL  Optical flow" in line for line in output.getvalue().splitlines())
 
 
+def test_evidence_cycle_qualifies_tracks_before_metric_or_semantic_models(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection, frames, hardware = _mock_evidence_cycle(tmp_path, monkeypatch)
+    audit_path = tmp_path / "evidence" / "track_audit.json"
+    report = TrackAuditReport(
+        schema_version=1,
+        raw_track_count=1,
+        accepted_track_count=0,
+        rejected_track_count=1,
+        raw_observation_count=1,
+        accepted_observation_count=0,
+        rejected_observation_count=1,
+        rejected_tracks_by_reason={"insufficient_observations": 1},
+        rejected_observations_by_reason={"out_of_bounds": 1},
+        examples=(),
+        accepted_tracks_sha256="a" * 64,
+    )
+
+    def reject_tracks(
+        _model: Path,
+        _frames: tuple[FrameArtifact, ...],
+        target: Path,
+        **_kwargs: object,
+    ) -> object:
+        target.write_text('{"schema_version":1}\n', encoding="utf-8")
+        raise TrackQualificationError(
+            "no qualified COLMAP static tracks remain",
+            report=report,
+            audit_path=target,
+        )
+
+    def expensive_model_must_not_run(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("post-COLMAP learned model ran before track qualification")
+
+    monkeypatch.setattr(runtime_module, "qualify_colmap_static_tracks", reject_tracks)
+    monkeypatch.setattr(runtime_module, "run_metric_sky", expensive_model_must_not_run)
+    monkeypatch.setattr(
+        runtime_module, "run_semantic_evidence", expensive_model_must_not_run
+    )
+
+    with pytest.raises(TrackQualificationError, match="no qualified"):
+        _run_evidence_cycle(selection, frames, hardware, tmp_path / "evidence")
+
+    assert audit_path.is_file()
+
+
 def test_final_reconstruction_prints_geometry_depth_and_validation_stages(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -314,7 +348,14 @@ def test_final_reconstruction_prints_geometry_depth_and_validation_stages(
         "run_geometry_comparison",
         lambda *_args, **_kwargs: comparison,
     )
-    monkeypatch.setattr(runtime_module, "_rigid_scene", lambda *_args: object())
+    monkeypatch.setattr(
+        runtime_module, "_rigid_scene", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "qualify_colmap_static_tracks",
+        lambda *_args, **_kwargs: SimpleNamespace(tracks=()),
+    )
     monkeypatch.setattr(
         runtime_module,
         "fit_and_validate_photometric_transforms",

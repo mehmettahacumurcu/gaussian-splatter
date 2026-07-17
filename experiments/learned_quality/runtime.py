@@ -49,7 +49,6 @@ from .flow import (
     RigidFrameEvidence,
     RigidSceneEvidence,
     StaticTrack,
-    TrackObservation,
     run_motion_evidence,
 )
 from .geometry import (
@@ -69,6 +68,7 @@ from .model_adapters import (
 )
 from .photometric import PhotometricPolicy, fit_and_validate_photometric_transforms
 from .segmentation import SemanticPolicy, run_semantic_evidence
+from .tracks import TrackQualificationPolicy, qualify_colmap_static_tracks
 
 
 _SOURCE_ROOT = Path("/content/learned-sources")
@@ -230,86 +230,12 @@ def _materialize_metric(
     return tuple(depth_rows), tuple(sky_rows)
 
 
-def _image_point_rows(model_dir: Path):
-    rows = (model_dir / "images.txt").read_text(encoding="utf-8").splitlines()
-    content = [line.strip() for line in rows if not line.startswith("#")]
-    content = [line for line in content if line or line == ""]
-    result = {}
-    index = 0
-    while index < len(content):
-        if not content[index]:
-            index += 1
-            continue
-        header = content[index].split(maxsplit=9)
-        points = content[index + 1].split() if index + 1 < len(content) else []
-        image_id = int(header[0])
-        coordinates = {}
-        for point_index in range(0, len(points), 3):
-            point_id = int(points[point_index + 2])
-            if point_id >= 0:
-                coordinates[point_index // 3] = (
-                    float(points[point_index]),
-                    float(points[point_index + 1]),
-                    point_id,
-                )
-        result[image_id] = (header[9], coordinates)
-        index += 2
-    return result
-
-
-def _static_tracks(
-    model_dir: Path, frames: tuple[FrameArtifact, ...]
-) -> tuple[StaticTrack, ...]:
-    by_name = {frame.image_name: frame for frame in frames}
-    images = _image_point_rows(model_dir)
-    tracks = []
-    for raw in (model_dir / "points3D.txt").read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        point_id = int(parts[0])
-        error = float(parts[7])
-        observations = []
-        observed_frame_ids: set[str] = set()
-        ambiguous_track = False
-        for offset in range(8, len(parts), 2):
-            image_id = int(parts[offset])
-            point_index = int(parts[offset + 1])
-            image = images.get(image_id)
-            if image is None or image[0] not in by_name:
-                continue
-            coordinate = image[1].get(point_index)
-            if coordinate is None or coordinate[2] != point_id:
-                continue
-            frame_id = by_name[image[0]].frame_id
-            if frame_id in observed_frame_ids:
-                ambiguous_track = True
-                break
-            observed_frame_ids.add(frame_id)
-            observations.append(
-                TrackObservation(
-                    frame_id=frame_id,
-                    x=coordinate[0],
-                    y=coordinate[1],
-                )
-            )
-        if not ambiguous_track and len(observations) >= 2:
-            tracks.append(
-                StaticTrack(
-                    track_id=point_id,
-                    xyz=tuple(float(value) for value in parts[1:4]),
-                    mean_reprojection_error=error,
-                    observations=tuple(observations),
-                )
-            )
-    return tuple(tracks)
-
-
 def _rigid_scene(
     frames: tuple[FrameArtifact, ...],
     model_dir: Path,
     depths: tuple[tuple[Path, str], ...],
+    *,
+    static_tracks: tuple[StaticTrack, ...],
 ) -> RigidSceneEvidence:
     cameras = parse_cameras_from_model(model_dir)
     records = []
@@ -352,7 +278,7 @@ def _rigid_scene(
     )
     return RigidSceneEvidence(
         frames=tuple(records),
-        static_tracks=_static_tracks(model_dir, frames),
+        static_tracks=static_tracks,
         geometry_digest=_digest_rows((model_hashes, geometry_rows)),
         depth_digest=_digest_rows(tuple(digest for _, digest in depths)),
     )
@@ -480,6 +406,12 @@ def _run_evidence_cycle(
                         "COLMAP checkpoint",
                         str(generation),
                     )
+        qualified_tracks = qualify_colmap_static_tracks(
+            pre_model,
+            frames,
+            output_root / "track_audit.json",
+            policy=TrackQualificationPolicy(),
+        )
 
     with _learned_stage("da3_metric_sky"):
         metric_model = load_da3_model(
@@ -503,7 +435,12 @@ def _run_evidence_cycle(
             release_cuda_model(metric_model)
             del metric_model
         depths, sky = _materialize_metric(frames, metric, output_root / "metric-native")
-        scene = _rigid_scene(frames, pre_model, depths)
+        scene = _rigid_scene(
+            frames,
+            pre_model,
+            depths,
+            static_tracks=qualified_tracks.tracks,
+        )
 
     with _learned_stage("semantic_masks"):
         semantic = run_semantic_evidence(
@@ -672,7 +609,18 @@ def run_learned_reconstruction(
     )
     depths = tuple((path, _sha256(path)) for path, _ in depths)
     with _learned_stage("photometric_validation"):
-        final_scene = _rigid_scene(final_frames, comparison.accepted_model_dir, depths)
+        final_tracks = qualify_colmap_static_tracks(
+            comparison.accepted_model_dir,
+            final_frames,
+            output_root.parent / "final_track_audit.json",
+            policy=TrackQualificationPolicy(),
+        )
+        final_scene = _rigid_scene(
+            final_frames,
+            comparison.accepted_model_dir,
+            depths,
+            static_tracks=final_tracks.tracks,
+        )
         photometric = fit_and_validate_photometric_transforms(
             final_frames,
             final_scene,
