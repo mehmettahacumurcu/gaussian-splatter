@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import shutil
 from dataclasses import dataclass
@@ -106,6 +107,34 @@ def test_store_publishes_owned_hash_verified_generation(tmp_path: Path) -> None:
     assert (generation / "manifest.json").is_file()
     assert (generation / "_SUCCESS.json").is_file()
     assert store.find_generation(CheckpointKind.COLMAP, "b" * 64) == generation
+
+
+def test_drive_fuse_unsupported_atomic_rename_uses_verified_marker_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_root = tmp_path / "myroom_test_learned_test_cache"
+    store = LearnedCheckpointStore(cache_root, input_identity="a" * 64)
+
+    def reject_renameat2(_staged: Path, destination: Path) -> None:
+        raise OSError(errno.EINVAL, "Invalid argument", str(destination))
+
+    monkeypatch.setattr(
+        "experiments.learned_quality.cache._atomic_promote_no_replace",
+        reject_renameat2,
+    )
+
+    generation = store.publish_generation(
+        CheckpointKind.COLMAP,
+        fingerprint="b" * 64,
+        run_id="run-1",
+        source_root=_payload(tmp_path / "source"),
+    )
+
+    assert generation == cache_root / "colmap" / ("b" * 64)
+    assert store.find_generation(CheckpointKind.COLMAP, "b" * 64) == generation
+    assert (generation / "_SUCCESS.json").is_file()
+    assert not (cache_root / "staging" / "colmap-run-1").exists()
 
 
 def test_store_rejects_an_unowned_existing_cache_root(tmp_path: Path) -> None:

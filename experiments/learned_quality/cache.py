@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import math
@@ -20,6 +21,9 @@ from .contracts import GENERATOR_ID
 
 _SCHEMA_VERSION = 1
 _SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_UNSUPPORTED_NOREPLACE_ERRNOS = frozenset(
+    {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}
+)
 _PRETRAINING_ROOTS = frozenset(
     {
         "selection",
@@ -416,7 +420,12 @@ class LearnedCheckpointStore:
             sync = getattr(os, "sync", None)
             if callable(sync):
                 sync()
-            _atomic_promote_no_replace(staging, target)
+            self._promote_generation(
+                staging,
+                target,
+                kind=active_kind,
+                fingerprint=active_fingerprint,
+            )
         except BaseException:
             if os.path.lexists(staging):
                 self._remove_owned_tree(staging)
@@ -424,6 +433,73 @@ class LearnedCheckpointStore:
 
         self._remove_older_generations(active_kind, keep=target)
         return target
+
+    def _promote_generation(
+        self,
+        staging: Path,
+        target: Path,
+        *,
+        kind: CheckpointKind,
+        fingerprint: str,
+    ) -> None:
+        try:
+            _atomic_promote_no_replace(staging, target)
+            return
+        except OSError as error:
+            if error.errno not in _UNSUPPORTED_NOREPLACE_ERRNOS:
+                raise
+            if os.path.lexists(target):
+                raise FileExistsError(
+                    errno.EEXIST,
+                    os.strerror(errno.EEXIST),
+                    str(target),
+                ) from error
+        self._promote_generation_with_success_marker(
+            staging,
+            target,
+            kind=kind,
+            fingerprint=fingerprint,
+        )
+
+    def _promote_generation_with_success_marker(
+        self,
+        staging: Path,
+        target: Path,
+        *,
+        kind: CheckpointKind,
+        fingerprint: str,
+    ) -> None:
+        if not self._valid_generation(staging, kind, fingerprint):
+            raise ValueError("staged cache generation is invalid")
+        target.mkdir(exist_ok=False)
+        try:
+            shutil.copytree(
+                staging / "payload",
+                target / "payload",
+                copy_function=shutil.copy2,
+            )
+            shutil.copy2(staging / "manifest.json", target / "manifest.json")
+            if _inventory(staging / "payload") != _inventory(target / "payload"):
+                raise ValueError("Drive cache payload changed during publication")
+            if _sha256(staging / "manifest.json") != _sha256(target / "manifest.json"):
+                raise ValueError("Drive cache manifest changed during publication")
+            success_bytes = (staging / "_SUCCESS.json").read_bytes()
+            with (target / "_SUCCESS.json").open("xb") as stream:
+                stream.write(success_bytes)
+                stream.flush()
+            sync = getattr(os, "sync", None)
+            if callable(sync):
+                sync()
+            if not self._valid_generation(target, kind, fingerprint):
+                raise ValueError("Drive cache generation failed final verification")
+        except BaseException:
+            if os.path.lexists(target):
+                self._remove_owned_tree(target)
+            raise
+        try:
+            self._remove_owned_tree(staging)
+        except OSError:
+            pass
 
     def publish_colmap(
         self,
