@@ -444,6 +444,14 @@ def make_learned_quality_services(
             hardware = kwargs["hardware"]
             run_root = Path(kwargs["run_root"])
             store = cache_session.store_for(source_inventory)
+            store.probe_drive_publication(run_id=run_root.name)
+            reporter = current_stage_reporter()
+            if reporter is not None:
+                reporter.cache_event(
+                    "probe",
+                    "Drive cache publication",
+                    str(cache_session.cache_root),
+                )
             restored = store.restore_pretraining(
                 source_inventory=source_inventory,
                 destination=run_root / "pretraining-restored",
@@ -455,7 +463,6 @@ def make_learned_quality_services(
                     context.model_manifest_path,
                 ),
             )
-            reporter = current_stage_reporter()
             if reporter is not None:
                 reporter.cache_event(
                     "hit" if restored is not None else "miss",

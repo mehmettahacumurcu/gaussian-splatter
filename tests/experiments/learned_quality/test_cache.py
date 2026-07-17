@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from experiments.learned_quality import cache as cache_module
+
 from backend.static_pipeline.contracts import (
     ColmapAttempt,
     FrameRecord,
@@ -135,6 +137,68 @@ def test_drive_fuse_unsupported_atomic_rename_uses_verified_marker_fallback(
     assert store.find_generation(CheckpointKind.COLMAP, "b" * 64) == generation
     assert (generation / "_SUCCESS.json").is_file()
     assert not (cache_root / "staging" / "colmap-run-1").exists()
+
+
+def test_drive_publication_probe_uses_real_cache_operations_and_cleans_up(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_root = tmp_path / "myroom_test_learned_test_cache"
+    store = LearnedCheckpointStore(cache_root, input_identity="a" * 64)
+
+    def reject_renameat2(_staged: Path, destination: Path) -> None:
+        raise OSError(errno.EINVAL, "Invalid argument", str(destination))
+
+    monkeypatch.setattr(
+        "experiments.learned_quality.cache._atomic_promote_no_replace",
+        reject_renameat2,
+    )
+
+    store.probe_drive_publication(run_id="run-1")
+
+    assert (cache_root / "_OWNERSHIP.json").is_file()
+    assert not (cache_root / "probe").exists()
+    assert not (cache_root / "colmap").exists()
+    assert not (cache_root / "pretraining").exists()
+
+
+def test_verified_staging_survives_promotion_error_and_recovers_on_next_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache_root = tmp_path / "myroom_test_learned_test_cache"
+    store = LearnedCheckpointStore(cache_root, input_identity="a" * 64)
+    original_promote = cache_module._atomic_promote_no_replace
+
+    def fail_promotion(_staged: Path, destination: Path) -> None:
+        raise OSError(errno.EIO, "Drive unavailable", str(destination))
+
+    monkeypatch.setattr(
+        "experiments.learned_quality.cache._atomic_promote_no_replace",
+        fail_promotion,
+    )
+
+    with pytest.raises(OSError, match="Drive unavailable"):
+        store.publish_generation(
+            CheckpointKind.COLMAP,
+            fingerprint="b" * 64,
+            run_id="run-1",
+            source_root=_payload(tmp_path / "source"),
+        )
+
+    staged = cache_root / "staging" / "colmap-run-1"
+    assert staged.is_dir()
+    assert (staged / "_SUCCESS.json").is_file()
+
+    monkeypatch.setattr(
+        "experiments.learned_quality.cache._atomic_promote_no_replace",
+        original_promote,
+    )
+    generation = store.find_generation(CheckpointKind.COLMAP, "b" * 64)
+
+    assert generation == cache_root / "colmap" / ("b" * 64)
+    assert store.find_generation(CheckpointKind.COLMAP, "b" * 64) == generation
+    assert not staged.exists()
 
 
 def test_store_rejects_an_unowned_existing_cache_root(tmp_path: Path) -> None:

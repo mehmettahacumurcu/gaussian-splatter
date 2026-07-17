@@ -382,6 +382,10 @@ class LearnedCheckpointStore:
         _inventory(source)
         self._ensure_owned_root(create=True)
 
+        recovered = self.find_generation(active_kind, active_fingerprint)
+        if recovered is not None:
+            return recovered
+
         target_parent = self.cache_root / active_kind.value
         target_parent.mkdir(parents=True, exist_ok=True)
         target = target_parent / active_fingerprint
@@ -396,6 +400,7 @@ class LearnedCheckpointStore:
         if os.path.lexists(staging):
             self._remove_owned_tree(staging)
         staging.mkdir()
+        staging_complete = False
         try:
             payload_root = staging / "payload"
             shutil.copytree(source, payload_root, copy_function=shutil.copy2)
@@ -417,6 +422,13 @@ class LearnedCheckpointStore:
                     "manifest_sha256": _sha256(manifest_path),
                 },
             )
+            if not self._valid_generation(
+                staging,
+                active_kind,
+                active_fingerprint,
+            ):
+                raise ValueError("staged cache generation failed verification")
+            staging_complete = True
             sync = getattr(os, "sync", None)
             if callable(sync):
                 sync()
@@ -427,12 +439,86 @@ class LearnedCheckpointStore:
                 fingerprint=active_fingerprint,
             )
         except BaseException:
-            if os.path.lexists(staging):
+            if os.path.lexists(staging) and not (
+                staging_complete
+                and self._valid_generation(
+                    staging,
+                    active_kind,
+                    active_fingerprint,
+                )
+            ):
                 self._remove_owned_tree(staging)
             raise
 
         self._remove_older_generations(active_kind, keep=target)
         return target
+
+    def probe_drive_publication(self, *, run_id: str) -> None:
+        if not isinstance(run_id, str) or not _SAFE_RUN_ID.fullmatch(run_id):
+            raise ValueError("run_id must be a safe non-empty identifier")
+        self._ensure_owned_root(create=True)
+        fingerprint = hashlib.sha256(
+            f"drive-cache-probe:{self.input_identity}".encode("utf-8")
+        ).hexdigest()
+        probe_parent = self.cache_root / "probe"
+        probe_root = probe_parent / run_id
+        if os.path.lexists(probe_root):
+            self._remove_owned_tree(probe_root)
+        probe_root.mkdir(parents=True)
+        staging = probe_root / "staging"
+        target = probe_root / "published"
+        try:
+            payload_root = staging / "payload"
+            payload_root.mkdir(parents=True)
+            (payload_root / "probe.txt").write_text(
+                "learned-quality-drive-cache-probe\n",
+                encoding="utf-8",
+            )
+            manifest = {
+                "schema_version": _SCHEMA_VERSION,
+                "kind": CheckpointKind.COLMAP.value,
+                "fingerprint": fingerprint,
+                "files": _inventory(payload_root, relative_prefix="payload"),
+            }
+            manifest_path = staging / "manifest.json"
+            _write_json(manifest_path, manifest)
+            _write_json(
+                staging / "_SUCCESS.json",
+                {
+                    "schema_version": _SCHEMA_VERSION,
+                    "kind": CheckpointKind.COLMAP.value,
+                    "fingerprint": fingerprint,
+                    "manifest_sha256": _sha256(manifest_path),
+                },
+            )
+            if not self._valid_generation(
+                staging,
+                CheckpointKind.COLMAP,
+                fingerprint,
+            ):
+                raise ValueError("Drive cache probe staging failed verification")
+            sync = getattr(os, "sync", None)
+            if callable(sync):
+                sync()
+            self._promote_generation(
+                staging,
+                target,
+                kind=CheckpointKind.COLMAP,
+                fingerprint=fingerprint,
+            )
+            if not self._valid_generation(
+                target,
+                CheckpointKind.COLMAP,
+                fingerprint,
+            ):
+                raise ValueError("Drive cache publication probe failed verification")
+        finally:
+            if os.path.lexists(probe_root):
+                self._remove_owned_tree(probe_root)
+            try:
+                probe_parent.rmdir()
+            except OSError:
+                pass
 
     def _promote_generation(
         self,
@@ -730,6 +816,7 @@ class LearnedCheckpointStore:
     def _valid_pretraining_generations(self) -> tuple[Path, ...]:
         if not self._ensure_owned_root(create=False):
             return ()
+        self._recover_staged_generations(CheckpointKind.PRETRAINING)
         parent = self.cache_root / CheckpointKind.PRETRAINING.value
         if not parent.is_dir():
             return ()
@@ -757,11 +844,74 @@ class LearnedCheckpointStore:
         if not self._ensure_owned_root(create=False):
             return None
         target = self.cache_root / active_kind.value / active_fingerprint
-        if not os.path.lexists(target):
+        if os.path.lexists(target):
+            if self._valid_generation(target, active_kind, active_fingerprint):
+                return target
+        return self._recover_staged_generation(active_kind, active_fingerprint)
+
+    def _recover_staged_generations(self, kind: CheckpointKind) -> None:
+        staging_parent = self.cache_root / "staging"
+        if not staging_parent.is_dir() or staging_parent.is_symlink():
+            return
+        fingerprints: set[str] = set()
+        for candidate in sorted(staging_parent.iterdir(), key=lambda item: item.name):
+            if not candidate.name.startswith(f"{kind.value}-"):
+                continue
+            try:
+                manifest = json.loads(
+                    (candidate / "manifest.json").read_text(encoding="utf-8")
+                )
+                fingerprint = _require_digest(
+                    manifest.get("fingerprint"),
+                    "fingerprint",
+                )
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                continue
+            if self._valid_generation(candidate, kind, fingerprint):
+                fingerprints.add(fingerprint)
+        for fingerprint in sorted(fingerprints):
+            self._recover_staged_generation(kind, fingerprint)
+
+    def _recover_staged_generation(
+        self,
+        kind: CheckpointKind,
+        fingerprint: str,
+    ) -> Path | None:
+        staging_parent = self.cache_root / "staging"
+        if not staging_parent.is_dir() or staging_parent.is_symlink():
             return None
-        if not self._valid_generation(target, active_kind, active_fingerprint):
-            return None
-        return target
+        target = self.cache_root / kind.value / fingerprint
+        for candidate in sorted(staging_parent.iterdir(), key=lambda item: item.name):
+            if not candidate.name.startswith(
+                f"{kind.value}-"
+            ) or not self._valid_generation(
+                candidate,
+                kind,
+                fingerprint,
+            ):
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if os.path.lexists(target) and not self._valid_generation(
+                target,
+                kind,
+                fingerprint,
+            ):
+                self._remove_owned_tree(target)
+            try:
+                self._promote_generation(
+                    candidate,
+                    target,
+                    kind=kind,
+                    fingerprint=fingerprint,
+                )
+            except FileExistsError:
+                if not self._valid_generation(target, kind, fingerprint):
+                    raise
+            if not self._valid_generation(target, kind, fingerprint):
+                raise ValueError("recovered cache generation failed verification")
+            self._remove_older_generations(kind, keep=target)
+            return target
+        return None
 
     def _ensure_owned_root(self, *, create: bool) -> bool:
         if not os.path.lexists(self.cache_root):

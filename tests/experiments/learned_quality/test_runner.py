@@ -119,6 +119,9 @@ def test_cached_service_composition_uses_one_store_for_restore_reconstruct_and_s
             self.input_identity = input_identity
             calls.append(("store", (cache_root, input_identity)))
 
+        def probe_drive_publication(self, *, run_id: str) -> None:
+            calls.append(("probe", run_id))
+
         def restore_pretraining(self, **kwargs: object) -> None:
             calls.append(("restore", kwargs["destination"]))
             return None
@@ -178,10 +181,11 @@ def test_cached_service_composition_uses_one_store_for_restore_reconstruct_and_s
 
     store = calls[0][1]
     assert store == (cache_root, "a" * 64)
-    assert calls[1] == ("restore", run_root / "pretraining-restored")
-    assert calls[2][0] == "reconstruct"
-    assert isinstance(calls[2][1], FakeStore)
-    assert calls[3] == ("save", run_root)
+    assert calls[1] == ("probe", "run")
+    assert calls[2] == ("restore", run_root / "pretraining-restored")
+    assert calls[3][0] == "reconstruct"
+    assert isinstance(calls[3][1], FakeStore)
+    assert calls[4] == ("save", run_root)
 
 
 def test_notebook_run_enables_full_stage_reporter_and_default_drive_cache(
