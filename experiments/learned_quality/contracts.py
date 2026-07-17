@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 RESULT_SUFFIX = "_learned_test_result"
 DIAGNOSTICS_SUFFIX = "_learned_test_diagnostics"
+CACHE_SUFFIX = "_learned_test_cache"
 GENERATOR_ID = "4dgs-studio.learned-quality-a100"
 
 
@@ -50,7 +51,7 @@ class LearnedQualityRunSpec(StrictModel):
         if any(unicodedata.category(character) == "Cc" for character in value):
             raise ValueError("Input folder cannot contain control characters")
         canonical = normalize_input_folder(value)
-        if canonical.endswith((RESULT_SUFFIX, DIAGNOSTICS_SUFFIX)):
+        if canonical.endswith((RESULT_SUFFIX, DIAGNOSTICS_SUFFIX, CACHE_SUFFIX)):
             raise ValueError("Choose the input folder, not an experiment output")
         return canonical
 
@@ -86,6 +87,10 @@ def derive_learned_result_path(input_folder: Path) -> Path:
 
 def derive_learned_diagnostics_root(input_folder: Path) -> Path:
     return input_folder.with_name(f"{input_folder.name}{DIAGNOSTICS_SUFFIX}")
+
+
+def derive_learned_cache_root(input_folder: Path) -> Path:
+    return input_folder.with_name(f"{input_folder.name}{CACHE_SUFFIX}")
 
 
 @dataclass(frozen=True)

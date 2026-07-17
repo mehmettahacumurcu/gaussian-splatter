@@ -15,6 +15,7 @@ from backend.static_pipeline.contracts import (
     SelectionManifest,
 )
 from experiments.learned_quality.contracts import (
+    CACHE_SUFFIX,
     DIAGNOSTICS_SUFFIX,
     GENERATOR_ID,
     RESULT_SUFFIX,
@@ -26,6 +27,7 @@ from experiments.learned_quality.contracts import (
     LearnedTrainingOutput,
     ModelRef,
     StageRecord,
+    derive_learned_cache_root,
     derive_learned_diagnostics_root,
     derive_learned_result_path,
     parse_learned_spec_json,
@@ -91,6 +93,9 @@ def test_learned_spec_is_strict() -> None:
         f"room{DIAGNOSTICS_SUFFIX}",
         f"captures/room{DIAGNOSTICS_SUFFIX}",
         f"MyDrive/captures/room{DIAGNOSTICS_SUFFIX}",
+        f"room{CACHE_SUFFIX}",
+        f"captures/room{CACHE_SUFFIX}",
+        f"MyDrive/captures/room{CACHE_SUFFIX}",
     ],
 )
 def test_learned_spec_rejects_unsafe_or_output_folders(input_folder: str) -> None:
@@ -130,11 +135,15 @@ def test_paths_are_exact_siblings(tmp_path: Path) -> None:
     assert derive_learned_diagnostics_root(source) == tmp_path / (
         "2026-11-room_learned_test_diagnostics"
     )
+    assert derive_learned_cache_root(source) == tmp_path / (
+        "2026-11-room_learned_test_cache"
+    )
 
 
 def test_constants_are_locked() -> None:
     assert RESULT_SUFFIX == "_learned_test_result"
     assert DIAGNOSTICS_SUFFIX == "_learned_test_diagnostics"
+    assert CACHE_SUFFIX == "_learned_test_cache"
     assert GENERATOR_ID == "4dgs-studio.learned-quality-a100"
 
 
