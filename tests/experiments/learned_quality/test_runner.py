@@ -145,7 +145,11 @@ def test_cached_service_composition_uses_one_store_for_restore_reconstruct_and_s
         calls.append(("reconstruct", kwargs["checkpoint_store"]))
         return SimpleNamespace()
 
-    context = LearnedQualityContext(reconstruct, model_manifest)
+    context = LearnedQualityContext(
+        reconstruct,
+        model_manifest,
+        model_preflight=lambda: calls.append(("model_preflight", None)),
+    )
     cache_root = tmp_path / "drive" / "room_learned_test_cache"
     services = make_learned_quality_services(context, cache_root=cache_root)
     source_inventory = SimpleNamespace(digest="a" * 64)
@@ -183,9 +187,10 @@ def test_cached_service_composition_uses_one_store_for_restore_reconstruct_and_s
     assert store == (cache_root, "a" * 64)
     assert calls[1] == ("probe", "run")
     assert calls[2] == ("restore", run_root / "pretraining-restored")
-    assert calls[3][0] == "reconstruct"
-    assert isinstance(calls[3][1], FakeStore)
-    assert calls[4] == ("save", run_root)
+    assert calls[3] == ("model_preflight", None)
+    assert calls[4][0] == "reconstruct"
+    assert isinstance(calls[4][1], FakeStore)
+    assert calls[5] == ("save", run_root)
 
 
 def test_notebook_run_enables_full_stage_reporter_and_default_drive_cache(
@@ -225,6 +230,7 @@ def test_notebook_run_enables_full_stage_reporter_and_default_drive_cache(
         "input_discovery",
         "runtime_preflight",
         "cache_restore",
+        "learned_model_preflight",
         "source_copy",
         "frame_selection",
         "reconstruction",

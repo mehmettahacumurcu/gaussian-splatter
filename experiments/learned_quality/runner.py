@@ -42,6 +42,7 @@ from .reports import finalize_learned_bundle, validate_learned_bundle
 
 LearnedReconstruct = Callable[..., LearnedReconstructionOutput]
 ContactSheetBuilder = Callable[..., Mapping[str, Path]]
+ModelPreflight = Callable[[], None]
 
 
 LEARNED_STAGE_DEFINITIONS = tuple(
@@ -50,6 +51,7 @@ LEARNED_STAGE_DEFINITIONS = tuple(
         ("input_discovery", "Input discovery and verification"),
         ("runtime_preflight", "A100 runtime preflight"),
         ("cache_restore", "Complete pre-training cache restore"),
+        ("learned_model_preflight", "Learned model loading preflight"),
         ("source_copy", "Source copy to local runtime"),
         ("frame_selection", "Smart frame selection"),
         ("reconstruction", "Learned reconstruction pipeline"),
@@ -93,6 +95,7 @@ _PRETRAINING_PRODUCER_PATHS = (
 )
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _PRETRAINING_SKIPPED_STAGES = (
+    "learned_model_preflight",
     "source_copy",
     "frame_selection",
     "reconstruction",
@@ -115,6 +118,7 @@ class LearnedQualityContext:
     reconstruct: LearnedReconstruct
     model_manifest_path: Path
     contact_sheet_builder: ContactSheetBuilder | None = None
+    model_preflight: ModelPreflight | None = None
 
 
 class _LearnedCacheSession:
@@ -472,6 +476,12 @@ def make_learned_quality_services(
                 if restored is not None:
                     for stage_id in _PRETRAINING_SKIPPED_STAGES:
                         reporter.skip(stage_id, "restored from verified Drive cache")
+            if restored is None and context.model_preflight is not None:
+                if reporter is None:
+                    context.model_preflight()
+                else:
+                    with reporter.stage("learned_model_preflight"):
+                        context.model_preflight()
             return restored
 
         def save_pretraining_impl(**kwargs: object) -> Path:
@@ -565,6 +575,20 @@ def _late_failure_files(run_root: Path, error: Exception) -> Mapping[str, Path]:
     return files
 
 
+def _preflight_sea_raft_model() -> None:
+    from .lifecycle import release_cuda_model
+    from .model_adapters import SeaRaftTorchAdapter
+
+    model = SeaRaftTorchAdapter(
+        Path("/content/learned-sources/sea-raft"),
+        Path(
+            "/content/learned-checkpoints/"
+            "MemorySlices--Tartan-C-T-TSKH-spring540x960-M"
+        ),
+    )
+    release_cuda_model(model)
+
+
 def _default_context() -> LearnedQualityContext:
     from .runtime import run_learned_reconstruction
 
@@ -576,6 +600,7 @@ def _default_context() -> LearnedQualityContext:
     return LearnedQualityContext(
         reconstruct=run_learned_reconstruction,
         model_manifest_path=manifest,
+        model_preflight=_preflight_sea_raft_model,
     )
 
 

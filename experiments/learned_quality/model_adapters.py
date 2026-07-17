@@ -198,11 +198,30 @@ class SeaRaftTorchAdapter:
             if entry not in sys.path:
                 sys.path.insert(0, entry)
         from raft import RAFT
+        from safetensors.torch import load_file
 
         self.args = _sea_args(source)
-        self.model = RAFT.from_pretrained(
-            str(checkpoint), args=self.args, local_files_only=True
-        ).to(device)
+        checkpoint_file = checkpoint / "model.safetensors"
+        if not checkpoint_file.is_file():
+            raise FileNotFoundError(checkpoint_file)
+        self.model = RAFT(self.args)
+        state = load_file(checkpoint_file, device="cpu")
+        incompatible = self.model.load_state_dict(state, strict=False)
+        missing = set(incompatible.missing_keys)
+        unexpected = set(incompatible.unexpected_keys)
+        missing_learned_state = {
+            key for key in missing if not key.endswith(".num_batches_tracked")
+        }
+        if missing_learned_state:
+            raise RuntimeError(
+                "SEA-RAFT checkpoint is missing learned weight or required buffer: "
+                f"{sorted(missing_learned_state)}"
+            )
+        if unexpected:
+            raise RuntimeError(
+                "SEA-RAFT checkpoint has unexpected state: " f"{sorted(unexpected)}"
+            )
+        self.model.to(device)
         self.model.eval()
         self.device = device
 
