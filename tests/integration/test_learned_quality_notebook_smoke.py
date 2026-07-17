@@ -42,6 +42,9 @@ def test_notebook_is_deterministic_run_all_safe_and_pinned() -> None:
     assert notebook.cells[2].source.find("A100") >= 0
     assert "drive.mount" in notebook.cells[3].source
     assert "input(" in notebook.cells[4].source
+    assert "_learned_test_cache" in notebook.cells[4].source
+    assert "Pre-training cache:" in notebook.cells[4].source
+    assert "CACHE_PATH" in notebook.cells[4].source
     assert commit in notebook.cells[5].source
     assert re.fullmatch(r"[0-9a-f]{40}", commit)
     assert "static_notebook_bootstrap.sh" in notebook.cells[6].source

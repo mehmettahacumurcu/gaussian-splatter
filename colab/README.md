@@ -100,6 +100,22 @@ the learned experiment beside the capture as:
 MyDrive/<input_folder>_learned_test_result/
 ```
 
+Before Gaussian training starts, it also publishes an owned, hash-verified recovery
+cache beside the capture:
+
+```text
+MyDrive/<input_folder>_learned_test_cache/
+```
+
+The notebook prints every preprocessing stage as it runs, including heartbeats during
+quiet COLMAP work. The cache has two recovery boundaries: verified COLMAP geometry and
+the complete pre-training state. If training or a later stage fails, rerunning the same
+pinned notebook with the unchanged input restores valid work into fresh local Colab
+storage and proceeds without repeating the cached stages. Changed inputs, model pins,
+preprocessing settings, tools, or preprocessing code cause a visible cache miss and safe
+recomputation; incomplete or modified cache files are never trusted. Do not select the
+`_learned_test_cache` folder as notebook input.
+
 Compare that folder with the existing `MyDrive/<input_folder>_result/`. Inspect
 `experiment_report.json`, `quality_report.json`, and the four images under
 `diagnostics/`: masks, depth, geometry, and final render contact sheets. The output

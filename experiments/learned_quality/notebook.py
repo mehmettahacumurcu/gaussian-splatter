@@ -71,17 +71,20 @@ def build_learned_quality_notebook(
             "assert not folder.is_absolute() and folder.parts\n"
             "assert all(part not in {'', '.', '..'} for part in folder.parts)\n"
             "assert not raw_folder.endswith(('_result', '_learned_test_result', "
-            "'_learned_test_diagnostics'))\n"
+            "'_learned_test_diagnostics', '_learned_test_cache'))\n"
             "INPUT_PATH = DRIVE_ROOT.joinpath(*folder.parts).resolve()\n"
             "INPUT_PATH.relative_to(DRIVE_ROOT)\n"
             "assert INPUT_PATH.is_dir(), f'Input folder does not exist: {INPUT_PATH}'\n"
+            "RESULT_PATH = INPUT_PATH.with_name(INPUT_PATH.name + '_learned_test_result')\n"
+            "CACHE_PATH = INPUT_PATH.with_name(INPUT_PATH.name + '_learned_test_cache')\n"
             "RUN_SPEC = {'schema_version': 1, 'input_folder': folder.as_posix(), "
             "'publish': {'replace_owned_result': True}}\n"
             "SPEC_PATH = Path('/content/learned_spec.json')\n"
             "with SPEC_PATH.open('w', encoding='utf-8') as handle:\n"
             "    json.dump(RUN_SPEC, handle, sort_keys=True, separators=(',', ':'))\n"
             "print(f'Input: {INPUT_PATH}')\n"
-            "print(f'Result: {INPUT_PATH.with_name(INPUT_PATH.name + \"_learned_test_result\")}')\n",
+            "print(f'Pre-training cache: {CACHE_PATH}')\n"
+            "print(f'Result: {RESULT_PATH}')\n",
             metadata=_tag("path-spec"),
         ),
         nbformat.v4.new_code_cell(
@@ -170,9 +173,8 @@ def build_learned_quality_notebook(
             "        if diagnostics:\n"
             "            print(f'Failure diagnostics: {diagnostics}')\n"
             "        raise RuntimeError(f'Learned-quality run failed: {receipt}')\n"
-            "    expected = INPUT_PATH.with_name(\n"
-            "        INPUT_PATH.name + '_learned_test_result'\n"
-            "    ).resolve()\n"
+            "    assert RESULT_PATH.name.endswith('_learned_test_result')\n"
+            "    expected = RESULT_PATH.resolve()\n"
             "    actual = Path(receipt['final_path']).resolve()\n"
             "    if actual != expected:\n"
             "        raise RuntimeError(f'Unexpected result path: {actual}')\n"
