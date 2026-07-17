@@ -52,7 +52,7 @@ Do not claim Luma parity or a visual improvement until the learned output is com
 with the untouched legacy output and the four contact sheets show no systematic
 corruption.
 
-## Resume point: COLMAP startup failure (2026-07-17)
+## Resolved: COLMAP startup failure (2026-07-17)
 
 The first corrected A100 room run passed the iPhone MOV compatibility probe, then
 failed before training while validating the installed COLMAP executable:
@@ -68,6 +68,10 @@ Command '('/usr/local/bin/colmap', '--version')' returned non-zero exit status 1
 - Error type: `CalledProcessError`
 - Runtime was flushed, unmounted, and released correctly after the failure.
 
-Resume by inspecting the captured diagnostics and COLMAP's stderr/runtime
-dependencies. Do not rerun the full A100 experiment until `colmap --version` is
-verified inside the same generated Colab environment.
+The pinned CUDA build supports `colmap -h` but rejects `colmap --version` with
+exit status 1. Runtime commit `d130d92531be5f805acaaef4c4681f10ca287cd2`
+now probes the supported help command and extracts the version banner from its
+stdout or stderr. The generated notebook is pinned to that runtime commit.
+
+The next acceptance step is a fresh A100 run that confirms COLMAP advances past
+the version probe and begins reconstruction.
