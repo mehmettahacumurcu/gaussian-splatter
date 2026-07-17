@@ -25,6 +25,10 @@ ColmapProgressCallback = Callable[[float, str], None]
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _FRAME_ID_PATTERN = re.compile(r"[0-9a-f]{24}")
 _OUTPUT_NAME_PATTERN = re.compile(r"frame_[0-9]{6}\.png")
+_COLMAP_VERSION_LINE_PATTERN = re.compile(
+    r"\bCOLMAP\s+[0-9]+(?:\.[0-9]+)+",
+    re.IGNORECASE,
+)
 _CONVERTED_MODEL_FILES = ("cameras.txt", "images.txt", "points3D.txt")
 _MANIFEST_KEYS = {
     "schema_version",
@@ -93,6 +97,15 @@ def _resolve_colmap_executable(colmap_exe: str | Path | None) -> str:
     if resolved is None:
         raise RuntimeError("COLMAP executable was not found")
     return resolved
+
+
+def _colmap_version_from_help(completed: subprocess.CompletedProcess[str]) -> str:
+    for output in (completed.stdout, completed.stderr):
+        for line in (output or "").splitlines():
+            candidate = line.strip()
+            if _COLMAP_VERSION_LINE_PATTERN.search(candidate) is not None:
+                return candidate
+    raise RuntimeError("COLMAP help did not report a version")
 
 
 def _path_identity(path: Path) -> tuple[int, int, int] | None:
@@ -741,16 +754,12 @@ def run_colmap_attempt(
     selection_digest = _read_selection_digest(frames)
     executable = _resolve_colmap_executable(colmap_exe)
     version_result = subprocess.run(
-        (executable, "--version"),
+        (executable, "-h"),
         check=True,
         capture_output=True,
         text=True,
     )
-    stdout_version = (version_result.stdout or "").strip()
-    stderr_version = (version_result.stderr or "").strip()
-    colmap_version = stdout_version or stderr_version
-    if not colmap_version:
-        raise RuntimeError("COLMAP did not report a version")
+    colmap_version = _colmap_version_from_help(version_result)
 
     attempt.mkdir(parents=True, exist_ok=False)
     attempt_identity = _directory_identity(attempt)

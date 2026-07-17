@@ -612,7 +612,7 @@ def test_attempt_runs_fresh_commands_converts_every_model_and_fingerprints_selec
         assert check is True
         assert isinstance(command, tuple)
         commands.append(command)
-        if command[1] == "--version":
+        if command[1] == "-h":
             assert kwargs == {"capture_output": True, "text": True}
             return subprocess.CompletedProcess(
                 command,
@@ -663,7 +663,7 @@ def test_attempt_runs_fresh_commands_converts_every_model_and_fingerprints_selec
     assert len(converters) == 2
     assert all(command[-2:] == ("--output_type", "TXT") for command in converters)
     assert [command[1] for command in commands[:4]] == [
-        "--version",
+        "-h",
         "feature_extractor",
         "sequential_matcher",
         "mapper",
@@ -736,7 +736,7 @@ def test_progress_stays_monotonic_with_many_sparse_models(
         **_kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         assert check is True
-        if command[1] == "--version":
+        if command[1] == "-h":
             return subprocess.CompletedProcess(command, 0, stdout="COLMAP 3.11")
         if command[1] == "feature_extractor":
             (attempt / "colmap.db").write_bytes(b"database")
@@ -781,7 +781,7 @@ def test_attempt_fails_when_colmap_produces_no_sparse_model(
         return subprocess.CompletedProcess(
             command,
             0,
-            stdout="COLMAP 3.11\n" if command[1] == "--version" else "",
+            stdout="COLMAP 3.11\n" if command[1] == "-h" else "",
             stderr="",
         )
 
@@ -811,7 +811,7 @@ def _successful_attempt_run(
         **_kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         assert check is True
-        if command[1] == "--version":
+        if command[1] == "-h":
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -829,6 +829,54 @@ def _successful_attempt_run(
         return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
     return fake_run
+
+
+def test_version_probe_uses_colmap_311_help_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frames = _write_selected_frames(tmp_path / "frames")
+    attempt = tmp_path / "attempt"
+    commands: list[tuple[str, ...]] = []
+    successful_run = _successful_attempt_run(attempt)
+
+    def fake_run(
+        command: tuple[str, ...],
+        *,
+        check: bool,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        if command[1] == "--version":
+            raise subprocess.CalledProcessError(1, command)
+        if command[1] == "-h":
+            assert check is True
+            assert kwargs == {"capture_output": True, "text": True}
+            return subprocess.CompletedProcess(
+                command,
+                0,
+                stdout=(
+                    "COLMAP 3.11.1 -- Structure-from-Motion and "
+                    "Multi-View Stereo (with CUDA)\n\nUsage:\n"
+                ),
+                stderr="",
+            )
+        return successful_run(command, check=check, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = run_colmap_attempt(
+        frames,
+        attempt,
+        choose_colmap_policy(use_gpu=True, selected_count=1, attempt_index=0),
+        colmap_exe="colmap",
+    )
+
+    assert commands[0] == ("colmap", "-h")
+    assert all(command[1] != "--version" for command in commands)
+    assert result.colmap_version == (
+        "COLMAP 3.11.1 -- Structure-from-Motion and Multi-View Stereo (with CUDA)"
+    )
 
 
 def test_version_uses_trimmed_stderr_when_stdout_is_whitespace(
@@ -934,7 +982,7 @@ def test_failed_attempt_is_preserved_and_cannot_be_reused(
         nonlocal calls
         assert check is True
         calls += 1
-        if command[1] == "--version":
+        if command[1] == "-h":
             return subprocess.CompletedProcess(command, 0, stdout="COLMAP 3.11")
         if command[1] == "feature_extractor":
             (attempt / "colmap.db").write_bytes(b"database")
@@ -1113,7 +1161,7 @@ def test_attempt_revalidates_selected_frames_after_progress_callback(
         nonlocal subprocess_calls
         assert check is True
         subprocess_calls += 1
-        if command[1] == "--version":
+        if command[1] == "-h":
             return subprocess.CompletedProcess(command, 0, stdout="COLMAP 3.11")
         if command[1] == "feature_extractor":
             image_root = Path(command[command.index("--image_path") + 1])
@@ -1171,7 +1219,7 @@ def test_attempt_rejects_database_injected_by_progress_callback(
         nonlocal subprocess_calls
         assert check is True
         subprocess_calls += 1
-        if command[1] == "--version":
+        if command[1] == "-h":
             return subprocess.CompletedProcess(command, 0, stdout="COLMAP 3.11")
         if command[1] == "feature_extractor":
             assert (attempt / "colmap.db").read_bytes() == b"stale-database"
@@ -1223,7 +1271,7 @@ def test_attempt_rejects_in_place_database_overwrite_before_matcher(
         nonlocal subprocess_calls
         assert check is True
         subprocess_calls += 1
-        if command[1] == "--version":
+        if command[1] == "-h":
             return subprocess.CompletedProcess(command, 0, stdout="COLMAP 3.11")
         if command[1] == "feature_extractor":
             (attempt / "colmap.db").write_bytes(b"feature-database")
@@ -1270,7 +1318,7 @@ def test_attempt_revalidates_converted_outputs_after_progress_callback(
         **_kwargs: object,
     ) -> subprocess.CompletedProcess[str]:
         assert check is True
-        if command[1] == "--version":
+        if command[1] == "-h":
             return subprocess.CompletedProcess(command, 0, stdout="COLMAP 3.11")
         if command[1] == "feature_extractor":
             (attempt / "colmap.db").write_bytes(b"database")
