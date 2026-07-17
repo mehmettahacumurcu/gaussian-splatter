@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ from backend.static_pipeline.runner import (
     HardwareInfo,
     MetadataPreviewOutput,
     NotebookRuntimePaths,
+    PretrainingRestore,
     RunnerServices,
     RuntimePreflightError,
     SelectionOutput,
@@ -23,6 +25,27 @@ from backend.static_pipeline.runner import (
     run_static_notebook,
 )
 from backend.static_pipeline.publish import validate_bundle
+from backend.static_pipeline.progress import StageDefinition, StageReporter
+
+
+RUNNER_STAGE_DEFINITIONS = tuple(
+    StageDefinition(stage_id, label)
+    for stage_id, label in (
+        ("input_discovery", "Input discovery"),
+        ("runtime_preflight", "Runtime preflight"),
+        ("cache_restore", "Pre-training cache restore"),
+        ("source_copy", "Source copy"),
+        ("frame_selection", "Frame selection"),
+        ("reconstruction", "Reconstruction"),
+        ("pretraining_cache_save", "Pre-training cache save"),
+        ("gaussian_training", "Gaussian training"),
+        ("polish", "Splat polish"),
+        ("metadata_preview", "Metadata and preview"),
+        ("report_assembly", "Report assembly"),
+        ("bundle_validation", "Bundle validation"),
+        ("result_publication", "Drive result publication"),
+    )
+)
 
 
 def test_balanced_l4_accepts_24gb_and_rejects_clearly_unsafe_vram() -> None:
@@ -168,6 +191,171 @@ def test_gate_failure_publishes_diagnostics_but_never_trains(tmp_path: Path) -> 
     assert "train" not in calls
     assert "publish" not in calls
     assert calls[-1] == "publish_diagnostics"
+
+
+def test_complete_pretraining_restore_skips_copy_selection_and_reconstruction(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    services = _services(calls)
+    restored_selection = SimpleNamespace(
+        inventory=SimpleNamespace(digest="a" * 64),
+        image_set_digest="b" * 64,
+    )
+    restored_reconstruction = SimpleNamespace(
+        decision=SimpleNamespace(passed=True, failures=()),
+    )
+
+    def restore_pretraining(**kwargs: object) -> PretrainingRestore:
+        assert Path(kwargs["run_root"]).parent == tmp_path / "work"
+        calls.append("restore_pretraining")
+        return PretrainingRestore(restored_selection, restored_reconstruction)
+
+    services = RunnerServices(
+        **{
+            **services.__dict__,
+            "restore_pretraining": restore_pretraining,
+        }
+    )
+
+    run_static_notebook(
+        StaticNotebookRunSpec(input_folder="captures/room"),
+        runtime_paths=NotebookRuntimePaths(tmp_path / "drive", tmp_path / "work"),
+        services=services,
+    )
+
+    assert "restore_pretraining" in calls
+    assert "copy_input" not in calls
+    assert "select" not in calls
+    assert "colmap_gate" not in calls
+    assert calls.index("restore_pretraining") < calls.index("train")
+
+
+def test_verified_pretraining_is_saved_before_training(tmp_path: Path) -> None:
+    calls: list[str] = []
+    services = _services(calls)
+
+    def save_pretraining(**kwargs: object) -> None:
+        assert kwargs["selection"] is not None
+        assert kwargs["reconstruction"] is not None
+        calls.append("save_pretraining")
+
+    services = RunnerServices(
+        **{
+            **services.__dict__,
+            "save_pretraining": save_pretraining,
+        }
+    )
+
+    run_static_notebook(
+        StaticNotebookRunSpec(input_folder="captures/room"),
+        runtime_paths=NotebookRuntimePaths(tmp_path / "drive", tmp_path / "work"),
+        services=services,
+    )
+
+    assert calls.index("colmap_gate") < calls.index("save_pretraining")
+    assert calls.index("save_pretraining") < calls.index("train")
+
+
+def test_pretraining_save_failure_publishes_diagnostics_and_prevents_training(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    services = _services(calls)
+
+    def fail_save(**_kwargs: object) -> None:
+        calls.append("save_pretraining")
+        raise RuntimeError("Drive cache publication failed")
+
+    services = RunnerServices(
+        **{
+            **services.__dict__,
+            "save_pretraining": fail_save,
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="Drive cache publication failed"):
+        run_static_notebook(
+            StaticNotebookRunSpec(input_folder="captures/room"),
+            runtime_paths=NotebookRuntimePaths(
+                tmp_path / "drive",
+                tmp_path / "work",
+            ),
+            services=services,
+        )
+
+    assert "train" not in calls
+    assert calls[-1] == "publish_diagnostics"
+
+
+def test_runner_prints_live_top_level_stages_and_writes_jsonl(tmp_path: Path) -> None:
+    output = StringIO()
+    reporter = StageReporter(RUNNER_STAGE_DEFINITIONS, stream=output)
+    work = tmp_path / "work"
+
+    run_static_notebook(
+        StaticNotebookRunSpec(input_folder="captures/room"),
+        runtime_paths=NotebookRuntimePaths(tmp_path / "drive", work),
+        services=_services([]),
+        reporter=reporter,
+    )
+
+    lines = output.getvalue().splitlines()
+    assert any("START Input discovery" in line for line in lines)
+    assert any("DONE  Reconstruction" in line for line in lines)
+    assert any("START Gaussian training" in line for line in lines)
+    assert any("DONE  Drive result publication" in line for line in lines)
+    progress_logs = tuple(work.glob("*/logs/progress.jsonl"))
+    assert len(progress_logs) == 1
+    rows = [
+        json.loads(line)
+        for line in progress_logs[0].read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows[0]["stage_id"] == "input_discovery"
+    assert rows[-1]["stage_id"] == "result_publication"
+
+
+def test_runner_publishes_progress_log_with_failure_diagnostics(
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, Path] = {}
+    services = _services([], gate_failure=True)
+
+    def publish_diagnostics(
+        _input_path: Path,
+        _run_id: str,
+        files: dict[str, Path],
+    ) -> Path:
+        captured.update(files)
+        return tmp_path / "diagnostics"
+
+    services = RunnerServices(
+        **{
+            **services.__dict__,
+            "publish_diagnostics": publish_diagnostics,
+        }
+    )
+
+    with pytest.raises(ReconstructionGateError):
+        run_static_notebook(
+            StaticNotebookRunSpec(input_folder="captures/room"),
+            runtime_paths=NotebookRuntimePaths(
+                tmp_path / "drive",
+                tmp_path / "work",
+            ),
+            services=services,
+            reporter=StageReporter(RUNNER_STAGE_DEFINITIONS, stream=StringIO()),
+        )
+
+    assert "logs/progress.jsonl" in captured
+    rows = [
+        json.loads(line)
+        for line in captured["logs/progress.jsonl"]
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert rows[-1]["stage_id"] == "reconstruction"
+    assert rows[-1]["status"] == "fail"
 
 
 def test_smart_and_fixed_share_identical_downstream_spec(tmp_path: Path) -> None:

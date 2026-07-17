@@ -8,6 +8,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -17,6 +18,8 @@ from backend.notebooks.presets import get_notebook_profile
 
 if TYPE_CHECKING:
     from backend.notebooks.models import StaticNotebookRunSpec
+
+    from .progress import StageReporter
 
 
 class RuntimePreflightError(RuntimeError):
@@ -93,6 +96,12 @@ class ReconstructionOutput:
 
 
 @dataclass(frozen=True)
+class PretrainingRestore:
+    selection: object
+    reconstruction: object
+
+
+@dataclass(frozen=True)
 class RunnerServices:
     discover_source: Callable[..., object]
     copy_input: Callable[..., object]
@@ -108,6 +117,8 @@ class RunnerServices:
     preflight: Callable[..., object]
     assemble_reports: Callable[..., Path]
     resolve_input: Callable[..., Path | None] | None = None
+    restore_pretraining: Callable[..., PretrainingRestore | None] | None = None
+    save_pretraining: Callable[..., object] | None = None
 
 
 def runtime_paths_from_env() -> NotebookRuntimePaths:
@@ -719,6 +730,9 @@ def _failure_diagnostic_files(
         "quality_report.json": quality_path,
         "uncovered_intervals.json": uncovered_path,
     }
+    progress_path = run_root / "logs" / "progress.jsonl"
+    if progress_path.is_file():
+        files["logs/progress.jsonl"] = progress_path
 
     frames_dir = getattr(selection, "frames_dir", None)
     manifest = getattr(selection, "manifest", None)
@@ -771,17 +785,52 @@ def _production_services() -> RunnerServices:
     )
 
 
+@contextmanager
+def _reported_stage(
+    reporter: StageReporter | None,
+    stage_id: str,
+    *,
+    summary: Callable[[], str | None] | None = None,
+):
+    if reporter is None:
+        yield
+        return
+    with reporter.stage(stage_id, summary=summary):
+        yield
+
+
 def run_static_notebook(
     spec: StaticNotebookRunSpec,
     *,
     runtime_paths: NotebookRuntimePaths | None = None,
     services: RunnerServices | None = None,
+    reporter: StageReporter | None = None,
+) -> NotebookRunResult:
+    from .progress import use_stage_reporter
+
+    with use_stage_reporter(reporter):
+        return _run_static_notebook_with_context(
+            spec,
+            runtime_paths=runtime_paths,
+            services=services,
+            reporter=reporter,
+        )
+
+
+def _run_static_notebook_with_context(
+    spec: StaticNotebookRunSpec,
+    *,
+    runtime_paths: NotebookRuntimePaths | None,
+    services: RunnerServices | None,
+    reporter: StageReporter | None,
 ) -> NotebookRunResult:
     paths = runtime_paths or runtime_paths_from_env()
     boundaries = services or _production_services()
     run_id = uuid.uuid4().hex
     run_root = Path(paths.work_root) / run_id
     run_root.mkdir(parents=True, exist_ok=False)
+    if reporter is not None:
+        reporter.bind_log(run_root / "logs" / "progress.jsonl", run_id=run_id)
     timings: dict[str, float] = {}
     run_started = time.perf_counter()
     publish_input_path = (
@@ -791,60 +840,93 @@ def run_static_notebook(
     )
 
     stage_started = time.perf_counter()
-    input_path = _resolve_drive_input(spec, paths, boundaries.resolve_input)
-    timings["resolve_input_seconds"] = time.perf_counter() - stage_started
-    stage_started = time.perf_counter()
-    try:
-        source_inventory = boundaries.discover_source(input_path)
-    except Exception as exc:
-        files = _failure_diagnostic_files(run_root, exc, None)
+    with _reported_stage(reporter, "input_discovery"):
+        input_path = _resolve_drive_input(spec, paths, boundaries.resolve_input)
+        timings["resolve_input_seconds"] = time.perf_counter() - stage_started
+        stage_started = time.perf_counter()
         try:
-            diagnostics = boundaries.publish_diagnostics(
-                publish_input_path, run_id, files
-            )
-            setattr(exc, "diagnostics_path", diagnostics)
-        except Exception as diagnostics_exc:
-            exc.add_note(f"diagnostics publication failed: {diagnostics_exc}")
-        raise
-    timings["discover_seconds"] = time.perf_counter() - stage_started
-    hardware = boundaries.inspect_hardware(paths)
+            source_inventory = boundaries.discover_source(input_path)
+        except Exception as exc:
+            files = _failure_diagnostic_files(run_root, exc, None)
+            try:
+                diagnostics = boundaries.publish_diagnostics(
+                    publish_input_path, run_id, files
+                )
+                setattr(exc, "diagnostics_path", diagnostics)
+            except Exception as diagnostics_exc:
+                exc.add_note(f"diagnostics publication failed: {diagnostics_exc}")
+            raise
+        timings["discover_seconds"] = time.perf_counter() - stage_started
     stage_started = time.perf_counter()
-    boundaries.preflight(
-        spec,
-        hardware,
-        input_size_gb=_input_size_gb(source_inventory),
-    )
+    with _reported_stage(reporter, "runtime_preflight"):
+        hardware = boundaries.inspect_hardware(paths)
+        boundaries.preflight(
+            spec,
+            hardware,
+            input_size_gb=_input_size_gb(source_inventory),
+        )
     timings["preflight_seconds"] = time.perf_counter() - stage_started
 
     local_input = run_root / "input"
     selection: object | None = None
+    reconstruction: object | None = None
     try:
-        stage_started = time.perf_counter()
-        copied_inventory = boundaries.copy_input(input_path, local_input)
-        timings["copy_input_seconds"] = time.perf_counter() - stage_started
-        if _inventory_signature(copied_inventory) != _inventory_signature(
-            source_inventory
-        ):
-            raise ValueError("copied input inventory differs from the Drive source")
+        restored: PretrainingRestore | None = None
+        if boundaries.restore_pretraining is not None:
+            stage_started = time.perf_counter()
+            with _reported_stage(reporter, "cache_restore"):
+                restored = boundaries.restore_pretraining(
+                    source_inventory=source_inventory,
+                    spec=spec,
+                    hardware=hardware,
+                    run_root=run_root,
+                )
+            timings["restore_pretraining_seconds"] = time.perf_counter() - stage_started
+        if restored is not None:
+            selection = restored.selection
+            reconstruction = restored.reconstruction
+        else:
+            stage_started = time.perf_counter()
+            with _reported_stage(reporter, "source_copy"):
+                copied_inventory = boundaries.copy_input(input_path, local_input)
+            timings["copy_input_seconds"] = time.perf_counter() - stage_started
+            if _inventory_signature(copied_inventory) != _inventory_signature(
+                source_inventory
+            ):
+                raise ValueError("copied input inventory differs from the Drive source")
 
-        stage_started = time.perf_counter()
-        selection = boundaries.select_frames(
-            copied_inventory,
-            spec=spec,
-            output_root=run_root / "selection",
-        )
-        timings["selection_seconds"] = time.perf_counter() - stage_started
-        stage_started = time.perf_counter()
-        reconstruction = boundaries.reconstruct(
-            selection,
-            spec=spec,
-            hardware=hardware,
-            output_root=run_root / "reconstruction",
-        )
+            stage_started = time.perf_counter()
+            with _reported_stage(reporter, "frame_selection"):
+                selection = boundaries.select_frames(
+                    copied_inventory,
+                    spec=spec,
+                    output_root=run_root / "selection",
+                )
+            timings["selection_seconds"] = time.perf_counter() - stage_started
+            stage_started = time.perf_counter()
+            with _reported_stage(reporter, "reconstruction"):
+                reconstruction = boundaries.reconstruct(
+                    selection,
+                    spec=spec,
+                    hardware=hardware,
+                    output_root=run_root / "reconstruction",
+                )
+            timings["reconstruction_seconds"] = time.perf_counter() - stage_started
         decision = getattr(reconstruction, "decision", None)
         if decision is None or not decision.passed or decision.failures:
             raise RuntimeError("reconstruction service returned a non-passing decision")
-        timings["reconstruction_seconds"] = time.perf_counter() - stage_started
+        if restored is None and boundaries.save_pretraining is not None:
+            stage_started = time.perf_counter()
+            with _reported_stage(reporter, "pretraining_cache_save"):
+                boundaries.save_pretraining(
+                    source_inventory=source_inventory,
+                    selection=selection,
+                    reconstruction=reconstruction,
+                    spec=spec,
+                    hardware=hardware,
+                    run_root=run_root,
+                )
+            timings["save_pretraining_seconds"] = time.perf_counter() - stage_started
     except Exception as exc:
         files = _failure_diagnostic_files(run_root, exc, selection)
         try:
@@ -859,60 +941,66 @@ def run_static_notebook(
         raise
     os.environ["FOURDGS_DATA_ROOT"] = str(run_root / "training-data")
     stage_started = time.perf_counter()
-    training = boundaries.train(
-        reconstruction,
-        spec=spec,
-        selection=selection,
-        run_id=run_id,
-        output_root=run_root / "training",
-    )
+    with _reported_stage(reporter, "gaussian_training"):
+        training = boundaries.train(
+            reconstruction,
+            spec=spec,
+            selection=selection,
+            run_id=run_id,
+            output_root=run_root / "training",
+        )
     timings["training_seconds"] = time.perf_counter() - stage_started
     stage_started = time.perf_counter()
-    polish = boundaries.polish(
-        training,
-        reconstruction=reconstruction,
-        spec=spec,
-        selection=selection,
-        output_root=run_root / "polish",
-    )
+    with _reported_stage(reporter, "polish"):
+        polish = boundaries.polish(
+            training,
+            reconstruction=reconstruction,
+            spec=spec,
+            selection=selection,
+            output_root=run_root / "polish",
+        )
     timings["polish_seconds"] = time.perf_counter() - stage_started
     stage_started = time.perf_counter()
-    metadata_preview = boundaries.build_metadata_preview(
-        polish,
-        reconstruction=reconstruction,
-        spec=spec,
-        output_root=run_root / "metadata",
-    )
+    with _reported_stage(reporter, "metadata_preview"):
+        metadata_preview = boundaries.build_metadata_preview(
+            polish,
+            reconstruction=reconstruction,
+            spec=spec,
+            output_root=run_root / "metadata",
+        )
     timings["metadata_preview_seconds"] = time.perf_counter() - stage_started
     bundle_root = run_root / "bundle"
     timings["total_before_reports_seconds"] = time.perf_counter() - run_started
     stage_started = time.perf_counter()
-    bundle = Path(
-        boundaries.assemble_reports(
-            spec=spec,
-            run_id=run_id,
-            source_inventory=source_inventory,
-            selection=selection,
-            reconstruction=reconstruction,
-            training=training,
-            polish=polish,
-            metadata_preview=metadata_preview,
-            hardware=hardware,
-            timings=timings,
-            bundle_root=bundle_root,
+    with _reported_stage(reporter, "report_assembly"):
+        bundle = Path(
+            boundaries.assemble_reports(
+                spec=spec,
+                run_id=run_id,
+                source_inventory=source_inventory,
+                selection=selection,
+                reconstruction=reconstruction,
+                training=training,
+                polish=polish,
+                metadata_preview=metadata_preview,
+                hardware=hardware,
+                timings=timings,
+                bundle_root=bundle_root,
+            )
         )
-    )
     timings["report_assembly_seconds"] = time.perf_counter() - stage_started
     stage_started = time.perf_counter()
-    boundaries.validate_bundle(bundle, run_id=run_id)
+    with _reported_stage(reporter, "bundle_validation"):
+        boundaries.validate_bundle(bundle, run_id=run_id)
     timings["bundle_validation_seconds"] = time.perf_counter() - stage_started
     stage_started = time.perf_counter()
-    receipt = boundaries.publish_result(
-        bundle,
-        publish_input_path,
-        run_id=run_id,
-        replace_owned_result=spec.publish.replace_owned_result,
-    )
+    with _reported_stage(reporter, "result_publication"):
+        receipt = boundaries.publish_result(
+            bundle,
+            publish_input_path,
+            run_id=run_id,
+            replace_owned_result=spec.publish.replace_owned_result,
+        )
     timings["publish_seconds"] = time.perf_counter() - stage_started
     return NotebookRunResult(
         run_id=run_id,
