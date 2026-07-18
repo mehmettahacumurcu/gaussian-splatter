@@ -214,6 +214,7 @@ def _selection_milestone_ref(
     hardware: HardwareInfo,
     model_manifest_path: Path,
 ) -> MilestoneRef:
+    del model_manifest_path
     source_digest = getattr(source_inventory, "digest", None)
     return MilestoneRef(
         CheckpointKind.SELECTION,
@@ -223,7 +224,9 @@ def _selection_milestone_ref(
                 source_digest=source_digest,
                 selection_digest=source_digest,
                 settings=_pretraining_settings(spec, hardware)["frame_selection"],
-                model_manifest_sha256=_sha256_path(model_manifest_path),
+                # Frame selection has no learned-model input. A neutral digest lets
+                # the CPU audit and A100 runtime address the exact same selection.
+                model_manifest_sha256="0" * 64,
                 tool_versions={"python": platform.python_version()},
                 producer_code_sha256=producer_code_digest(
                     _REPOSITORY_ROOT,
@@ -500,12 +503,46 @@ def make_learned_quality_services(
                     str(cache_session.cache_root),
                 )
             if restored is None:
-                return None
+                raise RuntimeError(
+                    "A verified CPU cache audit selection is required; run the CPU "
+                    "cache audit notebook before starting an A100 session"
+                )
             if not isinstance(restored.value, SelectionOutput):
                 raise ValueError("selection milestone restored the wrong state type")
             selection = restored.value
             if selection.inventory is not source_inventory:
                 raise ValueError("selection milestone inventory is not current")
+            from .audit import make_audit_inputs, require_audit_receipt
+            from .runtime import _colmap_cache_fingerprints
+            from .tracks import TrackQualificationPolicy
+
+            audit_error: RuntimeError | None = None
+            for colmap_fingerprint in _colmap_cache_fingerprints(
+                selection,
+                hardware,
+                context.model_manifest_path,
+            ):
+                expected = make_audit_inputs(
+                    input_digest=source_inventory.digest,
+                    selection_digest=selection.manifest.image_set_digest,
+                    colmap_fingerprint=colmap_fingerprint,
+                    policy=TrackQualificationPolicy(),
+                    repository_root=_REPOSITORY_ROOT,
+                )
+                try:
+                    require_audit_receipt(cache_session.cache_root, expected=expected)
+                    audit_error = None
+                    break
+                except RuntimeError as error:
+                    audit_error = error
+            if audit_error is not None:
+                raise audit_error
+            if context.model_preflight is not None:
+                if reporter is None:
+                    context.model_preflight()
+                else:
+                    with reporter.stage("learned_model_preflight"):
+                        context.model_preflight()
             return selection
 
         def save_selection_impl(**kwargs: object) -> Path:
@@ -606,12 +643,6 @@ def make_learned_quality_services(
                 if restored is not None:
                     for stage_id in _PRETRAINING_SKIPPED_STAGES:
                         reporter.skip(stage_id, "restored from verified Drive cache")
-            if restored is None and context.model_preflight is not None:
-                if reporter is None:
-                    context.model_preflight()
-                else:
-                    with reporter.stage("learned_model_preflight"):
-                        context.model_preflight()
             return restored
 
         def save_pretraining_impl(**kwargs: object) -> Path:

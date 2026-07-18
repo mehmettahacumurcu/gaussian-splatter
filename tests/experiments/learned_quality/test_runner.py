@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from backend.static_pipeline.runner import HardwareInfo, NotebookRuntimePaths
+from backend.static_pipeline.runner import (
+    HardwareInfo,
+    NotebookRuntimePaths,
+    SelectionOutput,
+)
 from backend.static_pipeline.progress import StageReporter
 from experiments.learned_quality.contracts import (
     LearnedQualityRunSpec,
@@ -17,6 +21,7 @@ from experiments.learned_quality.runner import (
     _late_failure_files,
     _pretraining_cache_fingerprint,
     _reported_winner,
+    _selection_milestone_ref,
     make_learned_quality_services,
     preflight_learned_runtime,
     run_learned_quality_notebook,
@@ -187,10 +192,108 @@ def test_cached_service_composition_uses_one_store_for_restore_reconstruct_and_s
     assert store == (cache_root, "a" * 64)
     assert calls[1] == ("probe", "run")
     assert calls[2] == ("restore", run_root / "pretraining-restored")
-    assert calls[3] == ("model_preflight", None)
-    assert calls[4][0] == "reconstruct"
-    assert isinstance(calls[4][1], FakeStore)
-    assert calls[5] == ("save", run_root)
+    assert calls[3][0] == "reconstruct"
+    assert isinstance(calls[3][1], FakeStore)
+    assert calls[4] == ("save", run_root)
+
+
+def test_selection_restore_requires_cpu_audit_before_learned_model_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.static_pipeline import runner as static_runner
+
+    production = SimpleNamespace(
+        discover_source=object(),
+        copy_input=object(),
+        select_frames=object(),
+        reconstruct=object(),
+        train=object(),
+        polish=object(),
+        build_metadata_preview=object(),
+        validate_bundle=object(),
+        publish_result=object(),
+        publish_diagnostics=object(),
+        inspect_hardware=object(),
+        preflight=object(),
+        assemble_reports=object(),
+        resolve_input=object(),
+    )
+    monkeypatch.setattr(static_runner, "_production_services", lambda: production)
+    source = SimpleNamespace(digest="a" * 64)
+    selection = SelectionOutput(
+        source,
+        SimpleNamespace(image_set_digest="b" * 64),
+        tmp_path,
+        tmp_path / "selection_manifest.json",
+    )
+    calls: list[str] = []
+
+    class FakeStore:
+        def __init__(self, _cache_root: Path, *, input_identity: str) -> None:
+            self.input_identity = input_identity
+
+        def restore_milestone(self, *_args: object, **_kwargs: object) -> object:
+            calls.append("selection")
+            return SimpleNamespace(value=selection)
+
+    monkeypatch.setattr(
+        "experiments.learned_quality.runner.LearnedCheckpointStore", FakeStore
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.runtime._colmap_cache_fingerprints",
+        lambda *_args, **_kwargs: ("c" * 64,),
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.audit.require_audit_receipt",
+        lambda *_args, **_kwargs: calls.append("audit") or object(),
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.audit.make_audit_inputs",
+        lambda **_kwargs: object(),
+    )
+    model_manifest = tmp_path / "model_manifest.json"
+    model_manifest.write_text("{}\n", encoding="utf-8")
+    context = LearnedQualityContext(
+        lambda *_args, **_kwargs: object(),
+        model_manifest,
+        model_preflight=lambda: calls.append("model_preflight"),
+    )
+    services = make_learned_quality_services(
+        context,
+        cache_root=tmp_path / "cache",
+    )
+
+    restored = services.restore_selection(
+        source_inventory=source,
+        spec=to_static_run_spec(LearnedQualityRunSpec(input_folder="room")),
+        hardware=HardwareInfo("NVIDIA A100", 80.0, True, 120.0, colmap_gpu_sift=True),
+        run_root=tmp_path / "run",
+    )
+
+    assert restored is selection
+    assert calls == ["selection", "audit", "model_preflight"]
+
+    calls.clear()
+
+    def reject_audit(*_args: object, **_kwargs: object) -> object:
+        calls.append("audit")
+        raise RuntimeError("CPU cache audit required")
+
+    monkeypatch.setattr(
+        "experiments.learned_quality.audit.require_audit_receipt",
+        reject_audit,
+    )
+    with pytest.raises(RuntimeError, match="CPU cache audit"):
+        services.restore_selection(
+            source_inventory=source,
+            spec=to_static_run_spec(LearnedQualityRunSpec(input_folder="room")),
+            hardware=HardwareInfo(
+                "NVIDIA A100", 80.0, True, 120.0, colmap_gpu_sift=True
+            ),
+            run_root=tmp_path / "run-again",
+        )
+    assert calls == ["selection", "audit"]
 
 
 def test_notebook_run_enables_full_stage_reporter_and_default_drive_cache(
@@ -321,6 +424,27 @@ def test_complete_cache_fingerprint_tracks_selected_geometry_but_not_iterations(
 
     assert training_only == original
     assert selected_change != original
+
+
+def test_selection_milestone_does_not_depend_on_learned_model_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "experiments.learned_quality.runner.producer_code_digest",
+        lambda *args, **kwargs: "c" * 64,
+    )
+    source = SimpleNamespace(digest="a" * 64)
+    spec = to_static_run_spec(LearnedQualityRunSpec(input_folder="myroom_test"))
+    hardware = HardwareInfo("CPU audit", 0.0, False, 120.0, colmap_gpu_sift=True)
+    first = tmp_path / "first.json"
+    second = tmp_path / "second.json"
+    first.write_text('{"model":"one"}\n', encoding="utf-8")
+    second.write_text('{"model":"two"}\n', encoding="utf-8")
+
+    assert _selection_milestone_ref(source, spec, hardware, first) == (
+        _selection_milestone_ref(source, spec, hardware, second)
+    )
 
 
 def test_late_failure_gets_learned_diagnostics(
