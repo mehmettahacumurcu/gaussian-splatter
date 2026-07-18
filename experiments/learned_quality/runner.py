@@ -512,16 +512,26 @@ def make_learned_quality_services(
             selection = restored.value
             if selection.inventory is not source_inventory:
                 raise ValueError("selection milestone inventory is not current")
-            from .audit import make_audit_inputs, require_audit_receipt
+            from .audit import (
+                find_compatible_audit_receipts,
+                make_audit_inputs,
+                require_audit_receipt,
+            )
             from .runtime import _colmap_cache_fingerprints
             from .tracks import TrackQualificationPolicy
 
-            audit_error: RuntimeError | None = None
-            for colmap_fingerprint in _colmap_cache_fingerprints(
+            colmap_fingerprints = _colmap_cache_fingerprints(
                 selection,
                 hardware,
                 context.model_manifest_path,
-            ):
+            )
+            if not colmap_fingerprints:
+                raise RuntimeError("no compatible COLMAP checkpoint fingerprint")
+            audit_error: RuntimeError | None = RuntimeError(
+                "A matching CPU cache audit receipt is required; run the CPU cache "
+                "audit notebook before starting an A100 session"
+            )
+            for colmap_fingerprint in colmap_fingerprints:
                 expected = make_audit_inputs(
                     input_digest=source_inventory.digest,
                     selection_digest=selection.manifest.image_set_digest,
@@ -535,6 +545,39 @@ def make_learned_quality_services(
                     break
                 except RuntimeError as error:
                     audit_error = error
+            if audit_error is not None:
+                audited = find_compatible_audit_receipts(
+                    cache_session.cache_root,
+                    input_digest=source_inventory.digest,
+                    selection_digest=selection.manifest.image_set_digest,
+                    policy=TrackQualificationPolicy(),
+                    repository_root=_REPOSITORY_ROOT,
+                )
+                if audited:
+                    receipt = audited[0]
+                    current_fingerprint = colmap_fingerprints[0]
+                    if receipt.colmap_fingerprint != current_fingerprint:
+                        migration_root = run_root / "audited-colmap-migration"
+                        attempt = store.restore_colmap(
+                            receipt.colmap_fingerprint,
+                            destination=migration_root,
+                        )
+                        if attempt is None:
+                            raise RuntimeError(
+                                "audited COLMAP checkpoint disappeared before migration"
+                            )
+                        generation = store.publish_colmap(
+                            attempt,
+                            fingerprint=current_fingerprint,
+                            run_id="audit-migration",
+                        )
+                        if reporter is not None:
+                            reporter.cache_event(
+                                "save",
+                                "COLMAP checkpoint (audited migration)",
+                                f"{current_fingerprint} -> {generation}",
+                            )
+                    audit_error = None
             if audit_error is not None:
                 raise audit_error
             if context.model_preflight is not None:

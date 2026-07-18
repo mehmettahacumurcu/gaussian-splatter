@@ -296,6 +296,116 @@ def test_selection_restore_requires_cpu_audit_before_learned_model_preflight(
     assert calls == ["selection", "audit"]
 
 
+def test_selection_restore_migrates_exact_cpu_audited_colmap_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.static_pipeline import runner as static_runner
+
+    known = "684800f437e38a019e9d96b6928b6a5d3995b93cc6c925eccd620a926756ec82"
+    current = "c" * 64
+    production = SimpleNamespace(
+        discover_source=object(),
+        copy_input=object(),
+        select_frames=object(),
+        reconstruct=object(),
+        train=object(),
+        polish=object(),
+        build_metadata_preview=object(),
+        validate_bundle=object(),
+        publish_result=object(),
+        publish_diagnostics=object(),
+        inspect_hardware=object(),
+        preflight=object(),
+        assemble_reports=object(),
+        resolve_input=object(),
+    )
+    monkeypatch.setattr(static_runner, "_production_services", lambda: production)
+    source = SimpleNamespace(digest="a" * 64)
+    selection = SelectionOutput(
+        source,
+        SimpleNamespace(image_set_digest="b" * 64),
+        tmp_path,
+        tmp_path / "selection_manifest.json",
+    )
+    calls: list[object] = []
+    restored_attempt = SimpleNamespace(root=tmp_path / "restored-colmap")
+
+    class FakeStore:
+        def __init__(self, cache_root: Path, *, input_identity: str) -> None:
+            self.cache_root = Path(cache_root)
+            self.input_identity = input_identity
+
+        def restore_milestone(self, *_args: object, **_kwargs: object) -> object:
+            calls.append("selection")
+            return SimpleNamespace(value=selection)
+
+        def restore_colmap(self, fingerprint: str, *, destination: Path) -> object:
+            calls.append(("restore_colmap", fingerprint, destination))
+            return restored_attempt
+
+        def publish_colmap(
+            self,
+            attempt: object,
+            *,
+            fingerprint: str,
+            run_id: str,
+        ) -> Path:
+            calls.append(("publish_colmap", attempt, fingerprint, run_id))
+            return self.cache_root / "colmap" / fingerprint
+
+    monkeypatch.setattr(
+        "experiments.learned_quality.runner.LearnedCheckpointStore", FakeStore
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.runtime._colmap_cache_fingerprints",
+        lambda *_args, **_kwargs: (current,),
+    )
+
+    def reject_current(*_args: object, **_kwargs: object) -> object:
+        calls.append("audit-current-miss")
+        raise RuntimeError("CPU cache audit required")
+
+    monkeypatch.setattr(
+        "experiments.learned_quality.audit.require_audit_receipt",
+        reject_current,
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.audit.find_compatible_audit_receipts",
+        lambda *_args, **_kwargs: (SimpleNamespace(colmap_fingerprint=known),),
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.audit.make_audit_inputs",
+        lambda **_kwargs: object(),
+    )
+    model_manifest = tmp_path / "model_manifest.json"
+    model_manifest.write_text("{}\n", encoding="utf-8")
+    services = make_learned_quality_services(
+        LearnedQualityContext(
+            lambda *_args, **_kwargs: object(),
+            model_manifest,
+            model_preflight=lambda: calls.append("model_preflight"),
+        ),
+        cache_root=tmp_path / "cache",
+    )
+
+    restored = services.restore_selection(
+        source_inventory=source,
+        spec=to_static_run_spec(LearnedQualityRunSpec(input_folder="room")),
+        hardware=HardwareInfo("NVIDIA A100", 80.0, True, 120.0, colmap_gpu_sift=True),
+        run_root=tmp_path / "run",
+    )
+
+    assert restored is selection
+    assert (
+        "restore_colmap",
+        known,
+        tmp_path / "run" / "audited-colmap-migration",
+    ) in calls
+    assert ("publish_colmap", restored_attempt, current, "audit-migration") in calls
+    assert calls[-1] == "model_preflight"
+
+
 def test_notebook_run_enables_full_stage_reporter_and_default_drive_cache(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

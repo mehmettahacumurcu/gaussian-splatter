@@ -312,6 +312,78 @@ def require_audit_receipt(
         raise RuntimeError(message) from error
 
 
+def find_compatible_audit_receipts(
+    cache_root: Path,
+    *,
+    input_digest: str,
+    selection_digest: str,
+    policy: object,
+    repository_root: Path | None = None,
+) -> tuple[AuditReceipt, ...]:
+    """Return verified receipts bound to this exact input and selection."""
+    active_input = _digest(input_digest, "input_digest")
+    active_selection = _digest(selection_digest, "selection_digest")
+    policy_digest = qualification_policy_digest(policy)
+    producer_digest = audit_producer_digest(repository_root)
+    store = LearnedCheckpointStore(
+        Path(cache_root),
+        input_identity=active_input,
+    )
+    try:
+        if not store._ensure_owned_root(create=False):
+            return ()
+    except (OSError, LearnedCacheOwnershipError):
+        return ()
+    parent = store.cache_root / "audits"
+    if parent.is_symlink() or not parent.is_dir():
+        return ()
+    receipts: list[AuditReceipt] = []
+    for candidate in sorted(parent.iterdir(), key=lambda path: path.name):
+        try:
+            _digest(candidate.name, "audit fingerprint")
+            if candidate.is_symlink() or not candidate.is_dir():
+                continue
+            success = candidate / "_SUCCESS.json"
+            if success.is_symlink() or not success.is_file():
+                continue
+            observed = _receipt_from_payload(_read_strict_json(success))
+            if (
+                observed.fingerprint != candidate.name
+                or observed.input_digest != active_input
+                or observed.selection_digest != active_selection
+                or observed.qualification_policy_sha256 != policy_digest
+                or observed.audit_producer_code_sha256 != producer_digest
+            ):
+                continue
+            expected = AuditInputs(
+                input_digest=active_input,
+                selection_digest=active_selection,
+                colmap_fingerprint=observed.colmap_fingerprint,
+                qualification_policy_sha256=policy_digest,
+                audit_producer_code_sha256=producer_digest,
+            )
+            verified = require_audit_receipt(store.cache_root, expected=expected)
+            if (
+                store.find_generation(
+                    CheckpointKind.COLMAP,
+                    verified.colmap_fingerprint,
+                )
+                is None
+            ):
+                continue
+            receipts.append(verified)
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            RuntimeError,
+        ):
+            continue
+    receipts.sort(key=lambda receipt: receipt.colmap_fingerprint)
+    return tuple(receipts)
+
+
 def _selection_frames(selection: object) -> tuple[object, ...]:
     from backend.static_pipeline.runner import SelectionOutput
 

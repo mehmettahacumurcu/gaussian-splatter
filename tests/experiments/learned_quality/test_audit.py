@@ -25,6 +25,8 @@ from experiments.learned_quality.contracts import (
 
 from experiments.learned_quality.audit import (
     AuditInputs,
+    find_compatible_audit_receipts,
+    make_audit_inputs,
     publish_audit_receipt,
     require_audit_receipt,
     run_cache_audit,
@@ -33,6 +35,12 @@ from experiments.learned_quality.cache import LearnedCheckpointStore
 from experiments.learned_quality.tracks import (
     QualifiedStaticTracks,
     TrackAuditReport,
+    TrackQualificationPolicy,
+)
+
+
+_KNOWN_ROOM_COLMAP_FINGERPRINT = (
+    "684800f437e38a019e9d96b6928b6a5d3995b93cc6c925eccd620a926756ec82"
 )
 
 
@@ -255,3 +263,56 @@ def test_cpu_audit_materializes_selection_and_publishes_colmap_receipt(
     assert receipts[0].colmap_fingerprint == "c" * 64
     assert receipts[0].selection_digest == "b" * 64
     assert (cache_root / "selection").is_dir()
+
+
+def test_compatible_audit_receipt_recovers_known_room_colmap_generation(
+    tmp_path: Path,
+) -> None:
+    cache_root = _owned_cache(tmp_path)
+    store = LearnedCheckpointStore(cache_root, input_identity="a" * 64)
+    attempt_root = tmp_path / "known-room-colmap"
+    model = attempt_root / "sparse" / "0"
+    model.mkdir(parents=True)
+    database = attempt_root / "colmap.db"
+    database.write_bytes(b"database")
+    for filename in ("cameras.txt", "images.txt", "points3D.txt"):
+        (model / filename).write_text(filename, encoding="utf-8")
+    store.publish_colmap(
+        ColmapAttempt(
+            root=attempt_root,
+            database_path=database,
+            model_dirs=(model,),
+            colmap_version="COLMAP 3.11.1",
+            fingerprint="f" * 64,
+        ),
+        fingerprint=_KNOWN_ROOM_COLMAP_FINGERPRINT,
+        run_id="known-room",
+    )
+    policy = TrackQualificationPolicy()
+    inputs = make_audit_inputs(
+        input_digest="a" * 64,
+        selection_digest="b" * 64,
+        colmap_fingerprint=_KNOWN_ROOM_COLMAP_FINGERPRINT,
+        policy=policy,
+        repository_root=Path(__file__).resolve().parents[3],
+    )
+    audit = tmp_path / "known-room-track-audit.json"
+    audit.write_text('{"accepted_track_count":1}\n', encoding="utf-8")
+    publish_audit_receipt(
+        cache_root,
+        inputs=inputs,
+        track_audit_path=audit,
+        accepted_track_count=1,
+    )
+
+    receipts = find_compatible_audit_receipts(
+        cache_root,
+        input_digest="a" * 64,
+        selection_digest="b" * 64,
+        policy=policy,
+        repository_root=Path(__file__).resolve().parents[3],
+    )
+
+    assert tuple(item.colmap_fingerprint for item in receipts) == (
+        _KNOWN_ROOM_COLMAP_FINGERPRINT,
+    )
