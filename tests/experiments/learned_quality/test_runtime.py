@@ -249,6 +249,8 @@ class _FakeMilestoneSession:
             CheckpointKind.SEMANTIC: "3",
             CheckpointKind.MOTION: "4",
             CheckpointKind.MASKS: "5",
+            CheckpointKind.GEOMETRY: "6",
+            CheckpointKind.PRETRAINING: "7",
         }
         return MilestoneRef(kind, digits[kind] * 64)
 
@@ -510,6 +512,147 @@ def test_final_reconstruction_prints_geometry_depth_and_validation_stages(
     ]
     assert starts == [definition.label for definition in FINAL_STAGES]
     assert observed_stores == [checkpoint_store]
+
+
+def test_terminal_milestones_skip_geometry_and_all_final_preprocessing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame_path = tmp_path / "frame.png"
+    frame_path.write_bytes(b"png")
+    depth_path = tmp_path / "frame.depth.npy"
+    depth_path.write_bytes(b"depth")
+    frame = FrameArtifact("frame.png", "frame-1", frame_path, "a" * 64)
+    manifest = object()
+    selection = cast(
+        SelectionOutput,
+        SimpleNamespace(
+            manifest=manifest,
+            inventory=object(),
+            frames_dir=tmp_path,
+            source_manifest_path=tmp_path / "selection_manifest.json",
+        ),
+    )
+    model = tmp_path / "model"
+    model.mkdir()
+    model_manifest = tmp_path / "model_manifest.json"
+    model_manifest.write_text("{}\n", encoding="utf-8")
+    flow = SimpleNamespace(frames=())
+    base = BaseEvidenceState(
+        anchors=object(),
+        depths=((depth_path, "d" * 64),),
+        sky=(),
+        scene=object(),
+        track_audit=object(),
+        colmap_ref="c" * 64,
+    )
+    artifacts = LearnedArtifacts(
+        da3=base.anchors,
+        base_evidence=base,
+        semantic=object(),
+        flow=flow,
+        masks=object(),
+        model_manifest_path=model_manifest,
+    )
+    comparison = SimpleNamespace(
+        selected_manifest=manifest,
+        accepted_model_dir=model,
+        geometry_candidates=(object(),),
+        bundle=cast(object, SimpleNamespace()),
+        frames_dir=tmp_path,
+    )
+    photometric = SimpleNamespace(
+        decision="accepted",
+        training_rgb_digest="b" * 64,
+    )
+    final_depth = SimpleNamespace(artifacts=(object(),))
+    validated = SimpleNamespace(
+        dense_seeds=SimpleNamespace(point_count=100),
+    )
+    session = _FakeMilestoneSession()
+
+    monkeypatch.setattr(
+        runtime_module, "_validate_model_manifest", lambda: model_manifest
+    )
+    monkeypatch.setattr(runtime_module, "_frame_artifacts", lambda _selection: (frame,))
+    monkeypatch.setattr(
+        runtime_module,
+        "_run_evidence_cycle",
+        lambda *_args, **_kwargs: artifacts,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "make_classical_candidate_runner",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "run_geometry_comparison",
+        lambda *_args, **_kwargs: comparison,
+    )
+    monkeypatch.setattr(
+        runtime_module, "_rigid_scene", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "qualify_colmap_static_tracks",
+        lambda *_args, **_kwargs: SimpleNamespace(tracks=()),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "fit_and_validate_photometric_transforms",
+        lambda *_args, **_kwargs: photometric,
+    )
+    monkeypatch.setattr(runtime_module, "load_da3_model", lambda *_args: object())
+    monkeypatch.setattr(runtime_module, "release_cuda_model", lambda _model: None)
+    monkeypatch.setattr(runtime_module, "_final_cameras", lambda *_args: ())
+    monkeypatch.setattr(
+        runtime_module,
+        "run_pose_conditioned_depth",
+        lambda *_args, **_kwargs: final_depth,
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "validate_depth_and_fuse_seeds",
+        lambda *_args, **_kwargs: validated,
+    )
+
+    first = run_learned_reconstruction(
+        selection,
+        spec=object(),
+        hardware=HardwareInfo("NVIDIA A100", 80.0, True, 100.0, True),
+        output_root=tmp_path / "reconstruction",
+        milestone_session=cast(object, session),
+    )
+    assert [kind for kind, _value in session.published] == [
+        CheckpointKind.GEOMETRY,
+        CheckpointKind.PRETRAINING,
+    ]
+    session.restored = {kind: value for kind, value in session.published}
+    session.published.clear()
+
+    def must_not_run(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("terminal preprocessing reran despite verified milestones")
+
+    monkeypatch.setattr(runtime_module, "run_geometry_comparison", must_not_run)
+    monkeypatch.setattr(
+        runtime_module, "fit_and_validate_photometric_transforms", must_not_run
+    )
+    monkeypatch.setattr(runtime_module, "run_pose_conditioned_depth", must_not_run)
+    monkeypatch.setattr(runtime_module, "validate_depth_and_fuse_seeds", must_not_run)
+
+    second = run_learned_reconstruction(
+        selection,
+        spec=object(),
+        hardware=HardwareInfo("NVIDIA A100", 80.0, True, 100.0, True),
+        output_root=tmp_path / "reconstruction-restored",
+        milestone_session=cast(object, session),
+    )
+
+    assert second.bundle is first.bundle
+    assert second.artifacts.photometric is first.artifacts.photometric
+    assert second.artifacts.depth is first.artifacts.depth
+    assert session.published == []
 
 
 def test_evidence_cycle_reuses_drive_colmap_checkpoint_in_fresh_runtime(

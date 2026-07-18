@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import uuid
 from collections.abc import Callable
@@ -62,12 +63,16 @@ from .lifecycle import release_cuda_model
 from .masks import MaskFusionPolicy, fuse_evidence_masks
 from .milestones import (
     BaseEvidenceState,
+    FinalPretrainingState,
+    GeometryMilestoneState,
     LEGACY_COLMAP_PRODUCER_DIGESTS,
     MasksMilestoneState,
     MilestoneRef,
     MilestoneSession,
+    MilestoneState,
     MotionMilestoneState,
     SemanticMilestoneState,
+    assemble_learned_reconstruction,
     compatible_colmap_fingerprints,
 )
 from .model_adapters import (
@@ -105,6 +110,19 @@ _MOTION_PRODUCER_PATHS = (
     "experiments/learned_quality/model_adapters.py",
 )
 _MASKS_PRODUCER_PATHS = ("experiments/learned_quality/masks.py",)
+_BACKFILL_SELECTION_PRODUCER_PATHS = (
+    "backend/static_pipeline/selection.py",
+    "experiments/learned_quality/runtime.py",
+)
+_GEOMETRY_PRODUCER_PATHS = (
+    "experiments/learned_quality/geometry.py",
+    "experiments/learned_quality/runtime.py",
+)
+_FINAL_PRETRAINING_PRODUCER_PATHS = (
+    "experiments/learned_quality/depth.py",
+    "experiments/learned_quality/photometric.py",
+    "experiments/learned_quality/runtime.py",
+)
 
 
 def _learned_stage(stage_id: str):
@@ -450,6 +468,91 @@ def _evidence_milestone_refs(
         CheckpointKind.MOTION: motion,
         CheckpointKind.MASKS: masks,
     }
+
+
+def _refs_for_artifacts(
+    session: MilestoneSession,
+    artifacts: LearnedArtifacts,
+) -> dict[CheckpointKind, MilestoneRef]:
+    base = artifacts.base_evidence
+    if not isinstance(base, BaseEvidenceState):
+        raise ValueError("learned artifacts are missing typed base evidence")
+    return _evidence_milestone_refs(session, colmap_fingerprint=base.colmap_ref)
+
+
+def _geometry_milestone_ref(
+    session: MilestoneSession,
+    masks_ref: MilestoneRef,
+    hardware: HardwareInfo,
+) -> MilestoneRef:
+    return session.make_ref(
+        CheckpointKind.GEOMETRY,
+        upstream={
+            CheckpointKind.SELECTION: session.selection_ref.fingerprint,
+            CheckpointKind.MASKS: masks_ref.fingerprint,
+        },
+        settings={
+            "candidate_rounds": 2,
+            "backfill_max_per_interval": 2,
+            "use_gpu": hardware.colmap_gpu_sift is True,
+        },
+        producer_paths=_GEOMETRY_PRODUCER_PATHS,
+    )
+
+
+def _final_pretraining_milestone_ref(
+    session: MilestoneSession,
+    geometry_ref: MilestoneRef,
+    masks_ref: MilestoneRef,
+) -> MilestoneRef:
+    return session.make_ref(
+        CheckpointKind.PRETRAINING,
+        upstream={
+            CheckpointKind.GEOMETRY: geometry_ref.fingerprint,
+            CheckpointKind.MASKS: masks_ref.fingerprint,
+        },
+        settings={
+            "photometric": [0.03, 0.10, 5],
+            "dense_seed": [0.20, 0.05, 0.003, 0.001, 2],
+        },
+        producer_paths=_FINAL_PRETRAINING_PRODUCER_PATHS,
+    )
+
+
+def _publish_backfill_selection(
+    session: MilestoneSession,
+    selection: SelectionOutput,
+    *,
+    parent_selection_ref: MilestoneRef,
+) -> MilestoneSession:
+    selection_ref = session.make_ref(
+        CheckpointKind.SELECTION,
+        upstream={},
+        settings={
+            "mode": "geometry_backfill",
+            "parent_selection": parent_selection_ref.fingerprint,
+            "max_per_interval": 2,
+        },
+        producer_paths=_BACKFILL_SELECTION_PRODUCER_PATHS,
+        selection_digest=selection.manifest.image_set_digest,
+    )
+    generation = session.store.publish_milestone(
+        MilestoneState(
+            ref=selection_ref,
+            upstream={},
+            value=selection,
+            artifact_roots={"selection": selection.frames_dir},
+        ),
+        run_id=f"{session.run_id}-selection-backfill",
+    )
+    reporter = current_stage_reporter()
+    if reporter is not None:
+        reporter.cache_event("save", "backfill selection milestone", str(generation))
+    return session.branch(
+        selection_digest=selection.manifest.image_set_digest,
+        selection_ref=selection_ref,
+        selection_root=selection.frames_dir,
+    )
 
 
 def _restore_stage_state(
@@ -854,7 +957,13 @@ def run_learned_reconstruction(
             output_root.parent / "learned-evidence-0",
             **evidence_kwargs,
         ),
+        "milestone_session": milestone_session,
     }
+    if milestone_session is not None:
+        active["milestone_refs"] = _refs_for_artifacts(
+            milestone_session,
+            active["artifacts"],
+        )
     classical = make_classical_candidate_runner(
         use_gpu=hardware.colmap_gpu_sift is True
     )
@@ -884,34 +993,137 @@ def run_learned_reconstruction(
             inventory=selection.inventory,
             manifest=new_manifest,
             frames_dir=backfill_root,
-            source_manifest_path=selection.source_manifest_path,
+            source_manifest_path=backfill_root / "selection_manifest.json",
         )
         new_frames = _frame_artifacts(new_selection)
+        branch_session = active["milestone_session"]
+        if branch_session is not None:
+            branch_session = _publish_backfill_selection(
+                branch_session,
+                new_selection,
+                parent_selection_ref=branch_session.selection_ref,
+            )
+        branch_kwargs: dict[str, object] = {"checkpoint_store": checkpoint_store}
+        if branch_session is not None:
+            branch_kwargs["milestone_session"] = branch_session
+        new_artifacts = _run_evidence_cycle(
+            new_selection,
+            new_frames,
+            hardware,
+            output_root.parent / "learned-evidence-1",
+            **branch_kwargs,
+        )
         active.update(
             selection=new_selection,
             frames=new_frames,
-            artifacts=_run_evidence_cycle(
-                new_selection,
-                new_frames,
-                hardware,
-                output_root.parent / "learned-evidence-1",
-                checkpoint_store=checkpoint_store,
-            ),
+            artifacts=new_artifacts,
+            milestone_session=branch_session,
         )
+        if branch_session is not None:
+            active["milestone_refs"] = _refs_for_artifacts(
+                branch_session,
+                new_artifacts,
+            )
         return new_manifest, new_frames
 
-    with _learned_stage("geometry_comparison"):
-        comparison = run_geometry_comparison(
-            selection.manifest,
-            frames,
-            output_root=output_root,
-            artifacts=active["artifacts"],
-            classical_runner=classical,
-            hybrid_runner=hybrid,
-            materialize_backfill=backfill,
+    geometry_state = None
+    geometry_ref = None
+    if active["milestone_session"] is not None:
+        geometry_ref = _geometry_milestone_ref(
+            active["milestone_session"],
+            active["milestone_refs"][CheckpointKind.MASKS],
+            hardware,
         )
+        geometry_state = _restore_stage_state(
+            active["milestone_session"],
+            geometry_ref,
+            output_root,
+            GeometryMilestoneState,
+        )
+    if isinstance(geometry_state, GeometryMilestoneState):
+        comparison = LearnedReconstructionOutput(
+            bundle=geometry_state.bundle,
+            frames_dir=geometry_state.frames_dir,
+            artifacts=active["artifacts"],
+            geometry_candidates=geometry_state.geometry_candidates,
+        )
+        reporter = current_stage_reporter()
+        if reporter is not None:
+            reporter.skip("geometry_comparison", "restored from geometry milestone")
+    else:
+        with _learned_stage("geometry_comparison"):
+            comparison = run_geometry_comparison(
+                selection.manifest,
+                frames,
+                output_root=output_root,
+                artifacts=active["artifacts"],
+                classical_runner=classical,
+                hybrid_runner=hybrid,
+                materialize_backfill=backfill,
+            )
+        geometry_state = GeometryMilestoneState(
+            bundle=comparison.bundle,
+            frames_dir=comparison.frames_dir,
+            geometry_candidates=comparison.geometry_candidates,
+        )
+        if active["milestone_session"] is not None:
+            geometry_ref = _geometry_milestone_ref(
+                active["milestone_session"],
+                active["milestone_refs"][CheckpointKind.MASKS],
+                hardware,
+            )
+            generation = active["milestone_session"].publish(
+                geometry_ref,
+                upstream={
+                    CheckpointKind.SELECTION: active[
+                        "milestone_session"
+                    ].selection_ref.fingerprint,
+                    CheckpointKind.MASKS: active["milestone_refs"][
+                        CheckpointKind.MASKS
+                    ].fingerprint,
+                },
+                value=geometry_state,
+                artifact_roots={"geometry": output_root},
+            )
+            reporter = current_stage_reporter()
+            if reporter is not None:
+                reporter.cache_event("save", "geometry milestone", str(generation))
     final_frames = active["frames"]
     artifacts = active["artifacts"]
+    final_ref = None
+    final_state = None
+    if active["milestone_session"] is not None and isinstance(
+        geometry_ref, MilestoneRef
+    ):
+        final_ref = _final_pretraining_milestone_ref(
+            active["milestone_session"],
+            geometry_ref,
+            active["milestone_refs"][CheckpointKind.MASKS],
+        )
+        final_state = _restore_stage_state(
+            active["milestone_session"],
+            final_ref,
+            output_root.parent / "restored-final-pretraining",
+            FinalPretrainingState,
+        )
+    if isinstance(final_state, FinalPretrainingState):
+        reporter = current_stage_reporter()
+        if reporter is not None:
+            for stage_id in (
+                "photometric_validation",
+                "final_pose_depth",
+                "dense_seed_fusion",
+            ):
+                reporter.skip(stage_id, "restored from final pretraining milestone")
+        return assemble_learned_reconstruction(
+            geometry=geometry_state,
+            base=artifacts.base_evidence,
+            semantic=SemanticMilestoneState(artifacts.semantic),
+            motion=MotionMilestoneState(artifacts.flow),
+            masks=MasksMilestoneState(artifacts.masks),
+            evidence_stage_records=artifacts.stage_records,
+            final=final_state,
+        )
     metric_artifacts = artifacts.da3
     # Use metric-native depth already bound into the motion evidence scene.
     rigid_frames = tuple(artifacts.flow.frames)
@@ -982,38 +1194,79 @@ def run_learned_reconstruction(
             output_root.parent / "validated-depth",
             policy=DenseSeedPolicy(0.20, 0.05, 0.003, 0.001, 2),
         )
-    final_artifacts = replace(
-        artifacts,
+    final_stage_records = (
+        StageRecord(
+            "geometry_comparison",
+            "accepted",
+            details={"candidates": len(comparison.geometry_candidates)},
+        ),
+        StageRecord(
+            "photometric_validation",
+            photometric.decision,
+            details={"training_rgb_digest": photometric.training_rgb_digest},
+        ),
+        StageRecord(
+            "final_pose_depth",
+            "accepted",
+            details={"frames": len(final_depth.artifacts)},
+        ),
+        StageRecord(
+            "dense_seed_fusion",
+            "accepted",
+            details={"points": validated_depth.dense_seeds.point_count},
+        ),
+    )
+    manifest_root = output_root.parent / "final-pretraining"
+    manifest_root.mkdir(parents=True, exist_ok=False)
+    manifest_copy = manifest_root / "model_manifest.json"
+    manifest_source = artifacts.model_manifest_path or _validate_model_manifest()
+    shutil.copy2(manifest_source, manifest_copy)
+    final_state = FinalPretrainingState(
         photometric=photometric,
         depth=validated_depth,
         dense_seeds=validated_depth.dense_seeds,
-        stage_records=(
-            *artifacts.stage_records,
-            StageRecord(
-                "geometry_comparison",
-                "accepted",
-                details={"candidates": len(comparison.geometry_candidates)},
-            ),
-            StageRecord(
-                "photometric_validation",
-                photometric.decision,
-                details={"training_rgb_digest": photometric.training_rgb_digest},
-            ),
-            StageRecord(
-                "final_pose_depth",
-                "accepted",
-                details={"frames": len(final_depth.artifacts)},
-            ),
-            StageRecord(
-                "dense_seed_fusion",
-                "accepted",
-                details={"points": validated_depth.dense_seeds.point_count},
-            ),
-        ),
+        final_stage_records=final_stage_records,
+        model_manifest_path=manifest_copy.resolve(strict=True),
     )
+    if active["milestone_session"] is not None and isinstance(final_ref, MilestoneRef):
+        generation = active["milestone_session"].publish(
+            final_ref,
+            upstream={
+                CheckpointKind.GEOMETRY: geometry_ref.fingerprint,
+                CheckpointKind.MASKS: active["milestone_refs"][
+                    CheckpointKind.MASKS
+                ].fingerprint,
+            },
+            value=final_state,
+            artifact_roots={
+                "photometric": output_root.parent / "photometric",
+                "validated_depth": output_root.parent / "validated-depth",
+                "final_metadata": manifest_root,
+            },
+        )
+        reporter = current_stage_reporter()
+        if reporter is not None:
+            reporter.cache_event("save", "final pretraining milestone", str(generation))
+    if isinstance(artifacts.base_evidence, BaseEvidenceState):
+        return assemble_learned_reconstruction(
+            geometry=geometry_state,
+            base=artifacts.base_evidence,
+            semantic=SemanticMilestoneState(artifacts.semantic),
+            motion=MotionMilestoneState(artifacts.flow),
+            masks=MasksMilestoneState(artifacts.masks),
+            evidence_stage_records=artifacts.stage_records,
+            final=final_state,
+        )
     return LearnedReconstructionOutput(
-        bundle=comparison.bundle,
-        frames_dir=comparison.frames_dir,
-        artifacts=final_artifacts,
-        geometry_candidates=comparison.geometry_candidates,
+        bundle=geometry_state.bundle,
+        frames_dir=geometry_state.frames_dir,
+        artifacts=replace(
+            artifacts,
+            photometric=photometric,
+            depth=validated_depth,
+            dense_seeds=validated_depth.dense_seeds,
+            model_manifest_path=manifest_copy.resolve(strict=True),
+            stage_records=(*artifacts.stage_records, *final_stage_records),
+        ),
+        geometry_candidates=geometry_state.geometry_candidates,
     )

@@ -22,6 +22,8 @@ from experiments.learned_quality.da3 import (
 from experiments.learned_quality.flow import RigidFrameEvidence, RigidSceneEvidence
 from experiments.learned_quality.milestones import (
     BaseEvidenceState,
+    FinalPretrainingState,
+    GeometryMilestoneState,
     LEGACY_COLMAP_PRODUCER_DIGESTS,
     MasksMilestoneState,
     MilestoneInputs,
@@ -31,6 +33,7 @@ from experiments.learned_quality.milestones import (
     MotionMilestoneState,
     SemanticMilestoneState,
     compatible_colmap_fingerprints,
+    assemble_learned_reconstruction,
     milestone_fingerprint,
 )
 from experiments.learned_quality.tracks import (
@@ -61,6 +64,68 @@ def _artifact_root(tmp_path: Path, name: str, payload: bytes) -> tuple[Path, Pat
     artifact = root / "frame.bin"
     artifact.write_bytes(payload)
     return root, artifact
+
+
+def test_assemble_learned_reconstruction_rehydrates_terminal_state(
+    tmp_path: Path,
+) -> None:
+    bundle = object()
+    candidate = object()
+    anchors = object()
+    semantic = object()
+    motion = object()
+    masks = object()
+    photometric = object()
+    depth = object()
+    dense_seeds = object()
+    manifest = tmp_path / "model_manifest.json"
+    manifest.write_text("{}\n", encoding="utf-8")
+    evidence_record = object()
+    final_record = object()
+    base = BaseEvidenceState(
+        anchors=anchors,
+        depths=(),
+        sky=(),
+        scene=object(),
+        track_audit=object(),
+        colmap_ref="a" * 64,
+    )
+    geometry = GeometryMilestoneState(
+        bundle=bundle,
+        frames_dir=tmp_path,
+        geometry_candidates=(candidate,),
+    )
+    final = FinalPretrainingState(
+        photometric=photometric,
+        depth=depth,
+        dense_seeds=dense_seeds,
+        final_stage_records=(final_record,),
+        model_manifest_path=manifest,
+    )
+
+    output = assemble_learned_reconstruction(
+        geometry=geometry,
+        base=base,
+        semantic=SemanticMilestoneState(semantic),
+        motion=MotionMilestoneState(motion),
+        masks=MasksMilestoneState(masks),
+        evidence_stage_records=(evidence_record,),
+        final=final,
+    )
+
+    assert output.bundle is bundle
+    assert output.frames_dir == tmp_path
+    assert output.geometry_candidates == (candidate,)
+    assert output.artifacts.da3 is anchors
+    assert output.artifacts.base_evidence is base
+    assert output.artifacts.semantic is semantic
+    assert output.artifacts.flow is motion
+    assert output.artifacts.masks is masks
+    assert output.artifacts.photometric is photometric
+    assert output.artifacts.depth is depth
+    assert output.artifacts.dense_seeds is dense_seeds
+    assert output.artifacts.model_manifest_path == manifest
+    assert output.artifacts.stage_records == (evidence_record, final_record)
 
 
 def _state(
@@ -144,6 +209,33 @@ def test_milestone_session_scopes_stage_refs_and_state_contracts(
     assert SemanticMilestoneState.__dataclass_params__.frozen is True
     assert MotionMilestoneState.__dataclass_params__.frozen is True
     assert MasksMilestoneState.__dataclass_params__.frozen is True
+
+    original_selection_ref = session.make_ref(
+        CheckpointKind.SELECTION,
+        upstream={},
+        settings={"mode": "geometry_backfill"},
+        producer_code_sha256="e" * 64,
+    )
+    branch_selection_ref = session.make_ref(
+        CheckpointKind.SELECTION,
+        upstream={},
+        settings={"mode": "geometry_backfill"},
+        producer_code_sha256="e" * 64,
+        selection_digest="f" * 64,
+    )
+    branch_root = tmp_path / "backfill-selection"
+    branch_root.mkdir()
+    branch = session.branch(
+        selection_digest="f" * 64,
+        selection_ref=branch_selection_ref,
+        selection_root=branch_root,
+    )
+
+    assert branch_selection_ref != original_selection_ref
+    assert session.selection_digest == "b" * 64
+    assert branch.selection_digest == "f" * 64
+    assert branch.selection_ref == branch_selection_ref
+    assert branch.external_roots == {"selection": branch_root.resolve()}
 
 
 def test_semantic_change_does_not_invalidate_motion_sibling() -> None:

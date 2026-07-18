@@ -76,6 +76,10 @@ from experiments.learned_quality.segmentation import (
     SemanticFrameEvidence,
     SemanticPolicy,
 )
+from experiments.learned_quality.milestones import (
+    FinalPretrainingState,
+    GeometryMilestoneState,
+)
 
 
 def _payload(root: Path, value: bytes = b"model") -> Path:
@@ -109,6 +113,25 @@ def test_store_publishes_owned_hash_verified_generation(tmp_path: Path) -> None:
     assert (generation / "manifest.json").is_file()
     assert (generation / "_SUCCESS.json").is_file()
     assert store.find_generation(CheckpointKind.COLMAP, "b" * 64) == generation
+
+
+def test_legacy_complete_restore_ignores_terminal_milestone_generation(
+    tmp_path: Path,
+) -> None:
+    store = LearnedCheckpointStore(tmp_path / "cache", input_identity="a" * 64)
+    store.publish_generation(
+        CheckpointKind.PRETRAINING,
+        fingerprint="b" * 64,
+        run_id="terminal",
+        source_root=_payload(tmp_path / "terminal-source"),
+        upstream={
+            CheckpointKind.GEOMETRY: "c" * 64,
+            CheckpointKind.MASKS: "d" * 64,
+        },
+        artifact_roots={"terminal": "artifacts/terminal"},
+    )
+
+    assert store._valid_pretraining_generations() == ()
 
 
 def test_drive_fuse_unsupported_atomic_rename_uses_verified_marker_fallback(
@@ -502,6 +525,41 @@ def test_portable_state_round_trip_rebases_paths_and_injects_inventory(
     assert reconstruction.artifacts.stage_records == (
         StageRecord("classical_prepass", "accepted"),
     )
+
+
+def test_terminal_milestone_states_round_trip_with_local_paths(tmp_path: Path) -> None:
+    snapshot, state, current_inventory = _portable_state(tmp_path)
+    reconstruction = state["reconstruction"]
+    geometry = GeometryMilestoneState(
+        bundle=reconstruction.bundle,
+        frames_dir=reconstruction.frames_dir,
+        geometry_candidates=reconstruction.geometry_candidates,
+    )
+    final = FinalPretrainingState(
+        photometric=None,
+        depth=None,
+        dense_seeds=None,
+        final_stage_records=(StageRecord("dense_seed_fusion", "accepted"),),
+        model_manifest_path=reconstruction.artifacts.model_manifest_path,
+    )
+
+    encoded = encode_checkpoint_state(
+        {"geometry": geometry, "final": final},
+        snapshot_root=snapshot,
+    )
+    restore = tmp_path / "terminal-restore"
+    shutil.copytree(snapshot, restore)
+    decoded = decode_checkpoint_state(
+        encoded,
+        restore_root=restore,
+        source_inventory=current_inventory,
+    )
+
+    assert isinstance(decoded["geometry"], GeometryMilestoneState)
+    assert isinstance(decoded["final"], FinalPretrainingState)
+    assert decoded["geometry"].bundle.accepted_model_dir.is_relative_to(restore)
+    assert decoded["geometry"].frames_dir.is_relative_to(restore)
+    assert decoded["final"].model_manifest_path.is_relative_to(restore)
 
 
 @dataclass(frozen=True)

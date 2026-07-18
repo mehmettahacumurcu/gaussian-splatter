@@ -6,6 +6,7 @@ from types import MappingProxyType
 from typing import Mapping, Sequence
 
 from backend.static_pipeline.stage_cache import stage_fingerprint
+from backend.static_pipeline.contracts import ReconstructionBundle
 
 from .cache import (
     CheckpointInputs,
@@ -14,7 +15,13 @@ from .cache import (
     checkpoint_fingerprint,
     producer_code_digest,
 )
-from .contracts import FrameArtifact
+from .contracts import (
+    FrameArtifact,
+    GeometryCandidateReport,
+    LearnedArtifacts,
+    LearnedReconstructionOutput,
+    StageRecord,
+)
 from .da3 import AnchorInferenceResult
 from .flow import MotionEvidence, RigidSceneEvidence
 from .masks import MaskFusionEvidence
@@ -213,6 +220,22 @@ class MasksMilestoneState:
 
 
 @dataclass(frozen=True)
+class GeometryMilestoneState:
+    bundle: ReconstructionBundle
+    frames_dir: Path
+    geometry_candidates: tuple[GeometryCandidateReport, ...]
+
+
+@dataclass(frozen=True)
+class FinalPretrainingState:
+    photometric: object
+    depth: object
+    dense_seeds: object
+    final_stage_records: tuple[StageRecord, ...]
+    model_manifest_path: Path
+
+
+@dataclass(frozen=True)
 class RestoredEvidenceGraph:
     base: BaseEvidenceState
     semantic: SemanticEvidence
@@ -298,6 +321,7 @@ class MilestoneSession:
         settings: Mapping[str, object],
         producer_paths: Sequence[str] = (),
         producer_code_sha256: str | None = None,
+        selection_digest: str | None = None,
     ) -> MilestoneRef:
         active_kind = _kind(kind, "kind")
         normalized_upstream = validate_upstream_kinds(active_kind, upstream)
@@ -323,7 +347,11 @@ class MilestoneSession:
                 active_kind,
                 MilestoneInputs(
                     source_digest=self.source_digest,
-                    selection_digest=self.selection_digest,
+                    selection_digest=(
+                        self.selection_digest
+                        if selection_digest is None
+                        else _digest(selection_digest, "selection_digest")
+                    ),
                     settings=settings,
                     model_manifest_sha256=self.model_manifest_sha256,
                     tool_versions=self.tool_versions,
@@ -331,6 +359,22 @@ class MilestoneSession:
                     upstream=normalized_upstream,
                 ),
             ),
+        )
+
+    def branch(
+        self,
+        *,
+        selection_digest: str,
+        selection_ref: MilestoneRef,
+        selection_root: Path,
+    ) -> MilestoneSession:
+        if selection_ref.kind is not CheckpointKind.SELECTION:
+            raise ValueError("selection_ref must reference a selection milestone")
+        return replace(
+            self,
+            selection_digest=_digest(selection_digest, "selection_digest"),
+            selection_ref=selection_ref,
+            external_roots={"selection": Path(selection_root)},
         )
 
     def restore(self, ref: MilestoneRef, destination: Path) -> MilestoneState | None:
@@ -360,6 +404,62 @@ class MilestoneSession:
             run_id=f"{self.run_id}-{ref.kind.value}",
             external_roots=self.external_roots,
         )
+
+
+def assemble_learned_reconstruction(
+    *,
+    geometry: GeometryMilestoneState,
+    base: BaseEvidenceState,
+    semantic: SemanticMilestoneState,
+    motion: MotionMilestoneState,
+    masks: MasksMilestoneState,
+    evidence_stage_records: tuple[StageRecord, ...],
+    final: FinalPretrainingState | None,
+) -> LearnedReconstructionOutput:
+    """Reassemble the public reconstruction contract from milestone states."""
+    if not isinstance(geometry, GeometryMilestoneState):
+        raise TypeError("geometry must be a GeometryMilestoneState")
+    if not isinstance(base, BaseEvidenceState):
+        raise TypeError("base must be a BaseEvidenceState")
+    if not isinstance(semantic, SemanticMilestoneState):
+        raise TypeError("semantic must be a SemanticMilestoneState")
+    if not isinstance(motion, MotionMilestoneState):
+        raise TypeError("motion must be a MotionMilestoneState")
+    if not isinstance(masks, MasksMilestoneState):
+        raise TypeError("masks must be a MasksMilestoneState")
+    if type(evidence_stage_records) is not tuple:
+        raise TypeError("evidence_stage_records must be a tuple")
+    final_records: tuple[StageRecord, ...] = ()
+    photometric = None
+    depth = None
+    dense_seeds = None
+    model_manifest_path = None
+    if final is not None:
+        if not isinstance(final, FinalPretrainingState):
+            raise TypeError("final must be a FinalPretrainingState or None")
+        final_records = final.final_stage_records
+        photometric = final.photometric
+        depth = final.depth
+        dense_seeds = final.dense_seeds
+        model_manifest_path = final.model_manifest_path
+    artifacts = LearnedArtifacts(
+        da3=base.anchors,
+        base_evidence=base,
+        semantic=semantic.semantic,
+        flow=motion.motion,
+        masks=masks.masks,
+        photometric=photometric,
+        depth=depth,
+        dense_seeds=dense_seeds,
+        model_manifest_path=model_manifest_path,
+        stage_records=(*evidence_stage_records, *final_records),
+    )
+    return LearnedReconstructionOutput(
+        bundle=geometry.bundle,
+        frames_dir=geometry.frames_dir,
+        artifacts=artifacts,
+        geometry_candidates=geometry.geometry_candidates,
+    )
 
 
 def expected_upstream_kinds(kind: CheckpointKind) -> frozenset[CheckpointKind]:

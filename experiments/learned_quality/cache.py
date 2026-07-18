@@ -400,6 +400,8 @@ def _checkpoint_types() -> dict[str, type[object]]:
     from .masks import FusedMaskFrame, MaskFusionEvidence, MaskFusionPolicy
     from .milestones import (
         BaseEvidenceState,
+        FinalPretrainingState,
+        GeometryMilestoneState,
         MasksMilestoneState,
         MotionMilestoneState,
         SemanticMilestoneState,
@@ -452,6 +454,8 @@ def _checkpoint_types() -> dict[str, type[object]]:
         TrackAuditReport,
         QualifiedStaticTracks,
         BaseEvidenceState,
+        GeometryMilestoneState,
+        FinalPretrainingState,
         SemanticMilestoneState,
         MotionMilestoneState,
         MasksMilestoneState,
@@ -1167,6 +1171,15 @@ class LearnedCheckpointStore:
                 CheckpointKind.PRETRAINING,
                 fingerprint,
             ):
+                manifest = _read_generation_manifest(
+                    candidate,
+                    CheckpointKind.PRETRAINING,
+                    fingerprint,
+                )
+                if "upstream" in manifest:
+                    # Terminal milestone generations are restored after selection
+                    # by the dependency graph, not by the legacy cumulative codec.
+                    continue
                 result.append(candidate)
         return tuple(result)
 
