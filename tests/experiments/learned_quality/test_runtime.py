@@ -29,6 +29,13 @@ from experiments.learned_quality.tracks import (
     TrackAuditReport,
     TrackQualificationError,
 )
+from experiments.learned_quality.milestones import (
+    BaseEvidenceState,
+    MasksMilestoneState,
+    MilestoneRef,
+    MotionMilestoneState,
+    SemanticMilestoneState,
+)
 
 
 EVIDENCE_STAGES = tuple(
@@ -224,6 +231,117 @@ def test_evidence_cycle_reports_failure_and_preserves_exception(
 
     assert caught.value is error
     assert any("FAIL  Optical flow" in line for line in output.getvalue().splitlines())
+
+
+class _FakeMilestoneSession:
+    def __init__(self) -> None:
+        self.selection_ref = MilestoneRef(CheckpointKind.SELECTION, "1" * 64)
+        self.published: list[tuple[CheckpointKind, object]] = []
+        self.restored: dict[CheckpointKind, object] = {}
+
+    def make_ref(
+        self,
+        kind: CheckpointKind,
+        **_kwargs: object,
+    ) -> MilestoneRef:
+        digits = {
+            CheckpointKind.BASE_EVIDENCE: "2",
+            CheckpointKind.SEMANTIC: "3",
+            CheckpointKind.MOTION: "4",
+            CheckpointKind.MASKS: "5",
+        }
+        return MilestoneRef(kind, digits[kind] * 64)
+
+    def restore(self, ref: MilestoneRef, _destination: Path) -> object | None:
+        value = self.restored.get(ref.kind)
+        return None if value is None else SimpleNamespace(value=value)
+
+    def publish(
+        self,
+        ref: MilestoneRef,
+        *,
+        value: object,
+        **_kwargs: object,
+    ) -> Path:
+        self.published.append((ref.kind, value))
+        return Path(f"/{ref.kind.value}")
+
+
+def test_evidence_cycle_publishes_and_restores_each_expensive_milestone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selection, frames, hardware = _mock_evidence_cycle(tmp_path, monkeypatch)
+    session = _FakeMilestoneSession()
+    monkeypatch.setattr(
+        runtime_module,
+        "_colmap_cache_fingerprints",
+        lambda *_args, **_kwargs: ("c" * 64,),
+    )
+
+    first = _run_evidence_cycle(
+        selection,
+        frames,
+        hardware,
+        tmp_path / "first",
+        milestone_session=cast(object, session),
+    )
+
+    assert [kind for kind, _ in session.published] == [
+        CheckpointKind.BASE_EVIDENCE,
+        CheckpointKind.SEMANTIC,
+        CheckpointKind.MOTION,
+        CheckpointKind.MASKS,
+    ]
+    assert isinstance(session.published[0][1], BaseEvidenceState)
+    assert isinstance(session.published[1][1], SemanticMilestoneState)
+    assert isinstance(session.published[2][1], MotionMilestoneState)
+    assert isinstance(session.published[3][1], MasksMilestoneState)
+
+    session.restored = {kind: value for kind, value in session.published}
+    session.published.clear()
+    monkeypatch.setattr(
+        runtime_module,
+        "load_da3_model",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("DA3 ran despite a base-evidence milestone")
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "run_semantic_evidence",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("semantic inference reran despite a milestone")
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "run_motion_evidence",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("optical flow reran despite a milestone")
+        ),
+    )
+    monkeypatch.setattr(
+        runtime_module,
+        "fuse_evidence_masks",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("mask fusion reran despite a milestone")
+        ),
+    )
+
+    second = _run_evidence_cycle(
+        selection,
+        frames,
+        hardware,
+        tmp_path / "second",
+        milestone_session=cast(object, session),
+    )
+
+    assert second.da3 is first.da3
+    assert second.semantic is first.semantic
+    assert second.flow is first.flow
+    assert second.masks is first.masks
+    assert session.published == []
 
 
 def test_evidence_cycle_qualifies_tracks_before_metric_or_semantic_models(

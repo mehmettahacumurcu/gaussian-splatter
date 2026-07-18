@@ -231,6 +231,74 @@ def test_complete_pretraining_restore_skips_copy_selection_and_reconstruction(
     assert calls.index("restore_pretraining") < calls.index("train")
 
 
+def test_selection_restore_skips_copy_and_selection_but_reconstructs(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    services = _services(calls)
+    restored_selection = SimpleNamespace(
+        inventory=SimpleNamespace(digest="a" * 64),
+        image_set_digest="b" * 64,
+    )
+
+    def restore_pretraining(**_kwargs: object) -> None:
+        calls.append("restore_pretraining")
+        return None
+
+    def restore_selection(**_kwargs: object) -> object:
+        calls.append("restore_selection")
+        return restored_selection
+
+    services = RunnerServices(
+        **{
+            **services.__dict__,
+            "restore_pretraining": restore_pretraining,
+            "restore_selection": restore_selection,
+        }
+    )
+
+    run_static_notebook(
+        StaticNotebookRunSpec(input_folder="captures/room"),
+        runtime_paths=NotebookRuntimePaths(tmp_path / "drive", tmp_path / "work"),
+        services=services,
+    )
+
+    assert "copy_input" not in calls
+    assert "select" not in calls
+    assert calls.index("restore_pretraining") < calls.index("restore_selection")
+    assert calls.index("restore_selection") < calls.index("colmap_gate")
+
+
+def test_selection_miss_saves_before_reconstruction(tmp_path: Path) -> None:
+    calls: list[str] = []
+    services = _services(calls)
+
+    def restore_selection(**_kwargs: object) -> None:
+        calls.append("restore_selection")
+        return None
+
+    def save_selection(**_kwargs: object) -> None:
+        calls.append("save_selection")
+
+    services = RunnerServices(
+        **{
+            **services.__dict__,
+            "restore_selection": restore_selection,
+            "save_selection": save_selection,
+        }
+    )
+
+    run_static_notebook(
+        StaticNotebookRunSpec(input_folder="captures/room"),
+        runtime_paths=NotebookRuntimePaths(tmp_path / "drive", tmp_path / "work"),
+        services=services,
+    )
+
+    assert calls.index("restore_selection") < calls.index("copy_input")
+    assert calls.index("select") < calls.index("save_selection")
+    assert calls.index("save_selection") < calls.index("colmap_gate")
+
+
 def test_verified_pretraining_is_saved_before_training(tmp_path: Path) -> None:
     calls: list[str] = []
     services = _services(calls)

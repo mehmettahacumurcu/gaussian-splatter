@@ -13,13 +13,29 @@ from experiments.learned_quality.cache import (
     LearnedCheckpointStore,
 )
 from experiments.learned_quality.contracts import FrameArtifact
+from experiments.learned_quality.da3 import (
+    AnchorInferenceResult,
+    CameraRecord,
+    FramePredictionArtifact,
+    PinholeCamera,
+)
+from experiments.learned_quality.flow import RigidFrameEvidence, RigidSceneEvidence
 from experiments.learned_quality.milestones import (
+    BaseEvidenceState,
     LEGACY_COLMAP_PRODUCER_DIGESTS,
+    MasksMilestoneState,
     MilestoneInputs,
     MilestoneRef,
+    MilestoneSession,
     MilestoneState,
+    MotionMilestoneState,
+    SemanticMilestoneState,
     compatible_colmap_fingerprints,
     milestone_fingerprint,
+)
+from experiments.learned_quality.tracks import (
+    QualifiedStaticTracks,
+    TrackAuditReport,
 )
 
 
@@ -98,6 +114,36 @@ def test_milestone_fingerprint_sorts_upstream_and_invalidates_transitively() -> 
 
     assert first == second
     assert first != changed
+
+
+def test_milestone_session_scopes_stage_refs_and_state_contracts(
+    tmp_path: Path,
+) -> None:
+    store = LearnedCheckpointStore(tmp_path / "cache", input_identity="a" * 64)
+    session = MilestoneSession(
+        store=store,
+        source_inventory=object(),
+        source_digest="a" * 64,
+        selection_digest="b" * 64,
+        model_manifest_sha256="c" * 64,
+        tool_versions={"python": "3.12.13"},
+        selection_ref=MilestoneRef(CheckpointKind.SELECTION, "1" * 64),
+        repository_root=tmp_path,
+        run_id="run-1",
+    )
+
+    semantic_ref = session.make_ref(
+        CheckpointKind.SEMANTIC,
+        upstream={CheckpointKind.BASE_EVIDENCE: "2" * 64},
+        settings={"threshold": 0.3},
+        producer_code_sha256="d" * 64,
+    )
+
+    assert semantic_ref.kind is CheckpointKind.SEMANTIC
+    assert BaseEvidenceState.__dataclass_params__.frozen is True
+    assert SemanticMilestoneState.__dataclass_params__.frozen is True
+    assert MotionMilestoneState.__dataclass_params__.frozen is True
+    assert MasksMilestoneState.__dataclass_params__.frozen is True
 
 
 def test_semantic_change_does_not_invalidate_motion_sibling() -> None:
@@ -340,6 +386,178 @@ def test_state_path_outside_direct_artifact_roots_is_rejected(tmp_path: Path) ->
         store.publish_milestone(state, run_id="selection")
 
     assert store.find_generation(CheckpointKind.SELECTION, "2" * 64) is None
+
+
+def test_external_selection_paths_are_rebound_without_copying_upstream_frames(
+    tmp_path: Path,
+) -> None:
+    store = LearnedCheckpointStore(tmp_path / "cache", input_identity="a" * 64)
+    direct_root, _ = _artifact_root(tmp_path, "direct", b"direct")
+    selected_root, selected_frame = _artifact_root(
+        tmp_path, "selected-source", b"selected"
+    )
+    fresh_selected_root, fresh_selected_frame = _artifact_root(
+        tmp_path, "selected-restored", b"selected"
+    )
+    state = MilestoneState(
+        ref=MilestoneRef(CheckpointKind.SELECTION, "2" * 64),
+        upstream={},
+        value=FrameArtifact("frame.png", "frame-1", selected_frame.resolve(), "f" * 64),
+        artifact_roots={"direct": direct_root.resolve()},
+    )
+
+    generation = store.publish_milestone(
+        state,
+        run_id="selection",
+        external_roots={"selection": selected_root.resolve()},
+    )
+    restored = store.restore_milestone(
+        state.ref,
+        destination=tmp_path / "external-restore",
+        source_inventory=object(),
+        external_roots={"selection": fresh_selected_root.resolve()},
+    )
+
+    assert restored is not None
+    assert restored.value.path == fresh_selected_frame.resolve()
+    assert not (generation / "payload" / "selected-source").exists()
+
+
+def test_base_evidence_round_trip_rebinds_canonical_frames_and_keeps_depth_local(
+    tmp_path: Path,
+) -> None:
+    store = LearnedCheckpointStore(tmp_path / "cache", input_identity="a" * 64)
+    selected_root, selected_path = _artifact_root(
+        tmp_path, "selected-base", b"selected"
+    )
+    restored_selected_root, restored_selected_path = _artifact_root(
+        tmp_path, "selected-base-restored", b"selected"
+    )
+    source_frame = FrameArtifact(
+        "frame.png", "frame-1", selected_path.resolve(), "f" * 64
+    )
+    colmap_root, _ = _artifact_root(tmp_path, "colmap-base", b"colmap")
+    colmap_ref = MilestoneRef(CheckpointKind.COLMAP, "1" * 64)
+    store.publish_generation(
+        colmap_ref.kind,
+        fingerprint=colmap_ref.fingerprint,
+        run_id="colmap-base",
+        source_root=colmap_root,
+    )
+    selection_state = MilestoneState(
+        ref=MilestoneRef(CheckpointKind.SELECTION, "2" * 64),
+        upstream={},
+        value=source_frame,
+        artifact_roots={"selection": selected_root.resolve()},
+    )
+    store.publish_milestone(selection_state, run_id="selection-base")
+
+    direct_root = tmp_path / "base-direct"
+    direct_root.mkdir()
+    depth_path = direct_root / "frame.depth.npy"
+    depth_path.write_bytes(b"depth")
+    sky_path = direct_root / "frame.sky.npy"
+    sky_path.write_bytes(b"sky")
+    metadata_path = direct_root / "anchors.json"
+    metadata_path.write_text("{}\n", encoding="utf-8")
+    audit_path = direct_root / "track_audit.json"
+    audit_path.write_text("{}\n", encoding="utf-8")
+    anchors = AnchorInferenceResult(
+        artifacts=(
+            FramePredictionArtifact(
+                "frame.png",
+                "frame-1",
+                selected_path.resolve(),
+                depth_path.resolve(),
+                None,
+                None,
+            ),
+        ),
+        cameras=(
+            CameraRecord(
+                "frame.png",
+                "frame-1",
+                (
+                    (1.0, 0.0, 0.0, 0.0),
+                    (0.0, 1.0, 0.0, 0.0),
+                    (0.0, 0.0, 1.0, 0.0),
+                    (0.0, 0.0, 0.0, 1.0),
+                ),
+            ),
+        ),
+        shared_camera=PinholeCamera("PINHOLE", 8, 6, 4.0, 4.0, 4.0, 3.0),
+        anchor_indices=(0,),
+        attempts=(),
+        metadata_path=metadata_path.resolve(),
+    )
+    scene = RigidSceneEvidence(
+        frames=(
+            RigidFrameEvidence(
+                source_frame,
+                8,
+                6,
+                False,
+                None,
+                None,
+                depth_path.resolve(),
+                "d" * 64,
+            ),
+        ),
+        static_tracks=(),
+        geometry_digest="e" * 64,
+        depth_digest="d" * 64,
+    )
+    report = TrackAuditReport(
+        1,
+        1,
+        1,
+        0,
+        3,
+        3,
+        0,
+        {},
+        {},
+        (),
+        "a" * 64,
+    )
+    base = BaseEvidenceState(
+        anchors=anchors,
+        depths=((depth_path.resolve(), "d" * 64),),
+        sky=(FrameArtifact("frame.png", "frame-1", sky_path.resolve(), "s" * 64),),
+        scene=scene,
+        track_audit=QualifiedStaticTracks((), report, audit_path.resolve(), "b" * 64),
+        colmap_ref=colmap_ref.fingerprint,
+    )
+    base_ref = MilestoneRef(CheckpointKind.BASE_EVIDENCE, "3" * 64)
+
+    generation = store.publish_milestone(
+        MilestoneState(
+            ref=base_ref,
+            upstream={
+                CheckpointKind.COLMAP: colmap_ref.fingerprint,
+                CheckpointKind.SELECTION: selection_state.ref.fingerprint,
+            },
+            value=base,
+            artifact_roots={"base": direct_root.resolve()},
+        ),
+        run_id="base",
+        external_roots={"selection": selected_root.resolve()},
+    )
+    restored = store.restore_milestone(
+        base_ref,
+        destination=tmp_path / "base-restored",
+        source_inventory=object(),
+        external_roots={"selection": restored_selected_root.resolve()},
+    )
+
+    assert restored is not None
+    assert isinstance(restored.value, BaseEvidenceState)
+    assert restored.value.anchors.artifacts[0].source_path == (
+        restored_selected_path.resolve()
+    )
+    assert restored.value.scene.frames[0].frame.path == restored_selected_path.resolve()
+    assert restored.value.depths[0][0].is_relative_to(tmp_path / "base-restored")
+    assert not (generation / "payload" / "selected-base").exists()
 
 
 def test_unknown_checkpoint_tag_is_ignored_without_leaking_restore_tree(

@@ -1,17 +1,25 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from backend.static_pipeline.stage_cache import stage_fingerprint
 
 from .cache import (
     CheckpointInputs,
     CheckpointKind,
+    LearnedCheckpointStore,
     checkpoint_fingerprint,
+    producer_code_digest,
 )
+from .contracts import FrameArtifact
+from .da3 import AnchorInferenceResult
+from .flow import MotionEvidence, RigidSceneEvidence
+from .masks import MaskFusionEvidence
+from .segmentation import SemanticEvidence
+from .tracks import QualifiedStaticTracks
 
 
 MILESTONE_SCHEMA_VERSION = 1
@@ -176,6 +184,181 @@ class MilestoneState:
             self,
             "artifact_roots",
             MappingProxyType(dict(sorted(normalized.items()))),
+        )
+
+
+@dataclass(frozen=True)
+class BaseEvidenceState:
+    anchors: AnchorInferenceResult
+    depths: tuple[tuple[Path, str], ...]
+    sky: tuple[FrameArtifact, ...]
+    scene: RigidSceneEvidence
+    track_audit: QualifiedStaticTracks
+    colmap_ref: str
+
+
+@dataclass(frozen=True)
+class SemanticMilestoneState:
+    semantic: SemanticEvidence
+
+
+@dataclass(frozen=True)
+class MotionMilestoneState:
+    motion: MotionEvidence
+
+
+@dataclass(frozen=True)
+class MasksMilestoneState:
+    masks: MaskFusionEvidence
+
+
+@dataclass(frozen=True)
+class RestoredEvidenceGraph:
+    base: BaseEvidenceState
+    semantic: SemanticEvidence
+    motion: MotionEvidence
+    masks: MaskFusionEvidence | None
+    refs: Mapping[CheckpointKind, MilestoneRef]
+
+
+@dataclass(frozen=True)
+class MilestoneSession:
+    store: LearnedCheckpointStore
+    source_inventory: object
+    source_digest: str
+    selection_digest: str
+    model_manifest_sha256: str
+    tool_versions: Mapping[str, str]
+    selection_ref: MilestoneRef
+    repository_root: Path
+    run_id: str
+    external_roots: Mapping[str, Path] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.store, LearnedCheckpointStore):
+            raise TypeError("store must be a LearnedCheckpointStore")
+        object.__setattr__(
+            self, "source_digest", _digest(self.source_digest, "source_digest")
+        )
+        object.__setattr__(
+            self,
+            "selection_digest",
+            _digest(self.selection_digest, "selection_digest"),
+        )
+        object.__setattr__(
+            self,
+            "model_manifest_sha256",
+            _digest(self.model_manifest_sha256, "model_manifest_sha256"),
+        )
+        if (
+            not isinstance(self.selection_ref, MilestoneRef)
+            or self.selection_ref.kind is not CheckpointKind.SELECTION
+        ):
+            raise ValueError("selection_ref must reference a selection milestone")
+        if not isinstance(self.tool_versions, Mapping) or any(
+            not isinstance(key, str)
+            or not key
+            or not isinstance(value, str)
+            or not value
+            for key, value in self.tool_versions.items()
+        ):
+            raise ValueError("tool_versions must map non-empty strings")
+        object.__setattr__(
+            self,
+            "tool_versions",
+            MappingProxyType(dict(sorted(self.tool_versions.items()))),
+        )
+        repository_root = Path(self.repository_root)
+        if repository_root.is_symlink() or not repository_root.is_dir():
+            raise ValueError("repository_root must be a regular directory")
+        object.__setattr__(
+            self,
+            "repository_root",
+            repository_root.resolve(strict=True),
+        )
+        if not isinstance(self.run_id, str) or not self.run_id:
+            raise ValueError("run_id must be a non-empty string")
+        if not isinstance(self.external_roots, Mapping):
+            raise TypeError("external_roots must be a mapping")
+        normalized_external_roots = {
+            label: Path(root).resolve(strict=True)
+            for label, root in self.external_roots.items()
+        }
+        object.__setattr__(
+            self,
+            "external_roots",
+            MappingProxyType(dict(sorted(normalized_external_roots.items()))),
+        )
+
+    def make_ref(
+        self,
+        kind: CheckpointKind,
+        *,
+        upstream: Mapping[CheckpointKind, str],
+        settings: Mapping[str, object],
+        producer_paths: Sequence[str] = (),
+        producer_code_sha256: str | None = None,
+    ) -> MilestoneRef:
+        active_kind = _kind(kind, "kind")
+        normalized_upstream = validate_upstream_kinds(active_kind, upstream)
+        if producer_code_sha256 is None:
+            if not producer_paths:
+                raise ValueError("producer_paths cannot be empty")
+            active_producer_digest = producer_code_digest(
+                self.repository_root,
+                producer_paths,
+            )
+        else:
+            if producer_paths:
+                raise ValueError(
+                    "provide producer_paths or producer_code_sha256, not both"
+                )
+            active_producer_digest = _digest(
+                producer_code_sha256,
+                "producer_code_sha256",
+            )
+        return MilestoneRef(
+            active_kind,
+            milestone_fingerprint(
+                active_kind,
+                MilestoneInputs(
+                    source_digest=self.source_digest,
+                    selection_digest=self.selection_digest,
+                    settings=settings,
+                    model_manifest_sha256=self.model_manifest_sha256,
+                    tool_versions=self.tool_versions,
+                    producer_code_sha256=active_producer_digest,
+                    upstream=normalized_upstream,
+                ),
+            ),
+        )
+
+    def restore(self, ref: MilestoneRef, destination: Path) -> MilestoneState | None:
+        return self.store.restore_milestone(
+            ref,
+            destination=destination,
+            source_inventory=self.source_inventory,
+            external_roots=self.external_roots,
+        )
+
+    def publish(
+        self,
+        ref: MilestoneRef,
+        *,
+        upstream: Mapping[CheckpointKind, str],
+        value: object,
+        artifact_roots: Mapping[str, Path],
+    ) -> Path:
+        state = MilestoneState(
+            ref=ref,
+            upstream=upstream,
+            value=value,
+            artifact_roots=artifact_roots,
+        )
+        return self.store.publish_milestone(
+            state,
+            run_id=f"{self.run_id}-{ref.kind.value}",
+            external_roots=self.external_roots,
         )
 
 

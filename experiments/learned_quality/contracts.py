@@ -122,6 +122,7 @@ class StageRecord:
 @dataclass(frozen=True)
 class LearnedArtifacts:
     da3: object | None = None
+    base_evidence: object | None = None
     semantic: object | None = None
     flow: object | None = None
     masks: object | None = None

@@ -119,6 +119,8 @@ class RunnerServices:
     resolve_input: Callable[..., Path | None] | None = None
     restore_pretraining: Callable[..., PretrainingRestore | None] | None = None
     save_pretraining: Callable[..., object] | None = None
+    restore_selection: Callable[..., object | None] | None = None
+    save_selection: Callable[..., object] | None = None
 
 
 def runtime_paths_from_env() -> NotebookRuntimePaths:
@@ -886,23 +888,53 @@ def _run_static_notebook_with_context(
             selection = restored.selection
             reconstruction = restored.reconstruction
         else:
-            stage_started = time.perf_counter()
-            with _reported_stage(reporter, "source_copy"):
-                copied_inventory = boundaries.copy_input(input_path, local_input)
-            timings["copy_input_seconds"] = time.perf_counter() - stage_started
-            if _inventory_signature(copied_inventory) != _inventory_signature(
-                source_inventory
-            ):
-                raise ValueError("copied input inventory differs from the Drive source")
-
-            stage_started = time.perf_counter()
-            with _reported_stage(reporter, "frame_selection"):
-                selection = boundaries.select_frames(
-                    copied_inventory,
+            if boundaries.restore_selection is not None:
+                stage_started = time.perf_counter()
+                selection = boundaries.restore_selection(
+                    source_inventory=source_inventory,
                     spec=spec,
-                    output_root=run_root / "selection",
+                    hardware=hardware,
+                    run_root=run_root,
                 )
-            timings["selection_seconds"] = time.perf_counter() - stage_started
+                timings["restore_selection_seconds"] = (
+                    time.perf_counter() - stage_started
+                )
+            if selection is not None:
+                if reporter is not None:
+                    reporter.skip("source_copy", "restored selected frames")
+                    reporter.skip("frame_selection", "restored selection milestone")
+            else:
+                stage_started = time.perf_counter()
+                with _reported_stage(reporter, "source_copy"):
+                    copied_inventory = boundaries.copy_input(input_path, local_input)
+                timings["copy_input_seconds"] = time.perf_counter() - stage_started
+                if _inventory_signature(copied_inventory) != _inventory_signature(
+                    source_inventory
+                ):
+                    raise ValueError(
+                        "copied input inventory differs from the Drive source"
+                    )
+
+                stage_started = time.perf_counter()
+                with _reported_stage(reporter, "frame_selection"):
+                    selection = boundaries.select_frames(
+                        copied_inventory,
+                        spec=spec,
+                        output_root=run_root / "selection",
+                    )
+                timings["selection_seconds"] = time.perf_counter() - stage_started
+                if boundaries.save_selection is not None:
+                    stage_started = time.perf_counter()
+                    boundaries.save_selection(
+                        source_inventory=source_inventory,
+                        selection=selection,
+                        spec=spec,
+                        hardware=hardware,
+                        run_root=run_root,
+                    )
+                    timings["save_selection_seconds"] = (
+                        time.perf_counter() - stage_started
+                    )
             stage_started = time.perf_counter()
             with _reported_stage(reporter, "reconstruction"):
                 reconstruction = boundaries.reconstruct(

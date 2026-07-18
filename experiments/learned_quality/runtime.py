@@ -61,7 +61,13 @@ from .geometry import (
 from .lifecycle import release_cuda_model
 from .masks import MaskFusionPolicy, fuse_evidence_masks
 from .milestones import (
+    BaseEvidenceState,
     LEGACY_COLMAP_PRODUCER_DIGESTS,
+    MasksMilestoneState,
+    MilestoneRef,
+    MilestoneSession,
+    MotionMilestoneState,
+    SemanticMilestoneState,
     compatible_colmap_fingerprints,
 )
 from .model_adapters import (
@@ -83,6 +89,22 @@ _COLMAP_PRODUCER_PATHS = (
     "experiments/learned_quality/geometry.py",
     "experiments/learned_quality/runtime.py",
 )
+_BASE_EVIDENCE_PRODUCER_PATHS = (
+    "backend/preprocess/parse_colmap.py",
+    "experiments/learned_quality/da3.py",
+    "experiments/learned_quality/runtime.py",
+    "experiments/learned_quality/tracks.py",
+)
+_SEMANTIC_PRODUCER_PATHS = (
+    "experiments/learned_quality/model_adapters.py",
+    "experiments/learned_quality/segmentation.py",
+)
+_MOTION_PRODUCER_PATHS = (
+    "experiments/learned_quality/flow.py",
+    "experiments/learned_quality/lifecycle.py",
+    "experiments/learned_quality/model_adapters.py",
+)
+_MASKS_PRODUCER_PATHS = ("experiments/learned_quality/masks.py",)
 
 
 def _learned_stage(stage_id: str):
@@ -359,6 +381,98 @@ def _final_cameras(
     return tuple(result)
 
 
+def _evidence_milestone_refs(
+    session: MilestoneSession,
+    *,
+    colmap_fingerprint: str,
+) -> dict[CheckpointKind, MilestoneRef]:
+    base_upstream = {
+        CheckpointKind.SELECTION: session.selection_ref.fingerprint,
+        CheckpointKind.COLMAP: colmap_fingerprint,
+    }
+    base = session.make_ref(
+        CheckpointKind.BASE_EVIDENCE,
+        upstream=base_upstream,
+        settings={
+            "track_policy": {
+                "minimum_observations": 3,
+                "maximum_invalid_fraction": 0.01,
+                "maximum_examples": 32,
+            },
+            "anchor_vram_policy": "a100-80gb",
+            "metric_batches": [12, 6],
+        },
+        producer_paths=_BASE_EVIDENCE_PRODUCER_PATHS,
+    )
+    semantic = session.make_ref(
+        CheckpointKind.SEMANTIC,
+        upstream={CheckpointKind.BASE_EVIDENCE: base.fingerprint},
+        settings={
+            "policy": [0.30, 0.25, 32, 3],
+            "batches": [8, 4],
+        },
+        producer_paths=_SEMANTIC_PRODUCER_PATHS,
+    )
+    motion = session.make_ref(
+        CheckpointKind.MOTION,
+        upstream={CheckpointKind.BASE_EVIDENCE: base.fingerprint},
+        settings={
+            "policy": [0.03, 0.005, 1.5, 0.01, 3.0, 3, 1.5, 3.0],
+            "pair_batches": [2, 1],
+        },
+        producer_paths=_MOTION_PRODUCER_PATHS,
+    )
+    masks = session.make_ref(
+        CheckpointKind.MASKS,
+        upstream={
+            CheckpointKind.BASE_EVIDENCE: base.fingerprint,
+            CheckpointKind.SEMANTIC: semantic.fingerprint,
+            CheckpointKind.MOTION: motion.fingerprint,
+        },
+        settings={
+            "policy": [
+                0.003,
+                0.001,
+                0.0002,
+                0.20,
+                0.45,
+                0.80,
+                0.003,
+                0.02,
+                0.01,
+            ]
+        },
+        producer_paths=_MASKS_PRODUCER_PATHS,
+    )
+    return {
+        CheckpointKind.BASE_EVIDENCE: base,
+        CheckpointKind.SEMANTIC: semantic,
+        CheckpointKind.MOTION: motion,
+        CheckpointKind.MASKS: masks,
+    }
+
+
+def _restore_stage_state(
+    session: MilestoneSession | None,
+    ref: MilestoneRef | None,
+    destination: Path,
+    expected_type: type[object],
+) -> object | None:
+    if session is None or ref is None:
+        return None
+    restored = session.restore(ref, destination)
+    if restored is None:
+        return None
+    if not isinstance(restored.value, expected_type):
+        raise ValueError(
+            f"restored {ref.kind.value} milestone has the wrong state type"
+        )
+    reporter = current_stage_reporter()
+    if reporter is not None:
+        reporter.cache_event("hit", f"{ref.kind.value} milestone", str(destination))
+    return restored.value
+
+
 def _run_evidence_cycle(
     selection: SelectionOutput,
     frames: tuple[FrameArtifact, ...],
@@ -366,171 +480,328 @@ def _run_evidence_cycle(
     output_root: Path,
     *,
     checkpoint_store: LearnedCheckpointStore | None = None,
+    milestone_session: MilestoneSession | None = None,
 ) -> LearnedArtifacts:
     output_root.mkdir(parents=True, exist_ok=False)
+    reporter = current_stage_reporter()
     da3_frames = tuple(
         DA3Frame(frame.image_name, frame.frame_id, frame.path) for frame in frames
     )
-    with _learned_stage("da3_anchor"):
-        base = load_da3_model(
-            _SOURCE_ROOT / "da3", _checkpoint("depth-anything/DA3-BASE")
-        )
-        try:
-            anchors = run_anchor_inference(
-                base,
-                da3_frames,
-                output_root / "da3-anchor",
-                vram_gb=hardware.vram_gb,
-            )
-        finally:
-            release_cuda_model(base)
-            del base
-
     model_manifest_path: Path | None = None
-    cache_fingerprint: str | None = None
-    pending_colmap_publish = False
-    reporter = current_stage_reporter()
-    with _learned_stage("classical_colmap"):
-        pre_attempt = None
-        if checkpoint_store is not None:
-            model_manifest_path = _validate_model_manifest()
-            cache_fingerprints = _colmap_cache_fingerprints(
-                selection,
-                hardware,
-                model_manifest_path,
-            )
-            cache_fingerprint = cache_fingerprints[0]
-            for index, candidate_fingerprint in enumerate(cache_fingerprints):
-                suffix = "" if index == 0 else f"-legacy-{index}"
-                pre_attempt = checkpoint_store.restore_colmap(
-                    candidate_fingerprint,
-                    destination=output_root / f"classical-prepass-restored{suffix}",
-                )
-                if pre_attempt is not None:
-                    pending_colmap_publish = index > 0
-                    break
-            if reporter is not None:
-                reporter.cache_event(
-                    "hit" if pre_attempt is not None else "miss",
-                    (
-                        "COLMAP checkpoint"
-                        if not pending_colmap_publish
-                        else "COLMAP checkpoint (compatible legacy)"
-                    ),
-                    str(checkpoint_store.cache_root),
-                )
-        if pre_attempt is None:
-            classical_runner = make_classical_candidate_runner(
-                use_gpu=hardware.colmap_gpu_sift is True
-            )
-            pre_attempt = classical_runner(
-                selection.manifest,
-                frames,
-                output_root / "classical-prepass",
-                0,
-                geometry_frame_set_digest(selection.manifest, frames),
-            )
-            pending_colmap_publish = checkpoint_store is not None
-        measured = tuple(measure_models(pre_attempt.model_dirs, selection.manifest))
-        if not measured:
-            raise RuntimeError("classical prepass produced no readable geometry")
-        pre_model = max(
-            measured,
-            key=lambda item: (item.registered_count, item.sparse_point_count),
-        ).model_dir
-        qualified_tracks = qualify_colmap_static_tracks(
-            pre_model,
-            frames,
-            output_root / "track_audit.json",
-            policy=TrackQualificationPolicy(),
+    cache_fingerprints: tuple[str, ...] | None = None
+    milestone_refs: dict[CheckpointKind, MilestoneRef] = {}
+    if milestone_session is not None:
+        model_manifest_path = _validate_model_manifest()
+        cache_fingerprints = _colmap_cache_fingerprints(
+            selection,
+            hardware,
+            model_manifest_path,
+        )
+        milestone_refs = _evidence_milestone_refs(
+            milestone_session,
+            colmap_fingerprint=cache_fingerprints[0],
         )
 
-    with _learned_stage("da3_metric_sky"):
-        metric_model = load_da3_model(
-            _SOURCE_ROOT / "da3", _checkpoint("depth-anything/DA3METRIC-LARGE")
+    base_state = _restore_stage_state(
+        milestone_session,
+        milestone_refs.get(CheckpointKind.BASE_EVIDENCE),
+        output_root / "restored-base-evidence",
+        BaseEvidenceState,
+    )
+    if isinstance(base_state, BaseEvidenceState):
+        anchors = base_state.anchors
+        depths = base_state.depths
+        sky = base_state.sky
+        scene = base_state.scene
+        if reporter is not None:
+            for stage_id in ("da3_anchor", "classical_colmap", "da3_metric_sky"):
+                reporter.skip(stage_id, "restored from base_evidence milestone")
+    else:
+        if milestone_session is not None and reporter is not None:
+            reporter.cache_event(
+                "miss",
+                "base_evidence milestone",
+                str(milestone_session.store.cache_root),
+            )
+        with _learned_stage("da3_anchor"):
+            base = load_da3_model(
+                _SOURCE_ROOT / "da3", _checkpoint("depth-anything/DA3-BASE")
+            )
+            try:
+                anchors = run_anchor_inference(
+                    base,
+                    da3_frames,
+                    output_root / "da3-anchor",
+                    vram_gb=hardware.vram_gb,
+                )
+            finally:
+                release_cuda_model(base)
+                del base
+
+        cache_fingerprint: str | None = None
+        pending_colmap_publish = False
+        with _learned_stage("classical_colmap"):
+            pre_attempt = None
+            if checkpoint_store is not None:
+                if model_manifest_path is None:
+                    model_manifest_path = _validate_model_manifest()
+                if cache_fingerprints is None:
+                    cache_fingerprints = _colmap_cache_fingerprints(
+                        selection,
+                        hardware,
+                        model_manifest_path,
+                    )
+                cache_fingerprint = cache_fingerprints[0]
+                for index, candidate_fingerprint in enumerate(cache_fingerprints):
+                    suffix = "" if index == 0 else f"-legacy-{index}"
+                    pre_attempt = checkpoint_store.restore_colmap(
+                        candidate_fingerprint,
+                        destination=output_root / f"classical-prepass-restored{suffix}",
+                    )
+                    if pre_attempt is not None:
+                        pending_colmap_publish = index > 0
+                        break
+                if reporter is not None:
+                    reporter.cache_event(
+                        "hit" if pre_attempt is not None else "miss",
+                        (
+                            "COLMAP checkpoint"
+                            if not pending_colmap_publish
+                            else "COLMAP checkpoint (compatible legacy)"
+                        ),
+                        str(checkpoint_store.cache_root),
+                    )
+            if pre_attempt is None:
+                classical_runner = make_classical_candidate_runner(
+                    use_gpu=hardware.colmap_gpu_sift is True
+                )
+                pre_attempt = classical_runner(
+                    selection.manifest,
+                    frames,
+                    output_root / "classical-prepass",
+                    0,
+                    geometry_frame_set_digest(selection.manifest, frames),
+                )
+                pending_colmap_publish = checkpoint_store is not None
+            measured = tuple(measure_models(pre_attempt.model_dirs, selection.manifest))
+            if not measured:
+                raise RuntimeError("classical prepass produced no readable geometry")
+            pre_model = max(
+                measured,
+                key=lambda item: (item.registered_count, item.sparse_point_count),
+            ).model_dir
+            qualified_tracks = qualify_colmap_static_tracks(
+                pre_model,
+                frames,
+                output_root / "track_audit.json",
+                policy=TrackQualificationPolicy(),
+            )
+
+        with _learned_stage("da3_metric_sky"):
+            metric_model = load_da3_model(
+                _SOURCE_ROOT / "da3", _checkpoint("depth-anything/DA3METRIC-LARGE")
+            )
+            try:
+                metric = run_metric_sky(
+                    metric_model,
+                    da3_frames,
+                    anchors.shared_camera,
+                    output_root / "da3-metric",
+                    initial_batch_size=12,
+                    retry_batch_size=6,
+                    release_model=release_cuda_model,
+                    retry_model_factory=lambda: load_da3_model(
+                        _SOURCE_ROOT / "da3",
+                        _checkpoint("depth-anything/DA3METRIC-LARGE"),
+                    ),
+                )
+            finally:
+                release_cuda_model(metric_model)
+                del metric_model
+            depths, sky = _materialize_metric(
+                frames, metric, output_root / "metric-native"
+            )
+            scene = _rigid_scene(
+                frames,
+                pre_model,
+                depths,
+                static_tracks=qualified_tracks.tracks,
+            )
+            if (
+                pending_colmap_publish
+                and checkpoint_store is not None
+                and cache_fingerprint is not None
+            ):
+                generation = checkpoint_store.publish_colmap(
+                    pre_attempt,
+                    fingerprint=cache_fingerprint,
+                    run_id=f"colmap-{uuid.uuid4().hex}",
+                )
+                if reporter is not None:
+                    reporter.cache_event(
+                        "save",
+                        "COLMAP checkpoint",
+                        str(generation),
+                    )
+        current_colmap_ref = (
+            cache_fingerprints[0]
+            if cache_fingerprints is not None
+            else cache_fingerprint
         )
-        try:
-            metric = run_metric_sky(
-                metric_model,
-                da3_frames,
-                anchors.shared_camera,
-                output_root / "da3-metric",
-                initial_batch_size=12,
-                retry_batch_size=6,
+        if current_colmap_ref is None and milestone_session is not None:
+            raise RuntimeError("base evidence cannot identify its COLMAP checkpoint")
+        base_state = BaseEvidenceState(
+            anchors=anchors,
+            depths=depths,
+            sky=sky,
+            scene=scene,
+            track_audit=qualified_tracks,
+            colmap_ref=current_colmap_ref or "0" * 64,
+        )
+        if milestone_session is not None:
+            base_ref = milestone_refs[CheckpointKind.BASE_EVIDENCE]
+            generation = milestone_session.publish(
+                base_ref,
+                upstream={
+                    CheckpointKind.SELECTION: (
+                        milestone_session.selection_ref.fingerprint
+                    ),
+                    CheckpointKind.COLMAP: base_state.colmap_ref,
+                },
+                value=base_state,
+                artifact_roots={"base": output_root},
+            )
+            if reporter is not None:
+                reporter.cache_event("save", "base_evidence milestone", str(generation))
+
+    semantic_state = _restore_stage_state(
+        milestone_session,
+        milestone_refs.get(CheckpointKind.SEMANTIC),
+        output_root / "restored-semantic",
+        SemanticMilestoneState,
+    )
+    if isinstance(semantic_state, SemanticMilestoneState):
+        semantic = semantic_state.semantic
+        if reporter is not None:
+            reporter.skip("semantic_masks", "restored from semantic milestone")
+    else:
+        with _learned_stage("semantic_masks"):
+            semantic = run_semantic_evidence(
+                frames,
+                output_root / "semantic",
+                policy=SemanticPolicy(0.30, 0.25, 32, 3),
+                detector_factory=lambda: TransformersGroundingDinoAdapter(
+                    _checkpoint("IDEA-Research/grounding-dino-tiny")
+                ),
+                sam_factory=lambda: Sam2ImageAdapter(
+                    _SOURCE_ROOT / "sam2", _checkpoint("facebook/sam2.1-hiera-large")
+                ),
+                initial_batch_size=8,
+                retry_batch_size=4,
                 release_model=release_cuda_model,
-                retry_model_factory=lambda: load_da3_model(
-                    _SOURCE_ROOT / "da3",
-                    _checkpoint("depth-anything/DA3METRIC-LARGE"),
+            )
+        if milestone_session is not None:
+            semantic_ref = milestone_refs[CheckpointKind.SEMANTIC]
+            generation = milestone_session.publish(
+                semantic_ref,
+                upstream={
+                    CheckpointKind.BASE_EVIDENCE: milestone_refs[
+                        CheckpointKind.BASE_EVIDENCE
+                    ].fingerprint
+                },
+                value=SemanticMilestoneState(semantic),
+                artifact_roots={"semantic": output_root / "semantic"},
+            )
+            if reporter is not None:
+                reporter.cache_event("save", "semantic milestone", str(generation))
+
+    motion_state = _restore_stage_state(
+        milestone_session,
+        milestone_refs.get(CheckpointKind.MOTION),
+        output_root / "restored-motion",
+        MotionMilestoneState,
+    )
+    if isinstance(motion_state, MotionMilestoneState):
+        flow = motion_state.motion
+        if reporter is not None:
+            reporter.skip("optical_flow", "restored from motion milestone")
+    else:
+        with _learned_stage("optical_flow"):
+            flow = run_motion_evidence(
+                frames,
+                scene,
+                output_root / "flow",
+                policy=FlowGatePolicy(0.03, 0.005, 1.5, 0.01, 3.0, 3, 1.5, 3.0),
+                model_factory=lambda: SeaRaftTorchAdapter(
+                    _SOURCE_ROOT / "sea-raft",
+                    _checkpoint("MemorySlices/Tartan-C-T-TSKH-spring540x960-M"),
+                ),
+                initial_pair_batch_size=2,
+                retry_pair_batch_size=1,
+                release_model=release_cuda_model,
+            )
+        if milestone_session is not None:
+            motion_ref = milestone_refs[CheckpointKind.MOTION]
+            generation = milestone_session.publish(
+                motion_ref,
+                upstream={
+                    CheckpointKind.BASE_EVIDENCE: milestone_refs[
+                        CheckpointKind.BASE_EVIDENCE
+                    ].fingerprint
+                },
+                value=MotionMilestoneState(flow),
+                artifact_roots={"motion": output_root / "flow"},
+            )
+            if reporter is not None:
+                reporter.cache_event("save", "motion milestone", str(generation))
+
+    masks_state = _restore_stage_state(
+        milestone_session,
+        milestone_refs.get(CheckpointKind.MASKS),
+        output_root / "restored-masks",
+        MasksMilestoneState,
+    )
+    if isinstance(masks_state, MasksMilestoneState):
+        masks = masks_state.masks
+        if reporter is not None:
+            reporter.skip("mask_fusion", "restored from masks milestone")
+    else:
+        with _learned_stage("mask_fusion"):
+            masks = fuse_evidence_masks(
+                frames,
+                semantic,
+                flow,
+                sky,
+                scene,
+                output_root / "masks",
+                policy=MaskFusionPolicy(
+                    0.003, 0.001, 0.0002, 0.20, 0.45, 0.80, 0.003, 0.02, 0.01
                 ),
             )
-        finally:
-            release_cuda_model(metric_model)
-            del metric_model
-        depths, sky = _materialize_metric(frames, metric, output_root / "metric-native")
-        scene = _rigid_scene(
-            frames,
-            pre_model,
-            depths,
-            static_tracks=qualified_tracks.tracks,
-        )
-        if (
-            pending_colmap_publish
-            and checkpoint_store is not None
-            and cache_fingerprint is not None
-        ):
-            generation = checkpoint_store.publish_colmap(
-                pre_attempt,
-                fingerprint=cache_fingerprint,
-                run_id=f"colmap-{uuid.uuid4().hex}",
+        if milestone_session is not None:
+            masks_ref = milestone_refs[CheckpointKind.MASKS]
+            generation = milestone_session.publish(
+                masks_ref,
+                upstream={
+                    CheckpointKind.BASE_EVIDENCE: milestone_refs[
+                        CheckpointKind.BASE_EVIDENCE
+                    ].fingerprint,
+                    CheckpointKind.SEMANTIC: milestone_refs[
+                        CheckpointKind.SEMANTIC
+                    ].fingerprint,
+                    CheckpointKind.MOTION: milestone_refs[
+                        CheckpointKind.MOTION
+                    ].fingerprint,
+                },
+                value=MasksMilestoneState(masks),
+                artifact_roots={"masks": output_root / "masks"},
             )
             if reporter is not None:
-                reporter.cache_event(
-                    "save",
-                    "COLMAP checkpoint",
-                    str(generation),
-                )
+                reporter.cache_event("save", "masks milestone", str(generation))
 
-    with _learned_stage("semantic_masks"):
-        semantic = run_semantic_evidence(
-            frames,
-            output_root / "semantic",
-            policy=SemanticPolicy(0.30, 0.25, 32, 3),
-            detector_factory=lambda: TransformersGroundingDinoAdapter(
-                _checkpoint("IDEA-Research/grounding-dino-tiny")
-            ),
-            sam_factory=lambda: Sam2ImageAdapter(
-                _SOURCE_ROOT / "sam2", _checkpoint("facebook/sam2.1-hiera-large")
-            ),
-            initial_batch_size=8,
-            retry_batch_size=4,
-            release_model=release_cuda_model,
-        )
-    with _learned_stage("optical_flow"):
-        flow = run_motion_evidence(
-            frames,
-            scene,
-            output_root / "flow",
-            policy=FlowGatePolicy(0.03, 0.005, 1.5, 0.01, 3.0, 3, 1.5, 3.0),
-            model_factory=lambda: SeaRaftTorchAdapter(
-                _SOURCE_ROOT / "sea-raft",
-                _checkpoint("MemorySlices/Tartan-C-T-TSKH-spring540x960-M"),
-            ),
-            initial_pair_batch_size=2,
-            retry_pair_batch_size=1,
-            release_model=release_cuda_model,
-        )
-    with _learned_stage("mask_fusion"):
-        masks = fuse_evidence_masks(
-            frames,
-            semantic,
-            flow,
-            sky,
-            scene,
-            output_root / "masks",
-            policy=MaskFusionPolicy(
-                0.003, 0.001, 0.0002, 0.20, 0.45, 0.80, 0.003, 0.02, 0.01
-            ),
-        )
+    registered_count = sum(
+        1 for frame in getattr(scene, "frames", ()) if frame.registered
+    )
     stages = (
         StageRecord(
             "da3_anchor", "accepted", details={"anchors": len(anchors.anchor_indices)}
@@ -538,11 +809,9 @@ def _run_evidence_cycle(
         StageRecord(
             "classical_prepass",
             "accepted",
-            details={"registered": max(item.registered_count for item in measured)},
+            details={"registered": registered_count},
         ),
-        StageRecord(
-            "da3_metric_sky", "accepted", details={"frames": len(metric.artifacts)}
-        ),
+        StageRecord("da3_metric_sky", "accepted", details={"frames": len(depths)}),
         *semantic.stage_records,
         *flow.stage_records,
         StageRecord(
@@ -551,6 +820,7 @@ def _run_evidence_cycle(
     )
     return LearnedArtifacts(
         da3=anchors,
+        base_evidence=base_state,
         semantic=semantic,
         flow=flow,
         masks=masks,
@@ -566,10 +836,14 @@ def run_learned_reconstruction(
     hardware: HardwareInfo,
     output_root: Path,
     checkpoint_store: LearnedCheckpointStore | None = None,
+    milestone_session: MilestoneSession | None = None,
 ) -> LearnedReconstructionOutput:
     del spec
     _validate_model_manifest()
     frames = _frame_artifacts(selection)
+    evidence_kwargs: dict[str, object] = {"checkpoint_store": checkpoint_store}
+    if milestone_session is not None:
+        evidence_kwargs["milestone_session"] = milestone_session
     active = {
         "selection": selection,
         "frames": frames,
@@ -578,7 +852,7 @@ def run_learned_reconstruction(
             frames,
             hardware,
             output_root.parent / "learned-evidence-0",
-            checkpoint_store=checkpoint_store,
+            **evidence_kwargs,
         ),
     }
     classical = make_classical_candidate_runner(
@@ -642,20 +916,25 @@ def run_learned_reconstruction(
     # Use metric-native depth already bound into the motion evidence scene.
     rigid_frames = tuple(artifacts.flow.frames)
     del metric_artifacts, rigid_frames
-    metric_dir = (
-        output_root.parent
-        / (
-            "learned-evidence-1"
-            if comparison.selected_manifest != selection.manifest
-            else "learned-evidence-0"
+    if isinstance(artifacts.base_evidence, BaseEvidenceState):
+        depths = artifacts.base_evidence.depths
+    else:
+        metric_dir = (
+            output_root.parent
+            / (
+                "learned-evidence-1"
+                if comparison.selected_manifest != selection.manifest
+                else "learned-evidence-0"
+            )
+            / "metric-native"
         )
-        / "metric-native"
-    )
-    depths = tuple(
-        (metric_dir / f"{Path(frame.image_name).stem}.depth.npy", "")
-        for frame in final_frames
-    )
-    depths = tuple((path, _sha256(path)) for path, _ in depths)
+        depths = tuple(
+            (metric_dir / f"{Path(frame.image_name).stem}.depth.npy", "")
+            for frame in final_frames
+        )
+        depths = tuple((path, _sha256(path)) for path, _ in depths)
+    if len(depths) != len(final_frames):
+        raise ValueError("base-evidence depth count differs from final frames")
     with _learned_stage("photometric_validation"):
         final_tracks = qualify_colmap_static_tracks(
             comparison.accepted_model_dir,

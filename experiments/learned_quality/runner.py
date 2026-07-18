@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import platform
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from backend.static_pipeline.runner import (
     NotebookRunResult,
     RunnerServices,
     RuntimePreflightError,
+    SelectionOutput,
     run_static_notebook,
     runtime_paths_from_env,
 )
@@ -35,6 +37,13 @@ from .contracts import (
     LearnedReconstructionOutput,
     derive_learned_cache_root,
     to_static_run_spec,
+)
+from .milestones import (
+    MilestoneInputs,
+    MilestoneRef,
+    MilestoneSession,
+    MilestoneState,
+    milestone_fingerprint,
 )
 from .publish import publish_learned_diagnostics, publish_learned_result
 from .reports import finalize_learned_bundle, validate_learned_bundle
@@ -92,6 +101,12 @@ _PRETRAINING_PRODUCER_PATHS = (
     "experiments/learned_quality/photometric.py",
     "experiments/learned_quality/runtime.py",
     "experiments/learned_quality/segmentation.py",
+)
+_SELECTION_PRODUCER_PATHS = (
+    "backend/static_pipeline/contracts.py",
+    "backend/static_pipeline/runner.py",
+    "backend/static_pipeline/selection.py",
+    "backend/static_pipeline/sources.py",
 )
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _PRETRAINING_SKIPPED_STAGES = (
@@ -189,6 +204,33 @@ def _pretraining_cache_fingerprint(
                 _PRETRAINING_PRODUCER_PATHS,
             ),
             upstream_fingerprint=upstream,
+        ),
+    )
+
+
+def _selection_milestone_ref(
+    source_inventory: object,
+    spec: object,
+    hardware: HardwareInfo,
+    model_manifest_path: Path,
+) -> MilestoneRef:
+    source_digest = getattr(source_inventory, "digest", None)
+    return MilestoneRef(
+        CheckpointKind.SELECTION,
+        milestone_fingerprint(
+            CheckpointKind.SELECTION,
+            MilestoneInputs(
+                source_digest=source_digest,
+                selection_digest=source_digest,
+                settings=_pretraining_settings(spec, hardware)["frame_selection"],
+                model_manifest_sha256=_sha256_path(model_manifest_path),
+                tool_versions={"python": platform.python_version()},
+                producer_code_sha256=producer_code_digest(
+                    _REPOSITORY_ROOT,
+                    _SELECTION_PRODUCER_PATHS,
+                ),
+                upstream={},
+            ),
         ),
     )
 
@@ -429,17 +471,105 @@ def make_learned_quality_services(
     reconstruct = context.reconstruct
     restore_pretraining = None
     save_pretraining = None
+    restore_selection = None
+    save_selection = None
     if cache_session is not None:
+
+        def restore_selection_impl(**kwargs: object) -> SelectionOutput | None:
+            source_inventory = kwargs["source_inventory"]
+            spec = kwargs["spec"]
+            hardware = kwargs["hardware"]
+            run_root = Path(kwargs["run_root"])
+            store = cache_session.store_for(source_inventory)
+            ref = _selection_milestone_ref(
+                source_inventory,
+                spec,
+                hardware,
+                context.model_manifest_path,
+            )
+            restored = store.restore_milestone(
+                ref,
+                destination=run_root / "selection-restored",
+                source_inventory=source_inventory,
+            )
+            reporter = current_stage_reporter()
+            if reporter is not None:
+                reporter.cache_event(
+                    "hit" if restored is not None else "miss",
+                    "Selection milestone",
+                    str(cache_session.cache_root),
+                )
+            if restored is None:
+                return None
+            if not isinstance(restored.value, SelectionOutput):
+                raise ValueError("selection milestone restored the wrong state type")
+            selection = restored.value
+            if selection.inventory is not source_inventory:
+                raise ValueError("selection milestone inventory is not current")
+            return selection
+
+        def save_selection_impl(**kwargs: object) -> Path:
+            source_inventory = kwargs["source_inventory"]
+            selection = kwargs["selection"]
+            spec = kwargs["spec"]
+            hardware = kwargs["hardware"]
+            run_root = Path(kwargs["run_root"])
+            if not isinstance(selection, SelectionOutput):
+                raise TypeError("selection must be a SelectionOutput")
+            store = cache_session.store_for(source_inventory)
+            ref = _selection_milestone_ref(
+                source_inventory,
+                spec,
+                hardware,
+                context.model_manifest_path,
+            )
+            generation = store.publish_milestone(
+                MilestoneState(
+                    ref=ref,
+                    upstream={},
+                    value=selection,
+                    artifact_roots={"selection": selection.frames_dir},
+                ),
+                run_id=f"{run_root.name}-selection",
+            )
+            reporter = current_stage_reporter()
+            if reporter is not None:
+                reporter.cache_event("save", "Selection milestone", str(generation))
+            return generation
 
         def cached_reconstruct(
             selection: object,
             **kwargs: object,
         ) -> LearnedReconstructionOutput:
             store = cache_session.store_for(selection.inventory)
+            milestone_session = None
+            if isinstance(selection, SelectionOutput):
+                spec = kwargs["spec"]
+                hardware = kwargs["hardware"]
+                output_root = Path(kwargs["output_root"])
+                selection_ref = _selection_milestone_ref(
+                    selection.inventory,
+                    spec,
+                    hardware,
+                    context.model_manifest_path,
+                )
+                milestone_session = MilestoneSession(
+                    store=store,
+                    source_inventory=selection.inventory,
+                    source_digest=selection.inventory.digest,
+                    selection_digest=selection.manifest.image_set_digest,
+                    model_manifest_sha256=_sha256_path(context.model_manifest_path),
+                    tool_versions={"python": platform.python_version()},
+                    selection_ref=selection_ref,
+                    repository_root=_REPOSITORY_ROOT,
+                    run_id=output_root.parent.name,
+                    external_roots={"selection": selection.frames_dir},
+                )
             return context.reconstruct(
                 selection,
                 **kwargs,
                 checkpoint_store=store,
+                milestone_session=milestone_session,
             )
 
         def restore_pretraining_impl(**kwargs: object) -> object | None:
@@ -519,6 +649,8 @@ def make_learned_quality_services(
         reconstruct = cached_reconstruct
         restore_pretraining = restore_pretraining_impl
         save_pretraining = save_pretraining_impl
+        restore_selection = restore_selection_impl
+        save_selection = save_selection_impl
 
     return RunnerServices(
         discover_source=production.discover_source,
@@ -537,6 +669,8 @@ def make_learned_quality_services(
         resolve_input=production.resolve_input,
         restore_pretraining=restore_pretraining,
         save_pretraining=save_pretraining,
+        restore_selection=restore_selection,
+        save_selection=save_selection,
     )
 
 

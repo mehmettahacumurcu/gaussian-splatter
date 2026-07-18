@@ -142,9 +142,14 @@ def decode_checkpoint_state(
     *,
     restore_root: Path,
     source_inventory: object,
+    external_roots: Mapping[str, Path] | None = None,
 ) -> object:
     root = _regular_directory(Path(restore_root), "restore_root")
-    return _CheckpointDecoder(root, source_inventory).decode(payload)
+    return _CheckpointDecoder(
+        root,
+        source_inventory,
+        external_roots=external_roots or {},
+    ).decode(payload)
 
 
 class _CheckpointEncoder:
@@ -152,9 +157,11 @@ class _CheckpointEncoder:
         self,
         root: Path,
         path_rewrites: tuple[tuple[Path, Path], ...] = (),
+        external_path_rewrites: tuple[tuple[str, Path], ...] = (),
     ) -> None:
         self.root = root
         self.path_rewrites = path_rewrites
+        self.external_path_rewrites = external_path_rewrites
         self._object_ids: dict[int, str] = {}
 
     def encode(self, value: object) -> object:
@@ -165,24 +172,42 @@ class _CheckpointEncoder:
                 raise ValueError("checkpoint floats must be finite")
             return value
         if isinstance(value, Path):
-            active_path = value
-            if self.path_rewrites:
-                resolved = value.resolve(strict=True)
-                matches = []
-                for source_root, destination_root in self.path_rewrites:
-                    try:
-                        relative = resolved.relative_to(source_root)
-                    except ValueError:
-                        continue
-                    matches.append(destination_root.joinpath(*relative.parts))
-                if len(matches) != 1:
-                    raise ValueError(
-                        "milestone artifact paths must belong to exactly one root"
-                    )
-                active_path = matches[0]
+            if not self.path_rewrites and not self.external_path_rewrites:
+                return {
+                    "__kind__": "path",
+                    "relative_path": _path_relative_to_root(value, self.root),
+                }
+            resolved = value.resolve(strict=True)
+            direct_matches = []
+            for source_root, destination_root in self.path_rewrites:
+                try:
+                    relative = resolved.relative_to(source_root)
+                except ValueError:
+                    continue
+                direct_matches.append(destination_root.joinpath(*relative.parts))
+            external_matches = []
+            for label, source_root in self.external_path_rewrites:
+                try:
+                    relative = resolved.relative_to(source_root)
+                except ValueError:
+                    continue
+                external_matches.append((label, relative))
+            if len(direct_matches) + len(external_matches) != 1:
+                raise ValueError(
+                    "milestone artifact paths must belong to exactly one root"
+                )
+            if direct_matches:
+                return {
+                    "__kind__": "path",
+                    "relative_path": _path_relative_to_root(
+                        direct_matches[0], self.root
+                    ),
+                }
+            label, relative = external_matches[0]
             return {
-                "__kind__": "path",
-                "relative_path": _path_relative_to_root(active_path, self.root),
+                "__kind__": "external_path",
+                "root": label,
+                "relative_path": _safe_relative_path(relative.as_posix()).as_posix(),
             }
         if is_dataclass(value) and not isinstance(value, type):
             return self._encode_dataclass(value)
@@ -227,9 +252,19 @@ class _CheckpointEncoder:
 
 
 class _CheckpointDecoder:
-    def __init__(self, root: Path, source_inventory: object) -> None:
+    def __init__(
+        self,
+        root: Path,
+        source_inventory: object,
+        *,
+        external_roots: Mapping[str, Path],
+    ) -> None:
         self.root = root
         self.source_inventory = source_inventory
+        self.external_roots = {
+            label: _regular_directory(Path(path), f"{label} external root")
+            for label, path in external_roots.items()
+        }
         self._objects: dict[str, object] = {}
 
     def decode(self, payload: object) -> object:
@@ -246,6 +281,13 @@ class _CheckpointDecoder:
             _require_keys(payload, {"__kind__", "relative_path"})
             relative = _safe_relative_path(payload["relative_path"])
             return _resolved_restore_path(self.root, relative)
+        if kind == "external_path":
+            _require_keys(payload, {"__kind__", "root", "relative_path"})
+            label = payload["root"]
+            if not isinstance(label, str) or label not in self.external_roots:
+                raise ValueError("checkpoint external root is unavailable")
+            relative = _safe_relative_path(payload["relative_path"])
+            return _resolved_restore_path(self.external_roots[label], relative)
         if kind == "tuple":
             _require_keys(payload, {"__kind__", "items"})
             return tuple(self.decode(item) for item in _require_list(payload["items"]))
@@ -345,11 +387,26 @@ def _checkpoint_types() -> dict[str, type[object]]:
         DepthValidationResult,
         ValidatedDepthFrame,
     )
-    from .flow import FlowGatePolicy, MotionEvidence, MotionFrameEvidence
+    from .flow import (
+        FlowGatePolicy,
+        MotionEvidence,
+        MotionFrameEvidence,
+        RigidFrameEvidence,
+        RigidSceneEvidence,
+        StaticTrack,
+        TrackObservation,
+    )
     from .lifecycle import BatchAttemptRecord
     from .masks import FusedMaskFrame, MaskFusionEvidence, MaskFusionPolicy
+    from .milestones import (
+        BaseEvidenceState,
+        MasksMilestoneState,
+        MotionMilestoneState,
+        SemanticMilestoneState,
+    )
     from .photometric import PhotometricEvidence, RgbAffineTransform
     from .segmentation import SemanticEvidence, SemanticFrameEvidence, SemanticPolicy
+    from .tracks import QualifiedStaticTracks, TrackAuditReport
 
     types = (
         SelectionOutput,
@@ -377,6 +434,10 @@ def _checkpoint_types() -> dict[str, type[object]]:
         SemanticFrameEvidence,
         SemanticEvidence,
         FlowGatePolicy,
+        RigidFrameEvidence,
+        TrackObservation,
+        StaticTrack,
+        RigidSceneEvidence,
         MotionFrameEvidence,
         MotionEvidence,
         MaskFusionPolicy,
@@ -388,6 +449,12 @@ def _checkpoint_types() -> dict[str, type[object]]:
         ValidatedDepthFrame,
         DenseSeedArtifact,
         DepthValidationResult,
+        TrackAuditReport,
+        QualifiedStaticTracks,
+        BaseEvidenceState,
+        SemanticMilestoneState,
+        MotionMilestoneState,
+        MasksMilestoneState,
     )
     return {f"{item.__module__}.{item.__qualname__}": item for item in types}
 
@@ -406,6 +473,7 @@ class LearnedCheckpointStore:
         source_root: Path,
         upstream: Mapping[CheckpointKind, str] | None = None,
         artifact_roots: Mapping[str, str] | None = None,
+        external_root_labels: Sequence[str] = (),
     ) -> Path:
         active_kind = _require_kind(kind)
         active_fingerprint = _require_digest(fingerprint, "fingerprint")
@@ -413,7 +481,11 @@ class LearnedCheckpointStore:
             raise ValueError("run_id must be a safe non-empty identifier")
         source = _regular_directory(Path(source_root), "source_root")
         _inventory(source)
-        metadata = _generation_metadata(upstream, artifact_roots)
+        metadata = _generation_metadata(
+            upstream,
+            artifact_roots,
+            external_root_labels,
+        )
         self._ensure_owned_root(create=True)
 
         recovered = self.find_generation(active_kind, active_fingerprint)
@@ -491,7 +563,13 @@ class LearnedCheckpointStore:
         self._remove_older_generations(active_kind, keep=target)
         return target
 
-    def publish_milestone(self, state: MilestoneState, *, run_id: str) -> Path:
+    def publish_milestone(
+        self,
+        state: MilestoneState,
+        *,
+        run_id: str,
+        external_roots: Mapping[str, Path] | None = None,
+    ) -> Path:
         from .milestones import (
             MilestoneRef,
             MilestoneState,
@@ -516,7 +594,14 @@ class LearnedCheckpointStore:
             resolved_roots[label] = _regular_directory(
                 Path(raw_root), f"{label} artifact root"
             )
-        root_rows = tuple(resolved_roots.items())
+        resolved_external_roots: dict[str, Path] = {}
+        for label, raw_root in (external_roots or {}).items():
+            if label in resolved_roots:
+                raise ValueError("direct and external artifact root labels must differ")
+            resolved_external_roots[label] = _regular_directory(
+                Path(raw_root), f"{label} external root"
+            )
+        root_rows = tuple([*resolved_roots.items(), *resolved_external_roots.items()])
         for index, (left_label, left_root) in enumerate(root_rows):
             for right_label, right_root in root_rows[index + 1 :]:
                 try:
@@ -550,6 +635,7 @@ class LearnedCheckpointStore:
             encoded = _CheckpointEncoder(
                 snapshot,
                 tuple(path_rewrites),
+                tuple(sorted(resolved_external_roots.items())),
             ).encode(state.value)
             _write_json(snapshot / "state.json", encoded)
             return self.publish_generation(
@@ -559,6 +645,7 @@ class LearnedCheckpointStore:
                 source_root=snapshot,
                 upstream=upstream,
                 artifact_roots=artifact_manifest,
+                external_root_labels=tuple(resolved_external_roots),
             )
 
     def restore_milestone(
@@ -567,6 +654,7 @@ class LearnedCheckpointStore:
         *,
         destination: Path,
         source_inventory: object,
+        external_roots: Mapping[str, Path] | None = None,
     ) -> MilestoneState | None:
         from .milestones import MilestoneRef, MilestoneState
 
@@ -593,12 +681,19 @@ class LearnedCheckpointStore:
                 ref.kind,
                 ref.fingerprint,
             )
-            upstream, raw_artifact_roots = _manifest_metadata(manifest)
+            upstream, raw_artifact_roots, external_labels = _manifest_metadata(manifest)
+            resolved_external_roots = {
+                label: _regular_directory(Path(path), f"{label} external root")
+                for label, path in (external_roots or {}).items()
+            }
+            if set(resolved_external_roots) != set(external_labels):
+                raise ValueError("milestone external roots do not match its manifest")
             payload = json.loads((target / "state.json").read_text(encoding="utf-8"))
             value = decode_checkpoint_state(
                 payload,
                 restore_root=target,
                 source_inventory=source_inventory,
+                external_roots=resolved_external_roots,
             )
             artifact_roots = {
                 label: _resolved_restore_path(
@@ -611,10 +706,13 @@ class LearnedCheckpointStore:
                 resolved = Path(path).resolve(strict=True)
                 if not any(
                     resolved == artifact_root or resolved.is_relative_to(artifact_root)
-                    for artifact_root in artifact_roots.values()
+                    for artifact_root in (
+                        *artifact_roots.values(),
+                        *resolved_external_roots.values(),
+                    )
                 ):
                     raise ValueError(
-                        "restored milestone state escapes its direct artifact roots"
+                        "restored milestone state escapes its artifact roots"
                     )
             return MilestoneState(
                 ref=ref,
@@ -659,7 +757,7 @@ class LearnedCheckpointStore:
                     ref.kind,
                     ref.fingerprint,
                 )
-                upstream, _ = _manifest_metadata(manifest)
+                upstream, _, _ = _manifest_metadata(manifest)
             observed_edges[ref] = upstream
             for upstream_kind, fingerprint in sorted(
                 upstream.items(), key=lambda item: item[0].value
@@ -1207,10 +1305,15 @@ class LearnedCheckpointStore:
                 return False
             base_keys = {"schema_version", "kind", "fingerprint", "files"}
             metadata_keys = {"upstream", "artifact_roots"}
-            if set(manifest) == base_keys:
+            external_keys = {"external_root_labels"}
+            manifest_keys = frozenset(manifest)
+            if manifest_keys == frozenset(base_keys):
                 upstream_payload = None
-            elif set(manifest) == base_keys | metadata_keys:
-                upstream, _ = _manifest_metadata(manifest)
+            elif manifest_keys in {
+                frozenset(base_keys | metadata_keys),
+                frozenset(base_keys | metadata_keys | external_keys),
+            }:
+                upstream, _, _ = _manifest_metadata(manifest)
                 upstream_payload = {
                     upstream_kind.value: upstream_fingerprint
                     for upstream_kind, upstream_fingerprint in upstream.items()
@@ -1254,7 +1357,7 @@ class LearnedCheckpointStore:
                         owner_kind,
                         fingerprint,
                     )
-                    upstream, _ = _manifest_metadata(manifest)
+                    upstream, _, _ = _manifest_metadata(manifest)
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
                     continue
                 referenced.update(upstream.items())
@@ -1468,8 +1571,11 @@ def _require_kind(value: CheckpointKind) -> CheckpointKind:
 def _generation_metadata(
     upstream: Mapping[CheckpointKind, str] | None,
     artifact_roots: Mapping[str, str] | None,
+    external_root_labels: Sequence[str],
 ) -> dict[str, object]:
     if upstream is None and artifact_roots is None:
+        if external_root_labels:
+            raise ValueError("external roots require milestone metadata")
         return {}
     if upstream is None or artifact_roots is None:
         raise ValueError("milestone metadata requires upstream and artifact_roots")
@@ -1497,19 +1603,37 @@ def _generation_metadata(
         if relative.parts != ("artifacts", label):
             raise ValueError("artifact roots must use artifacts/<label>")
         roots_payload[label] = relative.as_posix()
+    labels: list[str] = []
+    for label in external_root_labels:
+        if (
+            not isinstance(label, str)
+            or not label
+            or label in {".", ".."}
+            or any(separator in label for separator in ("/", "\\", ":"))
+            or label in labels
+        ):
+            raise ValueError("external root labels must be unique safe components")
+        if label in roots_payload:
+            raise ValueError("direct and external artifact root labels must differ")
+        labels.append(label)
     return {
         "upstream": dict(sorted(upstream_payload.items())),
         "artifact_roots": dict(sorted(roots_payload.items())),
+        "external_root_labels": sorted(labels),
     }
 
 
 def _manifest_metadata(
     manifest: Mapping[str, object],
-) -> tuple[Mapping[CheckpointKind, str], Mapping[str, str]]:
+) -> tuple[
+    Mapping[CheckpointKind, str],
+    Mapping[str, str],
+    tuple[str, ...],
+]:
     has_upstream = "upstream" in manifest
     has_roots = "artifact_roots" in manifest
     if not has_upstream and not has_roots:
-        return MappingProxyType({}), MappingProxyType({})
+        return MappingProxyType({}), MappingProxyType({}), ()
     if not has_upstream or not has_roots:
         raise ValueError("milestone manifest metadata is incomplete")
     raw_upstream = manifest["upstream"]
@@ -1546,11 +1670,27 @@ def _manifest_metadata(
         if relative.parts != ("artifacts", label):
             raise ValueError("milestone artifact root path is malformed")
         roots[label] = relative.as_posix()
+    raw_external_labels = manifest.get("external_root_labels", [])
+    if not isinstance(raw_external_labels, list):
+        raise ValueError("milestone external root labels are malformed")
+    external_labels: list[str] = []
+    for label in raw_external_labels:
+        if (
+            not isinstance(label, str)
+            or not label
+            or label in {".", ".."}
+            or any(separator in label for separator in ("/", "\\", ":"))
+            or label in external_labels
+            or label in roots
+        ):
+            raise ValueError("milestone external root label is malformed")
+        external_labels.append(label)
     return (
         MappingProxyType(
             dict(sorted(upstream.items(), key=lambda item: item[0].value))
         ),
         MappingProxyType(dict(sorted(roots.items()))),
+        tuple(sorted(external_labels)),
     )
 
 
