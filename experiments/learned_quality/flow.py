@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -31,13 +32,43 @@ from .lifecycle import (
 
 
 def _model_ref(repo_id: str) -> ModelRef:
-    matches = tuple(model for model in CHECKPOINT_MODEL_REFS if model.repo_id == repo_id)
+    matches = tuple(
+        model for model in CHECKPOINT_MODEL_REFS if model.repo_id == repo_id
+    )
     if len(matches) != 1:
         raise RuntimeError(f"expected one pinned model ref for {repo_id}")
     return matches[0]
 
 
 SEA_RAFT_MODEL_REF = _model_ref("MemorySlices/Tartan-C-T-TSKH-spring540x960-M")
+FlowProgressCallback = Callable[[str, int, int, Mapping[str, object]], None]
+
+
+def _runtime_usage_details() -> dict[str, object]:
+    details: dict[str, object] = {}
+    try:
+        import resource
+
+        rss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        details["rss_bytes"] = rss if rss > 10_000_000 else rss * 1024
+    except (ImportError, OSError, ValueError):
+        pass
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            details["cuda_allocated_bytes"] = int(torch.cuda.memory_allocated())
+            details["cuda_reserved_bytes"] = int(torch.cuda.memory_reserved())
+    except (ImportError, RuntimeError):
+        pass
+    return details
+
+
+def _progress_checkpoint(completed: int, total: int) -> bool:
+    if total <= 0:
+        return False
+    interval = max(1, total // 20)
+    return completed == total or completed % interval == 0
 
 
 @dataclass(frozen=True)
@@ -208,6 +239,7 @@ class SeaRaftAdapter(Protocol):
         pairs: tuple[FlowPairRequest, ...],
         *,
         batch_size: int,
+        progress: FlowProgressCallback | None = None,
     ) -> tuple[SeaRaftPairPrediction, ...]: ...
 
 
@@ -277,7 +309,9 @@ def _camera_arrays(
     try:
         w2c = np.asarray(evidence.w2c_4x4, dtype=np.float64).reshape(4, 4)
     except (TypeError, ValueError) as error:
-        raise ValueError("registered rigid frame must contain numeric W2C values") from error
+        raise ValueError(
+            "registered rigid frame must contain numeric W2C values"
+        ) from error
     if not np.isfinite(w2c).all():
         raise ValueError("W2C values must be finite")
     if not np.array_equal(w2c[3], np.array((0.0, 0.0, 0.0, 1.0))):
@@ -387,7 +421,9 @@ def _project_track_point(
     try:
         point = np.asarray((*xyz, 1.0), dtype=np.float64)
     except (TypeError, ValueError) as error:
-        raise ValueError("static track xyz must contain three numeric values") from error
+        raise ValueError(
+            "static track xyz must contain three numeric values"
+        ) from error
     if point.shape != (4,) or not np.isfinite(point).all():
         raise ValueError("static track xyz must contain three finite values")
     camera_point = w2c @ point
@@ -444,7 +480,9 @@ def _validated_static_tracks_payload(
             if observation.frame_id not in known_frame_ids:
                 raise ValueError("track observation frame_id is missing from the scene")
             if observation.frame_id in seen_observation_frames:
-                raise ValueError("a static track cannot observe one frame more than once")
+                raise ValueError(
+                    "a static track cannot observe one frame more than once"
+                )
             seen_observation_frames.add(observation.frame_id)
             observation_payload.append(
                 {
@@ -494,7 +532,9 @@ def calibrate_residual_threshold(
             or key[1] not in frame_by_id
             or abs(frame_index[key[0]] - frame_index[key[1]]) != 1
         ):
-            raise ValueError("directional residual keys must join adjacent scene frames")
+            raise ValueError(
+                "directional residual keys must join adjacent scene frames"
+            )
         source = frame_by_id[key[0]]
         raw_field = raw_value
         raw_valid: object | None = None
@@ -511,7 +551,9 @@ def calibrate_residual_threshold(
         else:
             valid = np.asarray(raw_valid)
             if valid.shape != field.shape or valid.dtype.kind != "b":
-                raise ValueError("directional residual validity must be a boolean HxW map")
+                raise ValueError(
+                    "directional residual validity must be a boolean HxW map"
+                )
         fields[key] = (field, valid)
 
     residual_samples: list[float] = []
@@ -554,7 +596,11 @@ def calibrate_residual_threshold(
                 sampled_valid, valid_inside = _bilinear_sample(
                     valid_field.astype(np.float64), x, y
                 )
-                if not bool(inside) or not bool(valid_inside) or float(sampled_valid) < 1.0:
+                if (
+                    not bool(inside)
+                    or not bool(valid_inside)
+                    or float(sampled_valid) < 1.0
+                ):
                     pair_samples = []
                     break
                 pair_samples.append(float(sampled))
@@ -595,7 +641,9 @@ def _scalar_map(value: object, width: int, height: int, label: str) -> np.ndarra
     return result
 
 
-def _bilinear_sample(array: np.ndarray, x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _bilinear_sample(
+    array: np.ndarray, x: np.ndarray, y: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
     height, width = array.shape[:2]
     inside = (
         np.isfinite(x)
@@ -635,7 +683,9 @@ def _depth_edges(depth: np.ndarray, relative_tolerance: float) -> np.ndarray:
         right_valid = right > 0.0
         scale = np.maximum(np.maximum(np.abs(left), np.abs(right)), 1e-12)
         discontinuity = (left_valid != right_valid) | (
-            left_valid & right_valid & (np.abs(left - right) > relative_tolerance * scale)
+            left_valid
+            & right_valid
+            & (np.abs(left - right) > relative_tolerance * scale)
         )
         first = [slice(None), slice(None)]
         second = [slice(None), slice(None)]
@@ -705,8 +755,12 @@ def evaluate_flow_pair(
         "residual_threshold",
         minimum=0.0,
     )
-    target_depth_array = _depth_array(target_depth, target.width, target.height, "target_depth")
-    source_depth_array = _depth_array(source_depth, source.width, source.height, "source_depth")
+    target_depth_array = _depth_array(
+        target_depth, target.width, target.height, "target_depth"
+    )
+    source_depth_array = _depth_array(
+        source_depth, source.width, source.height, "source_depth"
+    )
     forward = _flow_array(forward_flow, source.width, source.height, "forward_flow")
     backward = _flow_array(backward_flow, target.width, target.height, "backward_flow")
     forward_unc = _scalar_map(
@@ -776,11 +830,17 @@ def evaluate_flow_pair(
 
     measured_x = xx + forward[..., 0]
     measured_y = yy + forward[..., 1]
-    sampled_backward, backward_inside = _bilinear_sample(backward, measured_x, measured_y)
+    sampled_backward, backward_inside = _bilinear_sample(
+        backward, measured_x, measured_y
+    )
     cycle_error = np.linalg.norm(forward + sampled_backward, axis=-1)
-    cycle_limit = policy.cycle_absolute_pixels + policy.cycle_relative_fraction * np.maximum(
-        np.linalg.norm(forward, axis=-1),
-        np.linalg.norm(sampled_backward, axis=-1),
+    cycle_limit = (
+        policy.cycle_absolute_pixels
+        + policy.cycle_relative_fraction
+        * np.maximum(
+            np.linalg.norm(forward, axis=-1),
+            np.linalg.norm(sampled_backward, axis=-1),
+        )
     )
     cycle_consistent = backward_inside & (cycle_error <= cycle_limit)
 
@@ -804,8 +864,8 @@ def evaluate_flow_pair(
         uncertainty_threshold = uncertainty_median + (
             policy.uncertainty_mad_multiplier * 1.4826 * uncertainty_mad
         )
-        uncertainty_ok = (
-            backward_unc_inside & (combined_uncertainty <= uncertainty_threshold)
+        uncertainty_ok = backward_unc_inside & (
+            combined_uncertainty <= uncertainty_threshold
         )
 
     valid = (
@@ -1006,8 +1066,7 @@ def _validated_input_frames(
             not isinstance(frame.frame_id, str)
             or not frame.frame_id
             or any(
-                unicodedata.category(character) == "Cc"
-                for character in frame.frame_id
+                unicodedata.category(character) == "Cc" for character in frame.frame_id
             )
         ):
             raise ValueError("frame_id must be non-empty and control-free")
@@ -1181,14 +1240,18 @@ def _validated_output_dir(output_dir: Path) -> Path:
         raise ValueError("output_dir must have a safe final component")
     resolved_output = output_dir.resolve(strict=False)
     if output_dir != resolved_output:
-        raise ValueError("output_dir must be canonical and contain no symlink or traversal")
+        raise ValueError(
+            "output_dir must be canonical and contain no symlink or traversal"
+        )
     if os.path.lexists(output_dir):
         raise FileExistsError("motion output_dir must be previously absent")
     parent = output_dir.parent
     if not os.path.lexists(parent) or parent.is_symlink() or not parent.is_dir():
         raise ValueError("output_dir parent must be an existing non-symlink directory")
     if parent.resolve(strict=True) != parent:
-        raise ValueError("output_dir must be canonical and contain no symlink or traversal")
+        raise ValueError(
+            "output_dir must be canonical and contain no symlink or traversal"
+        )
     return output_dir
 
 
@@ -1237,9 +1300,7 @@ def _pair_requests(inputs: _SceneInputs) -> tuple[FlowPairRequest, ...]:
             source_path=source.path,
             target_path=target.path,
         )
-        for index, (source, target) in enumerate(
-            zip(inputs.frames, inputs.frames[1:])
-        )
+        for index, (source, target) in enumerate(zip(inputs.frames, inputs.frames[1:]))
     )
 
 
@@ -1247,18 +1308,21 @@ def _validated_pair_predictions(
     raw_predictions: object,
     requests: tuple[FlowPairRequest, ...],
     inputs: _SceneInputs,
+    progress: FlowProgressCallback | None = None,
 ) -> tuple[_ValidatedPairPrediction, ...]:
     if type(raw_predictions) is not tuple or len(raw_predictions) != len(requests):
         raise ValueError("SEA-RAFT must return one prediction per exact pair")
     validated: list[_ValidatedPairPrediction] = []
-    for raw, request in zip(raw_predictions, requests):
+    for completed, (raw, request) in enumerate(zip(raw_predictions, requests), start=1):
         if not isinstance(raw, SeaRaftPairPrediction):
             raise ValueError("SEA-RAFT predictions must use SeaRaftPairPrediction")
         if (
             raw.source_frame_id != request.source_frame_id
             or raw.target_frame_id != request.target_frame_id
         ):
-            raise ValueError("SEA-RAFT predictions must preserve exact pair order and joins")
+            raise ValueError(
+                "SEA-RAFT predictions must preserve exact pair order and joins"
+            )
         source = inputs.rigid_frames[request.pair_index]
         target = inputs.rigid_frames[request.pair_index + 1]
         forward = _narrow_float32(
@@ -1306,6 +1370,8 @@ def _validated_pair_predictions(
                 backward_uncertainty=backward_uncertainty,
             )
         )
+        if progress is not None and _progress_checkpoint(completed, len(requests)):
+            progress("prediction_validation", completed, len(requests), {})
     return tuple(validated)
 
 
@@ -1321,9 +1387,10 @@ def _unknown_maps(width: int, height: int) -> FrameMotionMaps:
 def _directional_rigid_residuals(
     inputs: _SceneInputs,
     predictions: tuple[_ValidatedPairPrediction, ...],
+    progress: FlowProgressCallback | None = None,
 ) -> dict[tuple[str, str], object]:
     fields: dict[tuple[str, str], object] = {}
-    for prediction in predictions:
+    for completed, prediction in enumerate(predictions, start=1):
         index = prediction.request.pair_index
         source = inputs.rigid_frames[index]
         target = inputs.rigid_frames[index + 1]
@@ -1335,6 +1402,10 @@ def _directional_rigid_residuals(
             or source_depth is None
             or target_depth is None
         ):
+            if progress is not None and _progress_checkpoint(
+                completed, len(predictions)
+            ):
+                progress("residual_evaluation", completed, len(predictions), {})
             continue
         rigid_forward, _, forward_valid = project_rigid_flow(
             source, target, source_depth
@@ -1342,21 +1413,18 @@ def _directional_rigid_residuals(
         rigid_backward, _, backward_valid = project_rigid_flow(
             target, source, target_depth
         )
-        forward_delta = np.asarray(prediction.forward_flow, dtype=np.float64) - np.asarray(
-            rigid_forward, dtype=np.float64
-        )
+        forward_delta = np.asarray(
+            prediction.forward_flow, dtype=np.float64
+        ) - np.asarray(rigid_forward, dtype=np.float64)
         backward_delta = np.asarray(
             prediction.backward_flow, dtype=np.float64
         ) - np.asarray(rigid_backward, dtype=np.float64)
-        forward_residual = np.hypot(
-            forward_delta[..., 0], forward_delta[..., 1]
-        )
-        backward_residual = np.hypot(
-            backward_delta[..., 0], backward_delta[..., 1]
-        )
-        if not np.isfinite(forward_residual).all() or not np.isfinite(
-            backward_residual
-        ).all():
+        forward_residual = np.hypot(forward_delta[..., 0], forward_delta[..., 1])
+        backward_residual = np.hypot(backward_delta[..., 0], backward_delta[..., 1])
+        if (
+            not np.isfinite(forward_residual).all()
+            or not np.isfinite(backward_residual).all()
+        ):
             raise ValueError("rigid-compensated SEA-RAFT residuals must be finite")
         source_id = prediction.request.source_frame_id
         target_id = prediction.request.target_frame_id
@@ -1368,6 +1436,8 @@ def _directional_rigid_residuals(
             _readonly(backward_residual),
             backward_valid,
         )
+        if progress is not None and _progress_checkpoint(completed, len(predictions)):
+            progress("residual_evaluation", completed, len(predictions), {})
     return fields
 
 
@@ -1401,11 +1471,12 @@ def _evaluate_predictions(
     predictions: tuple[_ValidatedPairPrediction, ...],
     policy: FlowGatePolicy,
     residual_threshold: float | None,
+    progress: FlowProgressCallback | None = None,
 ) -> tuple[tuple[FrameMotionMaps, ...], tuple[dict[str, object], ...]]:
     incoming: list[PairGateResult | None] = [None] * len(inputs.frames)
     outgoing: list[PairGateResult | None] = [None] * len(inputs.frames)
     pair_payloads: list[dict[str, object]] = []
-    for prediction in predictions:
+    for completed, prediction in enumerate(predictions, start=1):
         index = prediction.request.pair_index
         source = inputs.rigid_frames[index]
         target = inputs.rigid_frames[index + 1]
@@ -1413,7 +1484,11 @@ def _evaluate_predictions(
         target_depth = inputs.depths[index + 1]
         forward_result: PairGateResult | None = None
         backward_result: PairGateResult | None = None
-        status = "calibration_unavailable" if residual_threshold is None else "missing_geometry"
+        status = (
+            "calibration_unavailable"
+            if residual_threshold is None
+            else "missing_geometry"
+        )
         if (
             residual_threshold is not None
             and source.registered
@@ -1451,22 +1526,34 @@ def _evaluate_predictions(
         pair_payloads.append(
             {
                 "backward_motion_pixels": (
-                    0 if backward_result is None else int(np.count_nonzero(backward_result.motion))
+                    0
+                    if backward_result is None
+                    else int(np.count_nonzero(backward_result.motion))
                 ),
                 "backward_uncertainty_threshold": (
-                    None if backward_result is None else backward_result.uncertainty_threshold
+                    None
+                    if backward_result is None
+                    else backward_result.uncertainty_threshold
                 ),
                 "backward_valid_pixels": (
-                    0 if backward_result is None else int(np.count_nonzero(backward_result.valid))
+                    0
+                    if backward_result is None
+                    else int(np.count_nonzero(backward_result.valid))
                 ),
                 "forward_motion_pixels": (
-                    0 if forward_result is None else int(np.count_nonzero(forward_result.motion))
+                    0
+                    if forward_result is None
+                    else int(np.count_nonzero(forward_result.motion))
                 ),
                 "forward_uncertainty_threshold": (
-                    None if forward_result is None else forward_result.uncertainty_threshold
+                    None
+                    if forward_result is None
+                    else forward_result.uncertainty_threshold
                 ),
                 "forward_valid_pixels": (
-                    0 if forward_result is None else int(np.count_nonzero(forward_result.valid))
+                    0
+                    if forward_result is None
+                    else int(np.count_nonzero(forward_result.valid))
                 ),
                 "pair_index": index,
                 "source_frame_id": prediction.request.source_frame_id,
@@ -1474,6 +1561,8 @@ def _evaluate_predictions(
                 "status": status,
             }
         )
+        if progress is not None and _progress_checkpoint(completed, len(predictions)):
+            progress("motion_evaluation", completed, len(predictions), {})
 
     maps: list[FrameMotionMaps] = []
     for index, rigid in enumerate(inputs.rigid_frames):
@@ -1601,6 +1690,7 @@ def _publish_motion_evidence(
     final_release: VramReleaseRecord | None,
     stage_record: StageRecord,
     output_dir: Path,
+    progress: FlowProgressCallback | None = None,
 ) -> MotionEvidence:
     staging = Path(
         tempfile.mkdtemp(
@@ -1675,6 +1765,16 @@ def _publish_motion_evidence(
                     "width": rigid.width,
                 }
             )
+            completed = index + 1
+            if progress is not None and _progress_checkpoint(
+                completed, len(inputs.frames)
+            ):
+                progress(
+                    "artifact_publication",
+                    completed,
+                    len(inputs.frames),
+                    {},
+                )
 
         pair_manifest = {
             "attempts": [_attempt_payload(value) for value in retry_result.attempts],
@@ -1743,6 +1843,7 @@ def run_motion_evidence(
     initial_pair_batch_size: int,
     retry_pair_batch_size: int,
     release_model: Callable[[object], VramReleaseRecord],
+    progress: FlowProgressCallback | None = None,
 ) -> MotionEvidence:
     """Run exact bidirectional SEA-RAFT pairs and publish rigid motion evidence."""
 
@@ -1756,6 +1857,25 @@ def run_motion_evidence(
     active_model: object | None = None
     expected_provenance: _ModelProvenance | None = None
     created_model_ids: set[int] = set()
+    progress_high_water: dict[str, int] = {}
+
+    def emit_progress(
+        substage: str,
+        completed: int,
+        total: int,
+        details: Mapping[str, object],
+    ) -> None:
+        if progress is None:
+            return
+        if completed < progress_high_water.get(substage, -1):
+            return
+        progress_high_water[substage] = completed
+        progress(
+            substage,
+            completed,
+            total,
+            {**dict(details), **_runtime_usage_details()},
+        )
 
     def operation(batch_size: int) -> tuple[_ValidatedPairPrediction, ...]:
         nonlocal active_model, expected_provenance
@@ -1766,7 +1886,9 @@ def run_motion_evidence(
         if active_model is None:
             candidate = model_factory()
             if id(candidate) in created_model_ids:
-                raise ValueError("model_factory must recreate a released SEA-RAFT model")
+                raise ValueError(
+                    "model_factory must recreate a released SEA-RAFT model"
+                )
             created_model_ids.add(id(candidate))
             active_model = candidate
             candidate_provenance = _model_provenance(candidate)
@@ -1777,8 +1899,28 @@ def run_motion_evidence(
         infer = getattr(active_model, "infer_bidirectional", None)
         if not callable(infer):
             raise TypeError("SEA-RAFT adapter must expose infer_bidirectional")
-        raw_predictions = infer(requests, batch_size=batch_size)
-        return _validated_pair_predictions(raw_predictions, requests, inputs)
+        infer_parameters = inspect.signature(infer).parameters
+        if "progress" in infer_parameters:
+            raw_predictions = infer(
+                requests,
+                batch_size=batch_size,
+                progress=emit_progress,
+            )
+        else:
+            raw_predictions = infer(requests, batch_size=batch_size)
+            if requests:
+                emit_progress(
+                    "inference",
+                    len(requests),
+                    len(requests),
+                    {"batch_size": batch_size},
+                )
+        return _validated_pair_predictions(
+            raw_predictions,
+            requests,
+            inputs,
+            progress=emit_progress,
+        )
 
     def release_active_model() -> VramReleaseRecord:
         nonlocal active_model
@@ -1810,29 +1952,30 @@ def run_motion_evidence(
                 if hasattr(error, "add_note"):
                     error.add_note(f"SEA-RAFT cleanup also failed: {release_error!r}")
         raise error.with_traceback(traceback)
-    final_release = (
-        release_active_model() if active_model is not None else None
-    )
+    final_release = release_active_model() if active_model is not None else None
     if expected_provenance is None:
         raise AssertionError("SEA-RAFT provenance was not established")
     residual_threshold = calibrate_residual_threshold(
         scene,
         policy,
-        _directional_rigid_residuals(inputs, retry_result.value),
+        _directional_rigid_residuals(
+            inputs,
+            retry_result.value,
+            progress=emit_progress,
+        ),
     )
     maps, pair_payloads = _evaluate_predictions(
         inputs,
         retry_result.value,
         policy,
         residual_threshold,
+        progress=emit_progress,
     )
     _revalidate_source_inputs(inputs)
     status = (
         "skipped"
         if residual_threshold is None
-        else "fallback"
-        if retry_result.retry_size is not None
-        else "accepted"
+        else "fallback" if retry_result.retry_size is not None else "accepted"
     )
     stage_record = StageRecord(
         stage_id="sea_raft_motion",
@@ -1860,4 +2003,5 @@ def run_motion_evidence(
         final_release,
         stage_record,
         output_dir,
+        progress=emit_progress,
     )

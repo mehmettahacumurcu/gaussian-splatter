@@ -830,6 +830,23 @@ def _run_evidence_cycle(
             reporter.skip("optical_flow", "restored from motion milestone")
     else:
         with _learned_stage("optical_flow"):
+
+            def report_flow_progress(
+                substage: str,
+                completed: int,
+                total: int,
+                details: dict[str, object],
+            ) -> None:
+                active_reporter = current_stage_reporter()
+                if active_reporter is not None:
+                    active_reporter.progress(
+                        "optical_flow",
+                        substage=substage,
+                        completed=completed,
+                        total=total,
+                        details=details,
+                    )
+
             flow = run_motion_evidence(
                 frames,
                 scene,
@@ -842,6 +859,7 @@ def _run_evidence_cycle(
                 initial_pair_batch_size=2,
                 retry_pair_batch_size=1,
                 release_model=release_cuda_model,
+                progress=report_flow_progress,
             )
         if milestone_session is not None:
             motion_ref = milestone_refs[CheckpointKind.MOTION]

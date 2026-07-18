@@ -11,7 +11,7 @@ import numpy as np
 
 from .contracts import FrameArtifact
 from .dependencies import CHECKPOINT_MODEL_REFS
-from .flow import FlowPairRequest, SeaRaftPairPrediction
+from .flow import FlowPairRequest, FlowProgressCallback, SeaRaftPairPrediction
 from .segmentation import DetectionBox, SamBoxPrompt
 
 
@@ -309,6 +309,7 @@ class SeaRaftTorchAdapter:
         pairs: tuple[FlowPairRequest, ...],
         *,
         batch_size: int,
+        progress: FlowProgressCallback | None = None,
     ) -> tuple[SeaRaftPairPrediction, ...]:
         import torch
         from PIL import Image
@@ -349,6 +350,13 @@ class SeaRaftTorchAdapter:
                         forward_uncertainty=forward_uncertainty[index].cpu().numpy(),
                         backward_uncertainty=backward_uncertainty[index].cpu().numpy(),
                     )
+                )
+            if progress is not None:
+                progress(
+                    "inference",
+                    len(predictions),
+                    len(pairs),
+                    {"batch_size": len(batch)},
                 )
         return tuple(predictions)
 

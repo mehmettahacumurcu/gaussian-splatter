@@ -56,7 +56,9 @@ def _policy(**overrides: object) -> FlowGatePolicy:
     return FlowGatePolicy(**values)  # type: ignore[arg-type]
 
 
-def _frame(tmp_path: Path, index: int, *, width: int = 3, height: int = 3) -> FrameArtifact:
+def _frame(
+    tmp_path: Path, index: int, *, width: int = 3, height: int = 3
+) -> FrameArtifact:
     path = (tmp_path / f"frame_{index:06d}.png").resolve()
     path.write_bytes(f"frame-{index}".encode("ascii"))
     return FrameArtifact(
@@ -105,7 +107,9 @@ def _rigid_frame(
 
 
 def test_policy_has_no_defaults_is_frozen_and_rejects_invalid_values() -> None:
-    assert all(field.default is field.default_factory for field in fields(FlowGatePolicy))
+    assert all(
+        field.default is field.default_factory for field in fields(FlowGatePolicy)
+    )
     policy = _policy()
 
     with pytest.raises(FrozenInstanceError):
@@ -116,7 +120,9 @@ def test_policy_has_no_defaults_is_frozen_and_rejects_invalid_values() -> None:
         _policy(static_track_min_length=True)
 
 
-def test_producer_dtos_are_frozen_and_do_not_default_join_fields(tmp_path: Path) -> None:
+def test_producer_dtos_are_frozen_and_do_not_default_join_fields(
+    tmp_path: Path,
+) -> None:
     frame = _frame(tmp_path, 0)
     rigid = _rigid_frame(frame)
     observation = TrackObservation(frame_id=frame.frame_id, x=1.0, y=1.0)
@@ -137,8 +143,12 @@ def test_producer_dtos_are_frozen_and_do_not_default_join_fields(tmp_path: Path)
         rigid.width = 4  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         scene.geometry_digest = "e" * 64  # type: ignore[misc]
-    assert all(field.default is field.default_factory for field in fields(MotionFrameEvidence))
-    assert all(field.default is field.default_factory for field in fields(MotionEvidence))
+    assert all(
+        field.default is field.default_factory for field in fields(MotionFrameEvidence)
+    )
+    assert all(
+        field.default is field.default_factory for field in fields(MotionEvidence)
+    )
 
 
 def test_rigid_projection_uses_w2c_and_rejects_nonpositive_or_out_of_bounds(
@@ -243,11 +253,14 @@ def test_static_track_calibration_is_robust_and_reports_insufficiency(
         scene,
         static_tracks=(replace(long_track, observations=observations[:2]),),
     )
-    assert calibrate_residual_threshold(
-        insufficient,
-        _policy(),
-        directional_residuals,
-    ) is None
+    assert (
+        calibrate_residual_threshold(
+            insufficient,
+            _policy(),
+            directional_residuals,
+        )
+        is None
+    )
 
 
 def _gate_inputs(tmp_path: Path) -> tuple[
@@ -315,7 +328,6 @@ def test_z_buffer_keeps_nearest_projection_and_rejects_farther_collision(
     tmp_path: Path,
 ) -> None:
     values = list(_gate_inputs(tmp_path))
-    source = values[0]
     target = values[1]
     values[1] = replace(target, pinhole_fx_fy_cx_cy=(0.1, 2.0, 1.0, 1.0))
     values[2][1, 0] = 2.0
@@ -443,12 +455,8 @@ def _motion_fixture(
         with depth_path.open("wb") as handle:
             np.save(handle, np.full((3, 3), 2.0, dtype=np.float32), allow_pickle=False)
         frames.append(frame)
-        rigid_frames.append(
-            _rigid_frame(frame, depth_path=depth_path)
-        )
-        observations.append(
-            TrackObservation(frame_id=frame.frame_id, x=1.1, y=1.0)
-        )
+        rigid_frames.append(_rigid_frame(frame, depth_path=depth_path))
+        observations.append(TrackObservation(frame_id=frame.frame_id, x=1.1, y=1.0))
     rigid_frames = [
         replace(rigid, depth_sha256=_sha256(rigid.depth_path))  # type: ignore[arg-type]
         for rigid in rigid_frames
@@ -613,12 +621,16 @@ def test_motion_producer_publishes_exact_pairs_maps_and_deterministic_manifests(
 
     assert first_events == ["factory:model-1", "infer:model-1:4", "release:model-1"]
     assert tuple(frame.frame for frame in first.frames) == frames
-    assert all(path.is_absolute() for frame in first.frames for path in (
-        frame.confirmed_without_semantic_path,
-        frame.requires_semantic_path,
-        frame.uncertain_path,
-        frame.strength_path,
-    ))
+    assert all(
+        path.is_absolute()
+        for frame in first.frames
+        for path in (
+            frame.confirmed_without_semantic_path,
+            frame.requires_semantic_path,
+            frame.uncertain_path,
+            frame.strength_path,
+        )
+    )
     for index, frame in enumerate(first.frames):
         binary_paths = (
             frame.confirmed_without_semantic_path,
@@ -648,7 +660,10 @@ def test_motion_producer_publishes_exact_pairs_maps_and_deterministic_manifests(
         assert strength.dtype == np.float32
         assert np.isfinite(strength).all()
     pair_payload = json.loads(first.pair_manifest_path.read_text(encoding="utf-8"))
-    assert [(pair["source_frame_id"], pair["target_frame_id"]) for pair in pair_payload["pairs"]] == [
+    assert [
+        (pair["source_frame_id"], pair["target_frame_id"])
+        for pair in pair_payload["pairs"]
+    ] == [
         ("frame-0", "frame-1"),
         ("frame-1", "frame-2"),
     ]
@@ -679,7 +694,9 @@ def test_motion_producer_publishes_exact_pairs_maps_and_deterministic_manifests(
     )
     assert first.pair_manifest_sha256 == second.pair_manifest_sha256
     assert first.manifest_sha256 == second.manifest_sha256
-    assert first.pair_manifest_path.read_bytes() == second.pair_manifest_path.read_bytes()
+    assert (
+        first.pair_manifest_path.read_bytes() == second.pair_manifest_path.read_bytes()
+    )
     assert first.manifest_path.read_bytes() == second.manifest_path.read_bytes()
     for first_frame, second_frame in zip(first.frames, second.frames):
         assert first_frame.confirmed_without_semantic_path.read_bytes() == (
@@ -691,6 +708,41 @@ def test_motion_producer_publishes_exact_pairs_maps_and_deterministic_manifests(
         assert first_frame.uncertain_path.read_bytes() == (
             second_frame.uncertain_path.read_bytes()
         )
+
+
+def test_motion_producer_reports_every_expensive_substage_monotonically(
+    tmp_path: Path,
+) -> None:
+    frames, scene = _motion_fixture(tmp_path)
+    progress: list[tuple[str, int, int, dict[str, object]]] = []
+
+    run_motion_evidence(
+        frames,
+        scene,
+        (tmp_path / "motion-progress").resolve(),
+        policy=_policy(),
+        model_factory=FakeFactory([]),
+        initial_pair_batch_size=4,
+        retry_pair_batch_size=2,
+        release_model=_release([]),
+        progress=lambda substage, completed, total, details: progress.append(
+            (substage, completed, total, dict(details))
+        ),
+    )
+
+    expected_totals = {
+        "inference": len(frames) - 1,
+        "prediction_validation": len(frames) - 1,
+        "residual_evaluation": len(frames) - 1,
+        "motion_evaluation": len(frames) - 1,
+        "artifact_publication": len(frames),
+    }
+    assert {row[0] for row in progress} == set(expected_totals)
+    for substage, total in expected_totals.items():
+        rows = [row for row in progress if row[0] == substage]
+        assert rows[-1][1:3] == (total, total)
+        assert [row[1] for row in rows] == sorted(row[1] for row in rows)
+        assert all(row[2] == total for row in rows)
 
 
 def test_motion_manifest_serializes_unavailable_uncertainty_threshold_as_null(
@@ -931,9 +983,10 @@ def test_input_and_scene_digests_are_portable_and_bind_source_content(
 
     baseline_manifest = json.loads(baseline.manifest_path.read_text(encoding="utf-8"))
     relocated_manifest = json.loads(relocated.manifest_path.read_text(encoding="utf-8"))
-    assert relocated_manifest["input_frame_digest"] == baseline_manifest[
-        "input_frame_digest"
-    ]
+    assert (
+        relocated_manifest["input_frame_digest"]
+        == baseline_manifest["input_frame_digest"]
+    )
     assert relocated.scene_digest == baseline.scene_digest
 
     original_size = relocated_frames[0].path.stat().st_size
@@ -963,9 +1016,10 @@ def test_input_and_scene_digests_are_portable_and_bind_source_content(
     )
     changed_manifest = json.loads(changed.manifest_path.read_text(encoding="utf-8"))
 
-    assert changed_manifest["input_frame_digest"] != relocated_manifest[
-        "input_frame_digest"
-    ]
+    assert (
+        changed_manifest["input_frame_digest"]
+        != relocated_manifest["input_frame_digest"]
+    )
     assert changed.scene_digest != relocated.scene_digest
 
 
@@ -1166,7 +1220,9 @@ def test_motion_producer_rejects_prediction_pair_reorder_and_releases(
     assert not os.path.lexists(output_dir)
 
 
-def test_typed_cuda_oom_releases_and_recreates_exact_factory_once(tmp_path: Path) -> None:
+def test_typed_cuda_oom_releases_and_recreates_exact_factory_once(
+    tmp_path: Path,
+) -> None:
     frames, scene = _motion_fixture(tmp_path)
     events: list[str] = []
     oom = FakeCudaOutOfMemoryError("typed oom")

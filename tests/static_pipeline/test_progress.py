@@ -82,6 +82,81 @@ def test_stage_reporter_records_failure_and_reraises(tmp_path: Path) -> None:
     assert _rows(log_path)[-1]["error_type"] == "RuntimeError"
 
 
+def test_stage_reporter_flushes_strict_monotonic_substage_progress(
+    tmp_path: Path,
+) -> None:
+    output = RecordingStream()
+    times = iter((10.0, 12.0, 14.0, 15.0))
+    reporter = StageReporter(
+        (StageDefinition("optical_flow", "Optical flow"),),
+        stream=output,
+        clock=lambda: next(times),
+    )
+    log_path = tmp_path / "progress.jsonl"
+    reporter.bind_log(log_path, run_id="run-flow")
+
+    with reporter.stage("optical_flow"):
+        reporter.progress(
+            "optical_flow",
+            substage="motion_evaluation",
+            completed=590,
+            total=800,
+            details={"batch_size": 2, "rss_bytes": 89_000_000_000},
+        )
+        reporter.progress(
+            "optical_flow",
+            substage="motion_evaluation",
+            completed=800,
+            total=800,
+        )
+
+    assert output.lines[1].startswith(
+        "[OPTICAL FLOW] motion evaluation 590/800 - 73.8% - 00:02 elapsed"
+    )
+    assert output.flush_count == 4
+    rows = _rows(log_path)
+    assert rows[1] == {
+        "completed": 590,
+        "details": {"batch_size": 2, "rss_bytes": 89_000_000_000},
+        "elapsed_seconds": 2.0,
+        "percent": 73.75,
+        "run_id": "run-flow",
+        "schema_version": 1,
+        "stage_id": "optical_flow",
+        "status": "progress",
+        "substage": "motion_evaluation",
+        "total": 800,
+    }
+    assert rows[2]["completed"] == 800
+
+
+def test_stage_reporter_rejects_invalid_or_nonmonotonic_progress() -> None:
+    reporter = StageReporter((StageDefinition("optical_flow", "Optical flow"),))
+
+    with reporter.stage("optical_flow"):
+        reporter.progress(
+            "optical_flow",
+            substage="inference",
+            completed=2,
+            total=4,
+        )
+        with pytest.raises(ValueError, match="monotonic"):
+            reporter.progress(
+                "optical_flow",
+                substage="inference",
+                completed=1,
+                total=4,
+            )
+        with pytest.raises(ValueError, match="finite JSON"):
+            reporter.progress(
+                "optical_flow",
+                substage="publication",
+                completed=1,
+                total=4,
+                details={"rss": float("nan")},
+            )
+
+
 @pytest.mark.parametrize(
     "definitions",
     [
