@@ -31,6 +31,7 @@ from experiments.learned_quality.da3 import (
 from experiments.learned_quality.geometry import (
     GeometryComparisonError,
     HybridGeometryInputs,
+    PycolmapHybridBackend,
     _rotation_matrix_to_qvec,
     closest_failure_key,
     focal_refinement_is_safe,
@@ -775,6 +776,159 @@ def test_hybrid_runner_forwards_exact_known_poses_masks_and_fresh_database(
     assert call["anchor_cameras"] == inputs.anchors.cameras
     assert call["shared_camera"] == inputs.anchors.shared_camera
     assert call["use_gpu"] is True
+
+
+def test_pycolmap_hybrid_prefers_portable_device_for_gpu_request(
+    tmp_path: Path,
+) -> None:
+    calls: list[object] = []
+
+    class StopAfterFeatureExtraction(RuntimeError):
+        pass
+
+    class FakeReaderOptions:
+        def __init__(self, **kwargs: object) -> None:
+            self.values = kwargs
+
+    class FakePycolmap:
+        __version__ = "3.12.6-fake"
+
+        class Device:
+            auto = "auto"
+            cpu = "cpu"
+            cuda = "cuda"
+
+        class CameraMode:
+            SINGLE = "single"
+
+        ImageReaderOptions = FakeReaderOptions
+
+        @staticmethod
+        def extract_features(**kwargs: object) -> None:
+            calls.append(kwargs["device"])
+            raise StopAfterFeatureExtraction
+
+    sparse_root = tmp_path / "sparse"
+    sparse_root.mkdir()
+    backend = PycolmapHybridBackend(FakePycolmap())
+
+    with pytest.raises(StopAfterFeatureExtraction):
+        backend.reconstruct(
+            manifest=_manifest(1),
+            frames_root=tmp_path / "frames",
+            image_names=("frame_000000.png",),
+            mask_root=tmp_path / "masks",
+            database_path=tmp_path / "colmap.db",
+            sparse_root=sparse_root,
+            shared_camera=PinholeCamera("PINHOLE", 24, 20, 20.0, 20.0, 12.0, 10.0),
+            anchor_cameras=(),
+            use_gpu=True,
+        )
+
+    assert calls == ["auto"]
+
+
+def test_pycolmap_hybrid_keeps_bundle_adjustment_on_cpu(
+    tmp_path: Path,
+) -> None:
+    bundle_options: list[object] = []
+
+    class StopAfterBundleAdjustment(RuntimeError):
+        pass
+
+    class FakeReaderOptions:
+        def __init__(self, **kwargs: object) -> None:
+            self.values = kwargs
+
+    class FakeImage:
+        name = "frame_000000.png"
+        image_id = 1
+        camera_id = 1
+
+    class FakeCamera:
+        params = np.zeros(4, dtype=np.float64)
+
+    class FakeDatabase:
+        def __init__(self, path: str) -> None:
+            self.path = path
+
+        def read_all_images(self) -> tuple[FakeImage, ...]:
+            return (FakeImage(),)
+
+        def read_camera(self, camera_id: int) -> FakeCamera:
+            assert camera_id == 1
+            return FakeCamera()
+
+        def update_camera(self, camera: FakeCamera) -> None:
+            assert camera.params.shape == (4,)
+
+        def close(self) -> None:
+            pass
+
+    class FakeReconstruction:
+        def __init__(self, path: str) -> None:
+            self.path = path
+
+    class FakeBundleAdjustmentOptions:
+        def __init__(self, **kwargs: object) -> None:
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    class FakePycolmap:
+        __version__ = "3.12.6-fake"
+
+        class Device:
+            auto = "auto"
+            cpu = "cpu"
+            cuda = "cuda"
+
+        class CameraMode:
+            SINGLE = "single"
+
+        ImageReaderOptions = FakeReaderOptions
+        Database = FakeDatabase
+        Reconstruction = FakeReconstruction
+        BundleAdjustmentOptions = FakeBundleAdjustmentOptions
+
+        @staticmethod
+        def extract_features(**kwargs: object) -> None:
+            pass
+
+        @staticmethod
+        def match_exhaustive(**kwargs: object) -> None:
+            pass
+
+        @staticmethod
+        def triangulate_points(*args: object, **kwargs: object) -> object:
+            return object()
+
+        @staticmethod
+        def bundle_adjustment(
+            reconstruction: object,
+            options: object,
+        ) -> None:
+            bundle_options.append(options)
+            raise StopAfterBundleAdjustment
+
+    sparse_root = tmp_path / "sparse"
+    sparse_root.mkdir()
+    backend = PycolmapHybridBackend(FakePycolmap())
+
+    with pytest.raises(StopAfterBundleAdjustment):
+        backend.reconstruct(
+            manifest=_manifest(1),
+            frames_root=tmp_path / "frames",
+            image_names=("frame_000000.png",),
+            mask_root=tmp_path / "masks",
+            database_path=tmp_path / "colmap.db",
+            sparse_root=sparse_root,
+            shared_camera=PinholeCamera("PINHOLE", 24, 20, 20.0, 20.0, 12.0, 10.0),
+            anchor_cameras=(),
+            use_gpu=True,
+        )
+
+    assert len(bundle_options) == 1
+    assert bundle_options[0].use_gpu is False
 
 
 def test_rotation_to_colmap_qvec_preserves_identity_and_right_handed_rotation() -> None:

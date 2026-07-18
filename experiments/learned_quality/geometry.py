@@ -843,7 +843,10 @@ class PycolmapHybridBackend:
         use_gpu: bool,
     ) -> tuple[Path, ...]:
         pycolmap = self._pycolmap
-        device = pycolmap.Device.cuda if use_gpu else pycolmap.Device.cpu
+        device = pycolmap.Device.auto if use_gpu else pycolmap.Device.cpu
+        # The pinned wheel can expose CUDA enums without CUDA-compiled solvers.
+        # Device.auto falls back safely; the BA boolean has no such fallback.
+        bundle_adjustment_use_gpu = False
         reader_options = pycolmap.ImageReaderOptions(
             mask_path=str(mask_root),
             camera_model="PINHOLE",
@@ -914,7 +917,7 @@ class PycolmapHybridBackend:
             refine_principal_point=False,
             refine_extra_params=False,
             print_summary=False,
-            use_gpu=use_gpu,
+            use_gpu=bundle_adjustment_use_gpu,
         )
         pycolmap.bundle_adjustment(fixed, fixed_options)
         fixed_text = sparse_root / "fixed"
@@ -931,7 +934,7 @@ class PycolmapHybridBackend:
                 refine_rig_from_world=False,
                 refine_sensor_from_rig=False,
                 print_summary=False,
-                use_gpu=use_gpu,
+                use_gpu=bundle_adjustment_use_gpu,
             )
             pycolmap.bundle_adjustment(focal, focal_options)
             focal_text = sparse_root / "focal"
@@ -968,6 +971,7 @@ class PycolmapHybridBackend:
             options.refine_focal_length = False
             options.refine_principal_point = False
             options.refine_extra_params = False
+            options.use_gpu = bundle_adjustment_use_gpu
         mapped = pycolmap.incremental_mapping(
             database_path=str(database_path),
             image_path=str(frames_root),
