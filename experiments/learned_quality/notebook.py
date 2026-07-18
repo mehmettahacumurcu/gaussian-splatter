@@ -27,6 +27,8 @@ def build_learned_quality_notebook(
     cells = [
         nbformat.v4.new_markdown_cell(
             "# A100 learned-quality Gaussian splat test\n\n"
+            "First complete `learned_quality_cache_audit.ipynb` for the same input "
+            "and confirm `TRACK AUDIT PASSED`. Then "
             "Choose an **A100 High-RAM** runtime and use **Runtime → Run all**. "
             "This isolated experiment keeps the legacy result untouched, publishes "
             "`<input>_learned_test_result`, and includes diagnostics—not a web viewer.",

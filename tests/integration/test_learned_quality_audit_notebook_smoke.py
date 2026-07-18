@@ -1,8 +1,18 @@
 from __future__ import annotations
 
+import json
+import re
+from pathlib import Path
+
+import nbformat
+
 from experiments.learned_quality.notebook import (
     build_learned_quality_audit_notebook,
 )
+
+
+ROOT = Path(__file__).resolve().parents[2]
+GENERATED = ROOT / "colab" / "learned_quality_cache_audit.ipynb"
 
 
 def test_cpu_audit_notebook_is_run_all_safe_and_has_no_learned_downloads() -> None:
@@ -36,3 +46,16 @@ def test_cpu_audit_notebook_is_run_all_safe_and_has_no_learned_downloads() -> No
         "runtime.unassign()"
     )
     assert "shell=True" not in sources
+
+
+def test_checked_in_cpu_audit_notebook_matches_generator() -> None:
+    checked_in = nbformat.read(GENERATED, as_version=4)
+    checkout = next(
+        cell for cell in checked_in.cells if cell.metadata["tags"] == ["checkout"]
+    )
+    match = re.search(r"COMMIT_SHA = '([0-9a-f]{40})'", checkout.source)
+    assert match is not None
+    expected = build_learned_quality_audit_notebook(commit_sha=match.group(1))
+    assert json.loads(nbformat.writes(checked_in)) == json.loads(
+        nbformat.writes(expected)
+    )

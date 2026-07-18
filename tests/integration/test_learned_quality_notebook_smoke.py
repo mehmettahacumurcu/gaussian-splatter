@@ -7,7 +7,7 @@ from pathlib import Path
 
 import nbformat
 
-from experiments.learned_quality.notebook import build_learned_quality_notebook
+from experiments.learned_quality.notebook import build_learned_quality_a100_notebook
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -22,7 +22,7 @@ def test_notebook_is_deterministic_run_all_safe_and_pinned() -> None:
         capture_output=True,
         text=True,
     ).stdout.strip()
-    notebook = build_learned_quality_notebook(commit)
+    notebook = build_learned_quality_a100_notebook(commit_sha=commit)
     assert [cell.metadata["tags"][0] for cell in notebook.cells] == [
         "title",
         "config",
@@ -36,6 +36,7 @@ def test_notebook_is_deterministic_run_all_safe_and_pinned() -> None:
         "execute",
     ]
     sources = "\n".join(cell.source for cell in notebook.cells)
+    assert "learned_quality_cache_audit.ipynb" in notebook.cells[0].source
     assert sources.count('# @param {type:"string"}') == 1
     assert 'INPUT_FOLDER = ""  # @param {type:"string"}' in sources
     assert notebook.cells[2].source.find("nvidia-smi") >= 0
@@ -88,7 +89,7 @@ def test_checked_in_notebook_matches_generator() -> None:
     )
     match = re.search(r"COMMIT_SHA = '([0-9a-f]{40})'", checkout.source)
     assert match is not None
-    expected = build_learned_quality_notebook(match.group(1))
+    expected = build_learned_quality_a100_notebook(commit_sha=match.group(1))
     assert json.loads(nbformat.writes(checked_in)) == json.loads(
         nbformat.writes(expected)
     )

@@ -10,6 +10,8 @@ experiment, and a production video→world runner.
 | `sota_verify.ipynb` | The trust-builder: train static `premium` **or** `sota` (selectable `PRESET`) on a Mip-NeRF 360 scene (`garden`) with NVS eval, then `sota_compare.py` for a baseline-anchored verdict. Uses CUDA COLMAP (GPU SIFT) via `--colmap-cuda`. | ~1.5–4 h |
 | `video_to_world.ipynb` | Video on Drive → max-quality splat + gravity-aligned walkable world (`ultra` preset). Extracts frames itself at native res, then runs photo-set mode. | ~5–8 h |
 | `colmap_cuda_build.ipynb` | CUDA COLMAP feasibility — install or build a headless GPU-SIFT COLMAP, run a GPU vs CPU timing experiment on a real scene, persist the artifact to Drive. Feeds `bootstrap.sh --colmap-cuda` (now wired). | ~10–45 min |
+| `learned_quality_cache_audit.ipynb` | CPU-only safety gate: restores frame selection, verifies the owned COLMAP cache, qualifies tracks, and publishes the receipt required by the learned A100 run. | CPU only |
+| `learned_quality_a100_experiment.ipynb` | Maximum-quality learned preprocessing and 120k-iteration Gaussian training, resumable from verified Drive milestones. Run the CPU audit first. | Several hours |
 
 ## Verified results
 
@@ -87,11 +89,22 @@ apt's binary so the pipeline gets GPU SIFT with no code change. `sota_verify.ipy
 `--colmap-cuda` and passes `--colmap-cpu` only when the wrapper is absent (automatic
 fallback if the CUDA setup fails).
 
-## Isolated learned-quality A100 test
+## Isolated learned-quality CPU audit and A100 test
 
-`learned_quality_a100_experiment.ipynb` is the experimental maximum-quality room
-runner. Select an **A100 High-RAM** runtime, enter the existing input folder relative
-to `MyDrive` (for example `captures/myroom`), and choose **Runtime -> Run all**.
+Use this two-notebook flow for the experimental maximum-quality room runner:
+
+1. Open `learned_quality_cache_audit.ipynb` in a **CPU High-RAM** runtime, enter the
+   input folder relative to `MyDrive` (for the current test, exactly `myroom_test`),
+   and choose **Runtime -> Run all**.
+2. Continue only after the notebook prints `TRACK AUDIT PASSED` and a verified COLMAP
+   fingerprint. It flushes Drive and releases the CPU runtime automatically.
+3. Open `learned_quality_a100_experiment.ipynb` in a fresh **A100 High-RAM** runtime,
+   enter the same folder, and choose **Runtime -> Run all**.
+4. Confirm visible audit, selection, and COLMAP cache hits before learned inference.
+   During optical flow, the notebook prints inference, validation, residual, motion,
+   and artifact-publication counters. Gaussian training prints live iteration output.
+5. The final cell publishes the result to Drive, flushes pending writes, and releases
+   the A100 runtime on either success or failure.
 
 The notebook deliberately does not replace or modify the production result. It writes
 the learned experiment beside the capture as:
@@ -100,21 +113,23 @@ the learned experiment beside the capture as:
 MyDrive/<input_folder>_learned_test_result/
 ```
 
-Before Gaussian training starts, it also publishes an owned, hash-verified recovery
+Before Gaussian training starts, the notebooks publish an owned, hash-verified recovery
 cache beside the capture:
 
 ```text
 MyDrive/<input_folder>_learned_test_cache/
 ```
 
-The notebook prints every preprocessing stage as it runs, including heartbeats during
-quiet COLMAP work. The cache has two recovery boundaries: verified COLMAP geometry and
-the complete pre-training state. If training or a later stage fails, rerunning the same
-pinned notebook with the unchanged input restores valid work into fresh local Colab
-storage and proceeds without repeating the cached stages. Changed inputs, model pins,
-preprocessing settings, tools, or preprocessing code cause a visible cache miss and safe
-recomputation; incomplete or modified cache files are never trusted. Do not select the
-`_learned_test_cache` folder as notebook input.
+The A100 notebook prints every preprocessing stage as it runs. Recovery boundaries now
+cover selection, verified COLMAP/base evidence, semantic evidence, optical flow, fused
+masks, geometry, and final pre-training state. If a later stage fails, rerunning the same
+pinned notebooks with unchanged input restores the newest valid milestone into fresh
+local Colab storage instead of repeating completed work. The previous room run did not
+save its completed optical-flow arrays, so optical flow must run one more time; after the
+corrected run publishes the motion milestone, later retries can restore it. Changed
+inputs, model pins, preprocessing settings, tools, or producer code cause a visible cache
+miss and safe recomputation; incomplete or modified cache files are never trusted. Do
+not select the `_learned_test_cache` folder as notebook input.
 
 Compare that folder with the existing `MyDrive/<input_folder>_result/`. Inspect
 `experiment_report.json`, `quality_report.json`, and the four images under
