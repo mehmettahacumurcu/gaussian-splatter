@@ -42,6 +42,33 @@ from experiments.learned_quality.tracks import (
 )
 
 
+_COLMAP_PRODUCER_PATHS = (
+    "backend/static_pipeline/colmap.py",
+    "experiments/learned_quality/geometry.py",
+    "experiments/learned_quality/runtime.py",
+)
+
+
+def _producer_digest_at_commit(repository_root: Path, commit: str) -> str:
+    rows = []
+    for relative in sorted(_COLMAP_PRODUCER_PATHS):
+        content = subprocess.run(
+            ["git", "show", f"{commit}:{relative}"],
+            cwd=repository_root,
+            check=True,
+            capture_output=True,
+        ).stdout
+        rows.append((relative, hashlib.sha256(content).hexdigest()))
+    encoded = json.dumps(
+        rows,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _inputs(
     upstream: dict[CheckpointKind, str],
     *,
@@ -281,31 +308,54 @@ def test_colmap_keeps_legacy_fingerprint_function() -> None:
         milestone_fingerprint(CheckpointKind.COLMAP, _inputs({}))
 
 
-def test_allowlisted_colmap_producer_digest_matches_verified_legacy_commit() -> None:
+def test_pycolmap_only_fix_prefers_compatible_classical_colmap_fingerprint() -> None:
     repository_root = Path(__file__).resolve().parents[3]
-    paths = (
-        "backend/static_pipeline/colmap.py",
-        "experiments/learned_quality/geometry.py",
-        "experiments/learned_quality/runtime.py",
+    previous_producer = _producer_digest_at_commit(
+        repository_root,
+        "eca3bc222d907cf3130a31f3f72b777937693051",
     )
-    rows = []
-    for relative in sorted(paths):
-        content = subprocess.run(
-            ["git", "show", f"1684964:{relative}"],
-            cwd=repository_root,
-            check=True,
-            capture_output=True,
-        ).stdout
-        rows.append((relative, hashlib.sha256(content).hexdigest()))
-    encoded = json.dumps(
-        rows,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-        allow_nan=False,
-    ).encode("utf-8")
+    current_producer = _producer_digest_at_commit(
+        repository_root,
+        "afa0c8384b9a1639f191804875c8bb186f422e57",
+    )
+    current = CheckpointInputs(
+        source_digest="a" * 64,
+        settings={"selection_digest": "b" * 64, "use_gpu": True},
+        model_manifest_sha256="c" * 64,
+        tool_versions={"colmap": "COLMAP 3.11.1"},
+        producer_code_sha256=current_producer,
+    )
+    previous = CheckpointInputs(
+        source_digest=current.source_digest,
+        settings=current.settings,
+        model_manifest_sha256=current.model_manifest_sha256,
+        tool_versions=current.tool_versions,
+        producer_code_sha256=previous_producer,
+    )
+    expected = compatible_colmap_fingerprints(
+        previous,
+        legacy_producer_digests=(),
+    )[0]
 
-    assert LEGACY_COLMAP_PRODUCER_DIGESTS == (hashlib.sha256(encoded).hexdigest(),)
+    actual = compatible_colmap_fingerprints(
+        current,
+        legacy_producer_digests=(previous_producer,),
+    )
+
+    assert actual[0] == expected
+
+
+def test_allowlisted_colmap_producer_digests_match_verified_legacy_commits() -> None:
+    repository_root = Path(__file__).resolve().parents[3]
+    expected = tuple(
+        _producer_digest_at_commit(repository_root, commit)
+        for commit in (
+            "eca3bc222d907cf3130a31f3f72b777937693051",
+            "1684964",
+        )
+    )
+
+    assert LEGACY_COLMAP_PRODUCER_DIGESTS == expected
 
 
 def test_store_publishes_and_restores_portable_milestone_graph(

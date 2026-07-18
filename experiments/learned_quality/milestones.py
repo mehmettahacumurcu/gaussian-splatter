@@ -31,8 +31,14 @@ from .tracks import QualifiedStaticTracks
 
 MILESTONE_SCHEMA_VERSION = 1
 LEGACY_COLMAP_PRODUCER_DIGESTS = (
+    "498b687580e7cd45adc4ff973704e195b7714daf7a6c95d445660f57bfbb98da",
     "d45ac8a109637dec223e14a0b3b1e25790cf655c29093c6a2ec784ffe9b517a8",
 )
+_PREFERRED_COLMAP_PRODUCER_MIGRATIONS = {
+    "7c2fa3dd0461838d10474006a078d95e0797780fb1a4f7b7a4f54c42587254f9": (
+        "498b687580e7cd45adc4ff973704e195b7714daf7a6c95d445660f57bfbb98da"
+    ),
+}
 
 
 _EXPECTED_UPSTREAM_KINDS = {
@@ -519,13 +525,18 @@ def compatible_colmap_fingerprints(
     *,
     legacy_producer_digests: tuple[str, ...],
 ) -> tuple[str, ...]:
-    """Return current then allow-listed legacy fingerprints without duplicates."""
+    """Return verified-compatible COLMAP fingerprints without duplicates."""
     if not isinstance(current, CheckpointInputs):
         raise TypeError("current must be CheckpointInputs")
     if not isinstance(legacy_producer_digests, tuple):
         raise TypeError("legacy_producer_digests must be a tuple")
+    producer_digests = [current.producer_code_sha256, *legacy_producer_digests]
+    preferred = _PREFERRED_COLMAP_PRODUCER_MIGRATIONS.get(current.producer_code_sha256)
+    if preferred in legacy_producer_digests:
+        producer_digests.remove(preferred)
+        producer_digests.insert(0, preferred)
     result: list[str] = []
-    for producer_digest in (current.producer_code_sha256, *legacy_producer_digests):
+    for producer_digest in producer_digests:
         active_digest = _digest(producer_digest, "legacy producer digest")
         fingerprint = checkpoint_fingerprint(
             CheckpointKind.COLMAP,
