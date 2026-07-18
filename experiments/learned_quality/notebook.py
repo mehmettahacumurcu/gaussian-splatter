@@ -241,8 +241,179 @@ def build_learned_quality_notebook(
     return notebook
 
 
+def build_learned_quality_a100_notebook(
+    *,
+    commit_sha: str,
+    repository_url: str = REPOSITORY_URL,
+) -> nbformat.NotebookNode:
+    return build_learned_quality_notebook(
+        commit_sha,
+        repository_url=repository_url,
+    )
+
+
+def build_learned_quality_audit_notebook(
+    *,
+    commit_sha: str,
+    repository_url: str = REPOSITORY_URL,
+) -> nbformat.NotebookNode:
+    if _FULL_SHA.fullmatch(commit_sha) is None:
+        raise ValueError("notebook source requires a full commit SHA")
+    if repository_url != REPOSITORY_URL:
+        raise ValueError("notebook repository URL is not approved")
+    cells = [
+        nbformat.v4.new_markdown_cell(
+            "# CPU cache and COLMAP track audit\n\n"
+            "Use a **CPU High-RAM** runtime and choose **Runtime -> Run all**. "
+            "This free preflight creates/restores the exact frame selection, checks "
+            "the owned COLMAP cache, filters invalid tracks, and publishes the receipt "
+            "required by the A100 notebook.",
+            metadata=_tag("title"),
+        ),
+        nbformat.v4.new_code_cell(
+            'INPUT_FOLDER = ""  # @param {type:"string"}\n',
+            metadata=_tag("config"),
+        ),
+        nbformat.v4.new_code_cell(
+            "from google.colab import drive\n"
+            "from pathlib import Path\n"
+            "drive.mount('/content/drive')\n"
+            "DRIVE_ROOT = Path('/content/drive/MyDrive').resolve()\n",
+            metadata=_tag("drive"),
+        ),
+        nbformat.v4.new_code_cell(
+            "import json, unicodedata\n"
+            "from pathlib import Path, PurePosixPath\n"
+            "raw_folder = INPUT_FOLDER.strip()\n"
+            "if not raw_folder:\n"
+            "    raw_folder = input('MyDrive-relative input folder: ').strip()\n"
+            "assert raw_folder and '\\\\' not in raw_folder, 'Use a MyDrive-relative POSIX path'\n"
+            "assert not any(unicodedata.category(ch) == 'Cc' for ch in raw_folder)\n"
+            "folder = PurePosixPath(raw_folder)\n"
+            "assert not folder.is_absolute() and folder.parts\n"
+            "assert all(part not in {'', '.', '..'} for part in folder.parts)\n"
+            "assert not raw_folder.endswith(('_result', '_learned_test_result', "
+            "'_learned_test_diagnostics', '_learned_test_cache'))\n"
+            "INPUT_PATH = DRIVE_ROOT.joinpath(*folder.parts).resolve()\n"
+            "INPUT_PATH.relative_to(DRIVE_ROOT)\n"
+            "assert INPUT_PATH.is_dir(), f'Input folder does not exist: {INPUT_PATH}'\n"
+            "CACHE_PATH = INPUT_PATH.with_name(INPUT_PATH.name + '_learned_test_cache')\n"
+            "RUN_SPEC = {'schema_version': 1, 'input_folder': folder.as_posix(), "
+            "'publish': {'replace_owned_result': True}}\n"
+            "SPEC_PATH = Path('/content/learned_spec.json')\n"
+            "with SPEC_PATH.open('w', encoding='utf-8') as handle:\n"
+            "    json.dump(RUN_SPEC, handle, sort_keys=True, separators=(',', ':'))\n"
+            "print(f'Input: {INPUT_PATH}')\n"
+            "print(f'CPU audit/cache folder: {CACHE_PATH}')\n",
+            metadata=_tag("path-spec"),
+        ),
+        nbformat.v4.new_code_cell(
+            "import shutil, subprocess\n"
+            "from pathlib import Path\n"
+            "SOURCE_ROOT = Path('/content/gaussian-splatter-src')\n"
+            "if SOURCE_ROOT.exists():\n"
+            "    shutil.rmtree(SOURCE_ROOT)\n"
+            f"REPOSITORY_URL = {repository_url!r}\n"
+            f"COMMIT_SHA = {commit_sha!r}\n"
+            "subprocess.run(['git', 'clone', '--no-checkout', REPOSITORY_URL, "
+            "str(SOURCE_ROOT)], check=True)\n"
+            "subprocess.run(['git', '-C', str(SOURCE_ROOT), 'checkout', '--detach', "
+            "COMMIT_SHA], check=True)\n"
+            "actual = subprocess.run(['git', '-C', str(SOURCE_ROOT), 'rev-parse', "
+            "'HEAD'], check=True, capture_output=True, text=True).stdout.strip()\n"
+            "assert actual == COMMIT_SHA, 'Immutable source checkout mismatch'\n",
+            metadata=_tag("checkout"),
+        ),
+        nbformat.v4.new_code_cell(
+            "import subprocess, sys\n"
+            "subprocess.run(['apt-get', '-qq', 'update'], check=True)\n"
+            "subprocess.run(['apt-get', '-qq', 'install', '-y', 'ffmpeg'], check=True)\n"
+            "subprocess.run([\n"
+            "    sys.executable, '-m', 'pip', 'install', '-q',\n"
+            "    'numpy>=1.26,<2.0', 'opencv-python-headless>=4.8',\n"
+            "    'Pillow>=10', 'pydantic>=2.6,<3',\n"
+            "], check=True)\n"
+            "print('CPU audit dependencies are ready.')\n",
+            metadata=_tag("audit-dependencies"),
+        ),
+        nbformat.v4.new_code_cell(
+            "import json, subprocess, sys, traceback\n"
+            "from pathlib import Path\n"
+            "from google.colab import drive, runtime\n"
+            "failure = None\n"
+            "try:\n"
+            "    completed = subprocess.run(\n"
+            "        [\n"
+            '            sys.executable, "-u", "-m",\n'
+            '            "scripts.learned_quality_cache_audit",\n'
+            '            "--spec", "/content/learned_spec.json",\n'
+            "        ],\n"
+            "        cwd=SOURCE_ROOT, check=False,\n"
+            "    )\n"
+            "    receipt_path = Path('/content/learned_audit_result.json')\n"
+            "    if not receipt_path.is_file():\n"
+            "        raise RuntimeError('CPU audit ended without a receipt')\n"
+            "    receipt = json.loads(receipt_path.read_text(encoding='utf-8'))\n"
+            "    if completed.returncode != 0 or receipt.get('status') != 'success':\n"
+            "        raise RuntimeError(f'CPU cache audit failed: {receipt}')\n"
+            "    if not receipt.get('receipts'):\n"
+            "        raise RuntimeError('CPU cache audit published no passing receipt')\n"
+            "    for row in receipt['receipts']:\n"
+            "        print('TRACK AUDIT PASSED - ' + row['colmap_fingerprint'])\n"
+            "    print('The cache is ready for the pinned A100 notebook.')\n"
+            "except BaseException as exc:\n"
+            "    failure = exc\n"
+            "    print(f'CPU audit ended with {type(exc).__name__}: {exc}')\n"
+            "    traceback.print_exception(type(exc), exc, exc.__traceback__)\n"
+            "finally:\n"
+            "    print('Flushing outstanding Google Drive writes...')\n"
+            "    try:\n"
+            "        drive.flush_and_unmount()\n"
+            "    except BaseException as flush_error:\n"
+            "        print(f'Drive flush/unmount failed: {flush_error}')\n"
+            "    print('Releasing the CPU Colab runtime now.')\n"
+            "    try:\n"
+            "        runtime.unassign()\n"
+            "    except BaseException as release_error:\n"
+            "        print(f'Runtime release request failed: {release_error}')\n"
+            "        if failure is None:\n"
+            "            failure = release_error\n"
+            "if failure is not None:\n"
+            "    raise failure\n",
+            metadata=_tag("execute"),
+        ),
+    ]
+    for cell in cells:
+        cell["id"] = cell.metadata["tags"][0]
+    notebook = nbformat.v4.new_notebook(
+        cells=cells,
+        metadata={
+            "kernelspec": {
+                "display_name": "Python 3",
+                "language": "python",
+                "name": "python3",
+            },
+            "language_info": {"name": "python", "version": "3"},
+            "generator": {
+                "id": "4dgs-studio.learned-quality-cpu-audit-notebook",
+                "version": 1,
+                "commit_sha": commit_sha,
+            },
+        },
+    )
+    nbformat.validate(notebook)
+    return notebook
+
+
 def write_learned_quality_notebook(path: Path, commit_sha: str) -> Path:
-    notebook = build_learned_quality_notebook(commit_sha)
+    notebook = build_learned_quality_a100_notebook(commit_sha=commit_sha)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    nbformat.write(notebook, path, version=4)
+    return path
+
+
+def write_learned_quality_audit_notebook(path: Path, commit_sha: str) -> Path:
+    notebook = build_learned_quality_audit_notebook(commit_sha=commit_sha)
     path.parent.mkdir(parents=True, exist_ok=True)
     nbformat.write(notebook, path, version=4)
     return path

@@ -572,7 +572,11 @@ def _restore_stage_state(
         )
     reporter = current_stage_reporter()
     if reporter is not None:
-        reporter.cache_event("hit", f"{ref.kind.value} milestone", str(destination))
+        reporter.cache_event(
+            "hit",
+            f"{ref.kind.value} milestone",
+            f"{ref.fingerprint} -> {destination}",
+        )
     return restored.value
 
 

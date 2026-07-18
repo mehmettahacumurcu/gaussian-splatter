@@ -15,6 +15,7 @@ from typing import TextIO
 
 
 _STAGE_ID = re.compile(r"^[a-z][a-z0-9_]*$")
+_SHA256 = re.compile(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])")
 _ACTIVE_REPORTER: ContextVar[StageReporter | None]
 
 
@@ -51,6 +52,8 @@ class StageReporter:
         self._run_id: str | None = None
         self._active_started: dict[str, float] = {}
         self._progress_counts: dict[tuple[str, str], tuple[int, int]] = {}
+        self._latest_durable: tuple[str, str | None] | None = None
+        self._last_failed_stage: str | None = None
 
     def bind_log(self, path: Path, *, run_id: str) -> None:
         if not isinstance(path, Path):
@@ -72,6 +75,8 @@ class StageReporter:
         definition = self._definition(stage_id)
         if stage_id in self._active_started:
             raise ValueError(f"stage is already active: {stage_id}")
+        if not self._active_started:
+            self._last_failed_stage = None
         started = self._clock()
         self._active_started[stage_id] = started
         self._emit(
@@ -81,6 +86,8 @@ class StageReporter:
         try:
             yield
         except BaseException as error:
+            if self._last_failed_stage is None:
+                self._last_failed_stage = stage_id
             elapsed = self._clock() - started
             self._emit(
                 f"{self._prefix(definition)} FAIL  {definition.label} - "
@@ -166,6 +173,14 @@ class StageReporter:
         if not label.strip() or not detail.strip():
             raise ValueError("cache event label and detail must be non-empty")
         visible_action = action.replace("_", " ").upper()
+        if action in {"hit", "save"}:
+            durable_kind = _durable_kind(label)
+            if durable_kind is not None:
+                match = _SHA256.search(detail)
+                self._latest_durable = (
+                    durable_kind,
+                    None if match is None else match.group(0),
+                )
         self._emit(
             f"[CACHE {visible_action}] {label} - {detail}",
             {
@@ -175,6 +190,15 @@ class StageReporter:
                 "detail": detail,
             },
         )
+
+    def annotate_failure(self, error: BaseException) -> None:
+        if self._latest_durable is not None:
+            kind, fingerprint = self._latest_durable
+            setattr(error, "durable_milestone_kind", kind)
+            if fingerprint is not None:
+                setattr(error, "durable_milestone_fingerprint", fingerprint)
+        if self._last_failed_stage is not None:
+            setattr(error, "next_stage_id", self._last_failed_stage)
 
     def heartbeat(self, stage_id: str, elapsed_seconds: float) -> None:
         definition = self._definition(stage_id)
@@ -267,6 +291,23 @@ def _progress_details(details: Mapping[str, object] | None) -> dict[str, object]
         raise ValueError("progress details must be finite JSON")
 
     return {key: validate(value) for key, value in details.items()}
+
+
+def _durable_kind(label: str) -> str | None:
+    normalized = label.casefold().replace("-", "_").replace(" ", "_")
+    for kind in (
+        "base_evidence",
+        "selection",
+        "semantic",
+        "motion",
+        "masks",
+        "geometry",
+        "pretraining",
+        "colmap",
+    ):
+        if kind in normalized:
+            return kind
+    return None
 
 
 _ACTIVE_REPORTER = ContextVar("static_pipeline_progress_reporter", default=None)

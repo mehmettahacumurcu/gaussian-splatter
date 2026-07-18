@@ -157,6 +157,32 @@ def test_stage_reporter_rejects_invalid_or_nonmonotonic_progress() -> None:
             )
 
 
+def test_stage_reporter_attaches_durable_resume_context_to_failure() -> None:
+    reporter = StageReporter(
+        (
+            StageDefinition("reconstruction", "Reconstruction"),
+            StageDefinition("optical_flow", "Optical flow"),
+        )
+    )
+    error = RuntimeError("flow failed")
+    fingerprint = "a" * 64
+
+    with pytest.raises(RuntimeError):
+        with reporter.stage("reconstruction"):
+            reporter.cache_event(
+                "save",
+                "semantic milestone",
+                f"/drive/cache/semantic/{fingerprint}",
+            )
+            with reporter.stage("optical_flow"):
+                raise error
+    reporter.annotate_failure(error)
+
+    assert error.durable_milestone_kind == "semantic"
+    assert error.durable_milestone_fingerprint == fingerprint
+    assert error.next_stage_id == "optical_flow"
+
+
 @pytest.mark.parametrize(
     "definitions",
     [

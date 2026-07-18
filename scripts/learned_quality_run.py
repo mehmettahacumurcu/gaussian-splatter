@@ -60,6 +60,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "error_type": type(exc).__name__,
                 "error_message": str(exc),
                 "diagnostics_path": str(diagnostics) if diagnostics else None,
+                "durable_milestone_kind": getattr(exc, "durable_milestone_kind", None),
+                "durable_milestone_fingerprint": getattr(
+                    exc, "durable_milestone_fingerprint", None
+                ),
+                "next_stage_id": getattr(exc, "next_stage_id", None),
             },
         )
         return 1

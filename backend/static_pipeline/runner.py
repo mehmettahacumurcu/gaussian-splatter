@@ -715,6 +715,11 @@ def _failure_diagnostic_files(
             "error_message": str(error),
             "gate": decision,
             "components": getattr(error, "decisions", ()),
+            "durable_milestone_kind": getattr(error, "durable_milestone_kind", None),
+            "durable_milestone_fingerprint": getattr(
+                error, "durable_milestone_fingerprint", None
+            ),
+            "next_stage_id": getattr(error, "next_stage_id", None),
         },
     )
     uncovered_path = _write_json(
@@ -849,6 +854,8 @@ def _run_static_notebook_with_context(
         try:
             source_inventory = boundaries.discover_source(input_path)
         except Exception as exc:
+            if reporter is not None:
+                reporter.annotate_failure(exc)
             files = _failure_diagnostic_files(run_root, exc, None)
             try:
                 diagnostics = boundaries.publish_diagnostics(
@@ -960,6 +967,8 @@ def _run_static_notebook_with_context(
                 )
             timings["save_pretraining_seconds"] = time.perf_counter() - stage_started
     except Exception as exc:
+        if reporter is not None:
+            reporter.annotate_failure(exc)
         files = _failure_diagnostic_files(run_root, exc, selection)
         try:
             diagnostics = boundaries.publish_diagnostics(

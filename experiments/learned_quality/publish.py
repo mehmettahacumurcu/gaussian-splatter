@@ -20,7 +20,6 @@ from .reports import (
     _plain_tree,
     _safe_relative,
     _sha256,
-    inventory_learned_bundle,
     validate_learned_bundle,
 )
 

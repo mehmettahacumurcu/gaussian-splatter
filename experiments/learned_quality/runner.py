@@ -725,6 +725,13 @@ def _late_failure_files(run_root: Path, error: Exception) -> Mapping[str, Path]:
                 "status": "failed",
                 "error_type": type(error).__name__,
                 "error_message": str(error),
+                "durable_milestone_kind": getattr(
+                    error, "durable_milestone_kind", None
+                ),
+                "durable_milestone_fingerprint": getattr(
+                    error, "durable_milestone_fingerprint", None
+                ),
+                "next_stage_id": getattr(error, "next_stage_id", None),
             },
             sort_keys=True,
             separators=(",", ":"),
