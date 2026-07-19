@@ -351,7 +351,11 @@ class _CheckpointDecoder:
             expected.remove("inventory")
         if set(raw_fields) != expected:
             raise ValueError("checkpoint dataclass fields do not match the schema")
-        values = {key: self.decode(raw_fields[key]) for key in sorted(raw_fields)}
+        values = {
+            field.name: self.decode(raw_fields[field.name])
+            for field in fields(active_type)
+            if field.name in raw_fields
+        }
         if is_selection:
             values["inventory"] = self.source_inventory
         instance = active_type(**values)
@@ -375,6 +379,7 @@ def _checkpoint_types() -> dict[str, type[object]]:
 
     from .contracts import (
         FrameArtifact,
+        GeometryAcceptance,
         GeometryCandidateReport,
         LearnedArtifacts,
         LearnedReconstructionOutput,
@@ -431,6 +436,7 @@ def _checkpoint_types() -> dict[str, type[object]]:
         FrameArtifact,
         StageRecord,
         LearnedArtifacts,
+        GeometryAcceptance,
         GeometryCandidateReport,
         LearnedReconstructionOutput,
         BatchAttemptRecord,

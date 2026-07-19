@@ -41,6 +41,7 @@ from experiments.learned_quality.cache import (
 from experiments.learned_quality.contracts import (
     FrameArtifact,
     GENERATOR_ID,
+    GeometryAcceptance,
     GeometryCandidateReport,
     LearnedArtifacts,
     LearnedReconstructionOutput,
@@ -533,10 +534,25 @@ def test_portable_state_round_trip_rebases_paths_and_injects_inventory(
 def test_terminal_milestone_states_round_trip_with_local_paths(tmp_path: Path) -> None:
     snapshot, state, current_inventory = _portable_state(tmp_path)
     reconstruction = state["reconstruction"]
+    acceptance = GeometryAcceptance(
+        policy_version="output-first-v1",
+        mode="best_effort",
+        selection_digest=reconstruction.selected_manifest.image_set_digest,
+        model_hashes={
+            "cameras.txt": "4" * 64,
+            "images.txt": "5" * 64,
+            "points3D.txt": "6" * 64,
+        },
+        strict_failures=("registered_ratio",),
+        metrics=reconstruction.decision.dominant,
+        checks={"finite_metrics": True, "valid_model_files": True},
+        colmap_fingerprint="7" * 64,
+    )
     geometry = GeometryMilestoneState(
         bundle=reconstruction.bundle,
         frames_dir=reconstruction.frames_dir,
         geometry_candidates=reconstruction.geometry_candidates,
+        acceptance=acceptance,
     )
     final = FinalPretrainingState(
         photometric=None,
@@ -550,6 +566,9 @@ def test_terminal_milestone_states_round_trip_with_local_paths(tmp_path: Path) -
         {"geometry": geometry, "final": final},
         snapshot_root=snapshot,
     )
+    encoded = json.loads(
+        json.dumps(encoded, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    )
     restore = tmp_path / "terminal-restore"
     shutil.copytree(snapshot, restore)
     decoded = decode_checkpoint_state(
@@ -559,6 +578,22 @@ def test_terminal_milestone_states_round_trip_with_local_paths(tmp_path: Path) -
     )
 
     assert isinstance(decoded["geometry"], GeometryMilestoneState)
+    restored_acceptance = decoded["geometry"].acceptance
+    assert isinstance(restored_acceptance, GeometryAcceptance)
+    assert restored_acceptance.policy_version == acceptance.policy_version
+    assert restored_acceptance.mode == acceptance.mode
+    assert restored_acceptance.selection_digest == acceptance.selection_digest
+    assert restored_acceptance.model_hashes == acceptance.model_hashes
+    assert restored_acceptance.strict_failures == acceptance.strict_failures
+    assert restored_acceptance.checks == acceptance.checks
+    assert restored_acceptance.colmap_fingerprint == acceptance.colmap_fingerprint
+    assert (
+        restored_acceptance.metrics
+        is decoded["geometry"].bundle.decision.dominant
+    )
+    assert restored_acceptance.metrics.model_dir == (
+        restore / "reconstruction" / "classical" / "sparse" / "0"
+    )
     assert isinstance(decoded["final"], FinalPretrainingState)
     assert decoded["geometry"].bundle.accepted_model_dir.is_relative_to(restore)
     assert decoded["geometry"].frames_dir.is_relative_to(restore)
@@ -1263,6 +1298,7 @@ def test_complete_checkpoint_registry_covers_every_persisted_learned_type() -> N
     registered = set(_checkpoint_types().values())
     persisted = {
         FrameArtifact,
+        GeometryAcceptance,
         BatchAttemptRecord,
         PinholeCamera,
         FramePredictionArtifact,
