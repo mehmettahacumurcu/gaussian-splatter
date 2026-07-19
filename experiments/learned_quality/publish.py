@@ -79,11 +79,18 @@ class LearnedFileOps:
 
 
 def _write_success(path: Path, run_id: str, manifest_sha256: str) -> None:
+    manifest = _json_object(path / "run_manifest.json")
     payload = {
         "generator_id": GENERATOR_ID,
         "run_id": run_id,
         "manifest_sha256": manifest_sha256,
         "published_at": datetime.now(timezone.utc).isoformat(),
+        "geometry_acceptance_mode": manifest.get("geometry_acceptance_mode"),
+        "geometry_policy_version": manifest.get("geometry_policy_version"),
+        "geometry_strict_failures": manifest.get("geometry_strict_failures"),
+        "geometry_colmap_fingerprint": manifest.get(
+            "geometry_colmap_fingerprint"
+        ),
     }
     (path / "_SUCCESS").write_text(
         json.dumps(payload, sort_keys=True, separators=(",", ":")),
@@ -109,6 +116,14 @@ def is_owned_learned_result(path: Path) -> bool:
             success.get("generator_id") == GENERATOR_ID
             and success.get("run_id") == manifest["run_id"]
             and success.get("manifest_sha256") == _sha256(path / "run_manifest.json")
+            and success.get("geometry_acceptance_mode")
+            == manifest.get("geometry_acceptance_mode")
+            and success.get("geometry_policy_version")
+            == manifest.get("geometry_policy_version")
+            and success.get("geometry_strict_failures")
+            == manifest.get("geometry_strict_failures")
+            and success.get("geometry_colmap_fingerprint")
+            == manifest.get("geometry_colmap_fingerprint")
         )
     except (OSError, ValueError, KeyError):
         return False

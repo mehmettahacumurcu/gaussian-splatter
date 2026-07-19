@@ -26,11 +26,13 @@ def build_learned_quality_notebook(
         raise ValueError("notebook repository URL is not approved")
     cells = [
         nbformat.v4.new_markdown_cell(
-            "# A100 learned-quality Gaussian splat test\n\n"
-            "First complete `learned_quality_cache_audit.ipynb` for the same input "
-            "and confirm `TRACK AUDIT PASSED`. Then "
+            "# BEST-EFFORT ROUND 0 A100 Gaussian splat recovery\n\n"
+            "This fixed output-first notebook restores the complete Round 0 cache "
+            "for the same audited selection. First complete "
+            "`learned_quality_cache_audit.ipynb` and confirm `TRACK AUDIT PASSED`. Then "
             "Choose an **A100 High-RAM** runtime and use **Runtime → Run all**. "
-            "This isolated experiment keeps the legacy result untouched, publishes "
+            "This transparent best-effort experiment keeps the legacy result "
+            "untouched, publishes "
             "`<input>_learned_test_result`, and includes diagnostics—not a web viewer.",
             metadata=_tag("title"),
         ),
@@ -80,6 +82,7 @@ def build_learned_quality_notebook(
             "RESULT_PATH = INPUT_PATH.with_name(INPUT_PATH.name + '_learned_test_result')\n"
             "CACHE_PATH = INPUT_PATH.with_name(INPUT_PATH.name + '_learned_test_cache')\n"
             "RUN_SPEC = {'schema_version': 1, 'input_folder': folder.as_posix(), "
+            "'recovery_mode': 'round0_output_first_v1', "
             "'publish': {'replace_owned_result': True}}\n"
             "SPEC_PATH = Path('/content/learned_spec.json')\n"
             "with SPEC_PATH.open('w', encoding='utf-8') as handle:\n"

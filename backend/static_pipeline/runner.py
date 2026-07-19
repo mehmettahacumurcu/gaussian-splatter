@@ -121,6 +121,7 @@ class RunnerServices:
     save_pretraining: Callable[..., object] | None = None
     restore_selection: Callable[..., object | None] | None = None
     save_selection: Callable[..., object] | None = None
+    validate_reconstruction: Callable[[object], None] | None = None
 
 
 def runtime_paths_from_env() -> NotebookRuntimePaths:
@@ -951,9 +952,14 @@ def _run_static_notebook_with_context(
                     output_root=run_root / "reconstruction",
                 )
             timings["reconstruction_seconds"] = time.perf_counter() - stage_started
-        decision = getattr(reconstruction, "decision", None)
-        if decision is None or not decision.passed or decision.failures:
-            raise RuntimeError("reconstruction service returned a non-passing decision")
+        if boundaries.validate_reconstruction is None:
+            decision = getattr(reconstruction, "decision", None)
+            if decision is None or not decision.passed or decision.failures:
+                raise RuntimeError(
+                    "reconstruction service returned a non-passing decision"
+                )
+        else:
+            boundaries.validate_reconstruction(reconstruction)
         if restored is None and boundaries.save_pretraining is not None:
             stage_started = time.perf_counter()
             with _reported_stage(reporter, "pretraining_cache_save"):

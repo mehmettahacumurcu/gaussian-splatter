@@ -164,6 +164,7 @@ def test_cached_service_composition_uses_one_store_for_restore_reconstruct_and_s
 
     assert services.restore_pretraining is not None
     assert services.save_pretraining is not None
+    assert services.validate_reconstruction is None
     assert (
         services.restore_pretraining(
             source_inventory=source_inventory,
@@ -474,8 +475,9 @@ def test_notebook_run_enables_full_stage_reporter_and_default_drive_cache(
         "result_publication",
     )
     services = captured["services"]
-    assert services.restore_pretraining is not None
-    assert services.save_pretraining is not None
+    assert services.restore_pretraining is None
+    assert services.save_pretraining is None
+    assert services.validate_reconstruction is not None
     (tmp_path / "frames").mkdir()
     selection = SelectionOutput(
         inventory=SimpleNamespace(digest="a" * 64),

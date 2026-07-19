@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -31,6 +32,28 @@ def test_publish_uses_exact_learned_sibling_and_never_touches_legacy(
     assert receipt.final_path == derive_learned_result_path(input_folder)
     assert is_owned_learned_result(receipt.final_path)
     assert (legacy / "keep.txt").read_text(encoding="utf-8") == "legacy"
+
+
+def test_publish_success_marker_labels_best_effort_geometry(tmp_path: Path) -> None:
+    input_folder = tmp_path / "room"
+    input_folder.mkdir()
+    bundle = make_ready_bundle(
+        tmp_path / "bundle",
+        run_id="run-1",
+        geometry_acceptance={
+            "mode": "best_effort",
+            "policy_version": "output-first-v1",
+            "strict_failures": ["registered_ratio"],
+            "guarded_metrics": {"registered_count": 658},
+            "colmap_fingerprint": "c" * 64,
+        },
+    )
+
+    receipt = publish_learned_result(bundle, input_folder, run_id="run-1")
+    success = json.loads((receipt.final_path / "_SUCCESS").read_text())
+
+    assert success["geometry_acceptance_mode"] == "best_effort"
+    assert success["geometry_policy_version"] == "output-first-v1"
 
 
 def test_publish_refuses_to_replace_unowned_result(tmp_path: Path) -> None:

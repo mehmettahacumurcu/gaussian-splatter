@@ -3,11 +3,18 @@ from __future__ import annotations
 import json
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
 
 from experiments.learned_quality.contracts import GENERATOR_ID
+from backend.static_pipeline.contracts import ModelMetrics
+from experiments.learned_quality.contracts import (
+    MODEL_TEXT_FILES,
+    GeometryAcceptance,
+)
+from experiments.learned_quality.runner import _geometry_acceptance_payload
 from experiments.learned_quality.reports import (
     finalize_learned_bundle,
     validate_learned_bundle,
@@ -82,12 +89,25 @@ def _base_bundle(tmp_path: Path, run_id: str = "run-1") -> tuple[Path, dict[str,
     }
 
 
-def make_ready_bundle(tmp_path: Path, run_id: str = "run-1") -> Path:
+def make_ready_bundle(
+    tmp_path: Path,
+    run_id: str = "run-1",
+    geometry_acceptance: dict[str, object] | None = None,
+) -> Path:
     bundle, inputs = _base_bundle(tmp_path, run_id)
+    experiment_report: dict[str, object] = {"schema_version": 1, "status": "passed"}
+    if geometry_acceptance is not None:
+        experiment_report.update(
+            geometry_acceptance_mode=geometry_acceptance["mode"],
+            geometry_policy_version=geometry_acceptance["policy_version"],
+            geometry_strict_failures=geometry_acceptance["strict_failures"],
+            geometry_guarded_metrics=geometry_acceptance.get("guarded_metrics"),
+            geometry_colmap_fingerprint=geometry_acceptance["colmap_fingerprint"],
+        )
     finalize_learned_bundle(
         bundle,
         run_id=run_id,
-        experiment_report={"schema_version": 1, "status": "passed"},
+        experiment_report=experiment_report,
         geometry_candidates=[{"candidate_id": "classical", "passed": True}],
         model_manifest_path=inputs["model_manifest"],
         contact_sheets={
@@ -103,6 +123,65 @@ def make_ready_bundle(tmp_path: Path, run_id: str = "run-1") -> Path:
         photometric_report_path=inputs["photometric"],
     )
     return bundle
+
+
+def test_best_effort_acceptance_payload_never_claims_strict_pass() -> None:
+    metrics = ModelMetrics(
+        model_dir=Path("accepted"),
+        registered_names=frozenset({"frame_000000.png"}),
+        registered_count=658,
+        registered_ratio=658 / 800,
+        registered_share=1.0,
+        temporal_coverage_s=95.0,
+        max_interior_gap_s=9.59,
+        start_gap_s=0.0,
+        end_gap_s=0.0,
+        median_reprojection_error_px=1.217,
+        p95_reprojection_error_px=2.194,
+        median_track_length=5.0,
+        sparse_point_count=65_367,
+        valid_names_intrinsics_and_poses=True,
+    )
+    failures = ("registered_ratio", "interior_gap", "median_reprojection")
+    acceptance = GeometryAcceptance(
+        policy_version="output-first-v1",
+        mode="best_effort",
+        selection_digest="a" * 64,
+        model_hashes={name: "b" * 64 for name in MODEL_TEXT_FILES},
+        strict_failures=failures,
+        metrics=metrics,
+        checks={"registered_ratio": True},
+        colmap_fingerprint="c" * 64,
+    )
+    reconstruction = SimpleNamespace(
+        acceptance=acceptance,
+        decision=SimpleNamespace(failures=failures),
+    )
+
+    payload = _geometry_acceptance_payload(reconstruction)
+
+    assert payload["geometry_acceptance_mode"] == "best_effort"
+    assert payload["geometry_policy_version"] == "output-first-v1"
+    assert payload["geometry_strict_failures"] == list(failures)
+    assert payload["geometry_colmap_fingerprint"] == "c" * 64
+    assert payload["geometry_guarded_metrics"]["registered_count"] == 658
+
+
+def test_strict_acceptance_payload_has_no_recovery_claims() -> None:
+    reconstruction = SimpleNamespace(
+        acceptance=None,
+        decision=SimpleNamespace(failures=()),
+    )
+
+    payload = _geometry_acceptance_payload(reconstruction)
+
+    assert payload == {
+        "geometry_acceptance_mode": "strict",
+        "geometry_policy_version": "strict-v1",
+        "geometry_strict_failures": [],
+        "geometry_guarded_metrics": None,
+        "geometry_colmap_fingerprint": None,
+    }
 
 
 def test_finalize_builds_complete_experiment_inventory(tmp_path: Path) -> None:

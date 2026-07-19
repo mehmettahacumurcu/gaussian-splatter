@@ -6,7 +6,7 @@ import math
 import os
 import platform
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from backend.static_pipeline.progress import (
@@ -301,6 +301,65 @@ def preflight_learned_runtime(
     )
 
 
+def _geometry_acceptance_payload(
+    reconstruction: LearnedReconstructionOutput | object,
+) -> dict[str, object]:
+    acceptance = getattr(reconstruction, "acceptance", None)
+    if acceptance is None or acceptance.mode == "strict":
+        decision = getattr(reconstruction, "decision")
+        return {
+            "geometry_acceptance_mode": "strict",
+            "geometry_policy_version": "strict-v1",
+            "geometry_strict_failures": list(decision.failures),
+            "geometry_guarded_metrics": None,
+            "geometry_colmap_fingerprint": None,
+        }
+    metrics = acceptance.metrics
+    return {
+        "geometry_acceptance_mode": acceptance.mode,
+        "geometry_policy_version": acceptance.policy_version,
+        "geometry_strict_failures": list(acceptance.strict_failures),
+        "geometry_guarded_metrics": {
+            "registered_count": metrics.registered_count,
+            "registered_ratio": metrics.registered_ratio,
+            "registered_share": metrics.registered_share,
+            "max_interior_gap_s": metrics.max_interior_gap_s,
+            "start_gap_s": metrics.start_gap_s,
+            "end_gap_s": metrics.end_gap_s,
+            "median_reprojection_error_px": (
+                metrics.median_reprojection_error_px
+            ),
+            "p95_reprojection_error_px": metrics.p95_reprojection_error_px,
+            "median_track_length": metrics.median_track_length,
+            "sparse_point_count": metrics.sparse_point_count,
+            "valid_names_intrinsics_and_poses": (
+                metrics.valid_names_intrinsics_and_poses
+            ),
+        },
+        "geometry_colmap_fingerprint": acceptance.colmap_fingerprint,
+    }
+
+
+def _validate_output_first_reconstruction(reconstruction: object) -> None:
+    if not isinstance(reconstruction, LearnedReconstructionOutput):
+        raise ValueError("output-first recovery requires learned reconstruction")
+    decision = reconstruction.decision
+    acceptance = reconstruction.acceptance
+    if decision.passed and not decision.failures:
+        if acceptance is not None and acceptance.mode != "strict":
+            raise ValueError("strict geometry has a mismatched acceptance mode")
+        return
+    if (
+        acceptance is None
+        or acceptance.mode != "best_effort"
+        or acceptance.policy_version != "output-first-v1"
+        or acceptance.strict_failures != decision.failures
+        or not acceptance.checks
+        or not all(acceptance.checks.values())
+    ):
+        raise ValueError("reconstruction lacks a valid output-first acceptance")
+
+
 def _training_adapter(
     reconstruction: LearnedReconstructionOutput,
     *,
@@ -322,7 +381,10 @@ def _training_adapter(
         source_digest=selection.inventory.digest,
         selection_digest=reconstruction.selected_manifest.image_set_digest,
     )
-    return run_learned_training(prepared, spec, reconstruction)
+    training = run_learned_training(prepared, spec, reconstruction)
+    status = dict(training.status)
+    status.update(_geometry_acceptance_payload(reconstruction))
+    return replace(training, status=status)
 
 
 def _sheet_from_images(paths: tuple[Path, ...], destination: Path) -> Path:
@@ -454,13 +516,20 @@ def make_learned_quality_services(
         if photometric is None:
             raise ValueError("photometric evidence is required for learned reports")
         winner = _reported_winner(reconstruction)
+        geometry_acceptance = _geometry_acceptance_payload(reconstruction)
         experiment_report = {
-            "status": "passed",
+            "status": (
+                "best_effort"
+                if geometry_acceptance["geometry_acceptance_mode"] == "best_effort"
+                else "passed"
+            ),
             "winner": winner.candidate_id,
             "final_gaussian_count": training.final_gaussian_count,
             "training_rgb_digest": training.training_rgb_digest,
             "fallbacks": training.fallbacks,
+            "training_status": dict(training.status),
             "stages": artifacts.stage_records,
+            **geometry_acceptance,
         }
         return finalize_learned_bundle(
             bundle,
@@ -740,6 +809,12 @@ def make_learned_quality_services(
         restore_selection = restore_selection_impl
         save_selection = save_selection_impl
 
+    if recovery_mode != "strict":
+        # Recovery uses the immutable milestone graph directly. Avoid publishing
+        # another cumulative multi-gigabyte pre-training snapshot before training.
+        restore_pretraining = None
+        save_pretraining = None
+
     return RunnerServices(
         discover_source=production.discover_source,
         copy_input=production.copy_input,
@@ -759,6 +834,11 @@ def make_learned_quality_services(
         save_pretraining=save_pretraining,
         restore_selection=restore_selection,
         save_selection=save_selection,
+        validate_reconstruction=(
+            _validate_output_first_reconstruction
+            if recovery_mode == "round0_output_first_v1"
+            else None
+        ),
     )
 
 
@@ -789,6 +869,12 @@ def _late_failure_files(run_root: Path, error: Exception) -> Mapping[str, Path]:
                     error, "durable_milestone_fingerprint", None
                 ),
                 "next_stage_id": getattr(error, "next_stage_id", None),
+                "geometry_strict_failures": getattr(
+                    error, "strict_failures", None
+                ),
+                "geometry_guarded_failures": getattr(
+                    error, "guarded_failures", None
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),

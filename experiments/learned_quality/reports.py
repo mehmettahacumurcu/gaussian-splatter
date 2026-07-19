@@ -45,6 +45,13 @@ _REQUIRED_FILES = frozenset(
     }
 )
 _WEB_SUFFIXES = frozenset({".html", ".htm", ".js", ".mjs", ".wasm"})
+_GEOMETRY_ACCEPTANCE_KEYS = (
+    "geometry_acceptance_mode",
+    "geometry_policy_version",
+    "geometry_strict_failures",
+    "geometry_guarded_metrics",
+    "geometry_colmap_fingerprint",
+)
 
 
 def _sha256(path: Path) -> str:
@@ -234,6 +241,50 @@ def validate_learned_bundle(
         raise ValueError("run manifest does not match the requested run_id")
     if manifest.get("status") != "success":
         raise ValueError("run manifest status must be success")
+    expected = _manifest_inventory(manifest.get("artifacts"))
+    actual = inventory_learned_bundle(root)
+    if expected != actual:
+        raise ValueError(
+            "run manifest artifact inventory does not match bundle contents"
+        )
+    experiment = _json_object(root / "experiment_report.json")
+    quality = _json_object(root / "quality_report.json")
+    learned_quality = quality.get("learned_quality")
+    if not isinstance(learned_quality, dict):
+        raise ValueError("quality report learned_quality metadata is required")
+    geometry_metadata = {
+        key: manifest.get(key) for key in _GEOMETRY_ACCEPTANCE_KEYS
+    }
+    if geometry_metadata != {
+        key: experiment.get(key) for key in _GEOMETRY_ACCEPTANCE_KEYS
+    } or geometry_metadata != {
+        key: learned_quality.get(key) for key in _GEOMETRY_ACCEPTANCE_KEYS
+    }:
+        raise ValueError("geometry acceptance metadata differs across reports")
+    mode = geometry_metadata["geometry_acceptance_mode"]
+    policy = geometry_metadata["geometry_policy_version"]
+    failures = geometry_metadata["geometry_strict_failures"]
+    metrics = geometry_metadata["geometry_guarded_metrics"]
+    fingerprint = geometry_metadata["geometry_colmap_fingerprint"]
+    if mode not in {"strict", "best_effort"}:
+        raise ValueError("geometry acceptance mode is invalid")
+    if policy not in {"strict-v1", "output-first-v1"}:
+        raise ValueError("geometry policy version is invalid")
+    if not isinstance(failures, list) or any(
+        not isinstance(failure, str) or not failure for failure in failures
+    ):
+        raise ValueError("geometry strict failures are invalid")
+    if mode == "strict":
+        if policy != "strict-v1" or metrics is not None or fingerprint is not None:
+            raise ValueError("strict geometry contains recovery-only claims")
+    elif (
+        policy != "output-first-v1"
+        or not failures
+        or not isinstance(metrics, dict)
+        or not isinstance(fingerprint, str)
+        or len(fingerprint) != 64
+    ):
+        raise ValueError("best-effort geometry metadata is incomplete")
     source = manifest.get("source")
     if (
         not isinstance(source, dict)
@@ -249,12 +300,6 @@ def validate_learned_bundle(
     for key in ("tool_versions", "timing", "hardware"):
         if not isinstance(manifest.get(key), dict) or not manifest[key]:
             raise ValueError(f"run manifest {key} must be a non-empty object")
-    expected = _manifest_inventory(manifest.get("artifacts"))
-    actual = inventory_learned_bundle(root)
-    if expected != actual:
-        raise ValueError(
-            "run manifest artifact inventory does not match bundle contents"
-        )
     return actual
 
 
@@ -291,6 +336,22 @@ def finalize_learned_bundle(
     for name, source in contact_sheets.items():
         shutil.copyfile(source, diagnostics / name)
     report = dict(experiment_report)
+    geometry_metadata = {
+        "geometry_acceptance_mode": report.get(
+            "geometry_acceptance_mode", "strict"
+        ),
+        "geometry_policy_version": report.get(
+            "geometry_policy_version", "strict-v1"
+        ),
+        "geometry_strict_failures": report.get("geometry_strict_failures", []),
+        "geometry_guarded_metrics": report.get("geometry_guarded_metrics"),
+        "geometry_colmap_fingerprint": report.get(
+            "geometry_colmap_fingerprint"
+        ),
+    }
+    if geometry_metadata["geometry_acceptance_mode"] == "best_effort":
+        report["status"] = "best_effort"
+    report.update(geometry_metadata)
     report.update({"generator_id": GENERATOR_ID, "run_id": run_id})
     _write_json(bundle_root / "experiment_report.json", report)
     _write_json(bundle_root / "geometry_candidates.json", geometry_candidates)
@@ -301,6 +362,7 @@ def finalize_learned_bundle(
         "geometry_candidates": "geometry_candidates.json",
         "model_manifest": "model_manifest.json",
         "contact_sheets": [f"diagnostics/{name}" for name in sorted(_CONTACT_SHEETS)],
+        **geometry_metadata,
     }
     _write_json(bundle_root / "quality_report.json", quality)
 
@@ -310,6 +372,7 @@ def finalize_learned_bundle(
     manifest["generator_id"] = GENERATOR_ID
     manifest["schema_version"] = MANIFEST_SCHEMA_VERSION
     manifest["status"] = "success"
+    manifest.update(geometry_metadata)
     manifest["artifacts"] = [
         asdict(record) for record in inventory_learned_bundle(bundle_root)
     ]

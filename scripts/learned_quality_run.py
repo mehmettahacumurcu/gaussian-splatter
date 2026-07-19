@@ -65,10 +65,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                     exc, "durable_milestone_fingerprint", None
                 ),
                 "next_stage_id": getattr(exc, "next_stage_id", None),
+                "geometry_strict_failures": getattr(
+                    exc, "strict_failures", None
+                ),
+                "geometry_guarded_failures": getattr(
+                    exc, "guarded_failures", None
+                ),
             },
         )
         return 1
 
+    manifest = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
     _write_receipt(
         receipt_path,
         {
@@ -78,6 +85,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "local_bundle": str(result.local_bundle),
             "quality_report_path": str(result.quality_report_path),
             "manifest_path": str(result.manifest_path),
+            "geometry_acceptance_mode": manifest.get(
+                "geometry_acceptance_mode"
+            ),
+            "geometry_policy_version": manifest.get("geometry_policy_version"),
+            "geometry_strict_failures": manifest.get("geometry_strict_failures"),
         },
     )
     return 0

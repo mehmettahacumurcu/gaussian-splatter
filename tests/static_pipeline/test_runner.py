@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -191,6 +192,39 @@ def test_gate_failure_publishes_diagnostics_but_never_trains(tmp_path: Path) -> 
     assert "train" not in calls
     assert "publish" not in calls
     assert calls[-1] == "publish_diagnostics"
+
+
+def test_explicit_reconstruction_validator_may_accept_without_rewriting_gate(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    services = _services(calls)
+    failed = SimpleNamespace(
+        decision=SimpleNamespace(
+            passed=False,
+            failures=("registered_ratio",),
+        )
+    )
+
+    def validate(reconstruction: object) -> None:
+        calls.append("validate_reconstruction")
+        assert reconstruction is failed
+
+    services = replace(
+        services,
+        reconstruct=lambda *args, **kwargs: failed,
+        validate_reconstruction=validate,
+    )
+    result = run_static_notebook(
+        StaticNotebookRunSpec(input_folder="captures/room"),
+        runtime_paths=NotebookRuntimePaths(tmp_path / "drive", tmp_path / "work"),
+        services=services,
+    )
+
+    assert result.final_path.name == "room_result"
+    assert "validate_reconstruction" in calls
+    assert "train" in calls
+    assert failed.decision.passed is False
 
 
 def test_complete_pretraining_restore_skips_copy_selection_and_reconstruction(

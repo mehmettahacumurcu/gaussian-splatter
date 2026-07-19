@@ -46,6 +46,8 @@ def test_notebook_is_deterministic_run_all_safe_and_pinned() -> None:
     assert "_learned_test_cache" in notebook.cells[4].source
     assert "Pre-training cache:" in notebook.cells[4].source
     assert "CACHE_PATH" in notebook.cells[4].source
+    assert "'recovery_mode': 'round0_output_first_v1'" in notebook.cells[4].source
+    assert "BEST-EFFORT ROUND 0" in notebook.cells[0].source
     assert commit in notebook.cells[5].source
     assert re.fullmatch(r"[0-9a-f]{40}", commit)
     assert "static_notebook_bootstrap.sh" in notebook.cells[6].source
