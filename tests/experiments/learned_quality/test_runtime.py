@@ -407,8 +407,11 @@ def test_reconstruction_output_first_restores_exact_lineage_colmap_before_geomet
         CheckpointKind.SELECTION: MilestoneRef(CheckpointKind.SELECTION, "1" * 64),
         CheckpointKind.MASKS: MilestoneRef(CheckpointKind.MASKS, "2" * 64),
     }
-    restored_attempt = object()
+    restored_root = tmp_path / "round0-colmap-restored"
+    restored_root.mkdir()
+    restored_attempt = SimpleNamespace(root=restored_root)
     restore_calls: list[tuple[str, Path]] = []
+    external_bindings: list[tuple[str, Path]] = []
 
     class Store:
         def restore_colmap(self, fingerprint: str, *, destination: Path) -> object:
@@ -429,6 +432,14 @@ def test_reconstruction_output_first_restores_exact_lineage_colmap_before_geomet
 
         def restore(self, _ref: MilestoneRef, _destination: Path) -> None:
             return None
+
+        def bind_external_root(self, label: str, root: Path) -> object:
+            external_bindings.append((label, root))
+            return self
+
+        def publish(self, *_args: object, **_kwargs: object) -> Path:
+            assert external_bindings == [("round0_colmap", restored_root)]
+            raise reached_publish
 
     session = Session()
     manifest_path = tmp_path / "model_manifest.json"
@@ -453,7 +464,7 @@ def test_reconstruction_output_first_restores_exact_lineage_colmap_before_geomet
         "make_classical_candidate_runner",
         fail_normal_geometry,
     )
-    reached_guard = RuntimeError("guard reached")
+    reached_publish = RuntimeError("publish guard reached")
 
     def accept_guard(
         manifest: object,
@@ -465,7 +476,7 @@ def test_reconstruction_output_first_restores_exact_lineage_colmap_before_geomet
         assert frames == (frame,)
         assert attempt is restored_attempt
         assert kwargs["checkpoint_fingerprint"] == "c" * 64
-        raise reached_guard
+        return object(), (object(),), object()
 
     monkeypatch.setattr(runtime_module, "accept_output_first_geometry", accept_guard)
 
@@ -480,13 +491,14 @@ def test_reconstruction_output_first_restores_exact_lineage_colmap_before_geomet
             recovery_mode="round0_output_first_v1",
         )
 
-    assert captured.value is reached_guard
+    assert captured.value is reached_publish
     assert restore_calls == [
         (
             "c" * 64,
             tmp_path / "round0-colmap-restored",
         )
     ]
+    assert external_bindings == [("round0_colmap", restored_root)]
 
 
 def test_evidence_cycle_publishes_and_restores_each_expensive_milestone(

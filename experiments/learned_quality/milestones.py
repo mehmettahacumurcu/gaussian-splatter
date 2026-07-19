@@ -385,6 +385,24 @@ class MilestoneSession:
             external_roots={"selection": Path(selection_root)},
         )
 
+    def bind_external_root(self, label: str, root: Path) -> MilestoneSession:
+        if (
+            not isinstance(label, str)
+            or not label
+            or label in {".", ".."}
+            or "/" in label
+            or "\\" in label
+        ):
+            raise ValueError("external root labels must be safe path components")
+        resolved = Path(root).resolve(strict=True)
+        existing = self.external_roots.get(label)
+        if existing is not None and existing != resolved:
+            raise ValueError("external root labels cannot be rebound")
+        return replace(
+            self,
+            external_roots={**self.external_roots, label: resolved},
+        )
+
     def restore(self, ref: MilestoneRef, destination: Path) -> MilestoneState | None:
         return self.store.restore_milestone(
             ref,

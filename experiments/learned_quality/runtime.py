@@ -1123,6 +1123,10 @@ def run_learned_reconstruction(
             raise ValueError(
                 "output-first recovery could not restore its exact COLMAP checkpoint"
             )
+        geometry_session = milestone_session.bind_external_root(
+            "round0_colmap",
+            restored_attempt.root,
+        )
         geometry_ref = _geometry_milestone_ref(
             milestone_session,
             milestone_refs[CheckpointKind.MASKS],
@@ -1130,7 +1134,7 @@ def run_learned_reconstruction(
             recovery_mode,
         )
         geometry_state = _restore_stage_state(
-            milestone_session,
+            geometry_session,
             geometry_ref,
             output_root,
             GeometryMilestoneState,
@@ -1168,7 +1172,7 @@ def run_learned_reconstruction(
                 geometry_candidates=candidates,
                 acceptance=acceptance,
             )
-            generation = milestone_session.publish(
+            generation = geometry_session.publish(
                 geometry_ref,
                 upstream={
                     CheckpointKind.SELECTION: milestone_session.selection_ref.fingerprint,

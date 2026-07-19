@@ -267,6 +267,16 @@ def test_milestone_session_scopes_stage_refs_and_state_contracts(
     assert branch.selection_ref == branch_selection_ref
     assert branch.external_roots == {"selection": branch_root.resolve()}
 
+    restored_colmap = tmp_path / "restored-colmap"
+    restored_colmap.mkdir()
+    rebound = branch.bind_external_root("round0_colmap", restored_colmap)
+
+    assert branch.external_roots == {"selection": branch_root.resolve()}
+    assert rebound.external_roots == {
+        "round0_colmap": restored_colmap.resolve(),
+        "selection": branch_root.resolve(),
+    }
+
 
 def test_semantic_change_does_not_invalidate_motion_sibling() -> None:
     base = "a" * 64
