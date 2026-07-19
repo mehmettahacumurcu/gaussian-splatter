@@ -664,9 +664,10 @@ class LearnedCheckpointStore:
 
         if not isinstance(ref, MilestoneRef):
             raise TypeError("ref must be a MilestoneRef")
-        generation = self.find_generation(ref.kind, ref.fingerprint)
-        if generation is None:
+        located = self._find_generation_metadata(ref.kind, ref.fingerprint)
+        if located is None:
             return None
+        generation, manifest = located
         try:
             self.validate_milestone_graph(ref)
         except ValueError:
@@ -675,16 +676,8 @@ class LearnedCheckpointStore:
         if os.path.lexists(target):
             raise FileExistsError(f"milestone restore destination exists: {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
-        source = generation / "payload"
         try:
-            shutil.copytree(source, target, copy_function=shutil.copy2)
-            if _inventory(source) != _inventory(target):
-                raise ValueError("restored milestone differs from Drive")
-            manifest = _read_generation_manifest(
-                generation,
-                ref.kind,
-                ref.fingerprint,
-            )
+            _copy_verified_payload(generation, target, manifest)
             upstream, raw_artifact_roots, external_labels = _manifest_metadata(manifest)
             resolved_external_roots = {
                 label: _regular_directory(Path(path), f"{label} external root")
@@ -747,20 +740,16 @@ class LearnedCheckpointStore:
                 raise ValueError("milestone dependency graph contains a cycle")
             if ref in visited:
                 return
-            generation = self.find_generation(ref.kind, ref.fingerprint)
-            if generation is None:
+            located = self._find_generation_metadata(ref.kind, ref.fingerprint)
+            if located is None:
                 raise ValueError(
                     f"missing upstream milestone: {ref.kind.value}/{ref.fingerprint}"
                 )
+            _generation, manifest = located
             visiting.add(ref)
             if ref.kind is CheckpointKind.COLMAP:
                 upstream: Mapping[CheckpointKind, str] = {}
             else:
-                manifest = _read_generation_manifest(
-                    generation,
-                    ref.kind,
-                    ref.fingerprint,
-                )
                 upstream, _, _ = _manifest_metadata(manifest)
             observed_edges[ref] = upstream
             for upstream_kind, fingerprint in sorted(
@@ -810,7 +799,7 @@ class LearnedCheckpointStore:
                 fingerprint = _require_digest(generation.name, "fingerprint")
             except ValueError:
                 continue
-            if not self._valid_generation(generation, active_kind, fingerprint):
+            if self._generation_metadata(generation, active_kind, fingerprint) is None:
                 continue
             try:
                 modified = (generation / "_SUCCESS.json").stat().st_mtime_ns
@@ -1033,18 +1022,24 @@ class LearnedCheckpointStore:
     ) -> object | None:
         from backend.static_pipeline.contracts import ColmapAttempt
 
-        generation = self.find_generation(CheckpointKind.COLMAP, fingerprint)
-        if generation is None:
+        located = self._find_generation_metadata(
+            CheckpointKind.COLMAP,
+            fingerprint,
+        )
+        if located is None:
+            target_generation = (
+                self.cache_root / CheckpointKind.COLMAP.value / fingerprint
+            )
+            if os.path.lexists(target_generation):
+                raise ValueError("COLMAP checkpoint metadata differs from its manifest")
             return None
+        generation, manifest = located
         target = Path(destination)
         if os.path.lexists(target):
             raise FileExistsError(f"COLMAP restore destination exists: {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
-        source = generation / "payload"
         try:
-            shutil.copytree(source, target, copy_function=shutil.copy2)
-            if _inventory(source) != _inventory(target):
-                raise ValueError("restored COLMAP checkpoint differs from Drive")
+            _copy_verified_payload(generation, target, manifest)
             payload = json.loads((target / "state.json").read_text(encoding="utf-8"))
             restored = decode_checkpoint_state(
                 payload,
@@ -1165,13 +1160,15 @@ class LearnedCheckpointStore:
             raise FileExistsError(f"pretraining restore destination exists: {target}")
         target.parent.mkdir(parents=True, exist_ok=True)
         for generation in candidates:
-            source = generation / "payload"
             try:
-                shutil.copytree(source, target, copy_function=shutil.copy2)
-                if _inventory(source) != _inventory(target):
-                    raise ValueError(
-                        "restored pretraining checkpoint differs from Drive"
-                    )
+                manifest = self._generation_metadata(
+                    generation,
+                    CheckpointKind.PRETRAINING,
+                    generation.name,
+                )
+                if manifest is None:
+                    continue
+                _copy_verified_payload(generation, target, manifest)
                 payload = json.loads(
                     (target / "state.json").read_text(encoding="utf-8")
                 )
@@ -1220,16 +1217,12 @@ class LearnedCheckpointStore:
                 fingerprint = _require_digest(candidate.name, "fingerprint")
             except ValueError:
                 continue
-            if self._valid_generation(
+            manifest = self._generation_metadata(
                 candidate,
                 CheckpointKind.PRETRAINING,
                 fingerprint,
-            ):
-                manifest = _read_generation_manifest(
-                    candidate,
-                    CheckpointKind.PRETRAINING,
-                    fingerprint,
-                )
+            )
+            if manifest is not None:
                 if "upstream" in manifest:
                     # Terminal milestone generations are restored after selection
                     # by the dependency graph, not by the legacy cumulative codec.
@@ -1251,6 +1244,51 @@ class LearnedCheckpointStore:
             if self._valid_generation(target, active_kind, active_fingerprint):
                 return target
         return self._recover_staged_generation(active_kind, active_fingerprint)
+
+    def _generation_metadata(
+        self,
+        generation: Path,
+        kind: CheckpointKind,
+        fingerprint: str,
+    ) -> dict[str, object] | None:
+        try:
+            return _read_verified_generation_metadata(
+                generation,
+                kind,
+                fingerprint,
+            )
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+            return None
+
+    def _find_generation_metadata(
+        self,
+        kind: CheckpointKind,
+        fingerprint: str,
+    ) -> tuple[Path, dict[str, object]] | None:
+        active_kind = _require_kind(kind)
+        active_fingerprint = _require_digest(fingerprint, "fingerprint")
+        if not self._ensure_owned_root(create=False):
+            return None
+        target = self.cache_root / active_kind.value / active_fingerprint
+        if os.path.lexists(target):
+            manifest = self._generation_metadata(
+                target,
+                active_kind,
+                active_fingerprint,
+            )
+            if manifest is not None:
+                return target, manifest
+        recovered = self._recover_staged_generation(active_kind, active_fingerprint)
+        if recovered is None:
+            return None
+        manifest = self._generation_metadata(
+            recovered,
+            active_kind,
+            active_fingerprint,
+        )
+        if manifest is None:
+            return None
+        return recovered, manifest
 
     def _recover_staged_generations(self, kind: CheckpointKind) -> None:
         staging_parent = self.cache_root / "staging"
@@ -1357,51 +1395,16 @@ class LearnedCheckpointStore:
         fingerprint: str,
     ) -> bool:
         try:
-            root = _regular_directory(generation, "generation")
-            manifest_path = _regular_file(root / "manifest.json", "manifest")
-            success_path = _regular_file(root / "_SUCCESS.json", "success marker")
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            success = json.loads(success_path.read_text(encoding="utf-8"))
-            if not isinstance(manifest, dict) or not isinstance(success, dict):
-                return False
-            if manifest.get("schema_version") != _SCHEMA_VERSION:
-                return False
-            if manifest.get("kind") != kind.value:
-                return False
-            if manifest.get("fingerprint") != fingerprint:
-                return False
-            base_keys = {"schema_version", "kind", "fingerprint", "files"}
-            metadata_keys = {"upstream", "artifact_roots"}
-            external_keys = {"external_root_labels"}
-            manifest_keys = frozenset(manifest)
-            if manifest_keys == frozenset(base_keys):
-                upstream_payload = None
-            elif manifest_keys in {
-                frozenset(base_keys | metadata_keys),
-                frozenset(base_keys | metadata_keys | external_keys),
-            }:
-                upstream, _, _ = _manifest_metadata(manifest)
-                upstream_payload = {
-                    upstream_kind.value: upstream_fingerprint
-                    for upstream_kind, upstream_fingerprint in upstream.items()
-                }
-            else:
-                return False
-            expected_success = {
-                "schema_version": _SCHEMA_VERSION,
-                "kind": kind.value,
-                "fingerprint": fingerprint,
-                "manifest_sha256": _sha256(manifest_path),
-            }
-            if upstream_payload is not None:
-                expected_success["upstream"] = upstream_payload
-            if success != expected_success:
-                return False
-            expected = manifest.get("files")
-            if not isinstance(expected, list):
-                return False
-            actual = _inventory(root / "payload", relative_prefix="payload")
-            return expected == actual
+            manifest = _read_verified_generation_metadata(
+                generation,
+                kind,
+                fingerprint,
+            )
+            actual = _inventory(
+                generation / "payload",
+                relative_prefix="payload",
+            )
+            return manifest["files"] == actual
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
             return False
 
@@ -1771,9 +1774,186 @@ def _read_generation_manifest(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict):
         raise ValueError("generation manifest must be an object")
-    if manifest.get("kind") != kind.value or manifest.get("fingerprint") != fingerprint:
+    if (
+        manifest.get("kind") != kind.value
+        or manifest.get("fingerprint") != fingerprint
+    ):
         raise ValueError("generation manifest identity is malformed")
     return manifest
+
+
+@dataclass(frozen=True)
+class _ManifestEntry:
+    relative_path: PurePosixPath
+    size_bytes: int
+    sha256: str
+
+
+def _manifest_file_rows(
+    manifest: Mapping[str, object],
+) -> tuple[_ManifestEntry, ...]:
+    raw_rows = manifest.get("files")
+    if not isinstance(raw_rows, list):
+        raise ValueError("generation file manifest must be a list")
+    rows: list[_ManifestEntry] = []
+    observed: set[str] = set()
+    for raw_row in raw_rows:
+        if not isinstance(raw_row, dict) or set(raw_row) != {
+            "relative_path",
+            "size_bytes",
+            "sha256",
+        }:
+            raise ValueError("generation file row is malformed")
+        relative = _safe_relative_path(raw_row["relative_path"])
+        if len(relative.parts) < 2 or relative.parts[0] != "payload":
+            raise ValueError("generation files must be rooted below payload")
+        relative_text = relative.as_posix()
+        if relative_text in observed:
+            raise ValueError("generation file paths must be unique")
+        observed.add(relative_text)
+        size = raw_row["size_bytes"]
+        if type(size) is not int or size < 0:
+            raise ValueError("generation file size is malformed")
+        digest = _require_digest(raw_row["sha256"], "generation file digest")
+        rows.append(_ManifestEntry(relative, size, digest))
+    if [row.relative_path.as_posix() for row in rows] != sorted(observed):
+        raise ValueError("generation file rows must be canonically sorted")
+    return tuple(rows)
+
+
+def _payload_metadata_inventory(
+    root: Path,
+) -> tuple[tuple[str, int], ...]:
+    base = _regular_directory(root, "payload root")
+    rows: list[tuple[str, int]] = []
+    for path in sorted(base.rglob("*"), key=lambda item: item.as_posix()):
+        if path.is_symlink():
+            raise ValueError("checkpoint trees cannot contain symlinks")
+        if path.is_dir():
+            continue
+        file_path = _regular_file(path, "checkpoint artifact")
+        relative = _safe_relative_path(
+            f"payload/{file_path.relative_to(base).as_posix()}"
+        )
+        rows.append((relative.as_posix(), file_path.stat().st_size))
+    return tuple(rows)
+
+
+def _read_verified_generation_metadata(
+    generation: Path,
+    kind: CheckpointKind,
+    fingerprint: str,
+) -> dict[str, object]:
+    root = _regular_directory(generation, "generation")
+    manifest_path = _regular_file(root / "manifest.json", "manifest")
+    success_path = _regular_file(root / "_SUCCESS.json", "success marker")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    success = json.loads(success_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or not isinstance(success, dict):
+        raise ValueError("generation metadata must contain JSON objects")
+    if manifest.get("schema_version") != _SCHEMA_VERSION:
+        raise ValueError("generation schema version is unsupported")
+    if manifest.get("kind") != kind.value or manifest.get("fingerprint") != fingerprint:
+        raise ValueError("generation identity is malformed")
+    base_keys = {"schema_version", "kind", "fingerprint", "files"}
+    metadata_keys = {"upstream", "artifact_roots"}
+    external_keys = {"external_root_labels"}
+    manifest_keys = frozenset(manifest)
+    if manifest_keys == frozenset(base_keys):
+        upstream_payload = None
+    elif manifest_keys in {
+        frozenset(base_keys | metadata_keys),
+        frozenset(base_keys | metadata_keys | external_keys),
+    }:
+        upstream, _, _ = _manifest_metadata(manifest)
+        upstream_payload = {
+            upstream_kind.value: upstream_fingerprint
+            for upstream_kind, upstream_fingerprint in upstream.items()
+        }
+    else:
+        raise ValueError("generation manifest fields are malformed")
+    rows = _manifest_file_rows(manifest)
+    expected_success = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": kind.value,
+        "fingerprint": fingerprint,
+        "manifest_sha256": _sha256(manifest_path),
+    }
+    if upstream_payload is not None:
+        expected_success["upstream"] = upstream_payload
+    if success != expected_success:
+        raise ValueError("generation success marker is malformed")
+    expected_metadata = tuple(
+        (row.relative_path.as_posix(), row.size_bytes) for row in rows
+    )
+    if _payload_metadata_inventory(root / "payload") != expected_metadata:
+        raise ValueError("generation payload metadata differs from its manifest")
+    return manifest
+
+
+def _copy_verified_payload(
+    generation: Path,
+    destination: Path,
+    manifest: Mapping[str, object],
+) -> None:
+    source_root = _regular_directory(generation / "payload", "payload root")
+    target = Path(destination)
+    if os.path.lexists(target):
+        raise FileExistsError(f"restore destination exists: {target}")
+    rows = _manifest_file_rows(manifest)
+    target.mkdir()
+    total_bytes = sum(row.size_bytes for row in rows)
+    copied_total = 0
+    next_report = 512 * 1024 * 1024
+    print(
+        f"[CACHE RESTORE] Streaming {len(rows)} files "
+        f"({total_bytes / (1024 ** 3):.2f} GiB) from Drive...",
+        flush=True,
+    )
+    for row in rows:
+        payload_relative = PurePosixPath(*row.relative_path.parts[1:])
+        source = source_root.joinpath(*payload_relative.parts)
+        source_file = _regular_file(source, "restore source")
+        try:
+            source_file.relative_to(source_root)
+        except ValueError as error:
+            raise ValueError("restore source escapes the payload root") from error
+        if source_file.stat().st_size != row.size_bytes:
+            raise ValueError(
+                f"restore source size mismatch: {payload_relative.as_posix()}"
+            )
+        copied = target.joinpath(*payload_relative.parts)
+        copied.parent.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256()
+        copied_size = 0
+        with source_file.open("rb") as source_stream, copied.open("xb") as target_stream:
+            while block := source_stream.read(8 * 1024 * 1024):
+                copied_size += len(block)
+                copied_total += len(block)
+                digest.update(block)
+                target_stream.write(block)
+                if copied_total >= next_report:
+                    print(
+                        f"[CACHE RESTORE] {copied_total / (1024 ** 3):.2f}/"
+                        f"{total_bytes / (1024 ** 3):.2f} GiB verified",
+                        flush=True,
+                    )
+                    next_report += 512 * 1024 * 1024
+        if copied_size != row.size_bytes:
+            raise ValueError(
+                f"restore source size changed: {payload_relative.as_posix()}"
+            )
+        if digest.hexdigest() != row.sha256:
+            raise ValueError(
+                f"restore source hash mismatch: {payload_relative.as_posix()}"
+            )
+    expected_metadata = tuple(
+        (row.relative_path.as_posix(), row.size_bytes) for row in rows
+    )
+    actual_metadata = _payload_metadata_inventory(target)
+    if actual_metadata != expected_metadata:
+        raise ValueError("restored checkpoint metadata differs from Drive")
+    print("[CACHE RESTORE] Verified streaming copy complete.", flush=True)
 
 
 def _require_digest(value: object, label: str) -> str:

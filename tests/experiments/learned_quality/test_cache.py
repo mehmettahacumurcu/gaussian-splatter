@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import replace
 from pathlib import Path
@@ -633,6 +634,102 @@ def test_colmap_checkpoint_restores_attempt_into_fresh_local_root(
     assert restored.fingerprint == "4" * 64
 
 
+def test_colmap_restore_does_not_prehash_drive_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempt_root = tmp_path / "first-run" / "classical-prepass"
+    model = attempt_root / "sparse" / "0"
+    model.mkdir(parents=True)
+    database = attempt_root / "colmap.db"
+    database.write_bytes(b"database")
+    for name in ("cameras.txt", "images.txt", "points3D.txt"):
+        (model / name).write_text(name, encoding="utf-8")
+    attempt = ColmapAttempt(
+        root=attempt_root,
+        database_path=database,
+        model_dirs=(model,),
+        colmap_version="COLMAP 3.11.1",
+        fingerprint="4" * 64,
+    )
+    store = LearnedCheckpointStore(tmp_path / "drive-cache", input_identity="a" * 64)
+    generation = store.publish_colmap(
+        attempt,
+        fingerprint="5" * 64,
+        run_id="run-1",
+    )
+    payload_root = (generation / "payload").resolve()
+    hashed_paths: list[Path] = []
+    payload_reads: dict[Path, int] = {}
+    original_sha256 = cache_module._sha256
+    original_open = Path.open
+
+    def record_sha256(path: Path) -> str:
+        hashed_paths.append(Path(path).resolve())
+        return original_sha256(path)
+
+    def record_open(path: Path, *args: object, **kwargs: object):
+        candidate = Path(path).resolve()
+        mode = str(args[0]) if args else str(kwargs.get("mode", "r"))
+        if candidate.is_relative_to(payload_root) and "r" in mode:
+            payload_reads[candidate] = payload_reads.get(candidate, 0) + 1
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(cache_module, "_sha256", record_sha256)
+    monkeypatch.setattr(Path, "open", record_open)
+    restored = store.restore_colmap(
+        "5" * 64,
+        destination=tmp_path / "second-run" / "classical-prepass",
+    )
+
+    assert isinstance(restored, ColmapAttempt)
+    assert not any(path.is_relative_to(payload_root) for path in hashed_paths)
+    assert payload_reads
+    assert set(payload_reads.values()) == {1}
+
+
+@pytest.mark.parametrize("mutation", ["size", "digest", "missing", "unexpected"])
+def test_colmap_stream_restore_rejects_corruption_and_cleans_target(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    attempt_root = tmp_path / "first-run" / "classical-prepass"
+    model = attempt_root / "sparse" / "0"
+    model.mkdir(parents=True)
+    database = attempt_root / "colmap.db"
+    database.write_bytes(b"database")
+    for name in ("cameras.txt", "images.txt", "points3D.txt"):
+        (model / name).write_text(name, encoding="utf-8")
+    attempt = ColmapAttempt(
+        root=attempt_root,
+        database_path=database,
+        model_dirs=(model,),
+        colmap_version="COLMAP 3.11.1",
+        fingerprint="4" * 64,
+    )
+    store = LearnedCheckpointStore(tmp_path / "drive-cache", input_identity="a" * 64)
+    generation = store.publish_colmap(
+        attempt,
+        fingerprint="5" * 64,
+        run_id="run-1",
+    )
+    artifact = generation / "payload" / "attempt" / "colmap.db"
+    if mutation == "size":
+        artifact.write_bytes(artifact.read_bytes() + b"x")
+    elif mutation == "digest":
+        artifact.write_bytes(b"databasa")
+    elif mutation == "missing":
+        artifact.unlink()
+    else:
+        (generation / "payload" / "unexpected.bin").write_bytes(b"unexpected")
+    destination = tmp_path / "second-run" / "classical-prepass"
+
+    with pytest.raises(ValueError, match="metadata|size mismatch|hash mismatch"):
+        store.restore_colmap("5" * 64, destination=destination)
+
+    assert not destination.exists()
+
+
 def test_complete_pretraining_checkpoint_restores_into_fresh_local_root(
     tmp_path: Path,
 ) -> None:
@@ -712,24 +809,21 @@ def test_complete_checkpoint_restore_copy_corruption_is_a_hard_failure(
         run_id="run-1",
         run_root=run_root,
     )
-    original_copytree = shutil.copytree
+    original_copy = cache_module._copy_verified_payload
 
     destination = tmp_path / "restore"
 
     def corrupt_copy(
-        source: Path,
+        generation: Path,
         copied_destination: Path,
-        *args: object,
-        **kwargs: object,
-    ) -> Path:
-        copied = original_copytree(source, copied_destination, *args, **kwargs)
-        if Path(copied_destination) == destination:
-            (destination / "state.json").write_text("{}", encoding="utf-8")
-        return copied
+        manifest: Mapping[str, object],
+    ) -> None:
+        original_copy(generation, copied_destination, manifest)
+        (destination / "state.json").write_text("{}", encoding="utf-8")
 
-    monkeypatch.setattr(shutil, "copytree", corrupt_copy)
+    monkeypatch.setattr(cache_module, "_copy_verified_payload", corrupt_copy)
 
-    with pytest.raises(ValueError, match="differs from Drive"):
+    with pytest.raises(ValueError, match="malformed|unknown checkpoint value"):
         store.restore_pretraining(
             source_inventory=current_inventory,
             destination=destination,
