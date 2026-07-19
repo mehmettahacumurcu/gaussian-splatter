@@ -11,6 +11,7 @@ from pydantic import ValidationError
 from backend.static_pipeline.contracts import (
     ColmapAttempt,
     GateDecision,
+    ModelMetrics,
     ReconstructionBundle,
     SelectionManifest,
 )
@@ -20,11 +21,13 @@ from experiments.learned_quality.contracts import (
     GENERATOR_ID,
     RESULT_SUFFIX,
     FrameArtifact,
+    GeometryAcceptance,
     GeometryCandidateReport,
     LearnedArtifacts,
     LearnedQualityRunSpec,
     LearnedReconstructionOutput,
     LearnedTrainingOutput,
+    MODEL_TEXT_FILES,
     ModelRef,
     StageRecord,
     derive_learned_cache_root,
@@ -33,6 +36,25 @@ from experiments.learned_quality.contracts import (
     parse_learned_spec_json,
     to_static_run_spec,
 )
+
+
+def _acceptance_metrics(tmp_path: Path) -> ModelMetrics:
+    return ModelMetrics(
+        model_dir=tmp_path / "model",
+        registered_names=frozenset({"frame_000000.png"}),
+        registered_count=1,
+        registered_ratio=0.8,
+        registered_share=1.0,
+        temporal_coverage_s=1.0,
+        max_interior_gap_s=1.0,
+        start_gap_s=0.0,
+        end_gap_s=0.0,
+        median_reprojection_error_px=1.2,
+        p95_reprojection_error_px=2.0,
+        median_track_length=5.0,
+        sparse_point_count=10_000,
+        valid_names_intrinsics_and_poses=True,
+    )
 
 
 def test_static_conversion_is_locked() -> None:
@@ -49,6 +71,73 @@ def test_static_conversion_is_locked() -> None:
     assert static.quality.advanced.density_interval == 100
     assert static.quality.advanced.densify_grad_threshold == pytest.approx(1e-4)
     assert static.publish.replace_owned_result is True
+
+
+def test_learned_spec_defaults_to_strict_recovery_mode() -> None:
+    spec = LearnedQualityRunSpec(input_folder="room")
+
+    assert spec.recovery_mode == "strict"
+
+
+def test_learned_spec_accepts_only_named_round0_recovery_mode() -> None:
+    spec = LearnedQualityRunSpec(
+        input_folder="room",
+        recovery_mode="round0_output_first_v1",
+    )
+
+    assert spec.recovery_mode == "round0_output_first_v1"
+    with pytest.raises(ValidationError):
+        LearnedQualityRunSpec(
+            input_folder="room",
+            recovery_mode="best_effort",  # type: ignore[arg-type]
+        )
+
+
+def test_geometry_acceptance_freezes_hashes_and_checks(tmp_path: Path) -> None:
+    acceptance = GeometryAcceptance(
+        policy_version="output-first-v1",
+        mode="best_effort",
+        selection_digest="a" * 64,
+        model_hashes={name: "b" * 64 for name in MODEL_TEXT_FILES},
+        strict_failures=("registered_ratio",),
+        metrics=_acceptance_metrics(tmp_path),
+        checks={"registered_ratio": True},
+        colmap_fingerprint="c" * 64,
+    )
+
+    assert tuple(acceptance.model_hashes) == tuple(sorted(MODEL_TEXT_FILES))
+    with pytest.raises(TypeError):
+        acceptance.model_hashes["images.txt"] = "d" * 64  # type: ignore[index]
+    with pytest.raises(TypeError):
+        acceptance.checks["registered_ratio"] = False  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("selection_digest", "not-a-digest"),
+        ("colmap_fingerprint", "D" * 64),
+    ],
+)
+def test_geometry_acceptance_rejects_invalid_identity_digests(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    kwargs = {
+        "policy_version": "output-first-v1",
+        "mode": "best_effort",
+        "selection_digest": "a" * 64,
+        "model_hashes": {name: "b" * 64 for name in MODEL_TEXT_FILES},
+        "strict_failures": ("registered_ratio",),
+        "metrics": _acceptance_metrics(tmp_path),
+        "checks": {"registered_ratio": True},
+        "colmap_fingerprint": "c" * 64,
+    }
+    kwargs[field] = value
+
+    with pytest.raises(ValueError, match="lowercase SHA-256"):
+        GeometryAcceptance(**kwargs)  # type: ignore[arg-type]
 
 
 def test_static_conversion_forwards_publish_replacement_choice() -> None:

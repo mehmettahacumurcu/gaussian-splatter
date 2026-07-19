@@ -4,6 +4,7 @@ import unicodedata
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal
 
 from pydantic import Field, field_validator
@@ -22,6 +23,7 @@ from backend.notebooks.models import (
 from backend.static_pipeline.contracts import (
     ColmapAttempt,
     GateDecision,
+    ModelMetrics,
     ReconstructionBundle,
     SelectionManifest,
 )
@@ -34,6 +36,11 @@ RESULT_SUFFIX = "_learned_test_result"
 DIAGNOSTICS_SUFFIX = "_learned_test_diagnostics"
 CACHE_SUFFIX = "_learned_test_cache"
 GENERATOR_ID = "4dgs-studio.learned-quality-a100"
+MODEL_TEXT_FILES = ("cameras.txt", "images.txt", "points3D.txt")
+
+RecoveryMode = Literal["strict", "round0_output_first_v1"]
+GeometryAcceptanceMode = Literal["strict", "best_effort"]
+GeometryPolicyVersion = Literal["strict-v1", "output-first-v1"]
 
 
 class LearnedPublishSpec(StrictModel):
@@ -43,6 +50,7 @@ class LearnedPublishSpec(StrictModel):
 class LearnedQualityRunSpec(StrictModel):
     schema_version: Literal[1] = 1
     input_folder: str
+    recovery_mode: RecoveryMode = "strict"
     publish: LearnedPublishSpec = Field(default_factory=LearnedPublishSpec)
 
     @field_validator("input_folder")
@@ -144,12 +152,60 @@ class GeometryCandidateReport:
     covered_endpoint_count: int
 
 
+def _require_sha256(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a lowercase SHA-256")
+    return value
+
+
+@dataclass(frozen=True)
+class GeometryAcceptance:
+    policy_version: GeometryPolicyVersion
+    mode: GeometryAcceptanceMode
+    selection_digest: str
+    model_hashes: Mapping[str, str]
+    strict_failures: tuple[str, ...]
+    metrics: ModelMetrics
+    checks: Mapping[str, bool]
+    colmap_fingerprint: str
+
+    def __post_init__(self) -> None:
+        if set(self.model_hashes) != set(MODEL_TEXT_FILES):
+            raise ValueError("geometry acceptance must hash all COLMAP text files")
+        _require_sha256(self.selection_digest, "selection_digest")
+        _require_sha256(self.colmap_fingerprint, "colmap_fingerprint")
+        normalized_hashes = {
+            name: _require_sha256(digest, f"{name} digest")
+            for name, digest in self.model_hashes.items()
+        }
+        if not all(isinstance(name, str) and name for name in self.checks):
+            raise ValueError("geometry acceptance checks must use non-empty names")
+        if not all(type(passed) is bool for passed in self.checks.values()):
+            raise ValueError("geometry acceptance checks must contain booleans")
+        object.__setattr__(
+            self,
+            "model_hashes",
+            MappingProxyType(dict(sorted(normalized_hashes.items()))),
+        )
+        object.__setattr__(
+            self,
+            "checks",
+            MappingProxyType(dict(sorted(self.checks.items()))),
+        )
+
+
 @dataclass(frozen=True)
 class LearnedReconstructionOutput:
     bundle: ReconstructionBundle
     frames_dir: Path
     artifacts: LearnedArtifacts
     geometry_candidates: tuple[GeometryCandidateReport, ...]
+    acceptance: GeometryAcceptance | None = None
 
     @property
     def decision(self) -> GateDecision:
