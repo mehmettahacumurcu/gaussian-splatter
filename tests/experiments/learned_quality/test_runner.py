@@ -411,9 +411,14 @@ def test_notebook_run_enables_full_stage_reporter_and_default_drive_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
+    reconstruct_kwargs: dict[str, object] = {}
     model_manifest = tmp_path / "model_manifest.json"
     model_manifest.write_text("{}", encoding="utf-8")
-    context = LearnedQualityContext(lambda *args, **kwargs: None, model_manifest)
+
+    def reconstruct(*_args: object, **kwargs: object) -> None:
+        reconstruct_kwargs.update(kwargs)
+
+    context = LearnedQualityContext(reconstruct, model_manifest)
     sentinel = SimpleNamespace(final_path=tmp_path / "result")
 
     def run(*args: object, **kwargs: object) -> object:
@@ -433,7 +438,10 @@ def test_notebook_run_enables_full_stage_reporter_and_default_drive_cache(
     work = tmp_path / "work"
 
     result = run_learned_quality_notebook(
-        LearnedQualityRunSpec(input_folder="myroom_test"),
+        LearnedQualityRunSpec(
+            input_folder="myroom_test",
+            recovery_mode="round0_output_first_v1",
+        ),
         runtime_paths=NotebookRuntimePaths(drive, work),
     )
 
@@ -468,6 +476,20 @@ def test_notebook_run_enables_full_stage_reporter_and_default_drive_cache(
     services = captured["services"]
     assert services.restore_pretraining is not None
     assert services.save_pretraining is not None
+    (tmp_path / "frames").mkdir()
+    selection = SelectionOutput(
+        inventory=SimpleNamespace(digest="a" * 64),
+        manifest=SimpleNamespace(image_set_digest="b" * 64),
+        frames_dir=tmp_path / "frames",
+        source_manifest_path=tmp_path / "selection_manifest.json",
+    )
+    services.reconstruct(
+        selection,
+        spec=to_static_run_spec(LearnedQualityRunSpec(input_folder="myroom_test")),
+        hardware=HardwareInfo("NVIDIA A100", 80.0, True, 120.0),
+        output_root=tmp_path / "run" / "reconstruction",
+    )
+    assert reconstruct_kwargs["recovery_mode"] == "round0_output_first_v1"
 
 
 def test_complete_cache_fingerprint_tracks_selected_geometry_but_not_iterations(

@@ -35,6 +35,7 @@ from .cache import (
 from .contracts import (
     LearnedQualityRunSpec,
     LearnedReconstructionOutput,
+    RecoveryMode,
     derive_learned_cache_root,
     to_static_run_spec,
 )
@@ -421,6 +422,7 @@ def make_learned_quality_services(
     context: LearnedQualityContext,
     *,
     cache_root: Path | None = None,
+    recovery_mode: RecoveryMode = "strict",
 ) -> RunnerServices:
     if not isinstance(context, LearnedQualityContext):
         raise TypeError("context must be a LearnedQualityContext")
@@ -472,6 +474,16 @@ def make_learned_quality_services(
         )
 
     reconstruct = context.reconstruct
+    if cache_session is None and recovery_mode != "strict":
+
+        def recovery_reconstruct(selection: object, **kwargs: object) -> object:
+            return context.reconstruct(
+                selection,
+                **kwargs,
+                recovery_mode=recovery_mode,
+            )
+
+        reconstruct = recovery_reconstruct
     restore_pretraining = None
     save_pretraining = None
     restore_selection = None
@@ -645,12 +657,14 @@ def make_learned_quality_services(
                     run_id=output_root.parent.name,
                     external_roots={"selection": selection.frames_dir},
                 )
-            return context.reconstruct(
-                selection,
+            reconstruct_kwargs = {
                 **kwargs,
-                checkpoint_store=store,
-                milestone_session=milestone_session,
-            )
+                "checkpoint_store": store,
+                "milestone_session": milestone_session,
+            }
+            if recovery_mode != "strict":
+                reconstruct_kwargs["recovery_mode"] = recovery_mode
+            return context.reconstruct(selection, **reconstruct_kwargs)
 
         def restore_pretraining_impl(**kwargs: object) -> object | None:
             source_inventory = kwargs["source_inventory"]
@@ -841,6 +855,7 @@ def run_learned_quality_notebook(
             services=make_learned_quality_services(
                 active_context,
                 cache_root=cache_root,
+                recovery_mode=spec.recovery_mode,
             ),
             reporter=reporter,
         )

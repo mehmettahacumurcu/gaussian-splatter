@@ -98,6 +98,7 @@ def test_assemble_learned_reconstruction_rehydrates_terminal_state(
 ) -> None:
     bundle = object()
     candidate = object()
+    acceptance = object()
     anchors = object()
     semantic = object()
     motion = object()
@@ -121,6 +122,7 @@ def test_assemble_learned_reconstruction_rehydrates_terminal_state(
         bundle=bundle,
         frames_dir=tmp_path,
         geometry_candidates=(candidate,),
+        acceptance=acceptance,
     )
     final = FinalPretrainingState(
         photometric=photometric,
@@ -143,6 +145,7 @@ def test_assemble_learned_reconstruction_rehydrates_terminal_state(
     assert output.bundle is bundle
     assert output.frames_dir == tmp_path
     assert output.geometry_candidates == (candidate,)
+    assert output.acceptance is acceptance
     assert output.artifacts.da3 is anchors
     assert output.artifacts.base_evidence is base
     assert output.artifacts.semantic is semantic
@@ -427,6 +430,126 @@ def test_store_publishes_and_restores_portable_milestone_graph(
     assert manifest["upstream"] == {"base_evidence": base.ref.fingerprint}
     assert success["upstream"] == manifest["upstream"]
     assert not (generation / "payload" / "artifacts" / "base").exists()
+
+
+def test_latest_complete_lineage_ignores_newer_incomplete_semantic_branch(
+    tmp_path: Path,
+) -> None:
+    store = LearnedCheckpointStore(tmp_path / "cache", input_identity="a" * 64)
+    colmap_source, _ = _artifact_root(tmp_path, "colmap-lineage", b"colmap")
+    colmap = MilestoneRef(CheckpointKind.COLMAP, "1" * 64)
+    store.publish_generation(
+        CheckpointKind.COLMAP,
+        fingerprint=colmap.fingerprint,
+        run_id="colmap",
+        source_root=colmap_source,
+    )
+    round0_selection = _state(
+        tmp_path,
+        kind=CheckpointKind.SELECTION,
+        fingerprint="2" * 64,
+        upstream={},
+        name="round0-selection",
+        payload=b"selection-0",
+    )
+    store.publish_milestone(round0_selection, run_id="round0-selection")
+    round0_base = _state(
+        tmp_path,
+        kind=CheckpointKind.BASE_EVIDENCE,
+        fingerprint="3" * 64,
+        upstream={
+            CheckpointKind.COLMAP: colmap.fingerprint,
+            CheckpointKind.SELECTION: round0_selection.ref.fingerprint,
+        },
+        name="round0-base",
+        payload=b"base-0",
+    )
+    store.publish_milestone(round0_base, run_id="round0-base")
+    round0_semantic = _state(
+        tmp_path,
+        kind=CheckpointKind.SEMANTIC,
+        fingerprint="4" * 64,
+        upstream={CheckpointKind.BASE_EVIDENCE: round0_base.ref.fingerprint},
+        name="round0-semantic",
+        payload=b"semantic-0",
+    )
+    store.publish_milestone(round0_semantic, run_id="round0-semantic")
+    round0_motion = _state(
+        tmp_path,
+        kind=CheckpointKind.MOTION,
+        fingerprint="5" * 64,
+        upstream={CheckpointKind.BASE_EVIDENCE: round0_base.ref.fingerprint},
+        name="round0-motion",
+        payload=b"motion-0",
+    )
+    store.publish_milestone(round0_motion, run_id="round0-motion")
+    round0_masks = _state(
+        tmp_path,
+        kind=CheckpointKind.MASKS,
+        fingerprint="6" * 64,
+        upstream={
+            CheckpointKind.BASE_EVIDENCE: round0_base.ref.fingerprint,
+            CheckpointKind.SEMANTIC: round0_semantic.ref.fingerprint,
+            CheckpointKind.MOTION: round0_motion.ref.fingerprint,
+        },
+        name="round0-masks",
+        payload=b"masks-0",
+    )
+    store.publish_milestone(round0_masks, run_id="round0-masks")
+
+    round1_selection = _state(
+        tmp_path,
+        kind=CheckpointKind.SELECTION,
+        fingerprint="7" * 64,
+        upstream={},
+        name="round1-selection",
+        payload=b"selection-1",
+    )
+    store.publish_milestone(round1_selection, run_id="round1-selection")
+    round1_base = _state(
+        tmp_path,
+        kind=CheckpointKind.BASE_EVIDENCE,
+        fingerprint="8" * 64,
+        upstream={
+            CheckpointKind.COLMAP: colmap.fingerprint,
+            CheckpointKind.SELECTION: round1_selection.ref.fingerprint,
+        },
+        name="round1-base",
+        payload=b"base-1",
+    )
+    store.publish_milestone(round1_base, run_id="round1-base")
+    round1_semantic = _state(
+        tmp_path,
+        kind=CheckpointKind.SEMANTIC,
+        fingerprint="9" * 64,
+        upstream={CheckpointKind.BASE_EVIDENCE: round1_base.ref.fingerprint},
+        name="round1-semantic",
+        payload=b"semantic-1",
+    )
+    store.publish_milestone(round1_semantic, run_id="round1-semantic")
+
+    refs = store.find_latest_complete_lineage(
+        CheckpointKind.MASKS,
+        selection_fingerprint=round0_selection.ref.fingerprint,
+    )
+
+    assert refs is not None
+    assert refs == {
+        CheckpointKind.COLMAP: colmap,
+        CheckpointKind.SELECTION: round0_selection.ref,
+        CheckpointKind.BASE_EVIDENCE: round0_base.ref,
+        CheckpointKind.SEMANTIC: round0_semantic.ref,
+        CheckpointKind.MOTION: round0_motion.ref,
+        CheckpointKind.MASKS: round0_masks.ref,
+    }
+    assert round1_semantic.ref not in refs.values()
+    assert (
+        store.find_latest_complete_lineage(
+            CheckpointKind.MASKS,
+            selection_fingerprint=round1_selection.ref.fingerprint,
+        )
+        is None
+    )
 
 
 def test_missing_or_wrong_upstream_is_rejected_before_publication(

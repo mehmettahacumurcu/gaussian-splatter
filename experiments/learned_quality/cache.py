@@ -783,6 +783,60 @@ class LearnedCheckpointStore:
                 )
         return tuple(result)
 
+    def find_latest_complete_lineage(
+        self,
+        root_kind: CheckpointKind,
+        *,
+        selection_fingerprint: str,
+    ) -> Mapping[CheckpointKind, MilestoneRef] | None:
+        from .milestones import MilestoneRef
+
+        active_kind = _require_kind(root_kind)
+        if active_kind is CheckpointKind.COLMAP:
+            raise ValueError("a milestone lineage cannot be rooted at COLMAP")
+        selection_digest = _require_digest(
+            selection_fingerprint,
+            "selection_fingerprint",
+        )
+        if not self._ensure_owned_root(create=False):
+            return None
+        self._recover_staged_generations(active_kind)
+        parent = self.cache_root / active_kind.value
+        if not parent.is_dir() or parent.is_symlink():
+            return None
+        candidates: list[tuple[int, MilestoneRef]] = []
+        for generation in sorted(parent.iterdir(), key=lambda item: item.name):
+            try:
+                fingerprint = _require_digest(generation.name, "fingerprint")
+            except ValueError:
+                continue
+            if not self._valid_generation(generation, active_kind, fingerprint):
+                continue
+            try:
+                modified = (generation / "_SUCCESS.json").stat().st_mtime_ns
+            except OSError:
+                continue
+            candidates.append((modified, MilestoneRef(active_kind, fingerprint)))
+        for _modified, root in sorted(
+            candidates,
+            key=lambda item: (item[0], item[1].fingerprint),
+            reverse=True,
+        ):
+            try:
+                graph = self.validate_milestone_graph(root)
+            except ValueError:
+                continue
+            by_kind = {ref.kind: ref for ref in graph}
+            if len(by_kind) != len(graph):
+                continue
+            selection = by_kind.get(CheckpointKind.SELECTION)
+            if selection is None or selection.fingerprint != selection_digest:
+                continue
+            return MappingProxyType(
+                dict(sorted(by_kind.items(), key=lambda item: item[0].value))
+            )
+        return None
+
     def cleanup_unreferenced_milestones(self, keep: MilestoneRef) -> None:
         from .milestones import MilestoneRef
 

@@ -22,6 +22,7 @@ from experiments.learned_quality.cache import (
 from experiments.learned_quality.contracts import FrameArtifact, LearnedArtifacts
 from experiments.learned_quality.runtime import (
     _colmap_cache_fingerprint,
+    _restore_output_first_evidence,
     _run_evidence_cycle,
     run_learned_reconstruction,
 )
@@ -267,6 +268,227 @@ class _FakeMilestoneSession:
     ) -> Path:
         self.published.append((ref.kind, value))
         return Path(f"/{ref.kind.value}")
+
+
+def test_output_first_evidence_restores_complete_masks_graph_without_inference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refs = {
+        CheckpointKind.SELECTION: MilestoneRef(CheckpointKind.SELECTION, "1" * 64),
+        CheckpointKind.COLMAP: MilestoneRef(CheckpointKind.COLMAP, "2" * 64),
+        CheckpointKind.BASE_EVIDENCE: MilestoneRef(
+            CheckpointKind.BASE_EVIDENCE, "3" * 64
+        ),
+        CheckpointKind.SEMANTIC: MilestoneRef(CheckpointKind.SEMANTIC, "4" * 64),
+        CheckpointKind.MOTION: MilestoneRef(CheckpointKind.MOTION, "5" * 64),
+        CheckpointKind.MASKS: MilestoneRef(CheckpointKind.MASKS, "6" * 64),
+    }
+    anchors = SimpleNamespace(anchor_indices=(0,))
+    semantic = SimpleNamespace(stage_records=())
+    motion = SimpleNamespace(stage_records=())
+    masks = SimpleNamespace(mask_set_digest="7" * 64)
+    states = {
+        CheckpointKind.BASE_EVIDENCE: BaseEvidenceState(
+            anchors=anchors,
+            depths=(),
+            sky=(),
+            scene=SimpleNamespace(
+                frames=(SimpleNamespace(registered=True),)
+            ),
+            track_audit=object(),
+            colmap_ref="2" * 64,
+        ),
+        CheckpointKind.SEMANTIC: SemanticMilestoneState(semantic),
+        CheckpointKind.MOTION: MotionMilestoneState(motion),
+        CheckpointKind.MASKS: MasksMilestoneState(masks),
+    }
+
+    class Store:
+        def find_latest_complete_lineage(
+            self,
+            kind: CheckpointKind,
+            *,
+            selection_fingerprint: str,
+        ) -> object:
+            assert kind is CheckpointKind.MASKS
+            assert selection_fingerprint == "1" * 64
+            return refs
+
+    class Session:
+        selection_ref = refs[CheckpointKind.SELECTION]
+        store = Store()
+
+        def restore(self, ref: MilestoneRef, _destination: Path) -> object:
+            return SimpleNamespace(value=states[ref.kind])
+
+    manifest = tmp_path / "model_manifest.json"
+    manifest.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(runtime_module, "_validate_model_manifest", lambda: manifest)
+
+    def fail_if_called(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("output-first recovery attempted paid inference")
+
+    monkeypatch.setattr(runtime_module, "load_da3_model", fail_if_called)
+    monkeypatch.setattr(runtime_module, "run_semantic_evidence", fail_if_called)
+    monkeypatch.setattr(runtime_module, "run_motion_evidence", fail_if_called)
+    monkeypatch.setattr(runtime_module, "fuse_evidence_masks", fail_if_called)
+
+    artifacts, restored_refs = _restore_output_first_evidence(
+        cast(SelectionOutput, SimpleNamespace()),
+        (),
+        tmp_path / "recovery",
+        milestone_session=cast(object, Session()),
+    )
+
+    assert artifacts.base_evidence is states[CheckpointKind.BASE_EVIDENCE]
+    assert artifacts.semantic is semantic
+    assert artifacts.flow is motion
+    assert artifacts.masks is masks
+    assert restored_refs == refs
+
+
+def test_output_first_evidence_stops_when_complete_masks_graph_is_missing(
+    tmp_path: Path,
+) -> None:
+    class Store:
+        def find_latest_complete_lineage(
+            self,
+            _kind: CheckpointKind,
+            *,
+            selection_fingerprint: str,
+        ) -> None:
+            assert selection_fingerprint == "1" * 64
+            return None
+
+    session = SimpleNamespace(
+        selection_ref=MilestoneRef(CheckpointKind.SELECTION, "1" * 64),
+        store=Store(),
+    )
+
+    with pytest.raises(ValueError, match="complete Round 0 masks lineage"):
+        _restore_output_first_evidence(
+            cast(SelectionOutput, SimpleNamespace()),
+            (),
+            tmp_path / "recovery",
+            milestone_session=cast(object, session),
+        )
+
+
+def test_reconstruction_output_first_restores_exact_lineage_colmap_before_geometry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame_path = tmp_path / "frame.png"
+    frame_path.write_bytes(b"frame")
+    frame = FrameArtifact("frame.png", "frame-1", frame_path, "a" * 64)
+    selection = cast(
+        SelectionOutput,
+        SimpleNamespace(
+            manifest=object(),
+            inventory=object(),
+            frames_dir=tmp_path,
+            source_manifest_path=tmp_path / "selection_manifest.json",
+        ),
+    )
+    base = BaseEvidenceState(
+        anchors=object(),
+        depths=(),
+        sky=(),
+        scene=object(),
+        track_audit=object(),
+        colmap_ref="c" * 64,
+    )
+    artifacts = LearnedArtifacts(
+        base_evidence=base,
+        semantic=object(),
+        flow=object(),
+        masks=object(),
+    )
+    refs = {
+        CheckpointKind.SELECTION: MilestoneRef(CheckpointKind.SELECTION, "1" * 64),
+        CheckpointKind.MASKS: MilestoneRef(CheckpointKind.MASKS, "2" * 64),
+    }
+    restored_attempt = object()
+    restore_calls: list[tuple[str, Path]] = []
+
+    class Store:
+        def restore_colmap(self, fingerprint: str, *, destination: Path) -> object:
+            restore_calls.append((fingerprint, destination))
+            return restored_attempt
+
+    class Session:
+        selection_ref = refs[CheckpointKind.SELECTION]
+        store = Store()
+
+        def make_ref(
+            self,
+            kind: CheckpointKind,
+            **_kwargs: object,
+        ) -> MilestoneRef:
+            assert kind is CheckpointKind.GEOMETRY
+            return MilestoneRef(kind, "3" * 64)
+
+        def restore(self, _ref: MilestoneRef, _destination: Path) -> None:
+            return None
+
+    session = Session()
+    manifest_path = tmp_path / "model_manifest.json"
+    manifest_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        runtime_module,
+        "_validate_model_manifest",
+        lambda: manifest_path,
+    )
+    monkeypatch.setattr(runtime_module, "_frame_artifacts", lambda _selection: (frame,))
+    monkeypatch.setattr(
+        runtime_module,
+        "_restore_output_first_evidence",
+        lambda *_args, **_kwargs: (artifacts, refs),
+    )
+
+    def fail_normal_geometry(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("output-first recovery constructed a normal candidate")
+
+    monkeypatch.setattr(
+        runtime_module,
+        "make_classical_candidate_runner",
+        fail_normal_geometry,
+    )
+    reached_guard = RuntimeError("guard reached")
+
+    def accept_guard(
+        manifest: object,
+        frames: object,
+        attempt: object,
+        **kwargs: object,
+    ) -> object:
+        assert manifest is selection.manifest
+        assert frames == (frame,)
+        assert attempt is restored_attempt
+        assert kwargs["checkpoint_fingerprint"] == "c" * 64
+        raise reached_guard
+
+    monkeypatch.setattr(runtime_module, "accept_output_first_geometry", accept_guard)
+
+    with pytest.raises(RuntimeError) as captured:
+        run_learned_reconstruction(
+            selection,
+            spec=object(),
+            hardware=HardwareInfo("NVIDIA A100", 80.0, True, 100.0, True),
+            output_root=tmp_path / "reconstruction",
+            checkpoint_store=cast(object, session.store),
+            milestone_session=cast(object, session),
+            recovery_mode="round0_output_first_v1",
+        )
+
+    assert captured.value is reached_guard
+    assert restore_calls == [
+        (
+            "c" * 64,
+            tmp_path / "round0-colmap-restored",
+        )
+    ]
 
 
 def test_evidence_cycle_publishes_and_restores_each_expensive_milestone(

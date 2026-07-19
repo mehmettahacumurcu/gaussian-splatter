@@ -17,6 +17,7 @@ from .cache import (
 )
 from .contracts import (
     FrameArtifact,
+    GeometryAcceptance,
     GeometryCandidateReport,
     LearnedArtifacts,
     LearnedReconstructionOutput,
@@ -230,6 +231,7 @@ class GeometryMilestoneState:
     bundle: ReconstructionBundle
     frames_dir: Path
     geometry_candidates: tuple[GeometryCandidateReport, ...]
+    acceptance: GeometryAcceptance | None = None
 
 
 @dataclass(frozen=True)
@@ -465,6 +467,7 @@ def assemble_learned_reconstruction(
         frames_dir=geometry.frames_dir,
         artifacts=artifacts,
         geometry_candidates=geometry.geometry_candidates,
+        acceptance=geometry.acceptance,
     )
 
 

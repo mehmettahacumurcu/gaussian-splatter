@@ -6,7 +6,7 @@ import os
 import shutil
 import subprocess
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -28,6 +28,7 @@ from .contracts import (
     FrameArtifact,
     LearnedArtifacts,
     LearnedReconstructionOutput,
+    RecoveryMode,
     StageRecord,
 )
 from .cache import (
@@ -54,6 +55,7 @@ from .flow import (
 )
 from .geometry import (
     HybridGeometryInputs,
+    accept_output_first_geometry,
     geometry_frame_set_digest,
     make_classical_candidate_runner,
     make_hybrid_candidate_runner,
@@ -484,18 +486,26 @@ def _geometry_milestone_ref(
     session: MilestoneSession,
     masks_ref: MilestoneRef,
     hardware: HardwareInfo,
+    recovery_mode: RecoveryMode = "strict",
 ) -> MilestoneRef:
+    if recovery_mode == "strict":
+        settings: dict[str, object] = dict(
+            candidate_rounds=2,
+            backfill_max_per_interval=2,
+            use_gpu=hardware.colmap_gpu_sift is True,
+        )
+    else:
+        settings = {
+            "recovery_mode": recovery_mode,
+            "guard_policy": "output-first-v1",
+        }
     return session.make_ref(
         CheckpointKind.GEOMETRY,
         upstream={
             CheckpointKind.SELECTION: session.selection_ref.fingerprint,
             CheckpointKind.MASKS: masks_ref.fingerprint,
         },
-        settings={
-            "candidate_rounds": 2,
-            "backfill_max_per_interval": 2,
-            "use_gpu": hardware.colmap_gpu_sift is True,
-        },
+        settings=settings,
         producer_paths=_GEOMETRY_PRODUCER_PATHS,
     )
 
@@ -954,6 +964,118 @@ def _run_evidence_cycle(
     )
 
 
+def _restore_output_first_evidence(
+    selection: SelectionOutput,
+    frames: tuple[FrameArtifact, ...],
+    output_root: Path,
+    *,
+    milestone_session: MilestoneSession,
+) -> tuple[LearnedArtifacts, Mapping[CheckpointKind, MilestoneRef]]:
+    del selection, frames
+    if milestone_session is None:
+        raise ValueError("output-first recovery requires a milestone session")
+    refs = milestone_session.store.find_latest_complete_lineage(
+        CheckpointKind.MASKS,
+        selection_fingerprint=milestone_session.selection_ref.fingerprint,
+    )
+    required = frozenset(
+        {
+            CheckpointKind.COLMAP,
+            CheckpointKind.SELECTION,
+            CheckpointKind.BASE_EVIDENCE,
+            CheckpointKind.SEMANTIC,
+            CheckpointKind.MOTION,
+            CheckpointKind.MASKS,
+        }
+    )
+    if refs is None or frozenset(refs) != required:
+        raise ValueError(
+            "output-first recovery requires a complete Round 0 masks lineage"
+        )
+    base = _restore_stage_state(
+        milestone_session,
+        refs[CheckpointKind.BASE_EVIDENCE],
+        output_root / "restored-base-evidence",
+        BaseEvidenceState,
+    )
+    semantic_state = _restore_stage_state(
+        milestone_session,
+        refs[CheckpointKind.SEMANTIC],
+        output_root / "restored-semantic",
+        SemanticMilestoneState,
+    )
+    motion_state = _restore_stage_state(
+        milestone_session,
+        refs[CheckpointKind.MOTION],
+        output_root / "restored-motion",
+        MotionMilestoneState,
+    )
+    masks_state = _restore_stage_state(
+        milestone_session,
+        refs[CheckpointKind.MASKS],
+        output_root / "restored-masks",
+        MasksMilestoneState,
+    )
+    if not isinstance(base, BaseEvidenceState) or not isinstance(
+        semantic_state, SemanticMilestoneState
+    ) or not isinstance(motion_state, MotionMilestoneState) or not isinstance(
+        masks_state, MasksMilestoneState
+    ):
+        raise ValueError(
+            "output-first recovery could not restore the complete Round 0 masks lineage"
+        )
+    reporter = current_stage_reporter()
+    if reporter is not None:
+        for stage_id in (
+            "da3_anchor",
+            "classical_colmap",
+            "da3_metric_sky",
+            "semantic_masks",
+            "optical_flow",
+            "mask_fusion",
+        ):
+            reporter.skip(stage_id, "restored from complete Round 0 masks lineage")
+    registered_count = sum(
+        1 for frame in getattr(base.scene, "frames", ()) if frame.registered
+    )
+    stages = (
+        StageRecord(
+            "da3_anchor",
+            "accepted",
+            details={"anchors": len(base.anchors.anchor_indices)},
+        ),
+        StageRecord(
+            "classical_prepass",
+            "accepted",
+            details={"registered": registered_count},
+        ),
+        StageRecord(
+            "da3_metric_sky",
+            "accepted",
+            details={"frames": len(base.depths)},
+        ),
+        *semantic_state.semantic.stage_records,
+        *motion_state.motion.stage_records,
+        StageRecord(
+            "mask_fusion",
+            "accepted",
+            details={"digest": masks_state.masks.mask_set_digest},
+        ),
+    )
+    return (
+        LearnedArtifacts(
+            da3=base.anchors,
+            base_evidence=base,
+            semantic=semantic_state.semantic,
+            flow=motion_state.motion,
+            masks=masks_state.masks,
+            model_manifest_path=_validate_model_manifest(),
+            stage_records=stages,
+        ),
+        refs,
+    )
+
+
 def run_learned_reconstruction(
     selection: SelectionOutput,
     *,
@@ -962,145 +1084,94 @@ def run_learned_reconstruction(
     output_root: Path,
     checkpoint_store: LearnedCheckpointStore | None = None,
     milestone_session: MilestoneSession | None = None,
+    recovery_mode: RecoveryMode = "strict",
 ) -> LearnedReconstructionOutput:
     del spec
+    if recovery_mode not in {"strict", "round0_output_first_v1"}:
+        raise ValueError("unsupported learned-quality recovery mode")
     _validate_model_manifest()
     frames = _frame_artifacts(selection)
-    evidence_kwargs: dict[str, object] = {"checkpoint_store": checkpoint_store}
-    if milestone_session is not None:
-        evidence_kwargs["milestone_session"] = milestone_session
-    active = {
-        "selection": selection,
-        "frames": frames,
-        "artifacts": _run_evidence_cycle(
-            selection,
-            frames,
-            hardware,
-            output_root.parent / "learned-evidence-0",
-            **evidence_kwargs,
-        ),
-        "milestone_session": milestone_session,
-    }
-    if milestone_session is not None:
-        active["milestone_refs"] = _refs_for_artifacts(
-            milestone_session,
-            active["artifacts"],
-        )
-    classical = make_classical_candidate_runner(
-        use_gpu=hardware.colmap_gpu_sift is True
-    )
-
-    def hybrid(manifest, candidate_frames, attempt_dir, attempt_index, frame_digest):
-        runner = make_hybrid_candidate_runner(
-            HybridGeometryInputs(
-                anchors=active["artifacts"].da3,
-                masks=active["artifacts"].masks,
-            ),
-            use_gpu=hardware.colmap_gpu_sift is True,
-        )
-        return runner(
-            manifest, candidate_frames, attempt_dir, attempt_index, frame_digest
-        )
-
-    def backfill(manifest, uncovered, *, max_per_interval):
-        backfill_root = output_root.parent / "selection-backfill"
-        new_manifest = plan_backfill(
-            selection.inventory,
-            manifest,
-            uncovered,
-            backfill_root,
-            max_per_interval=max_per_interval,
-        )
-        new_selection = SelectionOutput(
-            inventory=selection.inventory,
-            manifest=new_manifest,
-            frames_dir=backfill_root,
-            source_manifest_path=backfill_root / "selection_manifest.json",
-        )
-        new_frames = _frame_artifacts(new_selection)
-        branch_session = active["milestone_session"]
-        if branch_session is not None:
-            branch_session = _publish_backfill_selection(
-                branch_session,
-                new_selection,
-                parent_selection_ref=branch_session.selection_ref,
-            )
-        branch_kwargs: dict[str, object] = {"checkpoint_store": checkpoint_store}
-        if branch_session is not None:
-            branch_kwargs["milestone_session"] = branch_session
-        new_artifacts = _run_evidence_cycle(
-            new_selection,
-            new_frames,
-            hardware,
-            output_root.parent / "learned-evidence-1",
-            **branch_kwargs,
-        )
-        active.update(
-            selection=new_selection,
-            frames=new_frames,
-            artifacts=new_artifacts,
-            milestone_session=branch_session,
-        )
-        if branch_session is not None:
-            active["milestone_refs"] = _refs_for_artifacts(
-                branch_session,
-                new_artifacts,
-            )
-        return new_manifest, new_frames
-
     geometry_state = None
     geometry_ref = None
-    if active["milestone_session"] is not None:
+    if recovery_mode == "round0_output_first_v1":
+        if checkpoint_store is None or milestone_session is None:
+            raise ValueError(
+                "output-first recovery requires Drive checkpoint and milestone stores"
+            )
+        artifacts, milestone_refs = _restore_output_first_evidence(
+            selection,
+            frames,
+            output_root.parent / "round0-evidence-restored",
+            milestone_session=milestone_session,
+        )
+        active = {
+            "selection": selection,
+            "frames": frames,
+            "artifacts": artifacts,
+            "milestone_session": milestone_session,
+            "milestone_refs": milestone_refs,
+        }
+        base = artifacts.base_evidence
+        if not isinstance(base, BaseEvidenceState):
+            raise ValueError("output-first recovery is missing typed base evidence")
+        restored_attempt = checkpoint_store.restore_colmap(
+            base.colmap_ref,
+            destination=output_root.parent / "round0-colmap-restored",
+        )
+        if restored_attempt is None:
+            raise ValueError(
+                "output-first recovery could not restore its exact COLMAP checkpoint"
+            )
         geometry_ref = _geometry_milestone_ref(
-            active["milestone_session"],
-            active["milestone_refs"][CheckpointKind.MASKS],
+            milestone_session,
+            milestone_refs[CheckpointKind.MASKS],
             hardware,
+            recovery_mode,
         )
         geometry_state = _restore_stage_state(
-            active["milestone_session"],
+            milestone_session,
             geometry_ref,
             output_root,
             GeometryMilestoneState,
         )
-    if isinstance(geometry_state, GeometryMilestoneState):
-        comparison = LearnedReconstructionOutput(
-            bundle=geometry_state.bundle,
-            frames_dir=geometry_state.frames_dir,
-            artifacts=active["artifacts"],
-            geometry_candidates=geometry_state.geometry_candidates,
-        )
-        reporter = current_stage_reporter()
-        if reporter is not None:
-            reporter.skip("geometry_comparison", "restored from geometry milestone")
-    else:
-        with _learned_stage("geometry_comparison"):
-            comparison = run_geometry_comparison(
-                selection.manifest,
-                frames,
-                output_root=output_root,
-                artifacts=active["artifacts"],
-                classical_runner=classical,
-                hybrid_runner=hybrid,
-                materialize_backfill=backfill,
+        if isinstance(geometry_state, GeometryMilestoneState):
+            comparison = LearnedReconstructionOutput(
+                bundle=geometry_state.bundle,
+                frames_dir=geometry_state.frames_dir,
+                artifacts=artifacts,
+                geometry_candidates=geometry_state.geometry_candidates,
+                acceptance=geometry_state.acceptance,
             )
-        geometry_state = GeometryMilestoneState(
-            bundle=comparison.bundle,
-            frames_dir=comparison.frames_dir,
-            geometry_candidates=comparison.geometry_candidates,
-        )
-        if active["milestone_session"] is not None:
-            geometry_ref = _geometry_milestone_ref(
-                active["milestone_session"],
-                active["milestone_refs"][CheckpointKind.MASKS],
-                hardware,
+            reporter = current_stage_reporter()
+            if reporter is not None:
+                reporter.skip("geometry_comparison", "restored from geometry milestone")
+        else:
+            with _learned_stage("geometry_comparison"):
+                bundle, candidates, acceptance = accept_output_first_geometry(
+                    selection.manifest,
+                    frames,
+                    restored_attempt,
+                    output_root=output_root,
+                    checkpoint_fingerprint=base.colmap_ref,
+                )
+            comparison = LearnedReconstructionOutput(
+                bundle=bundle,
+                frames_dir=selection.frames_dir,
+                artifacts=artifacts,
+                geometry_candidates=candidates,
+                acceptance=acceptance,
             )
-            generation = active["milestone_session"].publish(
+            geometry_state = GeometryMilestoneState(
+                bundle=bundle,
+                frames_dir=selection.frames_dir,
+                geometry_candidates=candidates,
+                acceptance=acceptance,
+            )
+            generation = milestone_session.publish(
                 geometry_ref,
                 upstream={
-                    CheckpointKind.SELECTION: active[
-                        "milestone_session"
-                    ].selection_ref.fingerprint,
-                    CheckpointKind.MASKS: active["milestone_refs"][
+                    CheckpointKind.SELECTION: milestone_session.selection_ref.fingerprint,
+                    CheckpointKind.MASKS: milestone_refs[
                         CheckpointKind.MASKS
                     ].fingerprint,
                 },
@@ -1110,6 +1181,164 @@ def run_learned_reconstruction(
             reporter = current_stage_reporter()
             if reporter is not None:
                 reporter.cache_event("save", "geometry milestone", str(generation))
+            if acceptance.mode == "best_effort":
+                metrics = acceptance.metrics
+                print("[GEOMETRY] BEST-EFFORT ROUND 0 ACCEPTED")
+                print(f"Strict failures: {', '.join(acceptance.strict_failures)}")
+                print(
+                    f"Registered: {metrics.registered_count}/"
+                    f"{len(selection.manifest.selected_frames)} | "
+                    f"max gap: {metrics.max_interior_gap_s:.3f}s | "
+                    "median reproj: "
+                    f"{metrics.median_reprojection_error_px:.3f}px"
+                )
+    else:
+        evidence_kwargs: dict[str, object] = {"checkpoint_store": checkpoint_store}
+        if milestone_session is not None:
+            evidence_kwargs["milestone_session"] = milestone_session
+        active = {
+            "selection": selection,
+            "frames": frames,
+            "artifacts": _run_evidence_cycle(
+                selection,
+                frames,
+                hardware,
+                output_root.parent / "learned-evidence-0",
+                **evidence_kwargs,
+            ),
+            "milestone_session": milestone_session,
+        }
+        if milestone_session is not None:
+            active["milestone_refs"] = _refs_for_artifacts(
+                milestone_session,
+                active["artifacts"],
+            )
+        classical = make_classical_candidate_runner(
+            use_gpu=hardware.colmap_gpu_sift is True
+        )
+
+        def hybrid(manifest, candidate_frames, attempt_dir, attempt_index, frame_digest):
+            runner = make_hybrid_candidate_runner(
+                HybridGeometryInputs(
+                    anchors=active["artifacts"].da3,
+                    masks=active["artifacts"].masks,
+                ),
+                use_gpu=hardware.colmap_gpu_sift is True,
+            )
+            return runner(
+                manifest, candidate_frames, attempt_dir, attempt_index, frame_digest
+            )
+
+        def backfill(manifest, uncovered, *, max_per_interval):
+            backfill_root = output_root.parent / "selection-backfill"
+            new_manifest = plan_backfill(
+                selection.inventory,
+                manifest,
+                uncovered,
+                backfill_root,
+                max_per_interval=max_per_interval,
+            )
+            new_selection = SelectionOutput(
+                inventory=selection.inventory,
+                manifest=new_manifest,
+                frames_dir=backfill_root,
+                source_manifest_path=backfill_root / "selection_manifest.json",
+            )
+            new_frames = _frame_artifacts(new_selection)
+            branch_session = active["milestone_session"]
+            if branch_session is not None:
+                branch_session = _publish_backfill_selection(
+                    branch_session,
+                    new_selection,
+                    parent_selection_ref=branch_session.selection_ref,
+                )
+            branch_kwargs: dict[str, object] = {"checkpoint_store": checkpoint_store}
+            if branch_session is not None:
+                branch_kwargs["milestone_session"] = branch_session
+            new_artifacts = _run_evidence_cycle(
+                new_selection,
+                new_frames,
+                hardware,
+                output_root.parent / "learned-evidence-1",
+                **branch_kwargs,
+            )
+            active.update(
+                selection=new_selection,
+                frames=new_frames,
+                artifacts=new_artifacts,
+                milestone_session=branch_session,
+            )
+            if branch_session is not None:
+                active["milestone_refs"] = _refs_for_artifacts(
+                    branch_session,
+                    new_artifacts,
+                )
+            return new_manifest, new_frames
+
+        if active["milestone_session"] is not None:
+            geometry_ref = _geometry_milestone_ref(
+                active["milestone_session"],
+                active["milestone_refs"][CheckpointKind.MASKS],
+                hardware,
+                recovery_mode,
+            )
+            geometry_state = _restore_stage_state(
+                active["milestone_session"],
+                geometry_ref,
+                output_root,
+                GeometryMilestoneState,
+            )
+        if isinstance(geometry_state, GeometryMilestoneState):
+            comparison = LearnedReconstructionOutput(
+                bundle=geometry_state.bundle,
+                frames_dir=geometry_state.frames_dir,
+                artifacts=active["artifacts"],
+                geometry_candidates=geometry_state.geometry_candidates,
+                acceptance=geometry_state.acceptance,
+            )
+            reporter = current_stage_reporter()
+            if reporter is not None:
+                reporter.skip("geometry_comparison", "restored from geometry milestone")
+        else:
+            with _learned_stage("geometry_comparison"):
+                comparison = run_geometry_comparison(
+                    selection.manifest,
+                    frames,
+                    output_root=output_root,
+                    artifacts=active["artifacts"],
+                    classical_runner=classical,
+                    hybrid_runner=hybrid,
+                    materialize_backfill=backfill,
+                )
+            geometry_state = GeometryMilestoneState(
+                bundle=comparison.bundle,
+                frames_dir=comparison.frames_dir,
+                geometry_candidates=comparison.geometry_candidates,
+                acceptance=getattr(comparison, "acceptance", None),
+            )
+            if active["milestone_session"] is not None:
+                geometry_ref = _geometry_milestone_ref(
+                    active["milestone_session"],
+                    active["milestone_refs"][CheckpointKind.MASKS],
+                    hardware,
+                    recovery_mode,
+                )
+                generation = active["milestone_session"].publish(
+                    geometry_ref,
+                    upstream={
+                        CheckpointKind.SELECTION: active[
+                            "milestone_session"
+                        ].selection_ref.fingerprint,
+                        CheckpointKind.MASKS: active["milestone_refs"][
+                            CheckpointKind.MASKS
+                        ].fingerprint,
+                    },
+                    value=geometry_state,
+                    artifact_roots={"geometry": output_root},
+                )
+                reporter = current_stage_reporter()
+                if reporter is not None:
+                    reporter.cache_event("save", "geometry milestone", str(generation))
     final_frames = active["frames"]
     artifacts = active["artifacts"]
     final_ref = None
@@ -1291,4 +1520,5 @@ def run_learned_reconstruction(
             stage_records=(*artifacts.stage_records, *final_stage_records),
         ),
         geometry_candidates=geometry_state.geometry_candidates,
+        acceptance=geometry_state.acceptance,
     )
