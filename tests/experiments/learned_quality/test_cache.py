@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import json
 import shutil
+import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
 from dataclasses import replace
@@ -80,6 +81,7 @@ from experiments.learned_quality.segmentation import (
 from experiments.learned_quality.milestones import (
     FinalPretrainingState,
     GeometryMilestoneState,
+    MilestoneRef,
 )
 
 
@@ -727,6 +729,305 @@ def test_colmap_stream_restore_rejects_corruption_and_cleans_target(
     with pytest.raises(ValueError, match="metadata|size mismatch|hash mismatch"):
         store.restore_colmap("5" * 64, destination=destination)
 
+    assert not destination.exists()
+
+
+def _published_parallel_payload(
+    tmp_path: Path,
+    *,
+    file_count: int,
+    file_size: int = 8,
+) -> tuple[Path, dict[str, object], dict[str, bytes]]:
+    source = tmp_path / "parallel-source"
+    source.mkdir()
+    expected: dict[str, bytes] = {}
+    for index in range(file_count):
+        relative = Path(f"group-{index % 2}") / f"file-{index:02d}.bin"
+        payload = bytes([index + 1]) * file_size
+        path = source / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        expected[relative.as_posix()] = payload
+    store = LearnedCheckpointStore(tmp_path / "parallel-cache", input_identity="a" * 64)
+    generation = store.publish_generation(
+        CheckpointKind.COLMAP,
+        fingerprint="b" * 64,
+        run_id="parallel-test",
+        source_root=source,
+    )
+    manifest = json.loads((generation / "manifest.json").read_text(encoding="utf-8"))
+    return generation, manifest, expected
+
+
+def test_copy_verified_payload_runs_file_workers_concurrently(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation, manifest, _expected = _published_parallel_payload(
+        tmp_path, file_count=4
+    )
+    barrier = threading.Barrier(4, timeout=3)
+    thread_ids: set[int] = set()
+    real_worker = cache_module._copy_verified_file
+
+    def wrapped_worker(*args: object) -> int:
+        thread_ids.add(threading.get_ident())
+        barrier.wait()
+        return real_worker(*args)
+
+    monkeypatch.setattr(cache_module, "_copy_verified_file", wrapped_worker)
+
+    cache_module._copy_verified_payload(
+        generation, tmp_path / "restored", manifest, max_workers=4
+    )
+
+    assert len(thread_ids) == 4
+
+
+@pytest.mark.parametrize("corrupt_index", range(4))
+def test_copy_verified_payload_verifies_sha256_for_every_manifest_row(
+    tmp_path: Path,
+    corrupt_index: int,
+) -> None:
+    generation, manifest, expected = _published_parallel_payload(tmp_path, file_count=4)
+    relative = sorted(expected)[corrupt_index]
+    payload = generation / "payload" / relative
+    payload.write_bytes(b"x" * len(expected[relative]))
+
+    with pytest.raises(ValueError, match=f"hash mismatch.*{relative}"):
+        cache_module._copy_verified_payload(
+            generation, tmp_path / "restored", manifest, max_workers=4
+        )
+
+
+@pytest.mark.parametrize(
+    ("file_count", "configured", "expected"),
+    ((12, 4, 4), (3, 16, 3), (1, 8, 1)),
+)
+def test_copy_verified_payload_clamps_workers_to_file_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    file_count: int,
+    configured: int,
+    expected: int,
+) -> None:
+    generation, manifest, _payloads = _published_parallel_payload(
+        tmp_path, file_count=file_count
+    )
+    observed: list[int] = []
+    real_executor = cache_module.ThreadPoolExecutor
+
+    def record_executor(*args: object, **kwargs: object):
+        observed.append(int(kwargs["max_workers"] if kwargs else args[0]))
+        return real_executor(*args, **kwargs)
+
+    monkeypatch.setattr(cache_module, "ThreadPoolExecutor", record_executor)
+
+    cache_module._copy_verified_payload(
+        generation, tmp_path / "restored", manifest, max_workers=configured
+    )
+
+    assert observed == [expected]
+
+
+@pytest.mark.parametrize("value", (True, False, None, 0, -1, 17, 1.0, "4"))
+def test_copy_verified_payload_rejects_invalid_worker_bounds_before_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    value: object,
+) -> None:
+    generation, manifest, _payloads = _published_parallel_payload(tmp_path, file_count=1)
+    destination = tmp_path / "restored"
+
+    def fail_executor(*args: object, **kwargs: object):
+        raise AssertionError("executor must not be constructed")
+
+    monkeypatch.setattr(cache_module, "ThreadPoolExecutor", fail_executor)
+
+    with pytest.raises(
+        ValueError, match="max_workers must be a plain integer from 1 through 16"
+    ):
+        cache_module._copy_verified_payload(
+            generation, destination, manifest, max_workers=value  # type: ignore[arg-type]
+        )
+
+    assert not destination.exists()
+
+
+def test_copy_verified_payload_default_worker_count_is_four(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation, manifest, _payloads = _published_parallel_payload(tmp_path, file_count=8)
+    observed: list[int] = []
+    real_executor = cache_module.ThreadPoolExecutor
+
+    def record_executor(*args: object, **kwargs: object):
+        observed.append(int(kwargs["max_workers"] if kwargs else args[0]))
+        return real_executor(*args, **kwargs)
+
+    monkeypatch.setattr(cache_module, "ThreadPoolExecutor", record_executor)
+
+    cache_module._copy_verified_payload(generation, tmp_path / "restored", manifest)
+
+    assert observed == [4]
+
+
+def test_copy_verified_payload_one_worker_preserves_single_pass_semantics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "single-source"
+    nested = source / "nested"
+    nested.mkdir(parents=True)
+    (nested / "payload.bin").write_bytes(b"payload")
+    (nested / "empty.bin").write_bytes(b"")
+    store = LearnedCheckpointStore(tmp_path / "single-cache", input_identity="a" * 64)
+    generation = store.publish_generation(
+        CheckpointKind.COLMAP,
+        fingerprint="b" * 64,
+        run_id="single-pass",
+        source_root=source,
+    )
+    manifest = json.loads((generation / "manifest.json").read_text(encoding="utf-8"))
+    payload_root = (generation / "payload").resolve()
+    reads: dict[Path, int] = {}
+    original_open = Path.open
+    original_sha256 = cache_module._sha256
+
+    def record_open(path: Path, *args: object, **kwargs: object):
+        candidate = Path(path).resolve()
+        mode = str(args[0]) if args else str(kwargs.get("mode", "r"))
+        if candidate.is_relative_to(payload_root) and "r" in mode:
+            reads[candidate] = reads.get(candidate, 0) + 1
+        return original_open(path, *args, **kwargs)
+
+    def fail_sha256(path: Path) -> str:
+        if Path(path).resolve().is_relative_to(payload_root):
+            raise AssertionError("Drive payload must not be prehashed")
+        return original_sha256(path)
+
+    monkeypatch.setattr(Path, "open", record_open)
+    monkeypatch.setattr(cache_module, "_sha256", fail_sha256)
+    destination = tmp_path / "restored"
+
+    cache_module._copy_verified_payload(
+        generation, destination, manifest, max_workers=1
+    )
+
+    assert (destination / "nested" / "payload.bin").read_bytes() == b"payload"
+    assert (destination / "nested" / "empty.bin").read_bytes() == b""
+    assert set(reads.values()) == {1}
+
+
+def _colmap_restore_generation(tmp_path: Path) -> tuple[LearnedCheckpointStore, Path]:
+    attempt_root = tmp_path / "first-run" / "classical-prepass"
+    attempt_root.mkdir(parents=True)
+    database = attempt_root / "colmap.db"
+    database.write_bytes(b"database")
+    attempt = ColmapAttempt(
+        root=attempt_root,
+        database_path=database,
+        model_dirs=(),
+        colmap_version="COLMAP 3.11.1",
+        fingerprint="4" * 64,
+    )
+    store = LearnedCheckpointStore(tmp_path / "drive-cache", input_identity="a" * 64)
+    store.publish_colmap(attempt, fingerprint="5" * 64, run_id="run-1")
+    return store, attempt_root
+
+
+def test_colmap_restore_propagates_first_worker_failure_after_quiescence_and_cleans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _attempt_root = _colmap_restore_generation(tmp_path)
+    barrier = threading.Barrier(2, timeout=3)
+    worker_completed = threading.Event()
+    failure = RuntimeError("first worker failure")
+
+    def fail_one_worker(
+        source_root: Path,
+        target: Path,
+        row: cache_module._ManifestEntry,
+        cancellation: threading.Event,
+        progress: object,
+    ) -> int:
+        barrier.wait()
+        if row.relative_path.name == "state.json":
+            raise failure
+        assert cancellation.wait(timeout=3)
+        worker_completed.set()
+        return 0
+
+    monkeypatch.setattr(cache_module, "_copy_verified_file", fail_one_worker)
+    destination = tmp_path / "restored"
+
+    with pytest.raises(RuntimeError) as raised:
+        store.restore_colmap("5" * 64, destination=destination)
+
+    assert raised.value is failure
+    assert worker_completed.is_set()
+    assert not destination.exists()
+
+
+def test_copy_verified_payload_progress_is_serialized_monotonic_and_completes_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation, manifest, _payloads = _published_parallel_payload(tmp_path, file_count=4)
+    monkeypatch.setattr(cache_module, "_RESTORE_PROGRESS_STEP_BYTES", 8)
+    observed: list[int] = []
+    original_add_verified = cache_module._RestoreProgress.add_verified
+    output: list[str] = []
+
+    def record_progress(self: object, byte_count: int) -> None:
+        original_add_verified(self, byte_count)
+        observed.append(self._verified_bytes)  # type: ignore[attr-defined]
+
+    def record_print(*args: object, **kwargs: object) -> None:
+        output.append(" ".join(str(arg) for arg in args))
+
+    monkeypatch.setattr(cache_module._RestoreProgress, "add_verified", record_progress)
+    monkeypatch.setattr("builtins.print", record_print)
+
+    cache_module._copy_verified_payload(
+        generation, tmp_path / "restored", manifest, max_workers=4
+    )
+
+    assert observed == sorted(observed)
+    assert len(set(observed)) == len(observed)
+    assert observed[-1] == 32
+    assert sum("Streaming" in line for line in output) == 1
+    assert output[-1] == "[CACHE RESTORE] Verified streaming copy complete."
+
+
+def test_restore_milestone_interrupt_cleans_destination_and_reraises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, _attempt_root = _colmap_restore_generation(tmp_path)
+    destination = tmp_path / "restored"
+    interrupt = KeyboardInterrupt()
+
+    def interrupt_copy(
+        generation: Path,
+        target: Path,
+        manifest: Mapping[str, object],
+    ) -> None:
+        target.mkdir()
+        raise interrupt
+
+    monkeypatch.setattr(cache_module, "_copy_verified_payload", interrupt_copy)
+
+    with pytest.raises(KeyboardInterrupt) as raised:
+        store.restore_milestone(
+            MilestoneRef(CheckpointKind.COLMAP, "5" * 64),
+            destination=destination,
+            source_inventory=object(),
+        )
+
+    assert raised.value is interrupt
     assert not destination.exists()
 
 

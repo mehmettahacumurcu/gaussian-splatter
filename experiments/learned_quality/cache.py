@@ -9,9 +9,11 @@ import re
 import shutil
 import tempfile
 from collections.abc import Mapping, Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, fields, is_dataclass
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
+from threading import Event, Lock
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -29,6 +31,10 @@ _SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _UNSUPPORTED_NOREPLACE_ERRNOS = frozenset(
     {errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP}
 )
+_RESTORE_DEFAULT_WORKERS = 4
+_RESTORE_MAX_WORKERS = 16
+_RESTORE_BLOCK_BYTES = 8 * 1024 * 1024
+_RESTORE_PROGRESS_STEP_BYTES = 512 * 1024 * 1024
 _PRETRAINING_ROOTS = frozenset(
     {
         "selection",
@@ -721,6 +727,10 @@ class LearnedCheckpointStore:
             if os.path.lexists(target):
                 self._remove_restore_tree(target)
             return None
+        except BaseException:
+            if os.path.lexists(target):
+                self._remove_restore_tree(target)
+            raise
 
     def validate_milestone_graph(self, root: MilestoneRef) -> tuple[MilestoneRef, ...]:
         from .milestones import (
@@ -1888,65 +1898,155 @@ def _read_verified_generation_metadata(
     return manifest
 
 
+class _RestoreProgress:
+    def __init__(self, total_bytes: int) -> None:
+        self._total_bytes = total_bytes
+        self._verified_bytes = 0
+        self._next_report = _RESTORE_PROGRESS_STEP_BYTES
+        self._lock = Lock()
+
+    def add_verified(self, byte_count: int) -> None:
+        with self._lock:
+            self._verified_bytes += byte_count
+            while self._verified_bytes >= self._next_report:
+                print(
+                    f"[CACHE RESTORE] {self._next_report / (1024**3):.2f}/"
+                    f"{self._total_bytes / (1024**3):.2f} GiB verified",
+                    flush=True,
+                )
+                self._next_report += _RESTORE_PROGRESS_STEP_BYTES
+
+
+def _restore_worker_count(max_workers: object, file_count: int) -> int:
+    if (
+        type(max_workers) is not int
+        or max_workers < 1
+        or max_workers > _RESTORE_MAX_WORKERS
+    ):
+        raise ValueError("max_workers must be a plain integer from 1 through 16")
+    if file_count == 0:
+        return 0
+    return min(max_workers, file_count)
+
+
+def _prepare_restore_target(target: Path, rows: Sequence[_ManifestEntry]) -> None:
+    paths = [PurePosixPath(*row.relative_path.parts[1:]) for row in rows]
+    rendered = {path.as_posix() for path in paths}
+    for path in paths:
+        for depth in range(1, len(path.parts)):
+            if PurePosixPath(*path.parts[:depth]).as_posix() in rendered:
+                raise ValueError("restore destination has file/directory conflict")
+    target.mkdir()
+    for path in paths:
+        copied = target.joinpath(*path.parts)
+        try:
+            copied.relative_to(target)
+        except ValueError as error:
+            raise ValueError("restore destination escapes the restore root") from error
+        copied.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _copy_verified_file(
+    source_root: Path,
+    target: Path,
+    row: _ManifestEntry,
+    cancellation: Event,
+    progress: _RestoreProgress,
+) -> int:
+    payload_relative = PurePosixPath(*row.relative_path.parts[1:])
+    source_file = _regular_file(
+        source_root.joinpath(*payload_relative.parts), "restore source"
+    )
+    source_file.relative_to(source_root)
+    if source_file.stat().st_size != row.size_bytes:
+        raise ValueError(f"restore source size mismatch: {payload_relative.as_posix()}")
+    copied = target.joinpath(*payload_relative.parts)
+    digest = hashlib.sha256()
+    copied_size = 0
+    with source_file.open("rb") as source_stream, copied.open("xb") as target_stream:
+        while not cancellation.is_set():
+            block = source_stream.read(_RESTORE_BLOCK_BYTES)
+            if not block:
+                break
+            copied_size += len(block)
+            digest.update(block)
+            target_stream.write(block)
+    if cancellation.is_set():
+        return copied_size
+    if copied_size != row.size_bytes:
+        raise ValueError(f"restore source size changed: {payload_relative.as_posix()}")
+    if digest.hexdigest() != row.sha256:
+        raise ValueError(f"restore source hash mismatch: {payload_relative.as_posix()}")
+    progress.add_verified(copied_size)
+    return copied_size
+
+
 def _copy_verified_payload(
     generation: Path,
     destination: Path,
     manifest: Mapping[str, object],
+    *,
+    max_workers: int = _RESTORE_DEFAULT_WORKERS,
 ) -> None:
+    rows = _manifest_file_rows(manifest)
+    active_workers = _restore_worker_count(max_workers, len(rows))
     source_root = _regular_directory(generation / "payload", "payload root")
     target = Path(destination)
     if os.path.lexists(target):
         raise FileExistsError(f"restore destination exists: {target}")
-    rows = _manifest_file_rows(manifest)
-    target.mkdir()
+    _prepare_restore_target(target, rows)
     total_bytes = sum(row.size_bytes for row in rows)
-    copied_total = 0
-    next_report = 512 * 1024 * 1024
+    progress = _RestoreProgress(total_bytes)
     print(
-        f"[CACHE RESTORE] Streaming {len(rows)} files "
+        f"[CACHE RESTORE] Streaming {len(rows)} files with {active_workers} workers "
         f"({total_bytes / (1024**3):.2f} GiB) from Drive...",
         flush=True,
     )
-    for row in rows:
-        payload_relative = PurePosixPath(*row.relative_path.parts[1:])
-        source = source_root.joinpath(*payload_relative.parts)
-        source_file = _regular_file(source, "restore source")
-        try:
-            source_file.relative_to(source_root)
-        except ValueError as error:
-            raise ValueError("restore source escapes the payload root") from error
-        if source_file.stat().st_size != row.size_bytes:
-            raise ValueError(
-                f"restore source size mismatch: {payload_relative.as_posix()}"
-            )
-        copied = target.joinpath(*payload_relative.parts)
-        copied.parent.mkdir(parents=True, exist_ok=True)
-        digest = hashlib.sha256()
-        copied_size = 0
-        with (
-            source_file.open("rb") as source_stream,
-            copied.open("xb") as target_stream,
-        ):
-            while block := source_stream.read(8 * 1024 * 1024):
-                copied_size += len(block)
-                copied_total += len(block)
-                digest.update(block)
-                target_stream.write(block)
-                if copied_total >= next_report:
-                    print(
-                        f"[CACHE RESTORE] {copied_total / (1024**3):.2f}/"
-                        f"{total_bytes / (1024**3):.2f} GiB verified",
-                        flush=True,
-                    )
-                    next_report += 512 * 1024 * 1024
-        if copied_size != row.size_bytes:
-            raise ValueError(
-                f"restore source size changed: {payload_relative.as_posix()}"
-            )
-        if digest.hexdigest() != row.sha256:
-            raise ValueError(
-                f"restore source hash mismatch: {payload_relative.as_posix()}"
-            )
+    cancellation = Event()
+    active: dict[Future[int], _ManifestEntry] = {}
+    rows_iter = iter(rows)
+    first_error: BaseException | None = None
+    if active_workers:
+        with ThreadPoolExecutor(max_workers=active_workers) as executor:
+            for _ in range(active_workers):
+                try:
+                    row = next(rows_iter)
+                except StopIteration:
+                    break
+                future = executor.submit(
+                    _copy_verified_file, source_root, target, row, cancellation, progress
+                )
+                active[future] = row
+            while active:
+                completed, _pending = wait(tuple(active), return_when=FIRST_COMPLETED)
+                for future in completed:
+                    del active[future]
+                    try:
+                        future.result()
+                    except BaseException as error:
+                        if first_error is None:
+                            first_error = error
+                            cancellation.set()
+                    if first_error is None:
+                        try:
+                            row = next(rows_iter)
+                        except StopIteration:
+                            continue
+                        replacement = executor.submit(
+                            _copy_verified_file,
+                            source_root,
+                            target,
+                            row,
+                            cancellation,
+                            progress,
+                        )
+                        active[replacement] = row
+                if first_error is not None:
+                    for future in active:
+                        future.cancel()
+                    break
+    if first_error is not None:
+        raise first_error
     expected_metadata = tuple(
         (row.relative_path.as_posix(), row.size_bytes) for row in rows
     )
