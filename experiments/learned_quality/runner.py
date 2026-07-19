@@ -109,6 +109,13 @@ _SELECTION_PRODUCER_PATHS = (
     "backend/static_pipeline/selection.py",
     "backend/static_pipeline/sources.py",
 )
+# The CPU audit notebook is immutably pinned to 7366421. Its selection producer
+# digest remains an allowed address only for the output-first recovery path; the
+# restored payload and its audit receipt are still verified before use.
+_CPU_AUDIT_SELECTION_PRODUCER_SHA256 = (
+    "344f0f0e878ffd61384abcf2dd3169e77351b9e18de87451daca15a8532dc4b4"
+)
+_CPU_AUDIT_PYTHON_VERSION = "3.12.13"
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _PRETRAINING_SKIPPED_STAGES = (
     "learned_model_preflight",
@@ -141,6 +148,7 @@ class _LearnedCacheSession:
     def __init__(self, cache_root: Path) -> None:
         self.cache_root = Path(cache_root)
         self._store: LearnedCheckpointStore | None = None
+        self.selection_ref: MilestoneRef | None = None
 
     def store_for(self, source_inventory: object) -> LearnedCheckpointStore:
         digest = getattr(source_inventory, "digest", None)
@@ -214,9 +222,17 @@ def _selection_milestone_ref(
     spec: object,
     hardware: HardwareInfo,
     model_manifest_path: Path,
+    *,
+    producer_code_sha256: str | None = None,
+    python_version: str | None = None,
 ) -> MilestoneRef:
     del model_manifest_path
     source_digest = getattr(source_inventory, "digest", None)
+    active_producer_digest = (
+        producer_code_digest(_REPOSITORY_ROOT, _SELECTION_PRODUCER_PATHS)
+        if producer_code_sha256 is None
+        else producer_code_sha256
+    )
     return MilestoneRef(
         CheckpointKind.SELECTION,
         milestone_fingerprint(
@@ -228,11 +244,8 @@ def _selection_milestone_ref(
                 # Frame selection has no learned-model input. A neutral digest lets
                 # the CPU audit and A100 runtime address the exact same selection.
                 model_manifest_sha256="0" * 64,
-                tool_versions={"python": platform.python_version()},
-                producer_code_sha256=producer_code_digest(
-                    _REPOSITORY_ROOT,
-                    _SELECTION_PRODUCER_PATHS,
-                ),
+                tool_versions={"python": python_version or platform.python_version()},
+                producer_code_sha256=active_producer_digest,
                 upstream={},
             ),
         ),
@@ -565,17 +578,37 @@ def make_learned_quality_services(
             hardware = kwargs["hardware"]
             run_root = Path(kwargs["run_root"])
             store = cache_session.store_for(source_inventory)
-            ref = _selection_milestone_ref(
-                source_inventory,
-                spec,
-                hardware,
-                context.model_manifest_path,
-            )
-            restored = store.restore_milestone(
-                ref,
-                destination=run_root / "selection-restored",
-                source_inventory=source_inventory,
-            )
+            refs = [
+                _selection_milestone_ref(
+                    source_inventory,
+                    spec,
+                    hardware,
+                    context.model_manifest_path,
+                )
+            ]
+            if recovery_mode == "round0_output_first_v1":
+                legacy_ref = _selection_milestone_ref(
+                    source_inventory,
+                    spec,
+                    hardware,
+                    context.model_manifest_path,
+                    producer_code_sha256=_CPU_AUDIT_SELECTION_PRODUCER_SHA256,
+                    python_version=_CPU_AUDIT_PYTHON_VERSION,
+                )
+                if legacy_ref not in refs:
+                    refs.append(legacy_ref)
+            restored = None
+            ref = refs[0]
+            for candidate_ref in refs:
+                candidate = store.restore_milestone(
+                    candidate_ref,
+                    destination=run_root / "selection-restored",
+                    source_inventory=source_inventory,
+                )
+                if candidate is not None:
+                    ref = candidate_ref
+                    restored = candidate
+                    break
             reporter = current_stage_reporter()
             if reporter is not None:
                 reporter.cache_event(
@@ -593,6 +626,7 @@ def make_learned_quality_services(
             selection = restored.value
             if selection.inventory is not source_inventory:
                 raise ValueError("selection milestone inventory is not current")
+            cache_session.selection_ref = ref
             from .audit import (
                 find_compatible_audit_receipts,
                 make_audit_inputs,
@@ -693,6 +727,7 @@ def make_learned_quality_services(
                 ),
                 run_id=f"{run_root.name}-selection",
             )
+            cache_session.selection_ref = ref
             reporter = current_stage_reporter()
             if reporter is not None:
                 reporter.cache_event("save", "Selection milestone", str(generation))
@@ -708,7 +743,7 @@ def make_learned_quality_services(
                 spec = kwargs["spec"]
                 hardware = kwargs["hardware"]
                 output_root = Path(kwargs["output_root"])
-                selection_ref = _selection_milestone_ref(
+                selection_ref = cache_session.selection_ref or _selection_milestone_ref(
                     selection.inventory,
                     spec,
                     hardware,

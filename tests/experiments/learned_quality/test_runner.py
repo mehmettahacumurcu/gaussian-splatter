@@ -297,6 +297,140 @@ def test_selection_restore_requires_cpu_audit_before_learned_model_preflight(
     assert calls == ["selection", "audit"]
 
 
+def test_round0_recovery_restores_audited_selection_from_cpu_notebook_pin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.static_pipeline import runner as static_runner
+    from experiments.learned_quality import runner as learned_runner
+    from experiments.learned_quality.cache import CheckpointKind
+    from experiments.learned_quality.milestones import (
+        MilestoneInputs,
+        milestone_fingerprint,
+    )
+
+    production = SimpleNamespace(
+        discover_source=object(),
+        copy_input=object(),
+        select_frames=object(),
+        reconstruct=object(),
+        train=object(),
+        polish=object(),
+        build_metadata_preview=object(),
+        validate_bundle=object(),
+        publish_result=object(),
+        publish_diagnostics=object(),
+        inspect_hardware=object(),
+        preflight=object(),
+        assemble_reports=object(),
+        resolve_input=object(),
+    )
+    monkeypatch.setattr(static_runner, "_production_services", lambda: production)
+    source = SimpleNamespace(digest="a" * 64)
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    selection = SelectionOutput(
+        source,
+        SimpleNamespace(image_set_digest="b" * 64),
+        frames,
+        tmp_path / "selection_manifest.json",
+    )
+    spec = to_static_run_spec(LearnedQualityRunSpec(input_folder="room"))
+    hardware = HardwareInfo("NVIDIA A100", 80.0, True, 120.0, colmap_gpu_sift=True)
+    legacy_producer = "d" * 64
+    legacy_python = "3.12.13"
+    monkeypatch.setattr(learned_runner, "producer_code_digest", lambda *_args: "c" * 64)
+    monkeypatch.setattr(
+        learned_runner,
+        "_CPU_AUDIT_SELECTION_PRODUCER_SHA256",
+        legacy_producer,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        learned_runner,
+        "_CPU_AUDIT_PYTHON_VERSION",
+        legacy_python,
+        raising=False,
+    )
+    legacy_fingerprint = milestone_fingerprint(
+        CheckpointKind.SELECTION,
+        MilestoneInputs(
+            source_digest=source.digest,
+            selection_digest=source.digest,
+            settings=spec.frame_selection.model_dump(mode="json"),
+            model_manifest_sha256="0" * 64,
+            tool_versions={"python": legacy_python},
+            producer_code_sha256=legacy_producer,
+            upstream={},
+        ),
+    )
+    restored_refs: list[object] = []
+    reconstruct_kwargs: dict[str, object] = {}
+
+    class FakeStore:
+        def __init__(self, _cache_root: Path, *, input_identity: str) -> None:
+            self.input_identity = input_identity
+
+        def restore_milestone(self, ref: object, **_kwargs: object) -> object | None:
+            restored_refs.append(ref)
+            if getattr(ref, "fingerprint", None) == legacy_fingerprint:
+                return SimpleNamespace(value=selection)
+            return None
+
+    class FakeMilestoneSession:
+        def __init__(self, **kwargs: object) -> None:
+            self.__dict__.update(kwargs)
+
+    monkeypatch.setattr(learned_runner, "LearnedCheckpointStore", FakeStore)
+    monkeypatch.setattr(learned_runner, "MilestoneSession", FakeMilestoneSession)
+    monkeypatch.setattr(
+        "experiments.learned_quality.runtime._colmap_cache_fingerprints",
+        lambda *_args, **_kwargs: ("e" * 64,),
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.audit.require_audit_receipt",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.audit.make_audit_inputs",
+        lambda **_kwargs: object(),
+    )
+    model_manifest = tmp_path / "model_manifest.json"
+    model_manifest.write_text("{}\n", encoding="utf-8")
+
+    def reconstruct(*_args: object, **kwargs: object) -> object:
+        reconstruct_kwargs.update(kwargs)
+        return object()
+
+    services = make_learned_quality_services(
+        LearnedQualityContext(reconstruct, model_manifest),
+        cache_root=tmp_path / "cache",
+        recovery_mode="round0_output_first_v1",
+    )
+
+    restored = services.restore_selection(
+        source_inventory=source,
+        spec=spec,
+        hardware=hardware,
+        run_root=tmp_path / "run",
+    )
+    services.reconstruct(
+        restored,
+        spec=spec,
+        hardware=hardware,
+        output_root=tmp_path / "run" / "reconstruction",
+    )
+
+    assert restored is selection
+    assert len(restored_refs) == 2
+    assert restored_refs[0].fingerprint != legacy_fingerprint
+    assert restored_refs[1].fingerprint == legacy_fingerprint
+    assert (
+        reconstruct_kwargs["milestone_session"].selection_ref.fingerprint
+        == legacy_fingerprint
+    )
+
+
 def test_selection_restore_migrates_exact_cpu_audited_colmap_key(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
