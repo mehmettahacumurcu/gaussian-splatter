@@ -1016,10 +1016,11 @@ def _restore_output_first_evidence(
         output_root / "restored-masks",
         MasksMilestoneState,
     )
-    if not isinstance(base, BaseEvidenceState) or not isinstance(
-        semantic_state, SemanticMilestoneState
-    ) or not isinstance(motion_state, MotionMilestoneState) or not isinstance(
-        masks_state, MasksMilestoneState
+    if (
+        not isinstance(base, BaseEvidenceState)
+        or not isinstance(semantic_state, SemanticMilestoneState)
+        or not isinstance(motion_state, MotionMilestoneState)
+        or not isinstance(masks_state, MasksMilestoneState)
     ):
         raise ValueError(
             "output-first recovery could not restore the complete Round 0 masks lineage"
@@ -1217,7 +1218,9 @@ def run_learned_reconstruction(
             use_gpu=hardware.colmap_gpu_sift is True
         )
 
-        def hybrid(manifest, candidate_frames, attempt_dir, attempt_index, frame_digest):
+        def hybrid(
+            manifest, candidate_frames, attempt_dir, attempt_index, frame_digest
+        ):
             runner = make_hybrid_candidate_runner(
                 HybridGeometryInputs(
                     anchors=active["artifacts"].da3,

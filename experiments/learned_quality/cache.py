@@ -1774,10 +1774,7 @@ def _read_generation_manifest(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict):
         raise ValueError("generation manifest must be an object")
-    if (
-        manifest.get("kind") != kind.value
-        or manifest.get("fingerprint") != fingerprint
-    ):
+    if manifest.get("kind") != kind.value or manifest.get("fingerprint") != fingerprint:
         raise ValueError("generation manifest identity is malformed")
     return manifest
 
@@ -1907,7 +1904,7 @@ def _copy_verified_payload(
     next_report = 512 * 1024 * 1024
     print(
         f"[CACHE RESTORE] Streaming {len(rows)} files "
-        f"({total_bytes / (1024 ** 3):.2f} GiB) from Drive...",
+        f"({total_bytes / (1024**3):.2f} GiB) from Drive...",
         flush=True,
     )
     for row in rows:
@@ -1926,7 +1923,10 @@ def _copy_verified_payload(
         copied.parent.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256()
         copied_size = 0
-        with source_file.open("rb") as source_stream, copied.open("xb") as target_stream:
+        with (
+            source_file.open("rb") as source_stream,
+            copied.open("xb") as target_stream,
+        ):
             while block := source_stream.read(8 * 1024 * 1024):
                 copied_size += len(block)
                 copied_total += len(block)
@@ -1934,8 +1934,8 @@ def _copy_verified_payload(
                 target_stream.write(block)
                 if copied_total >= next_report:
                     print(
-                        f"[CACHE RESTORE] {copied_total / (1024 ** 3):.2f}/"
-                        f"{total_bytes / (1024 ** 3):.2f} GiB verified",
+                        f"[CACHE RESTORE] {copied_total / (1024**3):.2f}/"
+                        f"{total_bytes / (1024**3):.2f} GiB verified",
                         flush=True,
                     )
                     next_report += 512 * 1024 * 1024

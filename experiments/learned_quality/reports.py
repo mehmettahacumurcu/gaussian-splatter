@@ -252,9 +252,7 @@ def validate_learned_bundle(
     learned_quality = quality.get("learned_quality")
     if not isinstance(learned_quality, dict):
         raise ValueError("quality report learned_quality metadata is required")
-    geometry_metadata = {
-        key: manifest.get(key) for key in _GEOMETRY_ACCEPTANCE_KEYS
-    }
+    geometry_metadata = {key: manifest.get(key) for key in _GEOMETRY_ACCEPTANCE_KEYS}
     if geometry_metadata != {
         key: experiment.get(key) for key in _GEOMETRY_ACCEPTANCE_KEYS
     } or geometry_metadata != {
@@ -337,17 +335,11 @@ def finalize_learned_bundle(
         shutil.copyfile(source, diagnostics / name)
     report = dict(experiment_report)
     geometry_metadata = {
-        "geometry_acceptance_mode": report.get(
-            "geometry_acceptance_mode", "strict"
-        ),
-        "geometry_policy_version": report.get(
-            "geometry_policy_version", "strict-v1"
-        ),
+        "geometry_acceptance_mode": report.get("geometry_acceptance_mode", "strict"),
+        "geometry_policy_version": report.get("geometry_policy_version", "strict-v1"),
         "geometry_strict_failures": report.get("geometry_strict_failures", []),
         "geometry_guarded_metrics": report.get("geometry_guarded_metrics"),
-        "geometry_colmap_fingerprint": report.get(
-            "geometry_colmap_fingerprint"
-        ),
+        "geometry_colmap_fingerprint": report.get("geometry_colmap_fingerprint"),
     }
     if geometry_metadata["geometry_acceptance_mode"] == "best_effort":
         report["status"] = "best_effort"

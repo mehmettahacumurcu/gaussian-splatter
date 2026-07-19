@@ -88,9 +88,7 @@ def _write_success(path: Path, run_id: str, manifest_sha256: str) -> None:
         "geometry_acceptance_mode": manifest.get("geometry_acceptance_mode"),
         "geometry_policy_version": manifest.get("geometry_policy_version"),
         "geometry_strict_failures": manifest.get("geometry_strict_failures"),
-        "geometry_colmap_fingerprint": manifest.get(
-            "geometry_colmap_fingerprint"
-        ),
+        "geometry_colmap_fingerprint": manifest.get("geometry_colmap_fingerprint"),
     }
     (path / "_SUCCESS").write_text(
         json.dumps(payload, sort_keys=True, separators=(",", ":")),

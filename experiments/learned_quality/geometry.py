@@ -1125,9 +1125,7 @@ def accept_output_first_geometry(
     output_root.mkdir()
 
     candidates: list[GeometryCandidateReport] = []
-    accepted: list[
-        tuple[GeometryCandidateReport, Mapping[str, bool], str]
-    ] = []
+    accepted: list[tuple[GeometryCandidateReport, Mapping[str, bool], str]] = []
     for metrics in measured:
         decision = evaluate_fn((metrics,), manifest, 1)
         if not isinstance(decision, GateDecision) or decision.dominant is not metrics:

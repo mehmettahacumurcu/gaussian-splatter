@@ -301,9 +301,10 @@ def test_output_first_requires_valid_model_and_only_waives_named_failures(
         ),
     )
 
-    assert evaluate_output_first_checks(unapproved)[
-        "strict_failures_are_waivable"
-    ] is False
+    assert (
+        evaluate_output_first_checks(unapproved)["strict_failures_are_waivable"]
+        is False
+    )
     assert evaluate_output_first_checks(invalid)["model_validity"] is False
 
 

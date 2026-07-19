@@ -293,9 +293,7 @@ def test_output_first_evidence_restores_complete_masks_graph_without_inference(
             anchors=anchors,
             depths=(),
             sky=(),
-            scene=SimpleNamespace(
-                frames=(SimpleNamespace(registered=True),)
-            ),
+            scene=SimpleNamespace(frames=(SimpleNamespace(registered=True),)),
             track_audit=object(),
             colmap_ref="2" * 64,
         ),
