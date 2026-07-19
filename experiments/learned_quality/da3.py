@@ -191,6 +191,178 @@ class _MetricOperationResult:
     chunks: tuple[ChunkProvenance, ...]
 
 
+@dataclass(frozen=True)
+class _AlignmentFallbackRecord:
+    chunk_index: int
+    scale: float
+    source: Literal["chunk_pairwise_median"]
+
+
+_DEGENERATE_UMEYAMA_MESSAGE = (
+    "Degenerate covariance rank, Umeyama alignment is not possible"
+)
+
+
+def _numpy_array(value: object) -> np.ndarray:
+    numpy_method = getattr(value, "numpy", None)
+    source = numpy_method() if callable(numpy_method) else value
+    return np.asarray(source)
+
+
+def _camera_centers(extrinsics: object) -> np.ndarray | None:
+    try:
+        matrices = np.asarray(_numpy_array(extrinsics), dtype=np.float64)
+    except (TypeError, ValueError):
+        return None
+    if (
+        matrices.ndim != 3
+        or matrices.shape[1:] not in {(3, 4), (4, 4)}
+        or len(matrices) < 2
+        or not np.isfinite(matrices).all()
+    ):
+        return None
+    rotations = matrices[:, :3, :3]
+    translations = matrices[:, :3, 3]
+    return -np.einsum("nji,nj->ni", rotations, translations)
+
+
+def _pairwise_similarity_scale(
+    reference_extrinsics: object,
+    estimated_extrinsics: object,
+) -> float | None:
+    """Estimate only Sim(3) scale from corresponding camera baselines.
+
+    Pair distances remain identifiable for collinear trajectories even though
+    Umeyama cannot recover a unique 3-D rotation. DA3 discards that rotation
+    when ``align_to_input_ext_scale`` is true and keeps only this scale.
+    """
+    reference = _camera_centers(reference_extrinsics)
+    estimated = _camera_centers(estimated_extrinsics)
+    if reference is None or estimated is None or reference.shape != estimated.shape:
+        return None
+    rows, columns = np.triu_indices(len(reference), 1)
+    reference_distance = np.linalg.norm(reference[rows] - reference[columns], axis=1)
+    estimated_distance = np.linalg.norm(estimated[rows] - estimated[columns], axis=1)
+    largest = max(
+        float(np.max(reference_distance, initial=0.0)),
+        float(np.max(estimated_distance, initial=0.0)),
+        1.0,
+    )
+    tolerance = np.finfo(np.float64).eps * largest * 1024.0
+    valid = (reference_distance > tolerance) & (estimated_distance > tolerance)
+    if not np.any(valid):
+        return None
+    scale = float(np.median(reference_distance[valid] / estimated_distance[valid]))
+    if not math.isfinite(scale) or scale <= 0.0:
+        return None
+    return scale
+
+
+def _is_degenerate_umeyama(error: BaseException) -> bool:
+    try:
+        geometry_module = importlib.import_module("evo.core.geometry")
+    except (ImportError, ModuleNotFoundError):
+        return False
+    exception_type = getattr(geometry_module, "GeometryException", None)
+    return (
+        isinstance(exception_type, type)
+        and issubclass(exception_type, BaseException)
+        and isinstance(error, exception_type)
+        and str(error) == _DEGENERATE_UMEYAMA_MESSAGE
+    )
+
+
+class _RankSafeAlignmentGuard:
+    """Preserve pinned DA3 alignment, replacing only its rank failure path."""
+
+    def __init__(self, model: object) -> None:
+        self._model = model
+        self._original: Callable[..., object] | None = None
+        self._attribute_name = "_align_to_input_extrinsics_intrinsics"
+        instance_values = getattr(model, "__dict__", {})
+        self._was_instance_owned = self._attribute_name in instance_values
+        self._original_instance_value = instance_values.get(self._attribute_name)
+        self._chunk_index = -1
+        self.fallbacks: list[_AlignmentFallbackRecord] = []
+
+    def install(self) -> None:
+        original = getattr(
+            self._model,
+            self._attribute_name,
+            None,
+        )
+        if not callable(original):
+            return
+        self._original = original
+
+        def guarded(
+            extrinsics: object,
+            intrinsics: object,
+            prediction: object,
+            align_to_input_ext_scale: bool = True,
+            ransac_view_thresh: int = 10,
+        ) -> object:
+            predicted_extrinsics = getattr(prediction, "extrinsics", None)
+            chunk_scale = _pairwise_similarity_scale(
+                predicted_extrinsics,
+                extrinsics,
+            )
+            try:
+                return original(
+                    extrinsics,
+                    intrinsics,
+                    prediction,
+                    align_to_input_ext_scale,
+                    ransac_view_thresh,
+                )
+            except BaseException as error:
+                if not align_to_input_ext_scale or not _is_degenerate_umeyama(error):
+                    raise
+                if chunk_scale is None:
+                    raise
+                scale = chunk_scale
+                source: Literal["chunk_pairwise_median"] = "chunk_pairwise_median"
+                prediction.intrinsics = np.array(_numpy_array(intrinsics), copy=True)
+                prediction.extrinsics = np.array(
+                    _numpy_array(extrinsics)[..., :3, :],
+                    copy=True,
+                )
+                prediction.depth = np.asarray(prediction.depth) / scale
+                self.fallbacks.append(
+                    _AlignmentFallbackRecord(
+                        chunk_index=self._chunk_index,
+                        scale=scale,
+                        source=source,
+                    )
+                )
+                print(
+                    "[FINAL-POSE] Rank-safe DA3 scale fallback for "
+                    f"chunk {self._chunk_index}: {scale:.9g} ({source})"
+                )
+                return prediction
+
+        setattr(
+            self._model,
+            self._attribute_name,
+            guarded,
+        )
+
+    def begin_chunk(self, chunk_index: int) -> None:
+        self._chunk_index = chunk_index
+
+    def restore(self) -> None:
+        if self._original is None:
+            return
+        if self._was_instance_owned:
+            setattr(
+                self._model,
+                self._attribute_name,
+                self._original_instance_value,
+            )
+        else:
+            delattr(self._model, self._attribute_name)
+
+
 def select_anchor_indices(frame_count: int, vram_gb: float) -> tuple[int, ...]:
     if type(frame_count) is not int or frame_count <= 0:
         raise ValueError("frame_count must be a positive plain integer")
@@ -1229,6 +1401,7 @@ def _publish_final_depth_artifacts(
     chunks: tuple[ChunkProvenance, ...],
     contributions: tuple[FrameContribution, ...],
     attempts: tuple[BatchAttemptRecord, ...],
+    alignment_fallbacks: tuple[_AlignmentFallbackRecord, ...],
     output_dir: Path,
     promote: Callable[[Path, Path], None],
 ) -> PoseConditionedDepthResult:
@@ -1282,6 +1455,14 @@ def _publish_final_depth_artifacts(
         for contribution in contributions
     ]
     metadata = {
+        "alignment_fallbacks": [
+            {
+                "chunk_index": fallback.chunk_index,
+                "scale": fallback.scale,
+                "source": fallback.source,
+            }
+            for fallback in alignment_fallbacks
+        ],
         "artifacts": artifact_payload,
         "attempts": [_attempt_payload(attempt) for attempt in attempts],
         "chunks": [_chunk_payload(chunk) for chunk in chunks],
@@ -1338,86 +1519,91 @@ def run_pose_conditioned_depth(
     processed_intrinsics: list[np.ndarray] = []
     processed_shape: tuple[int, int] | None = None
     confidence_presence: bool | None = None
-
-    for chunk in scheduled_chunks:
-        chunk_frames = validated_frames[chunk.start : chunk.stop]
-        chunk_cameras = validated_cameras[chunk.start : chunk.stop]
-        input_extrinsics = np.asarray(
-            [camera.w2c for camera in chunk_cameras],
-            dtype=np.float64,
-        )
-        input_intrinsics = np.asarray(
-            [camera.intrinsics for camera in chunk_cameras],
-            dtype=np.float64,
-        )
-        try:
-            raw_prediction = inference(
-                image=[str(frame.path) for frame in chunk_frames],
-                extrinsics=input_extrinsics,
-                intrinsics=input_intrinsics,
-                align_to_input_ext_scale=True,
-                process_res=ANCHOR_PROCESS_RESOLUTION,
-                process_res_method="upper_bound_resize",
+    alignment_guard = _RankSafeAlignmentGuard(model)
+    alignment_guard.install()
+    try:
+        for chunk in scheduled_chunks:
+            alignment_guard.begin_chunk(chunk.index)
+            chunk_frames = validated_frames[chunk.start : chunk.stop]
+            chunk_cameras = validated_cameras[chunk.start : chunk.stop]
+            input_extrinsics = np.asarray(
+                [camera.w2c for camera in chunk_cameras],
+                dtype=np.float64,
             )
-        except Exception as error:
-            if _is_injected_cuda_oom(error, torch_module):
-                raise FinalPoseStageFailure(
-                    chunk_index=chunk.index,
-                    chunk_start=chunk.start,
-                    chunk_stop=chunk.stop,
-                    actual_chunk_size=len(chunk_frames),
-                ) from error
-            raise
-        try:
-            prediction = _validated_prediction(
-                raw_prediction,
-                len(chunk_frames),
-                require_cameras=True,
+            input_intrinsics = np.asarray(
+                [camera.intrinsics for camera in chunk_cameras],
+                dtype=np.float64,
             )
-        except ValueError as error:
-            raise ValueError(f"final prediction is invalid: {error}") from error
-        for predicted, expected in zip(prediction.cameras, input_extrinsics):
-            if not _matches_pinned_camera_roundtrip(predicted, expected):
+            try:
+                raw_prediction = inference(
+                    image=[str(frame.path) for frame in chunk_frames],
+                    extrinsics=input_extrinsics,
+                    intrinsics=input_intrinsics,
+                    align_to_input_ext_scale=True,
+                    process_res=ANCHOR_PROCESS_RESOLUTION,
+                    process_res_method="upper_bound_resize",
+                )
+            except Exception as error:
+                if _is_injected_cuda_oom(error, torch_module):
+                    raise FinalPoseStageFailure(
+                        chunk_index=chunk.index,
+                        chunk_start=chunk.start,
+                        chunk_stop=chunk.stop,
+                        actual_chunk_size=len(chunk_frames),
+                    ) from error
+                raise
+            try:
+                prediction = _validated_prediction(
+                    raw_prediction,
+                    len(chunk_frames),
+                    require_cameras=True,
+                )
+            except ValueError as error:
+                raise ValueError(f"final prediction is invalid: {error}") from error
+            for predicted, expected in zip(prediction.cameras, input_extrinsics):
+                if not _matches_pinned_camera_roundtrip(predicted, expected):
+                    raise ValueError(
+                        "final prediction extrinsics drifted from final COLMAP W2C"
+                    )
+            current_shape = prediction.depth.shape[1:]
+            if processed_shape is None:
+                processed_shape = current_shape
+            elif processed_shape != current_shape:
+                raise ValueError("final prediction processed H/W changed between chunks")
+            has_confidence = prediction.confidence is not None
+            if confidence_presence is None:
+                confidence_presence = has_confidence
+            elif confidence_presence != has_confidence:
                 raise ValueError(
-                    "final prediction extrinsics drifted from final COLMAP W2C"
+                    "final prediction confidence presence changed between chunks"
                 )
-        current_shape = prediction.depth.shape[1:]
-        if processed_shape is None:
-            processed_shape = current_shape
-        elif processed_shape != current_shape:
-            raise ValueError("final prediction processed H/W changed between chunks")
-        has_confidence = prediction.confidence is not None
-        if confidence_presence is None:
-            confidence_presence = has_confidence
-        elif confidence_presence != has_confidence:
-            raise ValueError(
-                "final prediction confidence presence changed between chunks"
+            raw_intrinsics = np.asarray(
+                _required_prediction_attribute(raw_prediction, "intrinsics"),
+                dtype=np.float64,
             )
-        raw_intrinsics = np.asarray(
-            _required_prediction_attribute(raw_prediction, "intrinsics"),
-            dtype=np.float64,
-        )
-        processed_intrinsics.extend(np.array(raw_intrinsics, copy=True))
-        for local_index, global_index in enumerate(chunk.frame_indices):
-            depth_contributions[global_index].append(prediction.depth[local_index])
-            if prediction.confidence is not None:
-                confidence_contributions[global_index].append(
-                    prediction.confidence[local_index]
+            processed_intrinsics.extend(np.array(raw_intrinsics, copy=True))
+            for local_index, global_index in enumerate(chunk.frame_indices):
+                depth_contributions[global_index].append(prediction.depth[local_index])
+                if prediction.confidence is not None:
+                    confidence_contributions[global_index].append(
+                        prediction.confidence[local_index]
+                    )
+                chunk_contributions[global_index].append(chunk.index)
+            chunk_records.append(
+                ChunkProvenance(
+                    index=chunk.index,
+                    start=chunk.start,
+                    stop=chunk.stop,
+                    image_names=tuple(frame.image_name for frame in chunk_frames),
+                    frame_ids=tuple(frame.frame_id for frame in chunk_frames),
+                    requested_size=MAX_CHUNK_FRAMES,
                 )
-            chunk_contributions[global_index].append(chunk.index)
-        chunk_records.append(
-            ChunkProvenance(
-                index=chunk.index,
-                start=chunk.start,
-                stop=chunk.stop,
-                image_names=tuple(frame.image_name for frame in chunk_frames),
-                frame_ids=tuple(frame.frame_id for frame in chunk_frames),
-                requested_size=MAX_CHUNK_FRAMES,
             )
-        )
-        attempts.append(
-            BatchAttemptRecord(size=len(chunk_frames), outcome="succeeded")
-        )
+            attempts.append(
+                BatchAttemptRecord(size=len(chunk_frames), outcome="succeeded")
+            )
+    finally:
+        alignment_guard.restore()
 
     if processed_shape is None:
         raise AssertionError("final depth scheduler produced no chunks")
@@ -1511,6 +1697,7 @@ def run_pose_conditioned_depth(
         tuple(chunk_records),
         tuple(contributions),
         tuple(attempts),
+        tuple(alignment_guard.fallbacks),
         output_dir,
         promote,
     )

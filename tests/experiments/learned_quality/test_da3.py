@@ -1370,6 +1370,90 @@ class _FinalPoseModel:
         return SimpleNamespace(**attributes)
 
 
+class GeometryException(Exception):
+    pass
+
+
+ImpostorGeometryException = type("GeometryException", (Exception,), {})
+
+
+def _install_evo_geometry_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = da3_module.importlib.import_module
+
+    def import_module(name: str) -> object:
+        if name == "evo.core.geometry":
+            return SimpleNamespace(GeometryException=GeometryException)
+        return original(name)
+
+    monkeypatch.setattr(da3_module.importlib, "import_module", import_module)
+
+
+class _RankDegenerateFinalPoseModel(_FinalPoseModel):
+    def __init__(self, *, alignment_error: BaseException | None = None) -> None:
+        super().__init__()
+        self.alignment_error = alignment_error or GeometryException(
+            "Degenerate covariance rank, Umeyama alignment is not possible"
+        )
+
+    def _align_to_input_extrinsics_intrinsics(
+        self,
+        extrinsics: object,
+        intrinsics: object,
+        prediction: object,
+        align_to_input_ext_scale: bool = True,
+        ransac_view_thresh: int = 10,
+    ) -> object:
+        del extrinsics, intrinsics, prediction
+        del align_to_input_ext_scale, ransac_view_thresh
+        raise self.alignment_error
+
+    def inference(self, **kwargs: object) -> object:
+        prediction = super().inference(**kwargs)
+        predicted_extrinsics = np.array(prediction.extrinsics, copy=True)
+        predicted_extrinsics[:, :3, 3] *= 2.0
+        prediction.extrinsics = predicted_extrinsics
+        return self._align_to_input_extrinsics_intrinsics(
+            np.asarray(kwargs["extrinsics"]),
+            np.asarray(kwargs["intrinsics"]),
+            prediction,
+            bool(kwargs["align_to_input_ext_scale"]),
+        )
+
+
+class _SuccessfulAlignedFinalPoseModel(_FinalPoseModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.alignment_calls: list[tuple[object, object, object, bool, int]] = []
+
+    def _align_to_input_extrinsics_intrinsics(
+        self,
+        extrinsics: object,
+        intrinsics: object,
+        prediction: object,
+        align_to_input_ext_scale: bool = True,
+        ransac_view_thresh: int = 10,
+    ) -> object:
+        self.alignment_calls.append(
+            (
+                extrinsics,
+                intrinsics,
+                prediction,
+                align_to_input_ext_scale,
+                ransac_view_thresh,
+            )
+        )
+        return prediction
+
+    def inference(self, **kwargs: object) -> object:
+        prediction = super().inference(**kwargs)
+        return self._align_to_input_extrinsics_intrinsics(
+            kwargs["extrinsics"],
+            kwargs["intrinsics"],
+            prediction,
+            bool(kwargs["align_to_input_ext_scale"]),
+        )
+
+
 def test_run_pose_conditioned_depth_uses_exact_official_conditioning_call(
     tmp_path: Path,
 ) -> None:
@@ -1424,6 +1508,161 @@ def test_run_pose_conditioned_depth_uses_exact_official_conditioning_call(
     assert result.artifacts[0].depth_path.name.endswith(".final_depth.npy")
     assert result.artifacts[0].confidence_path is not None
     assert result.artifacts[0].sky_path is None
+
+
+def test_run_pose_conditioned_depth_recovers_rank_degenerate_umeyama_scale(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_evo_geometry_exception(monkeypatch)
+    frames = _frames(tmp_path / "input", 3)
+    model = _RankDegenerateFinalPoseModel()
+
+    result = run_pose_conditioned_depth(
+        model,
+        frames,
+        _pose_cameras(frames),
+        tmp_path / "final-depth",
+        torch_module=_FakeTorch,
+    )
+
+    assert len(model.calls) == 1
+    np.testing.assert_array_equal(
+        np.load(result.artifacts[0].depth_path, allow_pickle=False),
+        np.full((2, 3), 5.0, dtype=np.float32),
+    )
+    metadata = json.loads(result.metadata_path.read_bytes())
+    assert metadata["alignment_fallbacks"] == [
+        {
+            "chunk_index": 0,
+            "scale": 2.0,
+            "source": "chunk_pairwise_median",
+        }
+    ]
+
+
+def test_run_pose_conditioned_depth_fails_closed_for_zero_spread_chunk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _install_evo_geometry_exception(monkeypatch)
+    frames = _frames(tmp_path / "input", 49)
+    cameras = list(_pose_cameras(frames))
+    for index, camera in enumerate(cameras):
+        w2c = np.asarray(camera.w2c).copy()
+        w2c[0, 3] = 0.0 if index == 0 else 1.0
+        cameras[index] = FinalPoseCamera(
+            image_name=camera.image_name,
+            frame_id=camera.frame_id,
+            width=camera.width,
+            height=camera.height,
+            w2c=tuple(tuple(float(value) for value in row) for row in w2c),
+            intrinsics=camera.intrinsics,
+        )
+    model = _RankDegenerateFinalPoseModel()
+
+    with pytest.raises(GeometryException) as raised:
+        run_pose_conditioned_depth(
+            model,
+            frames,
+            tuple(cameras),
+            tmp_path / "final-depth",
+            torch_module=_FakeTorch,
+        )
+
+    assert raised.value is model.alignment_error
+    assert len(model.calls) == 2
+    assert "_align_to_input_extrinsics_intrinsics" not in vars(model)
+    assert not (tmp_path / "final-depth").exists()
+
+
+def test_run_pose_conditioned_depth_preserves_successful_official_alignment(
+    tmp_path: Path,
+) -> None:
+    frames = _frames(tmp_path / "input", 3)
+    cameras = _pose_cameras(frames)
+    model = _SuccessfulAlignedFinalPoseModel()
+
+    result = run_pose_conditioned_depth(
+        model,
+        frames,
+        cameras,
+        tmp_path / "final-depth",
+        torch_module=_FakeTorch,
+    )
+
+    assert len(model.alignment_calls) == 1
+    extrinsics, intrinsics, prediction, align_scale, ransac_threshold = (
+        model.alignment_calls[0]
+    )
+    assert prediction is not None
+    assert align_scale is True
+    assert ransac_threshold == 10
+    np.testing.assert_array_equal(
+        extrinsics,
+        np.asarray([camera.w2c for camera in cameras]),
+    )
+    np.testing.assert_array_equal(
+        intrinsics,
+        np.asarray([camera.intrinsics for camera in cameras]),
+    )
+    np.testing.assert_array_equal(
+        np.load(result.artifacts[0].depth_path, allow_pickle=False),
+        np.full((2, 3), 10.0, dtype=np.float32),
+    )
+    assert json.loads(result.metadata_path.read_bytes())["alignment_fallbacks"] == []
+    assert "_align_to_input_extrinsics_intrinsics" not in vars(model)
+
+
+def test_run_pose_conditioned_depth_does_not_hide_other_alignment_errors(
+    tmp_path: Path,
+) -> None:
+    frames = _frames(tmp_path / "input", 3)
+    error = RuntimeError("alignment implementation failed")
+
+    model = _RankDegenerateFinalPoseModel(alignment_error=error)
+    with pytest.raises(RuntimeError) as raised:
+        run_pose_conditioned_depth(
+            model,
+            frames,
+            _pose_cameras(frames),
+            tmp_path / "final-depth",
+            torch_module=_FakeTorch,
+        )
+
+    assert raised.value is error
+    assert "_align_to_input_extrinsics_intrinsics" not in vars(model)
+    assert not (tmp_path / "final-depth").exists()
+
+
+@pytest.mark.parametrize(
+    "error",
+    (
+        ImpostorGeometryException(
+            "Degenerate covariance rank, Umeyama alignment is not possible"
+        ),
+        GeometryException("data matrices must have the same shape"),
+    ),
+)
+def test_run_pose_conditioned_depth_requires_exact_evo_degeneracy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+) -> None:
+    _install_evo_geometry_exception(monkeypatch)
+    frames = _frames(tmp_path / "input", 3)
+
+    with pytest.raises(type(error)) as raised:
+        run_pose_conditioned_depth(
+            _RankDegenerateFinalPoseModel(alignment_error=error),
+            frames,
+            _pose_cameras(frames),
+            tmp_path / "final-depth",
+            torch_module=_FakeTorch,
+        )
+
+    assert raised.value is error
+    assert not (tmp_path / "final-depth").exists()
 
 
 def test_run_pose_conditioned_depth_accepts_faithful_float32_camera_roundtrip(
