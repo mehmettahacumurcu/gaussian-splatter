@@ -784,6 +784,73 @@ def test_copy_verified_payload_runs_file_workers_concurrently(
     assert len(thread_ids) == 4
 
 
+def test_copy_verified_payload_observes_completed_batch_before_replenishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation, manifest, _expected = _published_parallel_payload(
+        tmp_path, file_count=3
+    )
+    barrier = threading.Barrier(2, timeout=3)
+    failure = RuntimeError("sentinel worker failure")
+    submitted: list[str] = []
+    payload_opens: list[Path] = []
+    real_worker = cache_module._copy_verified_file
+    real_executor = cache_module.ThreadPoolExecutor
+    real_open = Path.open
+    payload_root = (generation / "payload").resolve()
+
+    def controlled_worker(
+        source_root: Path,
+        target: Path,
+        row: cache_module._ManifestEntry,
+        cancellation: threading.Event,
+        progress: cache_module._RestoreProgress,
+    ) -> int:
+        barrier.wait()
+        if row.relative_path.name == "file-02.bin":
+            raise failure
+        return real_worker(source_root, target, row, cancellation, progress)
+
+    def record_executor(*args: object, **kwargs: object):
+        executor = real_executor(*args, **kwargs)
+        original_submit = executor.submit
+
+        def record_submit(*submit_args: object, **submit_kwargs: object):
+            row = submit_args[3]
+            assert isinstance(row, cache_module._ManifestEntry)
+            submitted.append(row.relative_path.as_posix())
+            return original_submit(*submit_args, **submit_kwargs)
+
+        executor.submit = record_submit
+        return executor
+
+    def complete_batch(futures: tuple[object, ...], **_kwargs: object):
+        for future in futures:
+            future.exception()  # type: ignore[union-attr]
+        return futures, frozenset()
+
+    def record_open(path: Path, *args: object, **kwargs: object):
+        candidate = Path(path).resolve()
+        if candidate.is_relative_to(payload_root):
+            payload_opens.append(candidate)
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(cache_module, "_copy_verified_file", controlled_worker)
+    monkeypatch.setattr(cache_module, "ThreadPoolExecutor", record_executor)
+    monkeypatch.setattr(cache_module, "wait", complete_batch)
+    monkeypatch.setattr(Path, "open", record_open)
+
+    with pytest.raises(RuntimeError) as raised:
+        cache_module._copy_verified_payload(
+            generation, tmp_path / "restored", manifest, max_workers=2
+        )
+
+    assert raised.value is failure
+    assert submitted == ["payload/group-0/file-00.bin", "payload/group-0/file-02.bin"]
+    assert payload_opens == [payload_root / "group-0" / "file-00.bin"]
+
+
 @pytest.mark.parametrize("corrupt_index", range(4))
 def test_copy_verified_payload_verifies_sha256_for_every_manifest_row(
     tmp_path: Path,
@@ -871,6 +938,68 @@ def test_copy_verified_payload_default_worker_count_is_four(
     cache_module._copy_verified_payload(generation, tmp_path / "restored", manifest)
 
     assert observed == [4]
+
+
+def test_copy_verified_payload_empty_manifest_creates_no_executor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation, manifest, _payloads = _published_parallel_payload(tmp_path, file_count=0)
+    observed: list[tuple[object, ...]] = []
+
+    def fail_executor(*args: object, **kwargs: object):
+        observed.append(args)
+        raise AssertionError("empty restore must not construct an executor")
+
+    monkeypatch.setattr(cache_module, "ThreadPoolExecutor", fail_executor)
+    destination = tmp_path / "restored"
+
+    cache_module._copy_verified_payload(generation, destination, manifest)
+
+    assert observed == []
+    assert destination.is_dir()
+
+
+def test_copy_verified_payload_rejects_prefix_conflict_before_payload_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "conflict-source"
+    source.mkdir()
+    (source / "conflict").write_bytes(b"payload")
+    store = LearnedCheckpointStore(tmp_path / "conflict-cache", input_identity="a" * 64)
+    generation = store.publish_generation(
+        CheckpointKind.COLMAP,
+        fingerprint="b" * 64,
+        run_id="prefix-conflict",
+        source_root=source,
+    )
+    manifest = json.loads((generation / "manifest.json").read_text(encoding="utf-8"))
+    manifest["files"].append(
+        {
+            "relative_path": "payload/conflict/child.bin",
+            "size_bytes": 0,
+            "sha256": "0" * 64,
+        }
+    )
+    payload_root = (generation / "payload").resolve()
+    payload_opens: list[Path] = []
+    original_open = Path.open
+
+    def record_open(path: Path, *args: object, **kwargs: object):
+        candidate = Path(path).resolve()
+        if candidate.is_relative_to(payload_root):
+            payload_opens.append(candidate)
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", record_open)
+
+    with pytest.raises(ValueError, match="file/directory conflict"):
+        cache_module._copy_verified_payload(
+            generation, tmp_path / "restored", manifest
+        )
+
+    assert payload_opens == []
 
 
 def test_copy_verified_payload_one_worker_preserves_single_pass_semantics(
@@ -977,29 +1106,25 @@ def test_copy_verified_payload_progress_is_serialized_monotonic_and_completes_on
 ) -> None:
     generation, manifest, _payloads = _published_parallel_payload(tmp_path, file_count=4)
     monkeypatch.setattr(cache_module, "_RESTORE_PROGRESS_STEP_BYTES", 8)
-    observed: list[int] = []
-    original_add_verified = cache_module._RestoreProgress.add_verified
     output: list[str] = []
-
-    def record_progress(self: object, byte_count: int) -> None:
-        original_add_verified(self, byte_count)
-        observed.append(self._verified_bytes)  # type: ignore[attr-defined]
 
     def record_print(*args: object, **kwargs: object) -> None:
         output.append(" ".join(str(arg) for arg in args))
 
-    monkeypatch.setattr(cache_module._RestoreProgress, "add_verified", record_progress)
     monkeypatch.setattr("builtins.print", record_print)
 
     cache_module._copy_verified_payload(
         generation, tmp_path / "restored", manifest, max_workers=4
     )
 
-    assert observed == sorted(observed)
-    assert len(set(observed)) == len(observed)
-    assert observed[-1] == 32
-    assert sum("Streaming" in line for line in output) == 1
-    assert output[-1] == "[CACHE RESTORE] Verified streaming copy complete."
+    assert output == [
+        "[CACHE RESTORE] Streaming 4 files with 4 workers (0.00 GiB) from Drive...",
+        "[CACHE RESTORE] 8/32 bytes verified (0.00/0.00 GiB)",
+        "[CACHE RESTORE] 16/32 bytes verified (0.00/0.00 GiB)",
+        "[CACHE RESTORE] 24/32 bytes verified (0.00/0.00 GiB)",
+        "[CACHE RESTORE] 32/32 bytes verified (0.00/0.00 GiB)",
+        "[CACHE RESTORE] Verified streaming copy complete.",
+    ]
 
 
 def test_restore_milestone_interrupt_cleans_destination_and_reraises(

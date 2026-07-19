@@ -1910,8 +1910,9 @@ class _RestoreProgress:
             self._verified_bytes += byte_count
             while self._verified_bytes >= self._next_report:
                 print(
-                    f"[CACHE RESTORE] {self._next_report / (1024**3):.2f}/"
-                    f"{self._total_bytes / (1024**3):.2f} GiB verified",
+                    f"[CACHE RESTORE] {self._next_report}/{self._total_bytes} "
+                    f"bytes verified ({self._next_report / (1024**3):.2f}/"
+                    f"{self._total_bytes / (1024**3):.2f} GiB)",
                     flush=True,
                 )
                 self._next_report += _RESTORE_PROGRESS_STEP_BYTES
@@ -2027,24 +2028,24 @@ def _copy_verified_payload(
                         if first_error is None:
                             first_error = error
                             cancellation.set()
-                    if first_error is None:
-                        try:
-                            row = next(rows_iter)
-                        except StopIteration:
-                            continue
-                        replacement = executor.submit(
-                            _copy_verified_file,
-                            source_root,
-                            target,
-                            row,
-                            cancellation,
-                            progress,
-                        )
-                        active[replacement] = row
                 if first_error is not None:
                     for future in active:
                         future.cancel()
                     break
+                for _ in completed:
+                    try:
+                        row = next(rows_iter)
+                    except StopIteration:
+                        break
+                    replacement = executor.submit(
+                        _copy_verified_file,
+                        source_root,
+                        target,
+                        row,
+                        cancellation,
+                        progress,
+                    )
+                    active[replacement] = row
     if first_error is not None:
         raise first_error
     expected_metadata = tuple(
