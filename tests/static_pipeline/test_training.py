@@ -23,6 +23,7 @@ from backend.static_pipeline.contracts import (
 )
 from backend.static_pipeline.training import (
     PreparedTrainingInput,
+    ReconstructionValidation,
     TrainingResult,
     run_validated_training,
 )
@@ -215,6 +216,44 @@ def test_gate_failure_precedes_runner_and_data_root_mutation(tmp_path: Path) -> 
     assert runner.calls == []
     assert not prepared.data_root.exists()
     assert "FOURDGS_DATA_ROOT" not in os.environ
+
+
+def test_explicit_reconstruction_validator_may_accept_a_recorded_failed_gate(
+    tmp_path: Path,
+) -> None:
+    prepared = _prepared(tmp_path)
+    failed = replace(
+        prepared.reconstruction.decision,
+        passed=False,
+        failures=("registered_ratio",),
+    )
+    prepared = replace(
+        prepared,
+        reconstruction=replace(
+            prepared.reconstruction,
+            decision=failed,
+            decisions=(failed,),
+        ),
+    )
+    validations: list[ReconstructionValidation] = []
+
+    def accept_recorded_recovery(validation: ReconstructionValidation) -> None:
+        validations.append(validation)
+        assert validation.prepared is prepared
+        assert validation.manifest is prepared.reconstruction.selected_manifest
+        assert set(validation.model_hashes) == set(_MODEL_FILES)
+
+    runner = RecordingRunner()
+    result = run_validated_training(
+        prepared,
+        _spec(),
+        pipeline_runner=runner,
+        reconstruction_validator=accept_recorded_recovery,
+    )
+
+    assert result.raw_ply_path.is_file()
+    assert len(validations) == 1
+    assert len(runner.calls) == 1
 
 
 def test_success_copies_exact_validated_inputs_binds_root_and_calls_legacy_runner(

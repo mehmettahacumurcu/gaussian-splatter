@@ -20,6 +20,8 @@ from PIL import Image
 from backend.static_pipeline.training import (
     PipelineRunner,
     PreparedTrainingInput,
+    ReconstructionValidation,
+    ReconstructionValidator,
     TrainingResult,
     run_validated_training,
 )
@@ -31,6 +33,7 @@ from .contracts import (
     LearnedTrainingOutput,
 )
 from .density import AdaptiveDensityController
+from .geometry import evaluate_output_first_checks
 
 
 _MODEL_FILES = ("cameras.txt", "images.txt", "points3D.txt")
@@ -510,6 +513,42 @@ def make_experiment_pipeline_runner(
     )
 
 
+def make_output_first_reconstruction_validator(
+    reconstruction: LearnedReconstructionOutput,
+) -> ReconstructionValidator:
+    acceptance = reconstruction.acceptance
+    if acceptance is None:
+        raise ValueError("output-first training requires a geometry acceptance")
+    if (
+        acceptance.policy_version != "output-first-v1"
+        or acceptance.mode != "best_effort"
+    ):
+        raise ValueError("output-first training requires best-effort output-first-v1")
+
+    def validate(validation: ReconstructionValidation) -> None:
+        if validation.prepared.reconstruction != reconstruction.bundle:
+            raise ValueError("training reconstruction differs from its acceptance")
+        if validation.manifest != reconstruction.selected_manifest:
+            raise ValueError("training manifest differs from its acceptance")
+        if (
+            validation.prepared.selection_digest != acceptance.selection_digest
+            or validation.manifest.image_set_digest != acceptance.selection_digest
+        ):
+            raise ValueError("training selection differs from its acceptance")
+        if dict(validation.model_hashes) != dict(acceptance.model_hashes):
+            raise ValueError("training model hashes differ from their acceptance")
+        current = validation.current_decision
+        if current.passed or current.failures != acceptance.strict_failures:
+            raise ValueError("training strict failures differ from their acceptance")
+        if current.dominant != acceptance.metrics:
+            raise ValueError("training geometry metrics differ from their acceptance")
+        checks = evaluate_output_first_checks(current)
+        if dict(checks) != dict(acceptance.checks) or not all(checks.values()):
+            raise ValueError("training guard checks differ from their acceptance")
+
+    return validate
+
+
 def run_learned_training(
     prepared: PreparedTrainingInput,
     spec: object,
@@ -528,12 +567,18 @@ def run_learned_training(
         pipeline_runner=pipeline_runner,
         density_factory=density_factory,
     )
-    result = validated_training_runner(
-        prepared,
-        spec,
-        source_long_edge=source_long_edge,
-        pipeline_runner=experiment_runner,
-    )
+    training_kwargs: dict[str, object] = {
+        "source_long_edge": source_long_edge,
+        "pipeline_runner": experiment_runner,
+    }
+    if (
+        reconstruction.acceptance is not None
+        and reconstruction.acceptance.mode == "best_effort"
+    ):
+        training_kwargs["reconstruction_validator"] = (
+            make_output_first_reconstruction_validator(reconstruction)
+        )
+    result = validated_training_runner(prepared, spec, **training_kwargs)
     if experiment_runner.density_history_path is None:
         raise RuntimeError("learned density history was not persisted")
     return LearnedTrainingOutput(

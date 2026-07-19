@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,10 +9,22 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from experiments.learned_quality.contracts import FrameArtifact, LearnedArtifacts
+from backend.static_pipeline.contracts import GateDecision
+from backend.static_pipeline.training import ReconstructionValidation
+from experiments.learned_quality.contracts import (
+    FrameArtifact,
+    GeometryAcceptance,
+    LearnedArtifacts,
+    LearnedReconstructionOutput,
+)
 from experiments.learned_quality.density import AdaptiveDensityController
-from experiments.learned_quality.training import make_experiment_pipeline_runner
+from experiments.learned_quality.geometry import evaluate_output_first_checks
+from experiments.learned_quality.training import (
+    make_experiment_pipeline_runner,
+    make_output_first_reconstruction_validator,
+)
 from tests.static_pipeline.fixtures import write_colmap_text_model
+from tests.static_pipeline.test_training import _prepared
 
 
 def _sha(path: Path) -> str:
@@ -118,6 +131,77 @@ def _fixture(tmp_path: Path, *, photometric_decision: str = "accepted"):
     for name in ("cameras.txt", "images.txt", "points3D.txt"):
         (scene_model / name).write_bytes((model / name).read_bytes())
     return artifacts, model, scene, tuple(originals), tuple(corrected)
+
+
+def test_output_first_training_validator_requires_exact_acceptance_join(
+    tmp_path: Path,
+) -> None:
+    prepared = _prepared(tmp_path)
+    model_dir = prepared.reconstruction.accepted_model_dir
+    metrics = replace(
+        prepared.reconstruction.decision.dominant,
+        model_dir=model_dir,
+        registered_count=658,
+        registered_ratio=0.8225,
+        registered_share=1.0,
+        temporal_coverage_s=99.0,
+        max_interior_gap_s=9.59,
+        start_gap_s=0.0,
+        end_gap_s=0.0,
+        median_reprojection_error_px=1.217,
+        p95_reprojection_error_px=2.194,
+        median_track_length=5.0,
+        sparse_point_count=65_367,
+        valid_names_intrinsics_and_poses=True,
+    )
+    decision = GateDecision(
+        passed=False,
+        dominant=metrics,
+        failures=("registered_ratio", "interior_gap", "median_reprojection"),
+        uncovered_intervals=(),
+        retry_recommended=True,
+    )
+    bundle = replace(
+        prepared.reconstruction,
+        decision=decision,
+        decisions=(decision,),
+    )
+    prepared = replace(prepared, reconstruction=bundle)
+    model_hashes = {
+        name: _sha(model_dir / name)
+        for name in ("cameras.txt", "images.txt", "points3D.txt")
+    }
+    acceptance = GeometryAcceptance(
+        policy_version="output-first-v1",
+        mode="best_effort",
+        selection_digest=prepared.selection_digest,
+        model_hashes=model_hashes,
+        strict_failures=decision.failures,
+        metrics=metrics,
+        checks=evaluate_output_first_checks(decision),
+        colmap_fingerprint="b" * 64,
+    )
+    reconstruction = LearnedReconstructionOutput(
+        bundle=bundle,
+        frames_dir=prepared.frames_dir,
+        artifacts=LearnedArtifacts(),
+        geometry_candidates=(),
+        acceptance=acceptance,
+    )
+    validation = ReconstructionValidation(
+        prepared=prepared,
+        manifest=bundle.selected_manifest,
+        current_decision=decision,
+        model_hashes=model_hashes,
+    )
+    validator = make_output_first_reconstruction_validator(reconstruction)
+
+    validator(validation)
+
+    mutated = dict(model_hashes)
+    mutated["images.txt"] = "0" * 64
+    with pytest.raises(ValueError, match="model hashes"):
+        validator(replace(validation, model_hashes=mutated))
 
 
 def test_runner_installs_evidence_only_inside_training_scene(tmp_path: Path) -> None:

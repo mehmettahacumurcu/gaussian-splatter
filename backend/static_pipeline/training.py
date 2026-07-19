@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .contracts import ReconstructionBundle, SelectionManifest
+from .contracts import GateDecision, ReconstructionBundle, SelectionManifest
 
 if TYPE_CHECKING:
     from backend.notebooks.models import StaticNotebookRunSpec
@@ -60,6 +60,17 @@ class _ValidatedInputs:
 
 
 PipelineRunner = Callable[..., Mapping[str, object]]
+
+
+@dataclass(frozen=True)
+class ReconstructionValidation:
+    prepared: PreparedTrainingInput
+    manifest: SelectionManifest
+    current_decision: GateDecision
+    model_hashes: Mapping[str, str]
+
+
+ReconstructionValidator = Callable[[ReconstructionValidation], None]
 
 
 def _is_sha256(value: object) -> bool:
@@ -129,10 +140,6 @@ def _validate_manifest(
     prepared: PreparedTrainingInput,
 ) -> tuple[SelectionManifest, tuple[tuple[Path, str, str], ...]]:
     reconstruction = prepared.reconstruction
-    decision = reconstruction.decision
-    if not decision.passed or decision.failures:
-        raise ValueError("training requires a passing reconstruction decision")
-
     manifest = reconstruction.selected_manifest
     if manifest.schema_version != 1:
         raise ValueError("selection manifest must use schema version 1")
@@ -179,7 +186,26 @@ def _validate_manifest(
     return manifest, tuple(frame_sources)
 
 
-def _validate_inputs(prepared: PreparedTrainingInput) -> _ValidatedInputs:
+def _strict_reconstruction_validator(
+    validation: ReconstructionValidation,
+) -> None:
+    recorded = validation.prepared.reconstruction.decision
+    if not recorded.passed or recorded.failures:
+        raise ValueError("training requires a passing reconstruction decision")
+    current = validation.current_decision
+    if not current.passed:
+        failures = ", ".join(current.failures) or "unknown"
+        raise ValueError(
+            "accepted COLMAP model no longer passes the reconstruction gate: "
+            f"{failures}"
+        )
+
+
+def _validate_inputs(
+    prepared: PreparedTrainingInput,
+    *,
+    reconstruction_validator: ReconstructionValidator | None = None,
+) -> _ValidatedInputs:
     run_id = _require_safe_component(prepared.run_id, "run_id")
     scene_name = _require_safe_component(prepared.scene_name, "scene_name")
     if run_id != prepared.run_id or scene_name != prepared.scene_name:
@@ -206,12 +232,14 @@ def _validate_inputs(prepared: PreparedTrainingInput) -> _ValidatedInputs:
         raise ValueError(
             "accepted COLMAP model no longer passes the reconstruction gate"
         ) from exc
-    if not current_decision.passed:
-        failures = ", ".join(current_decision.failures) or "unknown"
-        raise ValueError(
-            "accepted COLMAP model no longer passes the reconstruction gate: "
-            f"{failures}"
-        )
+    validation = ReconstructionValidation(
+        prepared=prepared,
+        manifest=manifest,
+        current_decision=current_decision,
+        model_hashes={name: digest for _source, name, digest in model_sources},
+    )
+    validator = reconstruction_validator or _strict_reconstruction_validator
+    validator(validation)
 
     raw_data_root = Path(prepared.data_root)
     if os.path.lexists(raw_data_root):
@@ -293,8 +321,12 @@ def run_validated_training(
     *,
     source_long_edge: int | None = None,
     pipeline_runner: PipelineRunner | None = None,
+    reconstruction_validator: ReconstructionValidator | None = None,
 ) -> TrainingResult:
-    validated = _validate_inputs(prepared)
+    validated = _validate_inputs(
+        prepared,
+        reconstruction_validator=reconstruction_validator,
+    )
     native_image_size = _accepted_native_image_size(validated)
 
     os.environ["FOURDGS_DATA_ROOT"] = str(validated.data_root)
