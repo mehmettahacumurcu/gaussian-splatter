@@ -21,6 +21,7 @@ from experiments.learned_quality.contracts import (
     FrameArtifact,
     GeometryCandidateReport,
     LearnedArtifacts,
+    MODEL_TEXT_FILES,
 )
 from experiments.learned_quality.da3 import (
     AnchorInferenceResult,
@@ -31,9 +32,12 @@ from experiments.learned_quality.da3 import (
 from experiments.learned_quality.geometry import (
     GeometryComparisonError,
     HybridGeometryInputs,
+    OutputFirstGeometryError,
     PycolmapHybridBackend,
     _rotation_matrix_to_qvec,
+    accept_output_first_geometry,
     closest_failure_key,
+    evaluate_output_first_checks,
     focal_refinement_is_safe,
     geometry_frame_set_digest,
     make_classical_candidate_runner,
@@ -220,6 +224,176 @@ def _candidate(
         frame_set_digest="d" * 64,
         covered_endpoint_count=2,
     )
+
+
+def _output_first_metrics(
+    model_dir: Path,
+    manifest: SelectionManifest,
+    **changes: object,
+) -> ModelMetrics:
+    metrics = _metrics(
+        model_dir,
+        manifest,
+        registered_ratio=0.80,
+        registered_count=80,
+        registered_share=0.95,
+        max_interior_gap_s=10.0,
+        start_gap_s=1.0,
+        end_gap_s=1.0,
+        median_error=1.5,
+        p95_error=2.5,
+        median_track=3.0,
+        sparse_points=10_000,
+    )
+    return dataclasses.replace(metrics, **changes)
+
+
+@pytest.mark.parametrize(
+    ("field", "outside"),
+    [
+        ("registered_ratio", 0.799999),
+        ("registered_share", 0.949999),
+        ("max_interior_gap_s", 10.000001),
+        ("start_gap_s", 1.000001),
+        ("end_gap_s", 1.000001),
+        ("median_reprojection_error_px", 1.500001),
+        ("p95_reprojection_error_px", 2.500001),
+        ("median_track_length", 2.999999),
+        ("sparse_point_count", 9_999),
+    ],
+)
+def test_output_first_thresholds_are_inclusive(
+    tmp_path: Path,
+    field: str,
+    outside: float | int,
+) -> None:
+    manifest = _manifest(100)
+    boundary = _decision(
+        _output_first_metrics(tmp_path / "model", manifest),
+        passed=False,
+        failures=("registered_ratio", "interior_gap", "median_reprojection"),
+    )
+    rejected = dataclasses.replace(
+        boundary,
+        dominant=dataclasses.replace(boundary.dominant, **{field: outside}),
+    )
+
+    assert all(evaluate_output_first_checks(boundary).values())
+    assert not all(evaluate_output_first_checks(rejected).values())
+
+
+def test_output_first_requires_valid_model_and_only_waives_named_failures(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(100)
+    metrics = _output_first_metrics(tmp_path / "model", manifest)
+    unapproved = _decision(
+        metrics,
+        passed=False,
+        failures=("dominant_component",),
+    )
+    invalid = dataclasses.replace(
+        unapproved,
+        failures=("registered_ratio",),
+        dominant=dataclasses.replace(
+            metrics,
+            valid_names_intrinsics_and_poses=False,
+        ),
+    )
+
+    assert evaluate_output_first_checks(unapproved)[
+        "strict_failures_are_waivable"
+    ] is False
+    assert evaluate_output_first_checks(invalid)["model_validity"] is False
+
+
+def test_known_round0_shape_is_best_effort_without_rewriting_strict_failure(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(800)
+    frames = _artifacts(tmp_path / "frames", manifest)
+    attempt = _attempt(tmp_path / "attempt", "classical")
+    model = attempt.model_dirs[0]
+    for name in MODEL_TEXT_FILES:
+        (model / name).write_text(f"{name}\n", encoding="utf-8")
+    room_metrics = _metrics(
+        model,
+        manifest,
+        registered_ratio=658 / 800,
+        registered_count=658,
+        registered_share=1.0,
+        max_interior_gap_s=9.59,
+        median_error=1.217,
+        p95_error=2.194,
+        median_track=5.0,
+        sparse_points=65_367,
+    )
+    strict = _decision(
+        room_metrics,
+        passed=False,
+        failures=("registered_ratio", "interior_gap", "median_reprojection"),
+        retry=True,
+    )
+
+    def publish(source: Path, target: Path) -> Path:
+        target.mkdir(parents=True)
+        for name in MODEL_TEXT_FILES:
+            (target / name).write_bytes((source / name).read_bytes())
+        return target
+
+    bundle, candidates, acceptance = accept_output_first_geometry(
+        manifest,
+        frames,
+        attempt,
+        output_root=tmp_path / "geometry",
+        checkpoint_fingerprint="c" * 64,
+        measure_models_fn=lambda paths, current: (room_metrics,),
+        evaluate_fn=lambda measured, current, index: strict,
+        publish_model_fn=publish,
+    )
+
+    assert bundle.decision is strict
+    assert bundle.decision.passed is False
+    assert acceptance.mode == "best_effort"
+    assert acceptance.policy_version == "output-first-v1"
+    assert acceptance.strict_failures == strict.failures
+    assert acceptance.metrics == dataclasses.replace(
+        room_metrics,
+        model_dir=bundle.accepted_model_dir,
+    )
+    assert acceptance.colmap_fingerprint == "c" * 64
+    assert candidates[0].candidate_id == "classical"
+
+
+def test_output_first_rejects_unapproved_failure_without_publishing(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(100)
+    frames = _artifacts(tmp_path / "frames", manifest)
+    attempt = _attempt(tmp_path / "attempt", "classical")
+    metrics = _output_first_metrics(attempt.model_dirs[0], manifest)
+    strict = _decision(
+        metrics,
+        passed=False,
+        failures=("dominant_component",),
+    )
+
+    with pytest.raises(OutputFirstGeometryError) as captured:
+        accept_output_first_geometry(
+            manifest,
+            frames,
+            attempt,
+            output_root=tmp_path / "geometry",
+            checkpoint_fingerprint="c" * 64,
+            measure_models_fn=lambda paths, current: (metrics,),
+            evaluate_fn=lambda measured, current, index: strict,
+            publish_model_fn=lambda source, target: pytest.fail(
+                "failed guarded geometry must not publish"
+            ),
+        )
+
+    assert captured.value.strict_failures == ("dominant_component",)
+    assert "strict_failures_are_waivable" in captured.value.guarded_failures
 
 
 def test_winner_key_is_exact(tmp_path: Path) -> None:

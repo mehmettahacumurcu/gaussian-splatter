@@ -4,9 +4,10 @@ import hashlib
 import json
 import math
 import os
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
+from types import MappingProxyType
 from typing import Literal, Protocol
 
 import numpy as np
@@ -30,9 +31,11 @@ from backend.static_pipeline.reconstruction import (
 
 from .contracts import (
     FrameArtifact,
+    GeometryAcceptance,
     GeometryCandidateReport,
     LearnedArtifacts,
     LearnedReconstructionOutput,
+    MODEL_TEXT_FILES,
 )
 from .da3 import AnchorInferenceResult, CameraRecord, PinholeCamera
 from .masks import MaskFusionEvidence
@@ -111,6 +114,95 @@ class GeometryComparisonError(RuntimeError):
             "all geometry candidates failed; closest candidate "
             f"{closest_candidate.candidate_id} failed: {failures}"
         )
+
+
+class OutputFirstGeometryError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        candidates: tuple[GeometryCandidateReport, ...],
+        strict_failures: tuple[str, ...],
+        guarded_failures: tuple[str, ...],
+    ) -> None:
+        self.candidates = candidates
+        self.strict_failures = strict_failures
+        self.guarded_failures = guarded_failures
+        super().__init__(message)
+
+
+OUTPUT_FIRST_ALLOWED_FAILURES = frozenset(
+    {"registered_ratio", "interior_gap", "median_reprojection"}
+)
+
+
+def evaluate_output_first_checks(decision: GateDecision) -> Mapping[str, bool]:
+    if not isinstance(decision, GateDecision):
+        raise ValueError("decision must be a GateDecision")
+    metrics = decision.dominant
+    if not isinstance(metrics, ModelMetrics):
+        raise ValueError("decision dominant must be ModelMetrics")
+    registered_ratio = _finite(metrics.registered_ratio, "registered_ratio")
+    registered_share = _finite(metrics.registered_share, "registered_share")
+    max_gap = _finite(metrics.max_interior_gap_s, "max_interior_gap_s")
+    start_gap = _finite(metrics.start_gap_s, "start_gap_s")
+    end_gap = _finite(metrics.end_gap_s, "end_gap_s")
+    median_error = _finite(
+        metrics.median_reprojection_error_px,
+        "median_reprojection_error_px",
+    )
+    p95_error = _finite(
+        metrics.p95_reprojection_error_px,
+        "p95_reprojection_error_px",
+    )
+    median_track = _finite(metrics.median_track_length, "median_track_length")
+    if type(metrics.sparse_point_count) is not int:
+        raise ValueError("sparse_point_count must be a plain integer")
+    if type(metrics.valid_names_intrinsics_and_poses) is not bool:
+        raise ValueError("model validity must be a plain boolean")
+    failures = decision.failures
+    if type(failures) is not tuple or any(
+        not isinstance(failure, str) or not failure for failure in failures
+    ):
+        raise ValueError("strict failures must be a tuple of non-empty names")
+    return MappingProxyType(
+        {
+            "registered_ratio": registered_ratio >= 0.80,
+            "registered_share": registered_share >= 0.95,
+            "interior_gap": max_gap <= 10.0,
+            "start_gap": start_gap <= 1.0,
+            "end_gap": end_gap <= 1.0,
+            "median_reprojection": median_error <= 1.5,
+            "p95_reprojection": p95_error <= 2.5,
+            "median_track_length": median_track >= 3.0,
+            "sparse_point_count": metrics.sparse_point_count >= 10_000,
+            "model_validity": metrics.valid_names_intrinsics_and_poses,
+            "strict_failures_are_waivable": bool(failures)
+            and set(failures) <= OUTPUT_FIRST_ALLOWED_FAILURES,
+        }
+    )
+
+
+def _output_first_rank(candidate: GeometryCandidateReport) -> tuple[object, ...]:
+    metrics = candidate.decision.dominant
+    return (
+        candidate.covered_endpoint_count,
+        -_finite(metrics.max_interior_gap_s, "max_interior_gap_s"),
+        metrics.registered_count,
+        -_finite(
+            metrics.median_reprojection_error_px,
+            "median_reprojection_error_px",
+        ),
+        -_finite(metrics.p95_reprojection_error_px, "p95_reprojection_error_px"),
+        _finite(metrics.median_track_length, "median_track_length"),
+        metrics.sparse_point_count,
+    )
+
+
+def _model_text_hashes(model_dir: Path) -> Mapping[str, str]:
+    return MappingProxyType(
+        {name: _sha256_path(model_dir / name) for name in MODEL_TEXT_FILES}
+    )
 
 
 def _finite(value: object, label: str) -> float:
@@ -1000,6 +1092,105 @@ def _raise_all_failed(
         raise AssertionError("all-failed path requires failed candidates")
     closest = min(failed, key=closest_failure_key)
     raise GeometryComparisonError(candidates, closest)
+
+
+def accept_output_first_geometry(
+    manifest: SelectionManifest,
+    frames: tuple[FrameArtifact, ...],
+    restored_attempt: ColmapAttempt,
+    *,
+    output_root: Path,
+    checkpoint_fingerprint: str,
+    measure_models_fn: MeasureModels = measure_models,
+    evaluate_fn: EvaluateCandidate = evaluate_reconstruction,
+    publish_model_fn: PublishModel = _publish_validated_model,
+) -> tuple[
+    ReconstructionBundle,
+    tuple[GeometryCandidateReport, ...],
+    GeometryAcceptance,
+]:
+    if not isinstance(output_root, Path) or not output_root.is_absolute():
+        raise ValueError("output_root must be an absolute Path")
+    if output_root.resolve(strict=False) != output_root:
+        raise ValueError("output_root must be canonical")
+    if os.path.lexists(output_root):
+        raise FileExistsError(output_root)
+    if not output_root.parent.is_dir() or output_root.parent.is_symlink():
+        raise ValueError("output_root parent must be an existing regular directory")
+    frame_set_digest, _frames_root = _validate_frame_set(manifest, frames)
+    _validate_attempt(restored_attempt, restored_attempt.root)
+    measured = tuple(measure_models_fn(restored_attempt.model_dirs, manifest))
+    if not measured or any(not isinstance(model, ModelMetrics) for model in measured):
+        raise ValueError("restored COLMAP measurement returned no valid models")
+    output_root.mkdir()
+
+    candidates: list[GeometryCandidateReport] = []
+    accepted: list[
+        tuple[GeometryCandidateReport, Mapping[str, bool], str]
+    ] = []
+    for metrics in measured:
+        decision = evaluate_fn((metrics,), manifest, 1)
+        if not isinstance(decision, GateDecision) or decision.dominant is not metrics:
+            raise ValueError("restored COLMAP evaluation returned an invalid decision")
+        candidate = GeometryCandidateReport(
+            candidate_id="classical",
+            attempt=restored_attempt,
+            decision=decision,
+            model_dir=metrics.model_dir,
+            selected_manifest=manifest,
+            frame_set_digest=frame_set_digest,
+            covered_endpoint_count=_covered_endpoint_count(manifest, metrics),
+        )
+        candidates.append(candidate)
+        checks = evaluate_output_first_checks(decision)
+        if decision.passed and not decision.failures:
+            accepted.append((candidate, checks, "strict"))
+        elif all(checks.values()):
+            accepted.append((candidate, checks, "best_effort"))
+
+    all_candidates = tuple(candidates)
+    if not accepted:
+        closest = max(all_candidates, key=_output_first_rank)
+        checks = evaluate_output_first_checks(closest.decision)
+        raise OutputFirstGeometryError(
+            "restored Round 0 COLMAP model failed output-first-v1",
+            candidates=all_candidates,
+            strict_failures=closest.decision.failures,
+            guarded_failures=tuple(
+                name for name, passed in checks.items() if not passed
+            ),
+        )
+
+    winner, checks, acceptance_mode = max(
+        accepted,
+        key=lambda item: _output_first_rank(item[0]),
+    )
+    accepted_model = publish_model_fn(
+        winner.model_dir,
+        output_root / "validated",
+    )
+    if not isinstance(accepted_model, Path) or not accepted_model.is_absolute():
+        raise ValueError("published output-first model must be an absolute Path")
+    acceptance = GeometryAcceptance(
+        policy_version=(
+            "strict-v1" if acceptance_mode == "strict" else "output-first-v1"
+        ),
+        mode=acceptance_mode,
+        selection_digest=manifest.image_set_digest,
+        model_hashes=_model_text_hashes(accepted_model),
+        strict_failures=winner.decision.failures,
+        metrics=replace(winner.decision.dominant, model_dir=accepted_model),
+        checks=checks,
+        colmap_fingerprint=checkpoint_fingerprint,
+    )
+    bundle = ReconstructionBundle(
+        selected_manifest=manifest,
+        accepted_model_dir=accepted_model,
+        decision=winner.decision,
+        attempts=(restored_attempt,),
+        decisions=tuple(candidate.decision for candidate in all_candidates),
+    )
+    return bundle, all_candidates, acceptance
 
 
 def run_geometry_comparison(
