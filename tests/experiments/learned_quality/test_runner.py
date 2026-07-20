@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +11,12 @@ from backend.static_pipeline.runner import (
     HardwareInfo,
     NotebookRuntimePaths,
     SelectionOutput,
+)
+from experiments.learned_quality.contracts import (
+    GeometryAcceptance,
+    LearnedArtifacts,
+    LearnedReconstructionOutput,
+    MODEL_TEXT_FILES,
 )
 from backend.static_pipeline.progress import StageReporter
 from experiments.learned_quality.contracts import (
@@ -92,6 +100,173 @@ def test_service_composition_keeps_production_boundaries_and_replaces_learned_on
     assert services.publish_diagnostics is not sentinel.publish_diagnostics
     assert services.restore_pretraining is None
     assert services.save_pretraining is None
+
+
+def _best_effort_reconstruction(tmp_path: Path) -> LearnedReconstructionOutput:
+    from tests.static_pipeline.test_training import _prepared
+
+    tmp_path.mkdir(parents=True)
+    prepared = _prepared(tmp_path)
+    decision = replace(
+        prepared.reconstruction.decision,
+        passed=False,
+        failures=("registered_ratio", "interior_gap", "median_reprojection"),
+        retry_recommended=True,
+    )
+    bundle = replace(prepared.reconstruction, decision=decision)
+    acceptance = GeometryAcceptance(
+        policy_version="output-first-v1",
+        mode="best_effort",
+        selection_digest=bundle.selected_manifest.image_set_digest,
+        model_hashes={name: "a" * 64 for name in MODEL_TEXT_FILES},
+        strict_failures=decision.failures,
+        metrics=decision.dominant,
+        checks={"guarded": True},
+        colmap_fingerprint="b" * 64,
+    )
+    return LearnedReconstructionOutput(
+        bundle=bundle,
+        frames_dir=prepared.frames_dir,
+        artifacts=LearnedArtifacts(),
+        geometry_candidates=(),
+        acceptance=acceptance,
+    )
+
+
+def test_round0_recovery_keeps_raw_ply_and_proxies_metadata_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.static_pipeline import runner as static_runner
+
+    metadata_calls: list[object] = []
+
+    def strict_polish(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("best-effort recovery must not call strict production polish")
+
+    def metadata(*_args: object, **kwargs: object) -> object:
+        reconstruction = kwargs["reconstruction"]
+        metadata_calls.append(reconstruction)
+        assert reconstruction.decision.passed is True
+        assert reconstruction.decision.failures == ()
+        return "metadata"
+
+    production = SimpleNamespace(
+        discover_source=object(),
+        copy_input=object(),
+        select_frames=object(),
+        reconstruct=object(),
+        train=object(),
+        polish=strict_polish,
+        build_metadata_preview=metadata,
+        validate_bundle=object(),
+        publish_result=object(),
+        publish_diagnostics=object(),
+        inspect_hardware=object(),
+        preflight=object(),
+        assemble_reports=object(),
+        resolve_input=object(),
+    )
+    monkeypatch.setattr(static_runner, "_production_services", lambda: production)
+    raw = tmp_path / "raw.ply"
+    raw.write_bytes(b"ply")
+    monkeypatch.setattr(
+        "backend.static_pipeline.polish.validate_static_ply",
+        lambda path: SimpleNamespace(path=Path(path), count=736_632),
+    )
+    reconstruction = _best_effort_reconstruction(tmp_path / "reconstruction")
+    services = make_learned_quality_services(
+        LearnedQualityContext(lambda *_args, **_kwargs: None, tmp_path / "models.json"),
+        recovery_mode="round0_output_first_v1",
+    )
+
+    report = services.polish(
+        SimpleNamespace(raw_ply_path=raw),
+        reconstruction=reconstruction,
+        spec=object(),
+        selection=object(),
+        output_root=tmp_path / "polish",
+    )
+    metadata_result = services.build_metadata_preview(
+        report,
+        reconstruction=reconstruction,
+        spec=object(),
+        output_root=tmp_path / "metadata",
+    )
+
+    assert report.accepted is False
+    assert report.selected_path == raw
+    assert report.original_count == 736_632
+    assert report.kept_count == 736_632
+    assert report.reasons == ("best_effort_geometry_raw_fallback",)
+    assert metadata_result == "metadata"
+    assert len(metadata_calls) == 1
+    assert reconstruction.decision.passed is False
+    assert reconstruction.decision.failures
+
+
+def test_round0_recovery_publishes_training_rescue_before_polish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.static_pipeline import runner as static_runner
+    from experiments.learned_quality import runner as learned_runner
+
+    raw = tmp_path / "training" / "splat.ply"
+    density = tmp_path / "training" / "density_history.json"
+    manifest = tmp_path / "training" / "run_manifest.json"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"trained-splat")
+    density.write_text("{}\n", encoding="utf-8")
+    manifest.write_text("{}\n", encoding="utf-8")
+    training = SimpleNamespace(
+        raw_ply_path=raw,
+        density_history_path=density,
+        run_manifest_path=manifest,
+    )
+    monkeypatch.setattr(learned_runner, "_training_adapter", lambda *_a, **_k: training)
+    production = SimpleNamespace(
+        discover_source=object(),
+        copy_input=object(),
+        select_frames=object(),
+        reconstruct=object(),
+        train=object(),
+        polish=object(),
+        build_metadata_preview=object(),
+        validate_bundle=object(),
+        publish_result=object(),
+        publish_diagnostics=object(),
+        inspect_hardware=object(),
+        preflight=object(),
+        assemble_reports=object(),
+        resolve_input=object(),
+    )
+    monkeypatch.setattr(static_runner, "_production_services", lambda: production)
+    cache_root = tmp_path / "drive" / "room_learned_test_cache"
+    services = make_learned_quality_services(
+        LearnedQualityContext(lambda *_args, **_kwargs: None, tmp_path / "models.json"),
+        cache_root=cache_root,
+        recovery_mode="round0_output_first_v1",
+    )
+
+    result = services.train(
+        object(),
+        spec=object(),
+        selection=object(),
+        run_id="run-123",
+        output_root=tmp_path / "run" / "training",
+    )
+
+    rescue = cache_root / "training_rescue" / "run-123"
+    receipt = json.loads((rescue / "_SUCCESS.json").read_text(encoding="utf-8"))
+    assert result is training
+    assert (rescue / "splat.ply").read_bytes() == b"trained-splat"
+    assert (rescue / "density_history.json").read_text(encoding="utf-8") == "{}\n"
+    assert (rescue / "run_manifest.json").read_text(encoding="utf-8") == "{}\n"
+    assert receipt["status"] == "success"
+    assert receipt["run_id"] == "run-123"
+    assert receipt["splat_size_bytes"] == len(b"trained-splat")
+    assert len(receipt["splat_sha256"]) == 64
 
 
 def test_cached_service_composition_uses_one_store_for_restore_reconstruct_and_save(

@@ -5,6 +5,7 @@ import json
 import math
 import os
 import platform
+import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -400,6 +401,119 @@ def _training_adapter(
     return replace(training, status=status)
 
 
+def _copy_rescue_file(source: Path, destination: Path) -> tuple[int, str]:
+    metadata = os.lstat(source)
+    if not stat.S_ISREG(metadata.st_mode) or source.is_symlink():
+        raise ValueError(f"training rescue source must be a regular file: {source}")
+    digest = hashlib.sha256()
+    size = 0
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with source.open("rb") as reader, destination.open("xb") as writer:
+        for block in iter(lambda: reader.read(1024 * 1024), b""):
+            writer.write(block)
+            digest.update(block)
+            size += len(block)
+        writer.flush()
+        os.fsync(writer.fileno())
+    if size != metadata.st_size:
+        raise RuntimeError("training rescue copy size changed during publication")
+    return size, digest.hexdigest()
+
+
+def _publish_training_rescue(
+    training: object,
+    *,
+    cache_root: Path,
+    run_id: str,
+) -> Path:
+    if not isinstance(run_id, str) or not run_id:
+        raise ValueError("training rescue run_id must be non-empty")
+    root = Path(cache_root) / "training_rescue" / run_id
+    if os.path.lexists(root):
+        raise FileExistsError(f"training rescue already exists: {root}")
+    root.mkdir(parents=True)
+    print(json.dumps({"event": "training_rescue_start", "path": str(root)}))
+    size, digest = _copy_rescue_file(Path(training.raw_ply_path), root / "splat.ply")
+    _copy_rescue_file(
+        Path(training.density_history_path), root / "density_history.json"
+    )
+    _copy_rescue_file(Path(training.run_manifest_path), root / "run_manifest.json")
+    receipt = {
+        "schema_version": 1,
+        "status": "success",
+        "run_id": run_id,
+        "splat_size_bytes": size,
+        "splat_sha256": digest,
+    }
+    with (root / "_SUCCESS.json").open("x", encoding="utf-8", newline="\n") as file:
+        file.write(
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        file.flush()
+        os.fsync(file.fileno())
+    print(json.dumps({"event": "training_rescue_done", **receipt}, sort_keys=True))
+    return root
+
+
+def _best_effort_polish_adapter(
+    training: object,
+    *,
+    reconstruction: LearnedReconstructionOutput,
+    spec: object,
+    selection: object,
+    output_root: Path,
+) -> object:
+    del spec, selection
+    from backend.static_pipeline.contracts import PolishReport
+    from backend.static_pipeline.polish import validate_static_ply
+
+    _validate_output_first_reconstruction(reconstruction)
+    if reconstruction.decision.passed or not reconstruction.decision.failures:
+        raise ValueError("raw fallback is only valid for accepted best-effort geometry")
+    output_root.mkdir(parents=True, exist_ok=False)
+    raw = validate_static_ply(training.raw_ply_path)
+    return PolishReport(
+        accepted=False,
+        raw_path=raw.path,
+        candidate_path=None,
+        selected_path=raw.path,
+        original_count=raw.count,
+        kept_count=raw.count,
+        opacity_mass_loss=0.0,
+        render_metrics={
+            "kind": "best_effort_geometry_raw_fallback",
+            "sampled_view_count": 0,
+            "raw": [],
+            "candidate": [],
+            "views": [],
+            "mean_psnr_drop_db": None,
+            "mean_ssim_drop": None,
+            "max_single_view_psnr_drop_db": None,
+        },
+        reasons=("best_effort_geometry_raw_fallback",),
+    )
+
+
+def _accepted_metadata_proxy(
+    reconstruction: LearnedReconstructionOutput,
+) -> LearnedReconstructionOutput:
+    _validate_output_first_reconstruction(reconstruction)
+    decision = reconstruction.decision
+    if decision.passed and not decision.failures:
+        return reconstruction
+    accepted_decision = replace(
+        decision,
+        passed=True,
+        failures=(),
+        retry_recommended=False,
+        warnings=tuple(decision.warnings) + ("best_effort_geometry_metadata_proxy",),
+    )
+    return replace(
+        reconstruction,
+        bundle=replace(reconstruction.bundle, decision=accepted_decision),
+    )
+
+
 def _sheet_from_images(paths: tuple[Path, ...], destination: Path) -> Path:
     from PIL import Image, ImageOps
 
@@ -506,6 +620,41 @@ def make_learned_quality_services(
     production = _production_services()
     sheet_builder = context.contact_sheet_builder or _default_contact_sheets
     cache_session = _LearnedCacheSession(cache_root) if cache_root is not None else None
+    train = _training_adapter
+    polish = production.polish
+    build_metadata_preview = production.build_metadata_preview
+
+    if recovery_mode == "round0_output_first_v1":
+
+        def recovery_polish(training: object, **kwargs: object) -> object:
+            reconstruction = kwargs["reconstruction"]
+            _validate_output_first_reconstruction(reconstruction)
+            if reconstruction.decision.passed and not reconstruction.decision.failures:
+                return production.polish(training, **kwargs)
+            return _best_effort_polish_adapter(training, **kwargs)
+
+        def recovery_metadata(polish_result: object, **kwargs: object) -> object:
+            forwarded = dict(kwargs)
+            forwarded["reconstruction"] = _accepted_metadata_proxy(
+                kwargs["reconstruction"]
+            )
+            return production.build_metadata_preview(polish_result, **forwarded)
+
+        polish = recovery_polish
+        build_metadata_preview = recovery_metadata
+
+        if cache_root is not None:
+
+            def recovery_train(*args: object, **kwargs: object) -> object:
+                result = _training_adapter(*args, **kwargs)
+                _publish_training_rescue(
+                    result,
+                    cache_root=Path(cache_root),
+                    run_id=str(kwargs["run_id"]),
+                )
+                return result
+
+            train = recovery_train
 
     def preflight(
         spec: object, hardware: HardwareInfo, *, input_size_gb: float
@@ -855,9 +1004,9 @@ def make_learned_quality_services(
         copy_input=production.copy_input,
         select_frames=production.select_frames,
         reconstruct=reconstruct,
-        train=_training_adapter,
-        polish=production.polish,
-        build_metadata_preview=production.build_metadata_preview,
+        train=train,
+        polish=polish,
+        build_metadata_preview=build_metadata_preview,
         validate_bundle=validate_learned_bundle,
         publish_result=publish_learned_result,
         publish_diagnostics=publish_learned_diagnostics,
