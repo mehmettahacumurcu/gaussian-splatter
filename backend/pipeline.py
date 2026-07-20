@@ -67,7 +67,13 @@ def _static_trainer_overrides(cfg: Config) -> tuple[int, str]:
 
 
 _EXPERIMENT_TRAIN_KWARGS = frozenset(
-    {"validity_mask", "density_quality_probe"}
+    {
+        "validity_mask",
+        "density_quality_probe",
+        "camera_generator",
+        "diagnostic_iterations",
+        "diagnostic_callback",
+    }
 )
 _EXPLICIT_PIPELINE_TRAIN_KWARGS = frozenset(
     {

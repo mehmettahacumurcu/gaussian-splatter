@@ -26,6 +26,9 @@ from .density_control import DensityController
 
 
 TrainProgressCallback = Callable[[int, int, float, float, int], None]
+TrainingDiagnosticCallback = Callable[
+    ["Trainer4DGS", int, tuple[int, int], int], None
+]
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +282,41 @@ def _run_density_quality_probe(
             resolution=resolution,
         )
     return aggregate
+
+
+def _sample_training_index(
+    count: int,
+    generator: torch.Generator | None,
+) -> int:
+    if count <= 0:
+        raise ValueError("training sample count must be positive")
+    return int(torch.randint(0, count, (1,), generator=generator).item())
+
+
+def _normalize_diagnostic_iterations(
+    values: Sequence[int] | None,
+    n_iters: int,
+) -> frozenset[int]:
+    if values is None:
+        return frozenset()
+    normalized = frozenset(values)
+    if any(type(value) is not int or not 1 <= value <= n_iters for value in normalized):
+        raise ValueError(
+            "diagnostic_iterations must contain integers inside the training run"
+        )
+    return normalized
+
+
+def _run_training_diagnostic(
+    callback: TrainingDiagnosticCallback | None,
+    trainer: Any,
+    iteration: int,
+    diagnostic_iterations: frozenset[int],
+    resolution: tuple[int, int],
+    sh_degree: int,
+) -> None:
+    if callback is not None and iteration in diagnostic_iterations:
+        callback(trainer, iteration, resolution, sh_degree)
 
 
 # ---------------------------------------------------------------------------
@@ -1225,7 +1263,14 @@ class Trainer4DGS:
         density_quality_probe: Callable[
             ["Trainer4DGS", int, tuple[int, int], int], float
         ] | None = None,
+        camera_generator: torch.Generator | None = None,
+        diagnostic_iterations: Sequence[int] | None = None,
+        diagnostic_callback: TrainingDiagnosticCallback | None = None,
     ) -> dict:
+        diagnostic_iteration_set = _normalize_diagnostic_iterations(
+            diagnostic_iterations,
+            n_iters,
+        )
         # Static mode — 4D dynamic features bypass (deformation, Fourier, motion regs)
         self.static_mode = bool(static_mode)
         if self.static_mode:
@@ -1595,10 +1640,13 @@ class Trainer4DGS:
                 break
             if _train_idx_pool is not None:
                 idx = int(_train_idx_pool[
-                    torch.randint(0, _train_idx_pool.numel(), (1,)).item()
+                    _sample_training_index(
+                        _train_idx_pool.numel(),
+                        camera_generator,
+                    )
                 ].item())
             else:
-                idx = int(torch.randint(0, T, (1,)).item())
+                idx = _sample_training_index(T, camera_generator)
             t_norm = idx / max(T - 1, 1)
             warmup = self._warmup_factor(it)
 
@@ -1702,7 +1750,9 @@ class Trainer4DGS:
             # --- Ground truth load ---
             if is_multiview:
                 # v5.0: random cam selection
-                cam_id = train_cams[int(torch.randint(0, len(train_cams), (1,)).item())]
+                cam_id = train_cams[
+                    _sample_training_index(len(train_cams), camera_generator)
+                ]
                 if frames_cached_mv[cam_id][idx] is None:
                     # Lazy disk read at master resolution (cache survives multires).
                     frames_cached_mv[cam_id][idx] = load_frame_tensor(
@@ -1894,7 +1944,9 @@ class Trainer4DGS:
                 try:
                     # Farkli bir cam sec
                     other_cams = [c for c in train_cams if c != cam_id]
-                    cam_id2 = other_cams[int(torch.randint(0, len(other_cams), (1,)).item())]
+                    cam_id2 = other_cams[
+                        _sample_training_index(len(other_cams), camera_generator)
+                    ]
                     if frames_cached_mv[cam_id2][idx] is None:
                         frames_cached_mv[cam_id2][idx] = load_frame_tensor(
                             Path(mv_frame_paths[cam_id2][idx]), (Wm, Hm),
@@ -2509,6 +2561,15 @@ class Trainer4DGS:
                         run_logger.log_event("opacity_reset", iter=it)
                     except Exception:
                         pass
+
+            _run_training_diagnostic(
+                diagnostic_callback,
+                self,
+                it,
+                diagnostic_iteration_set,
+                (Ws, Hs),
+                active_sh_degree,
+            )
 
             # --- Log ---
             if it % log_interval == 0:
