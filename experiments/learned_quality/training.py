@@ -306,7 +306,10 @@ def _make_quality_probe(
     scene_dir: Path,
     frames: tuple[FrameArtifact, ...],
     validity: tuple[torch.Tensor, ...],
-) -> Callable[[Any, int, tuple[int, int], int], float]:
+) -> tuple[
+    Callable[[Any, int, tuple[int, int], int], float],
+    tuple[torch.Tensor, ...],
+]:
     from backend.preprocess.frame_alignment import join_registered_frames
     from backend.preprocess.parse_colmap import parse_cameras_from_model
 
@@ -316,10 +319,13 @@ def _make_quality_probe(
     by_name = {
         frame.image_name: mask for frame, mask in zip(frames, validity, strict=True)
     }
-    if tuple(frame.image_name for frame in registered) != tuple(
-        frame.image_name for frame in frames
-    ):
+    registered_names = tuple(frame.image_name for frame in registered)
+    expected_registered_names = tuple(
+        frame.image_name for frame in frames if frame.image_name in cameras
+    )
+    if registered_names != expected_registered_names:
         raise ValueError("quality probe cameras require an exact frame join")
+    registered_validity = tuple(by_name[name] for name in registered_names)
     probe_indices = _coverage_indices(len(registered))
 
     def probe(
@@ -380,7 +386,7 @@ def _make_quality_probe(
             raise ValueError("fixed-view quality probe produced invalid PSNR")
         return float(sum(scores) / len(scores))
 
-    return probe
+    return probe, registered_validity
 
 
 def _write_json_atomic(path: Path, payload: object) -> None:
@@ -449,7 +455,7 @@ class ExperimentPipelineRunner:
 
         points_path = scene_dir / "colmap" / "sparse" / "0" / "points3D.txt"
         _augment_points3d(points_path, evidence.seed_xyz, evidence.seed_rgb)
-        quality_probe = _make_quality_probe(
+        quality_probe, registered_validity = _make_quality_probe(
             scene_dir, evidence.original_frames, evidence.validity
         )
         state: dict[str, object] = {}
@@ -468,7 +474,7 @@ class ExperimentPipelineRunner:
         forwarded["skip_foundation"] = True
         forwarded["trainer_customizer"] = customize
         forwarded["trainer_train_kwargs"] = {
-            "validity_mask": evidence.validity,
+            "validity_mask": registered_validity,
             "density_quality_probe": quality_probe,
         }
         try:

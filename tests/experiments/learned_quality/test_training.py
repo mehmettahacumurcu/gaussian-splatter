@@ -36,7 +36,12 @@ def _image(path: Path, value: int) -> None:
     Image.new("RGB", (6, 4), (value, value, value)).save(path)
 
 
-def _fixture(tmp_path: Path, *, photometric_decision: str = "accepted"):
+def _fixture(
+    tmp_path: Path,
+    *,
+    photometric_decision: str = "accepted",
+    registered_indices: tuple[int, ...] | None = None,
+):
     source_frames = tmp_path / "source-frames"
     training_frames = tmp_path / "training-frames"
     mask_root = tmp_path / "masks"
@@ -115,9 +120,14 @@ def _fixture(tmp_path: Path, *, photometric_decision: str = "accepted"):
         ),
         dense_seeds=dense,
     )
+    registered_names = tuple(frame.image_name for frame in originals)
+    if registered_indices is not None:
+        registered_names = tuple(
+            originals[index].image_name for index in registered_indices
+        )
     model = write_colmap_text_model(
         tmp_path / "accepted-model",
-        tuple(frame.image_name for frame in originals),
+        registered_names,
         (0.2, 0.3),
         (2, 2),
     )
@@ -252,6 +262,41 @@ def test_runner_installs_evidence_only_inside_training_scene(tmp_path: Path) -> 
     assert all(
         frame.path.read_bytes() != corrected[index].path.read_bytes()
         for index, frame in enumerate(originals)
+    )
+    assert len(calls) == 1
+
+
+def test_training_handoff_aligns_probe_and_masks_to_registered_subset(
+    tmp_path: Path,
+) -> None:
+    artifacts, model, scene, originals, _ = _fixture(
+        tmp_path,
+        registered_indices=(1,),
+    )
+    calls: list[dict[str, object]] = []
+
+    def base_runner(**kwargs: object) -> dict[str, object]:
+        calls.append(dict(kwargs))
+        extra = kwargs["trainer_train_kwargs"]
+        assert len(extra["validity_mask"]) == 1
+        assert float(extra["validity_mask"][0][0, 0]) == 1.0
+        assert float(extra["validity_mask"][0][0, 1]) == 0.0
+        assert callable(extra["density_quality_probe"])
+        trainer = SimpleNamespace(gs=SimpleNamespace(num_points=3), density=None)
+        kwargs["trainer_customizer"](trainer)
+        return {}
+
+    runner = make_experiment_pipeline_runner(
+        artifacts,
+        accepted_model_dir=model,
+        pipeline_runner=base_runner,
+    )
+
+    runner(video_path=scene / "video.mp4", scene_name="scene", cfg=SimpleNamespace())
+
+    assert tuple(frame.image_name for frame in originals) == (
+        "frame_000000.png",
+        "frame_000001.png",
     )
     assert len(calls) == 1
 
