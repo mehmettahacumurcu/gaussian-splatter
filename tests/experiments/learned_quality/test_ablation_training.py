@@ -210,12 +210,29 @@ def test_ablation_spec_is_fixed_720p_and_uses_the_variant_iteration_budget() -> 
 
     assert spec.quality.n_iters == 5_000
     assert spec.quality.max_gaussians == base.quality.max_gaussians
-    assert spec.quality.advanced.foundation is False
+    assert spec.quality.advanced.foundation is True
+    assert spec.quality.advanced.lambda_depth is None
     assert spec.quality.advanced.run_eval is False
     assert spec.quality.advanced.resolution_long_edge_cap == 1_280
     assert spec.quality.advanced.multires_schedule == [(0, 720)]
     assert spec.quality.advanced.density_start_iter == 500
     assert spec.quality.advanced.density_end_iter == 4_500
+
+
+def test_ablation_spec_disables_depth_loss_when_depth_is_not_the_test_variable() -> None:
+    from backend.notebooks.training_config import resolve_static_training_config
+
+    base = to_static_run_spec(LearnedQualityRunSpec(input_folder="myroom_test"))
+
+    control = make_ablation_static_spec(base, _variant("legacy_control"))
+    depth = make_ablation_static_spec(base, _variant("depth_only"))
+    _, resolved_control = resolve_static_training_config(control)
+    _, resolved_depth = resolve_static_training_config(depth)
+
+    assert control.quality.advanced.foundation is True
+    assert control.quality.advanced.lambda_depth == 0.0
+    assert resolved_control.lambda_depth == 0.0
+    assert resolved_depth.lambda_depth > 0.0
 
 
 def _checkpoint(experiment_id: str, iteration: int = 500):

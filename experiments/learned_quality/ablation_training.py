@@ -97,10 +97,15 @@ def make_ablation_static_spec(
     """Resolve a short, fixed-720p diagnostic without changing core losses."""
 
     density_end = max(600, variant.n_iterations - 500)
+    uses_depth = "depth" in variant.features
     advanced = base_spec.quality.advanced.model_copy(
         update={
             "run_eval": False,
-            "foundation": False,
+            # Keep the profile's depth-loss defaults resolvable for depth
+            # variants. The ablation pipeline runner still forces
+            # skip_foundation=True because verified depth was staged once.
+            "foundation": True,
+            "lambda_depth": None if uses_depth else 0.0,
             "resolution_long_edge_cap": 1_280,
             "density_start_iter": 500,
             "density_end_iter": density_end,
