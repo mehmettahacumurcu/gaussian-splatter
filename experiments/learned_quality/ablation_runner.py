@@ -4,6 +4,7 @@ import csv
 import json
 import multiprocessing
 import os
+import re
 import shutil
 import subprocess
 import traceback
@@ -43,6 +44,7 @@ if TYPE_CHECKING:
 
 GENERATOR_ID = "4dgs-studio.learned-training-ablation"
 RESULT_SUFFIX = "_training_ablation"
+RuntimeProfile = Literal["l4_diagnostic", "a100_reference"]
 
 
 class AblationPublishSpec(StrictModel):
@@ -52,6 +54,7 @@ class AblationPublishSpec(StrictModel):
 class AblationRunSpec(StrictModel):
     schema_version: Literal[1] = 1
     input_folder: str
+    runtime_profile: RuntimeProfile = "l4_diagnostic"
     publish: AblationPublishSpec = Field(default_factory=AblationPublishSpec)
 
     @field_validator("input_folder")
@@ -694,6 +697,30 @@ def _hardware_payload(hardware: object) -> dict[str, object]:
     }
 
 
+def validate_ablation_hardware(profile: RuntimeProfile, hardware: object) -> None:
+    """Reject GPUs that cannot support the selected comparable runtime profile."""
+
+    gpu_name = str(getattr(hardware, "gpu_name", ""))
+    vram_gb = float(getattr(hardware, "vram_gb", 0.0))
+    is_l4 = re.search(r"\bL4\b", gpu_name, flags=re.IGNORECASE) is not None
+    is_a100 = re.search(r"\bA100\b", gpu_name, flags=re.IGNORECASE) is not None
+    if profile == "l4_diagnostic":
+        if (not is_l4 and not is_a100) or vram_gb < 22.0:
+            raise RuntimeError(
+                "l4_diagnostic requires an L4 or A100 with 22+ GiB VRAM; "
+                f"got {gpu_name} ({vram_gb:g} GiB)"
+            )
+        return
+    if profile == "a100_reference":
+        if not is_a100 or vram_gb < 75.0:
+            raise RuntimeError(
+                "a100_reference requires an A100 with 75+ GiB VRAM; "
+                f"got {gpu_name} ({vram_gb:g} GiB)"
+            )
+        return
+    raise ValueError(f"unsupported ablation runtime profile: {profile}")
+
+
 def run_training_ablation(
     spec: AblationRunSpec,
     *,
@@ -751,13 +778,8 @@ def run_training_ablation(
 
         inspect_hardware = _inspect_hardware
     hardware = inspect_hardware(runtime_paths)
-    gpu_name = str(getattr(hardware, "gpu_name", ""))
-    vram_gb = float(getattr(hardware, "vram_gb", 0.0))
     disk_free_gb = float(getattr(hardware, "disk_free_gb", 0.0))
-    if "A100" not in gpu_name.upper() or vram_gb < 75.0:
-        raise RuntimeError(
-            f"training ablation requires an A100 with 75+ GiB VRAM; got {gpu_name}"
-        )
+    validate_ablation_hardware(spec.runtime_profile, hardware)
     if disk_free_gb < 40.0:
         raise RuntimeError(
             f"training ablation requires at least 40 GiB local disk; got {disk_free_gb}"
@@ -892,6 +914,7 @@ def run_training_ablation(
         destination=final_path,
         run_id=run_id,
         environment={
+            "runtime_profile": spec.runtime_profile,
             "source_revision": revision,
             "model_manifest_path": manifest_path.as_posix(),
             **_hardware_payload(hardware),

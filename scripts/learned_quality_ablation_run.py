@@ -23,8 +23,8 @@ def _source_revision(value: str) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the standalone A100 learned-training ablation matrix from one "
-            "verified local cache snapshot."
+            "Run the standalone learned-training ablation matrix from one "
+            "verified local cache snapshot on the selected runtime profile."
         )
     )
     parser.add_argument("--spec", required=True, type=Path)

@@ -18,6 +18,7 @@ from experiments.learned_quality.ablation_runner import (
     publish_ablation_report,
     run_ablation_matrix,
     run_training_ablation,
+    validate_ablation_hardware,
 )
 from experiments.learned_quality.ablation_staging import StagedAblationInputs
 from experiments.learned_quality.ablation_training import AblationExperimentResult
@@ -67,6 +68,44 @@ def _result(experiment_id: str, *, passed: bool) -> AblationExperimentResult:
         run_manifest_path=None,
         status={"test": True},
     )
+
+
+@pytest.mark.parametrize(
+    ("profile", "gpu_name", "vram_gb", "accepted"),
+    [
+        ("l4_diagnostic", "NVIDIA L4", 24.0, True),
+        ("l4_diagnostic", "NVIDIA A100-SXM4-80GB", 80.0, True),
+        ("l4_diagnostic", "NVIDIA T4", 16.0, False),
+        ("l4_diagnostic", "NVIDIA L40S", 48.0, False),
+        ("a100_reference", "NVIDIA L4", 24.0, False),
+        ("a100_reference", "NVIDIA A100-SXM4-80GB", 80.0, True),
+    ],
+)
+def test_runtime_profile_hardware_admission(
+    profile: str,
+    gpu_name: str,
+    vram_gb: float,
+    accepted: bool,
+) -> None:
+    hardware = SimpleNamespace(gpu_name=gpu_name, vram_gb=vram_gb)
+
+    if accepted:
+        validate_ablation_hardware(profile, hardware)
+    else:
+        with pytest.raises(RuntimeError):
+            validate_ablation_hardware(profile, hardware)
+
+
+def test_runtime_profile_is_strictly_parsed() -> None:
+    spec = AblationRunSpec.model_validate(
+        {"input_folder": "myroom_test", "runtime_profile": "a100_reference"}
+    )
+
+    assert spec.runtime_profile == "a100_reference"
+    with pytest.raises(ValueError):
+        AblationRunSpec.model_validate(
+            {"input_folder": "myroom_test", "runtime_profile": "t4_diagnostic"}
+        )
 
 
 def test_matrix_runs_primary_sequentially_and_reports_tiny_progress(
@@ -228,7 +267,7 @@ def test_partial_matrix_publishes_receipts_without_success_marker(
     assert not (destination / "_SUCCESS.json").exists()
 
 
-def test_run_training_ablation_stages_once_and_uses_the_dedicated_output(
+def test_run_training_ablation_stages_once_and_uses_the_dedicated_output_with_profile(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -294,7 +333,10 @@ def test_run_training_ablation_stages_once_and_uses_the_dedicated_output(
         return True
 
     result = run_training_ablation(
-        AblationRunSpec(input_folder="myroom_test"),
+        AblationRunSpec(
+            input_folder="myroom_test",
+            runtime_profile="a100_reference",
+        ),
         model_manifest_path=model_manifest,
         expected_source_revision="c" * 40,
         actual_source_revision="c" * 40,
@@ -320,6 +362,7 @@ def test_run_training_ablation_stages_once_and_uses_the_dedicated_output(
     assert publish_calls[0]["destination"] == drive_root / (
         "myroom_test_training_ablation"
     )
+    assert publish_calls[0]["environment"]["runtime_profile"] == "a100_reference"
     assert result.complete is True
     assert result.final_path == drive_root / "myroom_test_training_ablation"
 

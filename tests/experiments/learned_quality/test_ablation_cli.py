@@ -47,6 +47,51 @@ def test_invalid_spec_returns_two_and_writes_receipt(
     assert json.loads(receipt.read_text())["status"] == "invalid_spec"
 
 
+def test_runtime_profile_is_strictly_parsed_before_invoking_runner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = tmp_path / "spec.json"
+    spec.write_text(
+        '{"input_folder":"myroom_test","runtime_profile":"a100_reference"}',
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "model_manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    receipt = tmp_path / "result.json"
+    monkeypatch.setattr(learned_quality_ablation_run, "RESULT_PATH", receipt)
+    captured: dict[str, object] = {}
+
+    def runner(active_spec, **_kwargs):
+        captured["spec"] = active_spec
+        return SimpleNamespace(
+            complete=True,
+            run_id="run-1",
+            final_path=Path("/drive/result"),
+            matrix=SimpleNamespace(
+                diagnosis=SimpleNamespace(kind="inconclusive", causes=()),
+                results={},
+                errors={},
+            ),
+        )
+
+    monkeypatch.setattr(learned_quality_ablation_run, "_load_runner", lambda: runner)
+
+    exit_code = learned_quality_ablation_run.main(
+        [
+            "--spec",
+            str(spec),
+            "--source-revision",
+            PIN,
+            "--model-manifest",
+            str(manifest),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["spec"].runtime_profile == "a100_reference"
+
+
 def test_success_receipt_contains_diagnosis_and_result_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
