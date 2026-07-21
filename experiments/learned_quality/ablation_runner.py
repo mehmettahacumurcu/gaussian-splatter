@@ -802,7 +802,10 @@ def run_training_ablation(
             raise RuntimeError("restored selection does not have an exact CPU audit")
 
     def validate_selection(selection: object) -> None:
-        audit_exact(cache_root, selection, inventory)
+        if not audit_exact(cache_root, selection, inventory):
+            raise RuntimeError(
+                "a matching verified CPU track-audit receipt is required before ablation"
+            )
 
     if stage_inputs is None:
         stage_inputs = stage_ablation_inputs

@@ -322,3 +322,59 @@ def test_run_training_ablation_stages_once_and_uses_the_dedicated_output(
     )
     assert result.complete is True
     assert result.final_path == drive_root / "myroom_test_training_ablation"
+
+
+def test_run_training_ablation_rejects_false_audit_before_large_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    drive_root = tmp_path / "drive"
+    input_path = drive_root / "myroom_test"
+    input_path.mkdir(parents=True)
+    model_manifest = tmp_path / "model_manifest.json"
+    model_manifest.write_text("{}", encoding="utf-8")
+    inventory = SimpleNamespace(digest="a" * 64)
+    hardware = SimpleNamespace(
+        gpu_name="NVIDIA A100-SXM4-80GB",
+        vram_gb=80.0,
+        disk_free_gb=200.0,
+        colmap_gpu_sift=True,
+    )
+    selection = SimpleNamespace(
+        manifest=SimpleNamespace(image_set_digest="d" * 64)
+    )
+    large_restore_started = False
+
+    def restore_graph(**kwargs):
+        nonlocal large_restore_started
+        kwargs["selection_validator"](selection)
+        large_restore_started = True
+        raise AssertionError("large restoration started after a failed audit")
+
+    monkeypatch.setattr(
+        "experiments.learned_quality.ablation_runner.restore_output_first_pretraining",
+        restore_graph,
+    )
+
+    def stage_once(**kwargs):
+        return kwargs["restore_pretraining"](tmp_path / "candidate")
+
+    with pytest.raises(
+        RuntimeError,
+        match="matching verified CPU track-audit receipt",
+    ):
+        run_training_ablation(
+            AblationRunSpec(input_folder="myroom_test"),
+            model_manifest_path=model_manifest,
+            expected_source_revision="c" * 40,
+            actual_source_revision="c" * 40,
+            drive_root=drive_root,
+            work_root=tmp_path / "work",
+            discover_source=lambda path: inventory if path == input_path else None,
+            inspect_hardware=lambda _paths: hardware,
+            store_factory=lambda _root, _digest: SimpleNamespace(),
+            stage_inputs=stage_once,
+            exact_audit_validator=lambda _cache, _selection, _inventory: False,
+        )
+
+    assert large_restore_started is False
