@@ -801,6 +801,9 @@ def run_training_ablation(
         if not audit_exact(cache_root, selection, inventory):
             raise RuntimeError("restored selection does not have an exact CPU audit")
 
+    def validate_selection(selection: object) -> None:
+        audit_exact(cache_root, selection, inventory)
+
     if stage_inputs is None:
         stage_inputs = stage_ablation_inputs
     from .runner import (
@@ -839,6 +842,7 @@ def run_training_ablation(
             model_manifest_path=manifest_path,
             repository_root=_REPOSITORY_ROOT,
             run_id=run_id,
+            selection_validator=validate_selection,
         )
 
     staged = stage_inputs(

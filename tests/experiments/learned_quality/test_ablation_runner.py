@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from experiments.learned_quality.ablation import (
     AblationCheckpoint,
     StructuralMetrics,
@@ -228,6 +230,7 @@ def test_partial_matrix_publishes_receipts_without_success_marker(
 
 def test_run_training_ablation_stages_once_and_uses_the_dedicated_output(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     drive_root = tmp_path / "drive"
     input_path = drive_root / "myroom_test"
@@ -254,12 +257,26 @@ def test_run_training_ablation_stages_once_and_uses_the_dedicated_output(
     staged = _staged(tmp_path)
     stage_calls: list[dict[str, object]] = []
     publish_calls: list[dict[str, object]] = []
+    audit_calls: list[tuple[Path, object, object]] = []
+    restored_selection = SimpleNamespace(
+        manifest=SimpleNamespace(image_set_digest="d" * 64)
+    )
+
+    def restore_graph(**kwargs):
+        kwargs["selection_validator"](restored_selection)
+        return SimpleNamespace(restored=True)
+
+    monkeypatch.setattr(
+        "experiments.learned_quality.ablation_runner.restore_output_first_pretraining",
+        restore_graph,
+    )
 
     def stage_once(**kwargs):
         stage_calls.append(kwargs)
         kwargs["audit_validator"](inventory)
+        assert kwargs["restore_pretraining"](tmp_path / "candidate").restored
         kwargs["restored_validator"](
-            SimpleNamespace(manifest=SimpleNamespace(image_set_digest="d" * 64)),
+            restored_selection,
             SimpleNamespace(),
         )
         return staged
@@ -272,6 +289,10 @@ def test_run_training_ablation_stages_once_and_uses_the_dedicated_output(
         kwargs["destination"].mkdir(parents=True)
         return kwargs["destination"]
 
+    def validate_exact(cache_root, selection, active_inventory):
+        audit_calls.append((cache_root, selection, active_inventory))
+        return True
+
     result = run_training_ablation(
         AblationRunSpec(input_folder="myroom_test"),
         model_manifest_path=model_manifest,
@@ -283,9 +304,7 @@ def test_run_training_ablation_stages_once_and_uses_the_dedicated_output(
         inspect_hardware=lambda _paths: hardware,
         store_factory=lambda _root, _digest: SimpleNamespace(),
         stage_inputs=stage_once,
-        exact_audit_validator=lambda _cache, selection, _inventory: (
-            selection.manifest.image_set_digest == "d" * 64
-        ),
+        exact_audit_validator=validate_exact,
         execute_experiment=execute,
         publish_report=publish,
     )
@@ -293,6 +312,10 @@ def test_run_training_ablation_stages_once_and_uses_the_dedicated_output(
     assert len(stage_calls) == 1
     assert stage_calls[0]["destination"].name == "inputs"
     assert callable(stage_calls[0]["restore_pretraining"])
+    assert [call[1:] for call in audit_calls] == [
+        (restored_selection, inventory),
+        (restored_selection, inventory),
+    ]
     assert len(publish_calls) == 1
     assert publish_calls[0]["destination"] == drive_root / (
         "myroom_test_training_ablation"

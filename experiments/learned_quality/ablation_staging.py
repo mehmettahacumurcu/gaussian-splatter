@@ -193,6 +193,7 @@ def restore_output_first_pretraining(
     model_manifest_path: Path,
     repository_root: Path,
     run_id: str,
+    selection_validator: Callable[[object], None] | None = None,
 ) -> RestoredAblationPretraining | None:
     """Restore the verified output-first graph without running preprocessing."""
 
@@ -204,8 +205,21 @@ def restore_output_first_pretraining(
     if os.path.lexists(target):
         raise FileExistsError(f"graph restore destination already exists: {target}")
 
+    required = frozenset(
+        {
+            CheckpointKind.COLMAP,
+            CheckpointKind.SELECTION,
+            CheckpointKind.BASE_EVIDENCE,
+            CheckpointKind.SEMANTIC,
+            CheckpointKind.MOTION,
+            CheckpointKind.MASKS,
+        }
+    )
     selection = None
     selection_ref = None
+    refs = None
+    audit_errors: list[Exception] = []
+    audited_candidate_seen = False
     selection_root = target / "selection"
     for candidate in selection_refs:
         restored = store.restore_milestone(
@@ -214,16 +228,37 @@ def restore_output_first_pretraining(
             source_inventory=source_inventory,
         )
         if restored is None:
+            if os.path.lexists(selection_root):
+                shutil.rmtree(selection_root)
             continue
         if not isinstance(restored.value, SelectionOutput):
             raise ValueError("selection milestone restored the wrong state type")
-        selection = restored.value
+        candidate_selection = restored.value
+        if candidate_selection.inventory is not source_inventory:
+            raise ValueError("selection milestone inventory is not current")
+        if selection_validator is not None:
+            try:
+                selection_validator(candidate_selection)
+            except Exception as error:
+                audit_errors.append(error)
+                shutil.rmtree(selection_root)
+                continue
+        audited_candidate_seen = True
+        candidate_refs = store.find_latest_complete_lineage(
+            CheckpointKind.MASKS,
+            selection_fingerprint=candidate.fingerprint,
+        )
+        if candidate_refs is None or frozenset(candidate_refs) != required:
+            shutil.rmtree(selection_root)
+            continue
+        selection = candidate_selection
         selection_ref = candidate
+        refs = candidate_refs
         break
-    if selection is None or selection_ref is None:
+    if selection is None or selection_ref is None or refs is None:
+        if not audited_candidate_seen and audit_errors:
+            raise audit_errors[-1]
         return None
-    if selection.inventory is not source_inventory:
-        raise ValueError("selection milestone inventory is not current")
 
     manifest = Path(model_manifest_path).resolve(strict=True)
     session = MilestoneSession(
@@ -238,23 +273,6 @@ def restore_output_first_pretraining(
         run_id=run_id,
         external_roots={"selection": selection.frames_dir},
     )
-    refs = store.find_latest_complete_lineage(
-        CheckpointKind.MASKS,
-        selection_fingerprint=selection_ref.fingerprint,
-    )
-    required = frozenset(
-        {
-            CheckpointKind.COLMAP,
-            CheckpointKind.SELECTION,
-            CheckpointKind.BASE_EVIDENCE,
-            CheckpointKind.SEMANTIC,
-            CheckpointKind.MOTION,
-            CheckpointKind.MASKS,
-        }
-    )
-    if refs is None or frozenset(refs) != required:
-        return None
-
     base = _restored_value(
         session,
         refs[CheckpointKind.BASE_EVIDENCE],

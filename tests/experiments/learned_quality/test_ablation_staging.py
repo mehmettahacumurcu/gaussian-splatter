@@ -353,6 +353,166 @@ def test_output_first_restore_uses_the_complete_graph_without_legacy_restore(
     ]
 
 
+def test_output_first_restore_rejects_unaudited_candidate_before_graph_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = SimpleNamespace(digest="c" * 64)
+    rejected_ref = MilestoneRef(CheckpointKind.SELECTION, "1" * 64)
+    accepted_ref = MilestoneRef(CheckpointKind.SELECTION, "2" * 64)
+    base_ref = MilestoneRef(CheckpointKind.BASE_EVIDENCE, "3" * 64)
+    semantic_ref = MilestoneRef(CheckpointKind.SEMANTIC, "4" * 64)
+    motion_ref = MilestoneRef(CheckpointKind.MOTION, "5" * 64)
+    masks_ref = MilestoneRef(CheckpointKind.MASKS, "6" * 64)
+    colmap_ref = MilestoneRef(CheckpointKind.COLMAP, "7" * 64)
+    geometry_ref = MilestoneRef(CheckpointKind.GEOMETRY, "8" * 64)
+    pretraining_ref = MilestoneRef(CheckpointKind.PRETRAINING, GRAPH_FINGERPRINT)
+    restored_selections: list[SelectionOutput] = []
+    lineage_queries: list[str] = []
+    non_selection_restores: list[tuple[str, CheckpointKind]] = []
+
+    class FakeGraphStore:
+        def restore_milestone(
+            self,
+            ref: MilestoneRef,
+            *,
+            destination: Path,
+            source_inventory: object,
+        ) -> MilestoneState:
+            assert ref.kind is CheckpointKind.SELECTION
+            assert source_inventory is inventory
+            assert not destination.exists()
+            frames = destination / "frames"
+            frames.mkdir(parents=True)
+            source = destination / "source.json"
+            source.write_text("{}", encoding="utf-8")
+            selection = SelectionOutput(
+                inventory=inventory,
+                manifest=SimpleNamespace(image_set_digest=ref.fingerprint),
+                frames_dir=frames,
+                source_manifest_path=source,
+            )
+            restored_selections.append(selection)
+            return MilestoneState(ref, {}, selection, {"frames": frames})
+
+        def find_latest_complete_lineage(
+            self,
+            kind: CheckpointKind,
+            *,
+            selection_fingerprint: str,
+        ) -> dict[CheckpointKind, MilestoneRef]:
+            assert kind is CheckpointKind.MASKS
+            lineage_queries.append(selection_fingerprint)
+            return {
+                CheckpointKind.SELECTION: accepted_ref,
+                CheckpointKind.COLMAP: colmap_ref,
+                CheckpointKind.BASE_EVIDENCE: base_ref,
+                CheckpointKind.SEMANTIC: semantic_ref,
+                CheckpointKind.MOTION: motion_ref,
+                CheckpointKind.MASKS: masks_ref,
+            }
+
+        def restore_colmap(self, fingerprint: str, *, destination: Path) -> object:
+            assert fingerprint == colmap_ref.fingerprint
+            destination.mkdir(parents=True)
+            return SimpleNamespace(root=destination)
+
+    class FakeSession:
+        def __init__(self, **kwargs: object) -> None:
+            self.selection_ref = kwargs["selection_ref"]
+
+        def bind_external_root(self, _label: str, _root: Path) -> "FakeSession":
+            return self
+
+    def fake_restored_value(
+        session: FakeSession,
+        ref: MilestoneRef,
+        _destination: Path,
+        expected_type: type,
+    ) -> object:
+        non_selection_restores.append((session.selection_ref.fingerprint, ref.kind))
+        if expected_type is BaseEvidenceState:
+            return BaseEvidenceState(
+                anchors=object(),
+                depths=(),
+                sky=(),
+                scene=object(),
+                track_audit=object(),
+                colmap_ref=colmap_ref.fingerprint,
+            )
+        if expected_type is SemanticMilestoneState:
+            return SemanticMilestoneState(object())
+        if expected_type is MotionMilestoneState:
+            return MotionMilestoneState(object())
+        if expected_type is MasksMilestoneState:
+            return MasksMilestoneState(object())
+        if expected_type is GeometryMilestoneState:
+            return GeometryMilestoneState(
+                bundle=object(),
+                frames_dir=tmp_path,
+                geometry_candidates=(),
+            )
+        if expected_type is FinalPretrainingState:
+            return FinalPretrainingState(
+                photometric=object(),
+                depth=object(),
+                dense_seeds=object(),
+                final_stage_records=(),
+                model_manifest_path=tmp_path / "model_manifest.json",
+            )
+        raise AssertionError(expected_type)
+
+    expected_reconstruction = SimpleNamespace(selection="second")
+    monkeypatch.setattr(
+        "experiments.learned_quality.ablation_staging.MilestoneSession",
+        FakeSession,
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.ablation_staging._restored_value",
+        fake_restored_value,
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.ablation_staging._geometry_milestone_ref",
+        lambda *_args, **_kwargs: geometry_ref,
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.ablation_staging._final_pretraining_milestone_ref",
+        lambda *_args, **_kwargs: pretraining_ref,
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.ablation_staging.assemble_learned_reconstruction",
+        lambda **_kwargs: expected_reconstruction,
+    )
+    model_manifest = tmp_path / "model_manifest.json"
+    model_manifest.write_text("{}", encoding="utf-8")
+
+    def validate_selection(selection: object) -> None:
+        assert isinstance(selection, SelectionOutput)
+        if selection.manifest.image_set_digest == rejected_ref.fingerprint:
+            raise RuntimeError("restored selection does not have an exact CPU audit")
+
+    restored = restore_output_first_pretraining(
+        store=FakeGraphStore(),
+        source_inventory=inventory,
+        destination=tmp_path / "restore",
+        selection_refs=(rejected_ref, accepted_ref),
+        selection_validator=validate_selection,
+        hardware=object(),
+        model_manifest_path=model_manifest,
+        repository_root=tmp_path,
+        run_id="ablation-run",
+    )
+
+    assert restored is not None
+    assert restored.selection is restored_selections[1]
+    assert restored.reconstruction is expected_reconstruction
+    assert lineage_queries == [accepted_ref.fingerprint]
+    assert all(
+        fingerprint == accepted_ref.fingerprint
+        for fingerprint, _kind in non_selection_restores
+    )
+
+
 def test_staging_rejects_revision_disk_and_existing_destination_before_restore(
     tmp_path: Path,
 ) -> None:
