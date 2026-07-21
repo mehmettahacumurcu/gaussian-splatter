@@ -292,6 +292,7 @@ def test_run_training_ablation_stages_once_and_uses_the_dedicated_output(
 
     assert len(stage_calls) == 1
     assert stage_calls[0]["destination"].name == "inputs"
+    assert callable(stage_calls[0]["restore_pretraining"])
     assert len(publish_calls) == 1
     assert publish_calls[0]["destination"] == drive_root / (
         "myroom_test_training_ablation"

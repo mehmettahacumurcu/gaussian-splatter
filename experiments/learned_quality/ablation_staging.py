@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import platform
 import re
 import shutil
 import stat
@@ -9,6 +10,25 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any
+
+from backend.static_pipeline.runner import SelectionOutput
+
+from .cache import CheckpointKind
+from .milestones import (
+    BaseEvidenceState,
+    FinalPretrainingState,
+    GeometryMilestoneState,
+    MasksMilestoneState,
+    MilestoneRef,
+    MilestoneSession,
+    MotionMilestoneState,
+    SemanticMilestoneState,
+    assemble_learned_reconstruction,
+)
+from .runtime import (
+    _final_pretraining_milestone_ref,
+    _geometry_milestone_ref,
+)
 
 
 _SAFE_EXPERIMENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
@@ -23,6 +43,13 @@ class StagedAblationInputs:
     pretraining_fingerprint: str
     source_revision: str
     manifest_path: Path
+
+
+@dataclass(frozen=True)
+class RestoredAblationPretraining:
+    selection: object
+    reconstruction: object
+    fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -129,6 +156,184 @@ def freeze_staged_tree(root: Path) -> None:
     base.chmod(mode & ~0o222)
 
 
+def _sha256_path(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _restored_value(
+    session: object,
+    ref: MilestoneRef,
+    destination: Path,
+    expected_type: type,
+) -> object | None:
+    restored = session.restore(ref, destination)
+    if restored is None:
+        return None
+    value = restored.value
+    if not isinstance(value, expected_type):
+        raise ValueError(
+            f"{ref.kind.value} milestone restored the wrong state type"
+        )
+    return value
+
+
+def restore_output_first_pretraining(
+    *,
+    store: object,
+    source_inventory: object,
+    destination: Path,
+    selection_refs: tuple[MilestoneRef, ...],
+    hardware: object,
+    model_manifest_path: Path,
+    repository_root: Path,
+    run_id: str,
+) -> RestoredAblationPretraining | None:
+    """Restore the verified output-first graph without running preprocessing."""
+
+    if not selection_refs or any(
+        ref.kind is not CheckpointKind.SELECTION for ref in selection_refs
+    ):
+        raise ValueError("selection_refs must contain selection milestone refs")
+    target = Path(destination).resolve(strict=False)
+    if os.path.lexists(target):
+        raise FileExistsError(f"graph restore destination already exists: {target}")
+
+    selection = None
+    selection_ref = None
+    selection_root = target / "selection"
+    for candidate in selection_refs:
+        restored = store.restore_milestone(
+            candidate,
+            destination=selection_root,
+            source_inventory=source_inventory,
+        )
+        if restored is None:
+            continue
+        if not isinstance(restored.value, SelectionOutput):
+            raise ValueError("selection milestone restored the wrong state type")
+        selection = restored.value
+        selection_ref = candidate
+        break
+    if selection is None or selection_ref is None:
+        return None
+    if selection.inventory is not source_inventory:
+        raise ValueError("selection milestone inventory is not current")
+
+    manifest = Path(model_manifest_path).resolve(strict=True)
+    session = MilestoneSession(
+        store=store,
+        source_inventory=source_inventory,
+        source_digest=source_inventory.digest,
+        selection_digest=selection.manifest.image_set_digest,
+        model_manifest_sha256=_sha256_path(manifest),
+        tool_versions={"python": platform.python_version()},
+        selection_ref=selection_ref,
+        repository_root=Path(repository_root),
+        run_id=run_id,
+        external_roots={"selection": selection.frames_dir},
+    )
+    refs = store.find_latest_complete_lineage(
+        CheckpointKind.MASKS,
+        selection_fingerprint=selection_ref.fingerprint,
+    )
+    required = frozenset(
+        {
+            CheckpointKind.COLMAP,
+            CheckpointKind.SELECTION,
+            CheckpointKind.BASE_EVIDENCE,
+            CheckpointKind.SEMANTIC,
+            CheckpointKind.MOTION,
+            CheckpointKind.MASKS,
+        }
+    )
+    if refs is None or frozenset(refs) != required:
+        return None
+
+    base = _restored_value(
+        session,
+        refs[CheckpointKind.BASE_EVIDENCE],
+        target / "base-evidence",
+        BaseEvidenceState,
+    )
+    semantic = _restored_value(
+        session,
+        refs[CheckpointKind.SEMANTIC],
+        target / "semantic",
+        SemanticMilestoneState,
+    )
+    motion = _restored_value(
+        session,
+        refs[CheckpointKind.MOTION],
+        target / "motion",
+        MotionMilestoneState,
+    )
+    masks = _restored_value(
+        session,
+        refs[CheckpointKind.MASKS],
+        target / "masks",
+        MasksMilestoneState,
+    )
+    if any(value is None for value in (base, semantic, motion, masks)):
+        return None
+
+    colmap = store.restore_colmap(
+        refs[CheckpointKind.COLMAP].fingerprint,
+        destination=target / "colmap",
+    )
+    if colmap is None:
+        return None
+    geometry_session = session.bind_external_root("round0_colmap", colmap.root)
+    geometry_ref = _geometry_milestone_ref(
+        session,
+        refs[CheckpointKind.MASKS],
+        hardware,
+        "round0_output_first_v1",
+    )
+    geometry = _restored_value(
+        geometry_session,
+        geometry_ref,
+        target / "geometry",
+        GeometryMilestoneState,
+    )
+    if geometry is None:
+        return None
+
+    pretraining_ref = _final_pretraining_milestone_ref(
+        session,
+        geometry_ref,
+        refs[CheckpointKind.MASKS],
+    )
+    final = _restored_value(
+        session,
+        pretraining_ref,
+        target / "final-pretraining",
+        FinalPretrainingState,
+    )
+    if final is None:
+        return None
+
+    reconstruction = assemble_learned_reconstruction(
+        geometry=geometry,
+        base=base,
+        semantic=semantic,
+        motion=motion,
+        masks=masks,
+        evidence_stage_records=(),
+        final=final,
+    )
+    return RestoredAblationPretraining(
+        selection=selection,
+        reconstruction=reconstruction,
+        fingerprint=pretraining_ref.fingerprint,
+    )
+
+
 def stage_ablation_inputs(
     *,
     store: object,
@@ -144,6 +349,7 @@ def stage_ablation_inputs(
     available_free_bytes: int | None = None,
     freeze: bool = True,
     restored_validator: Callable[[object, object], None] | None = None,
+    restore_pretraining: Callable[[Path], object | None] | None = None,
 ) -> StagedAblationInputs:
     if actual_source_revision != expected_source_revision:
         raise RuntimeError(
@@ -170,11 +376,14 @@ def stage_ablation_inputs(
     if probe is not None:
         probe(run_id=run_id)
     try:
-        restored = store.restore_pretraining(
-            source_inventory=source_inventory,
-            destination=target,
-            expected_fingerprint=expected_fingerprint,
-        )
+        if restore_pretraining is None:
+            restored = store.restore_pretraining(
+                source_inventory=source_inventory,
+                destination=target,
+                expected_fingerprint=expected_fingerprint,
+            )
+        else:
+            restored = restore_pretraining(target)
         if restored is None:
             raise RuntimeError("verified final pretraining checkpoint is missing")
         selection = restored.selection
@@ -184,7 +393,9 @@ def stage_ablation_inputs(
         source_digest = getattr(source_inventory, "digest", None)
         if not isinstance(source_digest, str) or len(source_digest) != 64:
             raise ValueError("source inventory digest is invalid")
-        fingerprint = expected_fingerprint(selection)
+        fingerprint = getattr(restored, "fingerprint", None)
+        if fingerprint is None:
+            fingerprint = expected_fingerprint(selection)
         if not isinstance(fingerprint, str) or len(fingerprint) != 64:
             raise ValueError("pretraining fingerprint is invalid")
         local_paths = _validate_payload_paths(

@@ -34,6 +34,7 @@ from .ablation_staging import (
     ExperimentWorkspace,
     StagedAblationInputs,
     materialize_experiment_workspace,
+    restore_output_first_pretraining,
 )
 
 if TYPE_CHECKING:
@@ -802,7 +803,43 @@ def run_training_ablation(
 
     if stage_inputs is None:
         stage_inputs = stage_ablation_inputs
-    from .runner import _pretraining_cache_fingerprint
+    from .runner import (
+        _CPU_AUDIT_PYTHON_VERSION,
+        _CPU_AUDIT_SELECTION_PRODUCER_SHA256,
+        _REPOSITORY_ROOT,
+        _pretraining_cache_fingerprint,
+        _selection_milestone_ref,
+    )
+
+    selection_refs = [
+        _selection_milestone_ref(
+            inventory,
+            base_spec,
+            hardware,
+            manifest_path,
+        ),
+        _selection_milestone_ref(
+            inventory,
+            base_spec,
+            hardware,
+            manifest_path,
+            producer_code_sha256=_CPU_AUDIT_SELECTION_PRODUCER_SHA256,
+            python_version=_CPU_AUDIT_PYTHON_VERSION,
+        ),
+    ]
+    selection_refs = list(dict.fromkeys(selection_refs))
+
+    def restore_graph(destination: Path) -> object | None:
+        return restore_output_first_pretraining(
+            store=store,
+            source_inventory=inventory,
+            destination=destination,
+            selection_refs=tuple(selection_refs),
+            hardware=hardware,
+            model_manifest_path=manifest_path,
+            repository_root=_REPOSITORY_ROOT,
+            run_id=run_id,
+        )
 
     staged = stage_inputs(
         store=store,
@@ -823,6 +860,7 @@ def run_training_ablation(
         minimum_free_bytes=35 * 1024**3,
         run_id=run_id,
         freeze=True,
+        restore_pretraining=restore_graph,
     )
 
     def publish_progress(payload: dict[str, object]) -> None:

@@ -6,15 +6,30 @@ from types import SimpleNamespace
 
 import pytest
 
+from backend.static_pipeline.runner import SelectionOutput
 from experiments.learned_quality.ablation_staging import (
+    RestoredAblationPretraining,
     freeze_staged_tree,
     materialize_experiment_workspace,
+    restore_output_first_pretraining,
     stage_ablation_inputs,
+)
+from experiments.learned_quality.cache import CheckpointKind
+from experiments.learned_quality.milestones import (
+    BaseEvidenceState,
+    FinalPretrainingState,
+    GeometryMilestoneState,
+    MasksMilestoneState,
+    MilestoneRef,
+    MilestoneState,
+    MotionMilestoneState,
+    SemanticMilestoneState,
 )
 
 
 PIN = "a" * 40
 FINGERPRINT = "b" * 64
+GRAPH_FINGERPRINT = "f" * 64
 
 
 class FakeStore:
@@ -109,6 +124,233 @@ def test_staging_restores_and_verifies_the_drive_payload_exactly_once(
     assert manifest["source_digest"] == "c" * 64
     assert manifest["pretraining_fingerprint"] == FINGERPRINT
     assert manifest["drive_reads_permitted_after_staging"] is False
+
+
+def test_staging_accepts_a_graph_restorer_and_records_its_real_fingerprint(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    calls: list[Path] = []
+
+    def restore_graph(destination: Path) -> object:
+        calls.append(destination)
+        frames = destination / "graph" / "frames"
+        model = destination / "graph" / "model"
+        frames.mkdir(parents=True)
+        model.mkdir(parents=True)
+        (frames / "frame_000001.png").write_bytes(b"rgb")
+        for name in ("cameras.txt", "images.txt", "points3D.txt"):
+            (model / name).write_text(name, encoding="utf-8")
+        source_manifest = destination / "graph" / "source.json"
+        source_manifest.write_text("{}", encoding="utf-8")
+        inventory = SimpleNamespace(digest="c" * 64)
+        selection = SimpleNamespace(
+            inventory=inventory,
+            manifest=SimpleNamespace(image_set_digest="d" * 64),
+            frames_dir=frames,
+            source_manifest_path=source_manifest,
+        )
+        reconstruction = SimpleNamespace(
+            frames_dir=frames,
+            accepted_model_dir=model,
+            artifacts=SimpleNamespace(model_manifest_path=model / "cameras.txt"),
+        )
+        return RestoredAblationPretraining(
+            selection=selection,
+            reconstruction=reconstruction,
+            fingerprint=GRAPH_FINGERPRINT,
+        )
+
+    inventory = SimpleNamespace(digest="c" * 64)
+    staged = stage_ablation_inputs(
+        store=store,
+        source_inventory=inventory,
+        destination=tmp_path / "local" / "inputs",
+        drive_root=tmp_path / "drive",
+        expected_fingerprint=lambda _selection: FINGERPRINT,
+        expected_source_revision=PIN,
+        actual_source_revision=PIN,
+        audit_validator=lambda _inventory: None,
+        minimum_free_bytes=1_000,
+        available_free_bytes=2_000,
+        run_id="ablation-run",
+        freeze=False,
+        restore_pretraining=restore_graph,
+    )
+
+    assert calls == [tmp_path / "local" / "inputs"]
+    assert store.restores == 0
+    assert staged.pretraining_fingerprint == GRAPH_FINGERPRINT
+    manifest = json.loads(staged.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["pretraining_fingerprint"] == GRAPH_FINGERPRINT
+
+
+def test_output_first_restore_uses_the_complete_graph_without_legacy_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inventory = SimpleNamespace(digest="c" * 64)
+    selection_ref = MilestoneRef(CheckpointKind.SELECTION, "1" * 64)
+    base_ref = MilestoneRef(CheckpointKind.BASE_EVIDENCE, "2" * 64)
+    semantic_ref = MilestoneRef(CheckpointKind.SEMANTIC, "3" * 64)
+    motion_ref = MilestoneRef(CheckpointKind.MOTION, "4" * 64)
+    masks_ref = MilestoneRef(CheckpointKind.MASKS, "5" * 64)
+    colmap_ref = MilestoneRef(CheckpointKind.COLMAP, "6" * 64)
+    geometry_ref = MilestoneRef(CheckpointKind.GEOMETRY, "7" * 64)
+    pretraining_ref = MilestoneRef(CheckpointKind.PRETRAINING, GRAPH_FINGERPRINT)
+    restored_kinds: list[CheckpointKind] = []
+
+    class FakeGraphStore:
+        def restore_pretraining(self, **_kwargs: object) -> object:
+            raise AssertionError("legacy cumulative restore must not be used")
+
+        def restore_milestone(
+            self,
+            ref: MilestoneRef,
+            *,
+            destination: Path,
+            source_inventory: object,
+            external_roots: object = None,
+        ) -> MilestoneState | None:
+            del external_roots
+            assert source_inventory is inventory
+            restored_kinds.append(ref.kind)
+            destination.mkdir(parents=True)
+            artifact = destination / "artifact"
+            artifact.mkdir()
+            if ref.kind is CheckpointKind.SELECTION:
+                frames = artifact / "frames"
+                frames.mkdir()
+                source = artifact / "source.json"
+                source.write_text("{}", encoding="utf-8")
+                value = SelectionOutput(
+                    inventory=inventory,
+                    manifest=SimpleNamespace(image_set_digest="9" * 64),
+                    frames_dir=frames,
+                    source_manifest_path=source,
+                )
+            elif ref.kind is CheckpointKind.BASE_EVIDENCE:
+                value = BaseEvidenceState(
+                    anchors=object(),
+                    depths=(),
+                    sky=(),
+                    scene=object(),
+                    track_audit=object(),
+                    colmap_ref=colmap_ref.fingerprint,
+                )
+            elif ref.kind is CheckpointKind.SEMANTIC:
+                value = SemanticMilestoneState(object())
+            elif ref.kind is CheckpointKind.MOTION:
+                value = MotionMilestoneState(object())
+            elif ref.kind is CheckpointKind.MASKS:
+                value = MasksMilestoneState(object())
+            elif ref.kind is CheckpointKind.GEOMETRY:
+                value = GeometryMilestoneState(
+                    bundle=object(),
+                    frames_dir=artifact,
+                    geometry_candidates=(),
+                )
+            elif ref.kind is CheckpointKind.PRETRAINING:
+                manifest = artifact / "model_manifest.json"
+                manifest.write_text("{}", encoding="utf-8")
+                value = FinalPretrainingState(
+                    photometric=object(),
+                    depth=object(),
+                    dense_seeds=object(),
+                    final_stage_records=(),
+                    model_manifest_path=manifest,
+                )
+            else:
+                raise AssertionError(ref.kind)
+            return MilestoneState(ref, {}, value, {"artifact": artifact})
+
+        def find_latest_complete_lineage(
+            self,
+            kind: CheckpointKind,
+            *,
+            selection_fingerprint: str,
+        ) -> dict[CheckpointKind, MilestoneRef]:
+            assert kind is CheckpointKind.MASKS
+            assert selection_fingerprint == selection_ref.fingerprint
+            return {
+                CheckpointKind.SELECTION: selection_ref,
+                CheckpointKind.COLMAP: colmap_ref,
+                CheckpointKind.BASE_EVIDENCE: base_ref,
+                CheckpointKind.SEMANTIC: semantic_ref,
+                CheckpointKind.MOTION: motion_ref,
+                CheckpointKind.MASKS: masks_ref,
+            }
+
+        def restore_colmap(self, fingerprint: str, *, destination: Path) -> object:
+            assert fingerprint == colmap_ref.fingerprint
+            destination.mkdir(parents=True)
+            return SimpleNamespace(root=destination)
+
+    class FakeSession:
+        def __init__(self, **kwargs: object) -> None:
+            self.store = kwargs["store"]
+            self.source_inventory = kwargs["source_inventory"]
+            self.external_roots = kwargs["external_roots"]
+
+        def restore(self, ref: MilestoneRef, destination: Path) -> object:
+            return self.store.restore_milestone(
+                ref,
+                destination=destination,
+                source_inventory=self.source_inventory,
+                external_roots=self.external_roots,
+            )
+
+        def bind_external_root(self, label: str, root: Path) -> "FakeSession":
+            assert label == "round0_colmap"
+            return FakeSession(
+                store=self.store,
+                source_inventory=self.source_inventory,
+                external_roots={**self.external_roots, label: root},
+            )
+
+    expected_reconstruction = SimpleNamespace(done=True)
+    monkeypatch.setattr(
+        "experiments.learned_quality.ablation_staging.MilestoneSession",
+        FakeSession,
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.ablation_staging._geometry_milestone_ref",
+        lambda *_args, **_kwargs: geometry_ref,
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.ablation_staging._final_pretraining_milestone_ref",
+        lambda *_args, **_kwargs: pretraining_ref,
+    )
+    monkeypatch.setattr(
+        "experiments.learned_quality.ablation_staging.assemble_learned_reconstruction",
+        lambda **_kwargs: expected_reconstruction,
+    )
+    model_manifest = tmp_path / "model_manifest.json"
+    model_manifest.write_text("{}", encoding="utf-8")
+
+    restored = restore_output_first_pretraining(
+        store=FakeGraphStore(),
+        source_inventory=inventory,
+        destination=tmp_path / "restore",
+        selection_refs=(selection_ref,),
+        hardware=object(),
+        model_manifest_path=model_manifest,
+        repository_root=tmp_path,
+        run_id="ablation-run",
+    )
+
+    assert restored is not None
+    assert restored.reconstruction is expected_reconstruction
+    assert restored.fingerprint == GRAPH_FINGERPRINT
+    assert restored_kinds == [
+        CheckpointKind.SELECTION,
+        CheckpointKind.BASE_EVIDENCE,
+        CheckpointKind.SEMANTIC,
+        CheckpointKind.MOTION,
+        CheckpointKind.MASKS,
+        CheckpointKind.GEOMETRY,
+        CheckpointKind.PRETRAINING,
+    ]
 
 
 def test_staging_rejects_revision_disk_and_existing_destination_before_restore(
