@@ -27,7 +27,7 @@ def build_learned_quality_ablation_notebook(
 
     cells = [
         nbformat.v4.new_markdown_cell(
-            "# A100 Gaussian training ablation\n\n"
+            "# Gaussian training ablation\n\n"
             "This is a **diagnostic notebook**, not another full-quality splat run. "
             "It requires the passing CPU cache audit and final pre-training cache for "
             "the same input. Drive inputs are restored and verified **once** into the "
@@ -39,22 +39,37 @@ def build_learned_quality_ablation_notebook(
             metadata=_tag("title"),
         ),
         nbformat.v4.new_code_cell(
-            'INPUT_FOLDER = ""  # @param {type:"string"}\n',
+            'INPUT_FOLDER = ""  # @param {type:"string"}\n'
+            'RUNTIME_PROFILE = "l4_diagnostic"  # @param '
+            '["l4_diagnostic", "a100_reference"]\n',
             metadata=_tag("config"),
         ),
         nbformat.v4.new_code_cell(
-            "import json, shutil, subprocess\n"
+            "import json, re, shutil, subprocess\n"
             "gpu_line = subprocess.run([\n"
             "    'nvidia-smi', '--query-gpu=name,memory.total',\n"
             "    '--format=csv,noheader,nounits',\n"
             "], check=True, capture_output=True, text=True).stdout.splitlines()[0]\n"
             "gpu_name, memory_mib = (part.strip() for part in gpu_line.rsplit(',', 1))\n"
             "vram_gib = float(memory_mib) / 1024.0\n"
-            "assert 'A100' in gpu_name.upper(), f'A100 required; detected {gpu_name}'\n"
-            "assert vram_gib >= 75.0, f'At least 75 GiB VRAM required; detected {vram_gib:.1f}'\n"
+            "is_l4 = re.search(r'\\bL4\\b', gpu_name, flags=re.IGNORECASE) is not None\n"
+            "is_a100 = re.search(r'\\bA100\\b', gpu_name, flags=re.IGNORECASE) is not None\n"
+            "if RUNTIME_PROFILE == 'l4_diagnostic':\n"
+            "    assert (is_l4 or is_a100) and vram_gib >= 22.0, (\n"
+            "        f'L4 or A100 with at least 22 GiB VRAM required; detected '\n"
+            "        f'{gpu_name} ({vram_gib:.1f} GiB)'\n"
+            "    )\n"
+            "elif RUNTIME_PROFILE == 'a100_reference':\n"
+            "    assert is_a100 and vram_gib >= 75.0, (\n"
+            "        f'A100 with at least 75 GiB VRAM required; detected '\n"
+            "        f'{gpu_name} ({vram_gib:.1f} GiB)'\n"
+            "    )\n"
+            "else:\n"
+            "    raise AssertionError(f'unsupported runtime profile: {RUNTIME_PROFILE}')\n"
             "disk_gib = shutil.disk_usage('/content').free / (1024 ** 3)\n"
             "assert disk_gib >= 80.0, f'At least 80 GiB local disk required; detected {disk_gib:.1f}'\n"
-            "print(json.dumps({'gpu': gpu_name, 'vram_gib': round(vram_gib, 1), "
+            "print(json.dumps({'runtime_profile': RUNTIME_PROFILE, 'gpu': gpu_name, "
+            "'vram_gib': round(vram_gib, 1), "
             "'disk_free_gib': round(disk_gib, 1)}, sort_keys=True))\n",
             metadata=_tag("preflight"),
         ),
@@ -85,6 +100,7 @@ def build_learned_quality_ablation_notebook(
             "CACHE_PATH = INPUT_PATH.with_name(INPUT_PATH.name + '_learned_test_cache')\n"
             "RESULT_PATH = INPUT_PATH.with_name(INPUT_PATH.name + '_training_ablation')\n"
             "RUN_SPEC = {'schema_version': 1, 'input_folder': folder.as_posix(), "
+            "'runtime_profile': RUNTIME_PROFILE, "
             "'publish': {'replace_owned_result': True}}\n"
             "SPEC_PATH = Path('/content/learned_ablation_spec.json')\n"
             "with SPEC_PATH.open('w', encoding='utf-8') as handle:\n"
@@ -243,7 +259,7 @@ def write_learned_quality_ablation_notebook(
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Generate the A100 ablation notebook")
+    parser = argparse.ArgumentParser(description="Generate the training ablation notebook")
     parser.add_argument("--commit", required=True)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)

@@ -1,4 +1,4 @@
-# A100 training ablation notebook
+# Training ablation notebook
 
 `colab/learned_quality_training_ablation.ipynb` diagnoses why the learned-quality
 training path can produce a white, exploded, or otherwise corrupted splat. It is
@@ -26,14 +26,24 @@ experiment records the same checkpoints at iterations 500, 1,000, 2,500, and
 The gates inspect fixed-view masked and unmasked PSNR/SSIM/L1, Gaussian count,
 non-finite values, visible white coverage, scale outliers, and anisotropy. A
 failing experiment stops early so a clearly broken variant does not continue
-burning A100 time.
+burning accelerator time.
+
+Both runtime profiles execute the same variants, iteration counts, inputs, and
+quality gates. `l4_diagnostic` accepts an NVIDIA L4 or A100 with at least 22 GiB
+VRAM and is the recommended, lower-cost choice for diagnosis.
+`a100_reference` retains the A100 check and requires at least 75 GiB VRAM for a
+reference run. Selecting a profile changes hardware admission only; it does not
+reduce experiment settings.
 
 ## Drive and local-disk behavior
 
-Before using the A100 notebook, the CPU cache-audit notebook must have completed
-successfully for the same input folder. The diagnostic notebook mounts Drive
-once, verifies the audit and learned-model manifest, and restores the selected
-frames and pre-training evidence once into `/content/4dgs-ablation/`.
+Before using the training notebook, the CPU cache-audit notebook must have
+completed successfully for the same input folder. The diagnostic notebook
+mounts Drive once and verifies the learned-model manifest. During staging, it
+restores each candidate selection first and requires a compatible CPU audit for
+that exact lineage. An audit mismatch fails after selection restore and before
+the large evidence restore. Only an audited selection can proceed to restoring
+the selected frames and pre-training evidence into `/content/4dgs-ablation/`.
 
 All experiment children read that session-local copy. They do not restore the
 same large Drive artifacts before each training run. Generated training PLY and
@@ -46,13 +56,16 @@ captured.
    `TRACK AUDIT PASSED` for the input.
 2. Open `colab/learned_quality_training_ablation.ipynb` from the
    `feature/learned-quality-a100` branch.
-3. Select an A100 High-RAM runtime.
+3. Select an L4 runtime for the recommended diagnostic run, or an A100 High-RAM
+   runtime for an A100 reference run.
 4. Set `INPUT_FOLDER` to the MyDrive-relative folder, for example
    `myroom_test`.
-5. Choose **Runtime -> Run all** and grant Drive access once.
-6. Leave the notebook running. It prints stage transitions, experiment IDs,
+5. Leave `RUNTIME_PROFILE` at `l4_diagnostic` for L4 diagnostics, or choose
+   `a100_reference` only for the 75+ GiB A100 reference profile.
+6. Choose **Runtime -> Run all** and grant Drive access once.
+7. Leave the notebook running. It prints stage transitions, experiment IDs,
    checkpoints, gate decisions, and completion receipts live.
-7. The final cell flushes Drive and releases the Colab runtime on success or
+8. The final cell flushes Drive and releases the Colab runtime on success or
    failure.
 
 ## Output

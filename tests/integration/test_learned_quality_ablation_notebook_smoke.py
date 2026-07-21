@@ -34,12 +34,22 @@ def test_ablation_notebook_is_pinned_run_all_safe_and_local_first() -> None:
     sources = "\n".join(cell.source for cell in notebook.cells)
     assert re.fullmatch(r"[0-9a-f]{40}", commit)
     assert sources.count('INPUT_FOLDER = ""  # @param {type:"string"}') == 1
-    assert "A100" in notebook.cells[2].source
-    assert "75.0" in notebook.cells[2].source
-    assert "nvidia-smi" in notebook.cells[2].source
+    assert sources.count(
+        'RUNTIME_PROFILE = "l4_diagnostic"  # @param '
+        '["l4_diagnostic", "a100_reference"]'
+    ) == 1
+
+    preflight = notebook.cells[2].source
+    assert "nvidia-smi" in preflight
+    assert "RUNTIME_PROFILE == 'l4_diagnostic'" in preflight
+    assert "L4 or A100 with at least 22 GiB VRAM required" in preflight
+    assert "RUNTIME_PROFILE == 'a100_reference'" in preflight
+    assert "A100 with at least 75 GiB VRAM required" in preflight
+    assert "unsupported runtime profile" in preflight
     assert sources.count("drive.mount") == 1
     assert "_training_ablation" in notebook.cells[4].source
     assert "_learned_test_cache" in notebook.cells[4].source
+    assert "'runtime_profile': RUNTIME_PROFILE" in notebook.cells[4].source
     assert commit in notebook.cells[5].source
     assert "static_notebook_bootstrap.sh" in notebook.cells[6].source
     assert "install_learned_environment" in notebook.cells[7].source

@@ -9,7 +9,11 @@ trains successfully but renders as a white, exploded, or structurally corrupted
 splat. The diagnostic notebook:
 
 - requires a compatible passing CPU cache audit;
+- restores a candidate selection first and rejects an audit mismatch before
+  restoring large evidence artifacts;
 - restores verified selection and pre-training evidence from Drive once;
+- defaults to the recommended `l4_diagnostic` profile for an eligible L4, while
+  retaining `a100_reference` for a 75+ GiB A100 reference run;
 - runs every experiment from the same immutable session-local inputs;
 - compares legacy control, dense seeds, masks, depth, adaptive density, and the
   complete learned combination at matched checkpoints;
@@ -17,6 +21,10 @@ splat. The diagnostic notebook:
   failing full combination; and
 - publishes compact reports to `<input>_training_ablation` without publishing a
   production PLY or modifying `<input>_learned_test_result`.
+
+The two runtime profiles change hardware admission only. They keep the same
+experiment variants, iteration counts, reconstruction inputs, and quality
+thresholds so diagnostic and reference results remain comparable.
 
 The implementation is split into:
 
@@ -30,4 +38,3 @@ The implementation is split into:
 
 See [the operator guide](../../docs/TRAINING_ABLATION_NOTEBOOK.md) for the exact
 Colab sequence and output semantics.
-
