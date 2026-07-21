@@ -16,7 +16,7 @@ GENERATED = ROOT / "colab" / "learned_quality_training_ablation.ipynb"
 
 
 def test_ablation_notebook_is_pinned_run_all_safe_and_local_first() -> None:
-    commit = "76f3c29f6778c9e73a54f59b5767d14160f9dbcd"
+    commit = "3d5e39f27afbcf095d6dde4881f68398dfaa44e2"
     notebook = build_learned_quality_ablation_notebook(commit_sha=commit)
 
     assert [cell.metadata["tags"][0] for cell in notebook.cells] == [
