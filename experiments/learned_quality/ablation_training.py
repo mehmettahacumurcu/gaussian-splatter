@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -190,16 +191,29 @@ def _finite_quantiles(values: torch.Tensor) -> dict[str, float]:
             "q99": 0.0,
             "q100": 0.0,
         }
-    levels = torch.tensor(
-        [0.0, 0.25, 0.50, 0.75, 0.95, 0.99, 1.0],
-        dtype=finite.dtype,
-    )
-    result = torch.quantile(finite, levels)
+    levels = (0.0, 0.25, 0.50, 0.75, 0.95, 0.99, 1.0)
+    if finite.numel() <= 1 << 24:
+        result = torch.quantile(
+            finite,
+            torch.tensor(levels, dtype=finite.dtype),
+        ).tolist()
+    else:
+        # torch.quantile rejects inputs above 2**24 elements. SH-rest has 45
+        # values per Gaussian, so otherwise healthy ablations can cross that
+        # boundary long before the configured Gaussian ceiling. The filtered
+        # tensor is already an owned CPU buffer, making an exact in-place NumPy
+        # quantile both bounded and equivalent to Torch's linear interpolation.
+        result = np.quantile(
+            finite.numpy(),
+            levels,
+            method="linear",
+            overwrite_input=True,
+        ).tolist()
     return {
         name: float(value)
         for name, value in zip(
             ("q0", "q25", "q50", "q75", "q95", "q99", "q100"),
-            result.tolist(),
+            result,
             strict=True,
         )
     }

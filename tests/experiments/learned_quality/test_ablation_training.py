@@ -11,6 +11,7 @@ from experiments.learned_quality.ablation_training import (
     AblationExperimentResult,
     AblationGateFailure,
     AblationPipelineRunner,
+    _finite_quantiles,
     collect_structural_snapshot,
     make_ablation_static_spec,
     prepare_ablation_scene,
@@ -130,6 +131,23 @@ def test_structural_snapshot_exposes_white_scale_anisotropy_and_quantiles() -> N
     assert snapshot.opacity_quantiles["q50"] == pytest.approx(0.5)
     assert snapshot.sh_dc_abs_quantiles["q100"] > 1.0
     assert snapshot.max_anisotropy == pytest.approx(50.0)
+
+
+def test_finite_quantiles_support_tensors_larger_than_torch_limit() -> None:
+    values = torch.zeros(16_777_217, dtype=torch.float32)
+    values[-1] = 1.0
+
+    quantiles = _finite_quantiles(values)
+
+    assert quantiles == {
+        "q0": 0.0,
+        "q25": 0.0,
+        "q50": 0.0,
+        "q75": 0.0,
+        "q95": 0.0,
+        "q99": 0.0,
+        "q100": 1.0,
+    }
 
 
 def test_structural_snapshot_counts_nonfinite_parameters() -> None:
