@@ -43,6 +43,7 @@ class StagedAblationInputs:
     pretraining_fingerprint: str
     source_revision: str
     manifest_path: Path
+    historical_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -59,6 +60,43 @@ class ExperimentWorkspace:
     inputs_root: Path
     scene_root: Path
     output_root: Path
+
+
+def stage_historical_reference(source: Path, destination: Path) -> Path | None:
+    """Copy the bounded historical evidence set from Drive exactly once."""
+
+    source_root = Path(source).resolve(strict=False)
+    if not source_root.is_dir():
+        return None
+    target = Path(destination).resolve(strict=False)
+    if os.path.lexists(target):
+        raise FileExistsError(f"historical staging destination exists: {target}")
+    selected = (
+        Path("splat.ply"),
+        Path("run_manifest.json"),
+        Path("experiment_report.json"),
+        Path("quality_report.json"),
+        Path("diagnostics") / "density_history.json",
+        Path("diagnostics") / "final_render_contact_sheet.png",
+    )
+    copied = 0
+    target.mkdir(parents=True)
+    try:
+        for relative in selected:
+            source_path = source_root / relative
+            if not source_path.is_file():
+                continue
+            destination_path = target / relative
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, destination_path)
+            copied += 1
+        if copied == 0:
+            shutil.rmtree(target)
+            return None
+        return target
+    except BaseException:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
 
 
 def _is_within(path: Path, root: Path) -> bool:

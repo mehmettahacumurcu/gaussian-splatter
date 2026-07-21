@@ -8,6 +8,7 @@ import torch
 
 from experiments.learned_quality.ablation import primary_variants
 from experiments.learned_quality.ablation_training import (
+    AblationDiagnosticCollector,
     AblationExperimentResult,
     AblationGateFailure,
     AblationPipelineRunner,
@@ -37,6 +38,7 @@ def _variant(experiment_id: str):
     ("experiment_id", "expects_seeds", "expects_masks", "expects_depth", "expects_density"),
     (
         ("legacy_control", False, False, False, False),
+        ("fixed_topology_control", False, False, False, False),
         ("dense_seeds_only", True, False, False, False),
         ("masks_only", False, True, False, False),
         ("depth_only", False, False, True, False),
@@ -98,6 +100,8 @@ def test_render_metrics_distinguish_masked_and_unmasked_quality() -> None:
     assert metrics["l1_unmasked"] > 0.0
     assert 0.0 <= metrics["ssim_unmasked"] <= 1.0
     assert 0.0 <= metrics["ssim_masked"] <= 1.0
+    assert metrics["edge_l1"] > 0.0
+    assert 0.0 <= metrics["edge_correlation"] <= 1.0
 
 
 def test_structural_snapshot_exposes_white_scale_anisotropy_and_quantiles() -> None:
@@ -121,7 +125,7 @@ def test_structural_snapshot_exposes_white_scale_anisotropy_and_quantiles() -> N
         num_points=count,
     )
 
-    snapshot = collect_structural_snapshot(SimpleNamespace(gs=gs))
+    snapshot = collect_structural_snapshot(SimpleNamespace(gs=gs, scene_extent=0.5))
 
     assert snapshot.metrics.visible_white_fraction == pytest.approx(0.10)
     assert snapshot.metrics.high_anisotropy_fraction == pytest.approx(0.01)
@@ -131,6 +135,9 @@ def test_structural_snapshot_exposes_white_scale_anisotropy_and_quantiles() -> N
     assert snapshot.opacity_quantiles["q50"] == pytest.approx(0.5)
     assert snapshot.sh_dc_abs_quantiles["q100"] > 1.0
     assert snapshot.max_anisotropy == pytest.approx(50.0)
+    assert len(snapshot.centroid) == 3
+    assert len(snapshot.covariance_eigenvalues) == 3
+    assert snapshot.metrics.out_of_bounds_fraction > 0.0
 
 
 def test_finite_quantiles_support_tensors_larger_than_torch_limit() -> None:
@@ -251,6 +258,86 @@ def test_ablation_spec_disables_depth_loss_when_depth_is_not_the_test_variable()
     assert control.quality.advanced.lambda_depth == 0.0
     assert resolved_control.lambda_depth == 0.0
     assert resolved_depth.lambda_depth > 0.0
+
+
+def test_fixed_topology_control_schedules_no_density_or_opacity_event() -> None:
+    from backend.notebooks.training_config import resolve_static_training_config
+
+    base = to_static_run_spec(LearnedQualityRunSpec(input_folder="myroom_test"))
+
+    spec = make_ablation_static_spec(base, _variant("fixed_topology_control"))
+    _, resolved = resolve_static_training_config(spec)
+
+    assert resolved.density_start_iter == 5_000
+    assert resolved.density_end_iter == 5_000
+    assert resolved.density_interval == 100
+    assert resolved.opacity_reset_interval == 0
+
+
+def test_collector_publishes_fixed_and_perturbed_structural_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts, model, scene, _, _ = _fixture(tmp_path)
+    prepared = prepare_ablation_scene(
+        artifacts,
+        accepted_model_dir=model,
+        scene_dir=scene,
+        variant=_variant("legacy_control"),
+    )
+    render_calls: list[dict[str, object]] = []
+
+    def fake_render_view(**kwargs):
+        render_calls.append(dict(kwargs))
+        height = int(kwargs["height"])
+        width = int(kwargs["width"])
+        output = torch.zeros((height, width, 4), dtype=torch.float32)
+        output[..., :3] = 0.1
+        output[..., 3] = 2.0
+        alpha = torch.full((height, width, 1), 0.75, dtype=torch.float32)
+        return output, alpha, {}
+
+    monkeypatch.setattr("backend.model.renderer.render_view", fake_render_view)
+    count = 10
+    means = torch.zeros((count, 3), dtype=torch.float32)
+    means[:, 0] = torch.linspace(-1.0, 1.0, count)
+    gs = SimpleNamespace(
+        means=means,
+        quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(count, 1),
+        get_scales=torch.full((count, 3), 0.01),
+        get_opacities=torch.full((count, 1), 0.5),
+        get_colors=torch.zeros((count, 1, 3)),
+        sh_dc=torch.zeros((count, 1, 3)),
+        sh_rest=torch.zeros((count, 15, 3)),
+        num_points=count,
+    )
+    trainer = SimpleNamespace(
+        gs=gs,
+        device=torch.device("cpu"),
+        static_mode=True,
+        scene_extent=1.0,
+    )
+    output_root = tmp_path / "diagnostics"
+    collector = AblationDiagnosticCollector(
+        scene_dir=scene,
+        frames=prepared.original_frames,
+        validity=prepared.quality_validity,
+        variant=_variant("legacy_control"),
+        output_root=output_root,
+    )
+
+    collector(trainer, 0, (6, 4), 0)
+
+    assert (output_root / "contact_000000_fixed.png").is_file()
+    assert (output_root / "contact_000000_perturbed.png").is_file()
+    assert len(render_calls) == len(collector.probe_indices) * 2
+    assert all(call["with_depth"] is True for call in render_calls)
+    checkpoint = collector.checkpoints[0]
+    assert checkpoint.iteration == 0
+    assert checkpoint.alpha_coverage == pytest.approx(1.0)
+    assert checkpoint.depth_finite_fraction == pytest.approx(1.0)
+    assert checkpoint.perturbed_alpha_coverage == pytest.approx(1.0)
+    assert checkpoint.edge_l1 >= 0.0
 
 
 def _checkpoint(experiment_id: str, iteration: int = 500):

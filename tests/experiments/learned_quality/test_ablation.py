@@ -48,6 +48,7 @@ def test_primary_matrix_changes_one_feature_at_a_time() -> None:
 
     assert tuple(variant.experiment_id for variant in variants) == (
         "legacy_control",
+        "fixed_topology_control",
         "dense_seeds_only",
         "masks_only",
         "depth_only",
@@ -55,7 +56,10 @@ def test_primary_matrix_changes_one_feature_at_a_time() -> None:
         "full_learned",
     )
     assert variants[0].features == frozenset()
-    assert tuple(variant.features for variant in variants[1:5]) == (
+    assert variants[0].density_events is True
+    assert variants[1].features == frozenset()
+    assert variants[1].density_events is False
+    assert tuple(variant.features for variant in variants[2:6]) == (
         frozenset({"dense_seeds"}),
         frozenset({"masks"}),
         frozenset({"depth"}),
@@ -63,7 +67,10 @@ def test_primary_matrix_changes_one_feature_at_a_time() -> None:
     )
     assert variants[-1].features == FEATURES
     assert all(variant.n_iterations == 5_000 for variant in variants)
-    assert all(variant.checkpoints == (500, 1_000, 2_500, 5_000) for variant in variants)
+    assert all(
+        variant.checkpoints == (0, 100, 499, 500, 600, 1_000, 2_500, 5_000)
+        for variant in variants
+    )
 
 
 def test_pairwise_matrix_is_complete_and_deterministic() -> None:
@@ -103,24 +110,57 @@ def test_nonfinite_structural_metrics_abort_immediately() -> None:
     assert decision.reasons == ("nonfinite_values",)
 
 
-def test_structural_gates_use_control_relative_white_and_fixed_fractions() -> None:
+def test_structural_issues_are_telemetry_before_final_checkpoint() -> None:
     decision = evaluate_checkpoint(
         _checkpoint(
             "full_learned",
-            1_000,
+            500,
             white=0.16,
             anisotropic=0.006,
             oversized=0.006,
         ),
-        control=_checkpoint("legacy_control", 1_000, white=0.10),
+        control=_checkpoint("legacy_control", 500, white=0.10),
     )
 
-    assert decision.stop
+    assert not decision.stop
     assert decision.reasons == (
         "visible_white_fraction",
         "anisotropy_fraction",
         "oversized_fraction",
     )
+
+
+def test_persistent_structural_issues_fail_only_at_the_5k_endpoint() -> None:
+    first = evaluate_checkpoint(
+        _checkpoint("full_learned", 500, oversized=0.02),
+        control=_checkpoint("legacy_control", 500),
+    )
+    second = evaluate_checkpoint(
+        _checkpoint("full_learned", 600, oversized=0.02),
+        control=_checkpoint("legacy_control", 600),
+        previous_structural_streaks=first.structural_streaks,
+    )
+    final = evaluate_checkpoint(
+        _checkpoint("full_learned", 5_000, oversized=0.02),
+        control=_checkpoint("legacy_control", 5_000),
+        previous_structural_streaks=second.structural_streaks,
+    )
+
+    assert not first.stop
+    assert not second.stop
+    assert final.stop
+    assert final.reasons == ("oversized_fraction",)
+    assert final.structural_streaks["oversized_fraction"] == 3
+
+
+def test_severe_structural_event_still_aborts_immediately() -> None:
+    decision = evaluate_checkpoint(
+        _checkpoint("full_learned", 500, oversized=0.10),
+        control=_checkpoint("legacy_control", 500),
+    )
+
+    assert decision.stop
+    assert decision.reasons == ("severe_oversized_fraction",)
 
 
 def test_psnr_gate_requires_two_consecutive_deficits_after_iteration_1000() -> None:
@@ -133,12 +173,19 @@ def test_psnr_gate_requires_two_consecutive_deficits_after_iteration_1000() -> N
         control=_checkpoint("legacy_control", 2_500, psnr=20.0),
         previous_psnr_deficits=first.consecutive_psnr_deficits,
     )
+    final = evaluate_checkpoint(
+        _checkpoint("depth_only", 5_000, psnr=17.0),
+        control=_checkpoint("legacy_control", 5_000, psnr=20.0),
+        previous_psnr_deficits=second.consecutive_psnr_deficits,
+    )
 
     assert not first.stop
     assert first.consecutive_psnr_deficits == 1
-    assert second.stop
+    assert not second.stop
     assert second.consecutive_psnr_deficits == 2
-    assert second.reasons == ("psnr_deficit",)
+    assert final.stop
+    assert final.consecutive_psnr_deficits == 3
+    assert final.reasons == ("psnr_deficit",)
 
 
 def test_legacy_control_must_be_structurally_sound_and_reach_15db() -> None:
@@ -222,4 +269,22 @@ def test_classifier_is_inconclusive_when_control_or_full_run_is_unusable() -> No
         }
     )
     assert diagnosis.kind == "inconclusive"
+    assert not diagnosis.requires_pairwise
+
+
+def test_classifier_identifies_density_transition_when_fixed_topology_survives() -> None:
+    outcomes = {
+        variant.experiment_id: ExperimentOutcome(variant.experiment_id, passed=True)
+        for variant in primary_variants()
+    }
+    outcomes["legacy_control"] = ExperimentOutcome("legacy_control", passed=False)
+    outcomes["fixed_topology_control"] = ExperimentOutcome(
+        "fixed_topology_control",
+        passed=True,
+    )
+
+    diagnosis = classify_experiments(outcomes)
+
+    assert diagnosis.kind == "density_transition_failure"
+    assert diagnosis.causes == (("density_events",),)
     assert not diagnosis.requires_pairwise

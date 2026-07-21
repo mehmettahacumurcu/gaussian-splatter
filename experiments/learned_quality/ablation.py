@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import combinations
 from math import isfinite
 from typing import Literal, Mapping
@@ -16,8 +16,10 @@ DiagnosisKind = Literal[
     "isolated_cause",
     "interaction_cause",
     "multiple_independent_causes",
+    "density_transition_failure",
     "inconclusive",
 ]
+DiagnosisCause = AblationFeature | Literal["density_events"]
 
 FEATURE_ORDER: tuple[AblationFeature, ...] = (
     "dense_seeds",
@@ -25,7 +27,7 @@ FEATURE_ORDER: tuple[AblationFeature, ...] = (
     "depth",
     "adaptive_density",
 )
-PRIMARY_CHECKPOINTS = (500, 1_000, 2_500, 5_000)
+PRIMARY_CHECKPOINTS = (0, 100, 499, 500, 600, 1_000, 2_500, 5_000)
 PAIRWISE_CHECKPOINTS = (500, 1_000, 2_500)
 
 
@@ -35,6 +37,7 @@ class AblationVariant:
     features: frozenset[AblationFeature]
     n_iterations: int
     checkpoints: tuple[int, ...]
+    density_events: bool = True
 
     def __post_init__(self) -> None:
         if not self.experiment_id:
@@ -47,6 +50,7 @@ class AblationVariant:
             not self.checkpoints
             or tuple(sorted(set(self.checkpoints))) != self.checkpoints
             or self.checkpoints[-1] != self.n_iterations
+            or self.checkpoints[0] < 0
         ):
             raise ValueError("checkpoints must be unique, ordered, and end at n_iterations")
 
@@ -57,12 +61,14 @@ class StructuralMetrics:
     high_anisotropy_fraction: float
     oversized_fraction: float
     nonfinite_count: int
+    out_of_bounds_fraction: float = 0.0
 
     def __post_init__(self) -> None:
         for name in (
             "visible_white_fraction",
             "high_anisotropy_fraction",
             "oversized_fraction",
+            "out_of_bounds_fraction",
         ):
             value = getattr(self, name)
             if not isfinite(value) or not 0.0 <= value <= 1.0:
@@ -83,6 +89,14 @@ class AblationCheckpoint:
     l1_masked: float
     gaussian_count: int
     structural: StructuralMetrics
+    edge_l1: float = 0.0
+    edge_correlation: float = 0.0
+    lpips_unmasked: float | None = None
+    alpha_coverage: float = 0.0
+    depth_finite_fraction: float = 0.0
+    depth_median: float = 0.0
+    perturbed_alpha_coverage: float = 0.0
+    perturbed_depth_finite_fraction: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -96,6 +110,11 @@ class AblationGatePolicy:
     psnr_deficit_patience: int = 2
     control_min_psnr_db: float = 15.0
     control_final_iteration: int = 5_000
+    structural_patience: int = 2
+    structural_start_iteration: int = 500
+    severe_white_fraction: float = 0.50
+    severe_high_anisotropy_fraction: float = 0.05
+    severe_oversized_fraction: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -103,6 +122,7 @@ class GateDecision:
     stop: bool
     reasons: tuple[str, ...]
     consecutive_psnr_deficits: int = 0
+    structural_streaks: Mapping[str, int] = field(default_factory=dict)
 
     @property
     def passed(self) -> bool:
@@ -118,7 +138,7 @@ class ExperimentOutcome:
 @dataclass(frozen=True)
 class AblationDiagnosis:
     kind: DiagnosisKind
-    causes: tuple[tuple[AblationFeature, ...], ...] = ()
+    causes: tuple[tuple[DiagnosisCause, ...], ...] = ()
     requires_pairwise: bool = False
 
 
@@ -138,6 +158,13 @@ def primary_variants() -> tuple[AblationVariant, ...]:
             features=frozenset(),
             n_iterations=5_000,
             checkpoints=PRIMARY_CHECKPOINTS,
+        ),
+        AblationVariant(
+            experiment_id="fixed_topology_control",
+            features=frozenset(),
+            n_iterations=5_000,
+            checkpoints=PRIMARY_CHECKPOINTS,
+            density_events=False,
         ),
         *isolated,
         AblationVariant(
@@ -166,13 +193,38 @@ def evaluate_checkpoint(
     *,
     control: AblationCheckpoint | None,
     previous_psnr_deficits: int = 0,
+    previous_structural_streaks: Mapping[str, int] | None = None,
     policy: AblationGatePolicy = AblationGatePolicy(),
 ) -> GateDecision:
     reasons: list[str] = []
+    stop_reasons: list[str] = []
     structural = current.structural
 
     if structural.nonfinite_count:
-        reasons.append("nonfinite_values")
+        return GateDecision(stop=True, reasons=("nonfinite_values",))
+
+    severe_checks = (
+        (
+            "severe_visible_white_fraction",
+            structural.visible_white_fraction,
+            policy.severe_white_fraction,
+        ),
+        (
+            "severe_anisotropy_fraction",
+            structural.high_anisotropy_fraction,
+            policy.severe_high_anisotropy_fraction,
+        ),
+        (
+            "severe_oversized_fraction",
+            structural.oversized_fraction,
+            policy.severe_oversized_fraction,
+        ),
+    )
+    severe_reasons = tuple(
+        name for name, value, limit in severe_checks if value > limit
+    )
+    if severe_reasons:
+        return GateDecision(stop=True, reasons=severe_reasons)
 
     white_limit = policy.absolute_white_fraction
     if control is not None:
@@ -187,24 +239,48 @@ def evaluate_checkpoint(
     if structural.oversized_fraction > policy.oversized_fraction:
         reasons.append("oversized_fraction")
 
+    prior_streaks = dict(previous_structural_streaks or {})
+    structural_streaks: dict[str, int] = {}
+    structural_reason_names = (
+        "visible_white_fraction",
+        "anisotropy_fraction",
+        "oversized_fraction",
+    )
+    for name in structural_reason_names:
+        if current.iteration >= policy.structural_start_iteration and name in reasons:
+            structural_streaks[name] = prior_streaks.get(name, 0) + 1
+        else:
+            structural_streaks[name] = 0
+
     consecutive_deficits = 0
     if control is not None and current.iteration >= policy.psnr_deficit_start_iteration:
         if control.psnr_unmasked - current.psnr_unmasked >= policy.psnr_deficit_db:
             consecutive_deficits = previous_psnr_deficits + 1
-        if consecutive_deficits >= policy.psnr_deficit_patience:
-            reasons.append("psnr_deficit")
+        if (
+            current.iteration == policy.control_final_iteration
+            and consecutive_deficits >= policy.psnr_deficit_patience
+        ):
+            stop_reasons.append("psnr_deficit")
+
+    if current.iteration == policy.control_final_iteration:
+        stop_reasons.extend(
+            name
+            for name in structural_reason_names
+            if structural_streaks[name] >= policy.structural_patience
+        )
 
     if (
         current.experiment_id == "legacy_control"
         and current.iteration == policy.control_final_iteration
         and current.psnr_unmasked < policy.control_min_psnr_db
     ):
-        reasons.append("unusable_control_psnr")
+        stop_reasons.append("unusable_control_psnr")
 
     return GateDecision(
-        stop=bool(reasons),
-        reasons=tuple(reasons),
+        stop=bool(stop_reasons),
+        reasons=tuple(stop_reasons or reasons),
         consecutive_psnr_deficits=consecutive_deficits,
+        structural_streaks=structural_streaks,
     )
 
 
@@ -212,7 +288,15 @@ def classify_experiments(
     outcomes: Mapping[str, ExperimentOutcome],
 ) -> AblationDiagnosis:
     control = outcomes.get("legacy_control")
+    fixed_topology = outcomes.get("fixed_topology_control")
     full = outcomes.get("full_learned")
+    if control is not None and not control.passed:
+        if fixed_topology is not None and fixed_topology.passed:
+            return AblationDiagnosis(
+                "density_transition_failure",
+                causes=(("density_events",),),
+            )
+        return AblationDiagnosis("inconclusive")
     if control is None or full is None or not control.passed:
         return AblationDiagnosis("inconclusive")
     if full.passed:

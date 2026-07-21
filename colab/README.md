@@ -141,6 +141,21 @@ Local tests prove the contracts, orchestration, publishing isolation, and notebo
 structure. Whether the learned path improves the room is intentionally undecided until
 the real A100 capture finishes and those reports are reviewed.
 
+## A100 structural diagnostic matrix
+
+Use `learned_quality_training_ablation.ipynb` after the CPU track audit when a learned
+run trains successfully but its scene is visually unstable or no longer recognizable.
+The notebook requires an **A100 80 GB High-RAM** runtime. It stages the verified cache
+and the historical learned result once, then runs seven deterministic 5K experiments:
+legacy control, fixed topology, dense seeds, masks, depth, adaptive density, and the
+full learned combination. It records checkpoints immediately before and after the
+first density transition, plus fixed-camera and perturbed-camera renders.
+
+The notebook stops after publishing `<input_folder>_training_ablation`. It never starts
+a full 120K training run and never publishes a replacement PLY. Review
+`diagnostic_summary.md`, `diagnostic_matrix.json`, and the plots under `plots/` before
+changing the production pipeline.
+
 ## Shared pieces
 
 - `bootstrap.sh` — idempotent env setup (deps, gsplat 1.5.3 JIT build, optional COLMAP).

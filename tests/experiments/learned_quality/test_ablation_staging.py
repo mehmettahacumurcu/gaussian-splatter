@@ -13,6 +13,7 @@ from experiments.learned_quality.ablation_staging import (
     materialize_experiment_workspace,
     restore_output_first_pretraining,
     stage_ablation_inputs,
+    stage_historical_reference,
 )
 from experiments.learned_quality.cache import CheckpointKind
 from experiments.learned_quality.milestones import (
@@ -647,3 +648,24 @@ def test_failed_restored_selection_validation_removes_local_payload(
         )
 
     assert not destination.exists()
+
+
+def test_historical_result_is_copied_once_to_local_staging(tmp_path: Path) -> None:
+    source = tmp_path / "drive" / "myroom_test_learned_test_result"
+    (source / "diagnostics").mkdir(parents=True)
+    (source / "splat.ply").write_bytes(b"ply-data")
+    (source / "run_manifest.json").write_text("{}", encoding="utf-8")
+    (source / "diagnostics" / "density_history.json").write_text(
+        "[]",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "local" / "historical"
+
+    staged = stage_historical_reference(source, destination)
+
+    assert staged == destination.resolve()
+    assert (staged / "splat.ply").read_bytes() == b"ply-data"
+    assert (staged / "run_manifest.json").is_file()
+    assert (staged / "diagnostics" / "density_history.json").is_file()
+    with pytest.raises(FileExistsError):
+        stage_historical_reference(source, destination)

@@ -10,7 +10,7 @@ import subprocess
 import traceback
 import uuid
 from collections.abc import Callable, Mapping
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -28,14 +28,15 @@ from .ablation import (
     ExperimentOutcome,
     StructuralMetrics,
     classify_experiments,
-    pairwise_variants,
     primary_variants,
 )
+from .ablation_history import analyze_historical_run
 from .ablation_staging import (
     ExperimentWorkspace,
     StagedAblationInputs,
     materialize_experiment_workspace,
     restore_output_first_pretraining,
+    stage_historical_reference,
 )
 
 if TYPE_CHECKING:
@@ -45,6 +46,11 @@ if TYPE_CHECKING:
 GENERATOR_ID = "4dgs-studio.learned-training-ablation"
 RESULT_SUFFIX = "_training_ablation"
 RuntimeProfile = Literal["l4_diagnostic", "a100_reference"]
+StructuralFindingKind = Literal[
+    "input_geometry_failure",
+    "density_transition_failure",
+    "weak_3d_consistency",
+]
 
 
 class AblationPublishSpec(StrictModel):
@@ -128,6 +134,13 @@ class TrainingAblationRunResult:
     @property
     def complete(self) -> bool:
         return self.matrix.complete
+
+
+@dataclass(frozen=True)
+class StructuralFinding:
+    kind: StructuralFindingKind
+    experiment_id: str
+    evidence: tuple[str, ...]
 
 
 ExperimentExecutor = Callable[
@@ -228,17 +241,6 @@ def run_ablation_matrix(
     for variant in primary_variants():
         run_variant(variant)
 
-    primary_matrix = AblationMatrixResult.from_results(
-        results,
-        errors=errors,
-        required_experiment_ids=tuple(required),
-    )
-    if primary_matrix.diagnosis.requires_pairwise and not errors:
-        pairs = pairwise_variants()
-        required.extend(variant.experiment_id for variant in pairs)
-        for variant in pairs:
-            run_variant(variant)
-
     return AblationMatrixResult.from_results(
         results,
         errors=errors,
@@ -293,6 +295,113 @@ def _experiment_payload(result: object) -> dict[str, object]:
     }
 
 
+def _checkpoint_at(result: object | None, iteration: int) -> AblationCheckpoint | None:
+    if result is None:
+        return None
+    return next(
+        (
+            checkpoint
+            for checkpoint in getattr(result, "checkpoints", ())
+            if checkpoint.iteration == iteration
+        ),
+        None,
+    )
+
+
+def derive_structural_findings(
+    matrix: AblationMatrixResult,
+) -> tuple[StructuralFinding, ...]:
+    """Turn render/geometry telemetry into room-recognizability findings."""
+
+    findings: list[StructuralFinding] = []
+    fixed_final = _checkpoint_at(
+        matrix.results.get("fixed_topology_control"),
+        5_000,
+    )
+    if fixed_final is not None:
+        evidence: list[str] = []
+        if fixed_final.psnr_unmasked < 12.0:
+            evidence.append(f"fixed-view PSNR {fixed_final.psnr_unmasked:.2f} dB")
+        if fixed_final.edge_correlation < 0.30:
+            evidence.append(
+                f"edge correlation {fixed_final.edge_correlation:.3f}"
+            )
+        if fixed_final.alpha_coverage < 0.10:
+            evidence.append(f"alpha coverage {fixed_final.alpha_coverage:.3f}")
+        if fixed_final.depth_finite_fraction < 0.10:
+            evidence.append(
+                f"depth coverage {fixed_final.depth_finite_fraction:.3f}"
+            )
+        if evidence:
+            findings.append(
+                StructuralFinding(
+                    kind="input_geometry_failure",
+                    experiment_id="fixed_topology_control",
+                    evidence=tuple(evidence),
+                )
+            )
+
+    legacy = matrix.results.get("legacy_control")
+    before_density = _checkpoint_at(legacy, 499)
+    after_density = _checkpoint_at(legacy, 600)
+    if before_density is not None and after_density is not None:
+        evidence = []
+        psnr_drop = before_density.psnr_unmasked - after_density.psnr_unmasked
+        edge_drop = before_density.edge_correlation - after_density.edge_correlation
+        alpha_drop = before_density.alpha_coverage - after_density.alpha_coverage
+        depth_drop = (
+            before_density.depth_finite_fraction
+            - after_density.depth_finite_fraction
+        )
+        point_ratio = after_density.gaussian_count / max(
+            before_density.gaussian_count,
+            1,
+        )
+        if psnr_drop >= 3.0:
+            evidence.append(f"PSNR dropped {psnr_drop:.2f} dB at density transition")
+        if edge_drop >= 0.12:
+            evidence.append(f"edge correlation dropped {edge_drop:.3f}")
+        if alpha_drop >= 0.20:
+            evidence.append(f"alpha coverage dropped {alpha_drop:.3f}")
+        if depth_drop >= 0.20:
+            evidence.append(f"depth coverage dropped {depth_drop:.3f}")
+        if point_ratio < 0.50 or point_ratio > 2.0:
+            evidence.append(f"Gaussian count changed by {point_ratio:.2f}x")
+        if evidence:
+            findings.append(
+                StructuralFinding(
+                    kind="density_transition_failure",
+                    experiment_id="legacy_control",
+                    evidence=tuple(evidence),
+                )
+            )
+
+    for experiment_id, result in matrix.results.items():
+        final = _checkpoint_at(result, 5_000)
+        if final is None:
+            continue
+        alpha_gap = final.alpha_coverage - final.perturbed_alpha_coverage
+        depth_gap = (
+            final.depth_finite_fraction
+            - final.perturbed_depth_finite_fraction
+        )
+        evidence = []
+        if alpha_gap >= 0.20:
+            evidence.append(f"perturbed-view alpha gap {alpha_gap:.3f}")
+        if depth_gap >= 0.20:
+            evidence.append(f"perturbed-view depth gap {depth_gap:.3f}")
+        if evidence:
+            findings.append(
+                StructuralFinding(
+                    kind="weak_3d_consistency",
+                    experiment_id=experiment_id,
+                    evidence=tuple(evidence),
+                )
+            )
+
+    return tuple(findings)
+
+
 def _checkpoint_from_payload(payload: Mapping[str, object]) -> AblationCheckpoint:
     structural = StructuralMetrics(**dict(payload["structural"]))
     return AblationCheckpoint(
@@ -306,6 +415,22 @@ def _checkpoint_from_payload(payload: Mapping[str, object]) -> AblationCheckpoin
         l1_masked=float(payload["l1_masked"]),
         gaussian_count=int(payload["gaussian_count"]),
         structural=structural,
+        edge_l1=float(payload.get("edge_l1", 0.0)),
+        edge_correlation=float(payload.get("edge_correlation", 0.0)),
+        lpips_unmasked=(
+            float(payload["lpips_unmasked"])
+            if payload.get("lpips_unmasked") is not None
+            else None
+        ),
+        alpha_coverage=float(payload.get("alpha_coverage", 0.0)),
+        depth_finite_fraction=float(payload.get("depth_finite_fraction", 0.0)),
+        depth_median=float(payload.get("depth_median", 0.0)),
+        perturbed_alpha_coverage=float(
+            payload.get("perturbed_alpha_coverage", 0.0)
+        ),
+        perturbed_depth_finite_fraction=float(
+            payload.get("perturbed_depth_finite_fraction", 0.0)
+        ),
     )
 
 
@@ -450,6 +575,15 @@ def _write_metrics_csv(path: Path, matrix: AblationMatrixResult) -> None:
                 "high_anisotropy_fraction",
                 "oversized_fraction",
                 "nonfinite_count",
+                "out_of_bounds_fraction",
+                "edge_l1",
+                "edge_correlation",
+                "lpips_unmasked",
+                "alpha_coverage",
+                "depth_finite_fraction",
+                "depth_median",
+                "perturbed_alpha_coverage",
+                "perturbed_depth_finite_fraction",
             )
         )
         for experiment_id, result in matrix.results.items():
@@ -471,6 +605,15 @@ def _write_metrics_csv(path: Path, matrix: AblationMatrixResult) -> None:
                         structural.high_anisotropy_fraction,
                         structural.oversized_fraction,
                         structural.nonfinite_count,
+                        structural.out_of_bounds_fraction,
+                        checkpoint.edge_l1,
+                        checkpoint.edge_correlation,
+                        checkpoint.lpips_unmasked,
+                        checkpoint.alpha_coverage,
+                        checkpoint.depth_finite_fraction,
+                        checkpoint.depth_median,
+                        checkpoint.perturbed_alpha_coverage,
+                        checkpoint.perturbed_depth_finite_fraction,
                     )
                 )
 
@@ -524,13 +667,61 @@ def _write_psnr_plot(path: Path, matrix: AblationMatrixResult) -> None:
     image.save(path)
 
 
+def _write_metric_plot(
+    path: Path,
+    matrix: AblationMatrixResult,
+    *,
+    value: Callable[[AblationCheckpoint], float],
+) -> None:
+    width, height = 1_200, 720
+    margin = 70
+    image = Image.new("RGB", (width, height), "#0f172a")
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((margin, margin, width - margin, height - margin), outline="#64748b")
+    colors = ("#22c55e", "#38bdf8", "#f59e0b", "#e879f9", "#f43f5e", "#a3e635", "#fb7185")
+    all_rows = [
+        checkpoint
+        for result in matrix.results.values()
+        for checkpoint in getattr(result, "checkpoints")
+    ]
+    max_iteration = max((row.iteration for row in all_rows), default=5_000)
+    values = [float(value(row)) for row in all_rows]
+    minimum = min(values, default=0.0)
+    maximum = max(values, default=1.0)
+    if maximum <= minimum:
+        maximum = minimum + 1.0
+    for index, (experiment_id, result) in enumerate(matrix.results.items()):
+        rows = tuple(getattr(result, "checkpoints"))
+        points = [
+            (
+                margin + row.iteration / max(max_iteration, 1) * (width - 2 * margin),
+                height
+                - margin
+                - (float(value(row)) - minimum)
+                / (maximum - minimum)
+                * (height - 2 * margin),
+            )
+            for row in rows
+        ]
+        color = colors[index % len(colors)]
+        if len(points) > 1:
+            draw.line(points, fill=color, width=3)
+        for x, y in points:
+            draw.ellipse((x - 4, y - 4, x + 4, y + 4), fill=color)
+        draw.text((margin + 10, margin + 20 * index), experiment_id, fill=color)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path)
+
+
 def _write_summary(path: Path, matrix: AblationMatrixResult) -> None:
     diagnosis = matrix.diagnosis
+    structural_findings = derive_structural_findings(matrix)
     lines = [
-        "# Learned training ablation",
+        "# Learned structural diagnostic matrix",
         "",
         f"Diagnosis: `{diagnosis.kind}`",
         f"Complete required matrix: `{str(matrix.complete).lower()}`",
+        "Full 120K training started: `false`",
         "",
         "| Experiment | Passed | Stop reason | Final PSNR | Gaussians |",
         "|---|---:|---|---:|---:|",
@@ -550,6 +741,15 @@ def _write_summary(path: Path, matrix: AblationMatrixResult) -> None:
             f"{final.psnr_unmasked if final else '-'} | "
             f"{final.gaussian_count if final else '-'} |"
         )
+    lines.extend(("", "## Structural findings", ""))
+    if structural_findings:
+        for finding in structural_findings:
+            lines.append(
+                f"- `{finding.kind}` in `{finding.experiment_id}`: "
+                + "; ".join(finding.evidence)
+            )
+    else:
+        lines.append("- No configured structural-failure threshold was crossed.")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
@@ -577,27 +777,51 @@ def _prepare_report(
     for experiment_id, result in matrix.results.items():
         receipt = root / "experiments" / experiment_id / "receipt.json"
         _write_json(receipt, _experiment_payload(result))
-    _write_json(
-        root / "ablation_report.json",
-        {
-            "schema_version": 1,
-            "run_id": run_id,
-            "complete": matrix.complete,
-            "diagnosis": matrix.diagnosis,
-            "required_experiment_ids": matrix.required_experiment_ids,
-            "errors": matrix.errors,
-            "staging": {
-                "source_digest": staged.source_digest,
-                "pretraining_fingerprint": staged.pretraining_fingerprint,
-                "source_revision": staged.source_revision,
-            },
-        },
+    historical = analyze_historical_run(
+        staged.historical_root or root / "historical-result-missing"
     )
+    structural_findings = derive_structural_findings(matrix)
+    matrix_payload = {
+        "schema_version": 2,
+        "run_id": run_id,
+        "complete": matrix.complete,
+        "diagnosis": matrix.diagnosis,
+        "structural_findings": structural_findings,
+        "full_120k_training_started": False,
+        "required_experiment_ids": matrix.required_experiment_ids,
+        "errors": matrix.errors,
+        "staging": {
+            "source_digest": staged.source_digest,
+            "pretraining_fingerprint": staged.pretraining_fingerprint,
+            "source_revision": staged.source_revision,
+        },
+        "historical_120k": historical,
+    }
+    _write_json(root / "diagnostic_matrix.json", matrix_payload)
+    _write_json(root / "ablation_report.json", matrix_payload)
+    _write_json(root / "historical_120k.json", historical)
     _write_json(root / "environment.json", dict(environment))
     shutil.copy2(staged.manifest_path, root / "staging_manifest.json")
     _write_metrics_csv(root / "metrics.csv", matrix)
     _write_summary(root / "ablation_summary.md", matrix)
+    _write_summary(root / "diagnostic_summary.md", matrix)
     _write_psnr_plot(root / "psnr_plot.png", matrix)
+    _write_psnr_plot(root / "plots" / "fixed_view_quality.png", matrix)
+    _write_metric_plot(
+        root / "plots" / "structural_fidelity.png",
+        matrix,
+        value=lambda checkpoint: checkpoint.edge_correlation,
+    )
+    _write_metric_plot(
+        root / "plots" / "gaussian_count.png",
+        matrix,
+        value=lambda checkpoint: float(checkpoint.gaussian_count),
+    )
+    _write_metric_plot(
+        root / "plots" / "density_events.png",
+        matrix,
+        value=lambda checkpoint: float(checkpoint.gaussian_count),
+    )
 
 
 def publish_ablation_report(
@@ -642,7 +866,7 @@ def publish_ablation_report(
         "schema_version": 1,
         "run_id": run_id,
         "status": "success" if matrix.complete else "partial",
-        "meaning": "diagnostic_matrix_published",
+        "meaning": "structural_diagnostic_matrix_published",
         "diagnosis": matrix.diagnosis.kind,
     }
     _write_json(target / marker_name, marker)
@@ -891,6 +1115,11 @@ def run_training_ablation(
         freeze=True,
         restore_pretraining=restore_graph,
     )
+    historical_root = stage_historical_reference(
+        input_path.with_name(f"{input_path.name}_learned_test_result"),
+        local_root / "historical-120k",
+    )
+    staged = replace(staged, historical_root=historical_root)
 
     def publish_progress(payload: dict[str, object]) -> None:
         experiment_id = str(payload["experiment_id"])

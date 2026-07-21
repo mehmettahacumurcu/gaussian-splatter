@@ -37,11 +37,14 @@ def test_camera_sampling_preserves_legacy_global_rng_when_generator_is_none() ->
 
 
 def test_diagnostic_callback_runs_only_at_normalized_checkpoints() -> None:
-    checkpoints = _normalize_diagnostic_iterations((2_500, 500, 500, 1_000), 5_000)
+    checkpoints = _normalize_diagnostic_iterations(
+        (2_500, 500, 500, 1_000, 0),
+        5_000,
+    )
     calls: list[tuple[object, int, tuple[int, int], int]] = []
     trainer = object()
 
-    for iteration in (499, 500, 999, 1_000, 2_499, 2_500, 5_000):
+    for iteration in (0, 499, 500, 999, 1_000, 2_499, 2_500, 5_000):
         _run_training_diagnostic(
             lambda *values: calls.append(values),
             trainer,
@@ -51,18 +54,28 @@ def test_diagnostic_callback_runs_only_at_normalized_checkpoints() -> None:
             3,
         )
 
-    assert checkpoints == frozenset({500, 1_000, 2_500})
+    assert checkpoints == frozenset({0, 500, 1_000, 2_500})
     assert calls == [
+        (trainer, 0, (1280, 720), 3),
         (trainer, 500, (1280, 720), 3),
         (trainer, 1_000, (1280, 720), 3),
         (trainer, 2_500, (1280, 720), 3),
     ]
 
 
-@pytest.mark.parametrize("values", [(0,), (-1,), (5_001,)])
+@pytest.mark.parametrize("values", [(-1,), (5_001,)])
 def test_diagnostic_checkpoints_must_fit_the_training_run(values: tuple[int, ...]) -> None:
     with pytest.raises(ValueError, match="diagnostic_iterations"):
         _normalize_diagnostic_iterations(values, 5_000)
+
+
+def test_train_invokes_initial_diagnostic_before_the_optimizer_loop() -> None:
+    source = inspect.getsource(Trainer4DGS.train)
+
+    initial = source.index("initial_diagnostic_sh_degree")
+    loop = source.index("for it in range(1, n_iters + 1)")
+
+    assert initial < loop
 
 
 def test_train_diagnostic_extensions_are_default_off() -> None:

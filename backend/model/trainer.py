@@ -300,7 +300,7 @@ def _normalize_diagnostic_iterations(
     if values is None:
         return frozenset()
     normalized = frozenset(values)
-    if any(type(value) is not int or not 1 <= value <= n_iters for value in normalized):
+    if any(type(value) is not int or not 0 <= value <= n_iters for value in normalized):
         raise ValueError(
             "diagnostic_iterations must contain integers inside the training run"
         )
@@ -1633,6 +1633,20 @@ class Trainer4DGS:
                   f"(pool size={_train_idx_pool.numel()})")
         else:
             _train_idx_pool = None  # sample uniformly from [0, T)
+
+        initial_diagnostic_sh_degree = (
+            progressive_sh_degree(0, n_iters, self.gs.sh_degree)
+            if self.sh_progressive_schedule
+            else self.gs.sh_degree
+        )
+        _run_training_diagnostic(
+            diagnostic_callback,
+            self,
+            0,
+            diagnostic_iteration_set,
+            (Ws, Hs),
+            initial_diagnostic_sh_degree,
+        )
 
         for it in range(1, n_iters + 1):
             if cancel_check is not None and cancel_check():

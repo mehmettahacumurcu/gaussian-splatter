@@ -9,12 +9,12 @@ import pytest
 from experiments.learned_quality.ablation import (
     AblationCheckpoint,
     StructuralMetrics,
-    pairwise_variants,
     primary_variants,
 )
 from experiments.learned_quality.ablation_runner import (
     AblationMatrixResult,
     AblationRunSpec,
+    derive_structural_findings,
     publish_ablation_report,
     run_ablation_matrix,
     run_training_ablation,
@@ -68,6 +68,104 @@ def _result(experiment_id: str, *, passed: bool) -> AblationExperimentResult:
         run_manifest_path=None,
         status={"test": True},
     )
+
+
+def _checkpoint(
+    experiment_id: str,
+    iteration: int,
+    *,
+    psnr: float = 20.0,
+    edge_correlation: float = 0.8,
+    alpha_coverage: float = 0.9,
+    depth_coverage: float = 0.9,
+    perturbed_alpha: float = 0.85,
+    perturbed_depth: float = 0.85,
+    gaussian_count: int = 100,
+) -> AblationCheckpoint:
+    return AblationCheckpoint(
+        experiment_id=experiment_id,
+        iteration=iteration,
+        psnr_unmasked=psnr,
+        psnr_masked=psnr,
+        ssim_unmasked=0.8,
+        ssim_masked=0.8,
+        l1_unmasked=0.1,
+        l1_masked=0.1,
+        gaussian_count=gaussian_count,
+        structural=StructuralMetrics(0.0, 0.0, 0.0, 0),
+        edge_correlation=edge_correlation,
+        alpha_coverage=alpha_coverage,
+        depth_finite_fraction=depth_coverage,
+        perturbed_alpha_coverage=perturbed_alpha,
+        perturbed_depth_finite_fraction=perturbed_depth,
+    )
+
+
+def _record(
+    experiment_id: str,
+    checkpoints: tuple[AblationCheckpoint, ...],
+) -> AblationExperimentResult:
+    return AblationExperimentResult(
+        experiment_id=experiment_id,
+        passed=True,
+        stopped_early=False,
+        stop_reasons=(),
+        checkpoints=checkpoints,
+        raw_ply_path=None,
+        metrics_path=None,
+        run_manifest_path=None,
+        status={"test": True},
+    )
+
+
+def test_structural_findings_separate_input_density_and_off_camera_failures() -> None:
+    fixed = _record(
+        "fixed_topology_control",
+        (
+            _checkpoint(
+                "fixed_topology_control",
+                5_000,
+                psnr=8.0,
+                edge_correlation=0.2,
+            ),
+        ),
+    )
+    legacy = _record(
+        "legacy_control",
+        (
+            _checkpoint("legacy_control", 499, psnr=20.0, gaussian_count=100),
+            _checkpoint(
+                "legacy_control",
+                600,
+                psnr=14.0,
+                edge_correlation=0.5,
+                gaussian_count=250,
+            ),
+            _checkpoint(
+                "legacy_control",
+                5_000,
+                alpha_coverage=0.9,
+                depth_coverage=0.9,
+                perturbed_alpha=0.4,
+                perturbed_depth=0.5,
+            ),
+        ),
+    )
+    matrix = AblationMatrixResult.from_results(
+        {
+            "legacy_control": legacy,
+            "fixed_topology_control": fixed,
+        },
+        required_experiment_ids=("legacy_control", "fixed_topology_control"),
+    )
+
+    findings = derive_structural_findings(matrix)
+
+    assert [finding.kind for finding in findings] == [
+        "input_geometry_failure",
+        "density_transition_failure",
+        "weak_3d_consistency",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -140,16 +238,15 @@ def test_matrix_runs_primary_sequentially_and_reports_tiny_progress(
     assert matrix.diagnosis.kind == "inconclusive"
 
 
-def test_pairwise_runs_only_when_full_failure_has_no_isolated_cause(
+def test_matrix_stops_after_primary_rows_even_when_pairwise_would_be_informative(
     tmp_path: Path,
 ) -> None:
     staged = _staged(tmp_path)
     calls: list[str] = []
-    failing_pair = pairwise_variants()[0].experiment_id
 
     def execute(_staged, variant, _workspace, _base_spec, _control):
         calls.append(variant.experiment_id)
-        passed = variant.experiment_id not in {"full_learned", failing_pair}
+        passed = variant.experiment_id != "full_learned"
         return _result(variant.experiment_id, passed=passed)
 
     matrix = run_ablation_matrix(
@@ -161,14 +258,9 @@ def test_pairwise_runs_only_when_full_failure_has_no_isolated_cause(
         execute_experiment=execute,
     )
 
-    assert calls == [
-        *(variant.experiment_id for variant in primary_variants()),
-        *(variant.experiment_id for variant in pairwise_variants()),
-    ]
-    assert matrix.diagnosis.kind == "interaction_cause"
-    assert matrix.diagnosis.causes == (
-        tuple(pairwise_variants()[0].features),
-    ) or set(matrix.diagnosis.causes[0]) == set(pairwise_variants()[0].features)
+    assert calls == [variant.experiment_id for variant in primary_variants()]
+    assert matrix.diagnosis.kind == "inconclusive"
+    assert matrix.diagnosis.requires_pairwise is True
 
 
 def test_isolated_failure_skips_pairwise_matrix(tmp_path: Path) -> None:
@@ -223,12 +315,19 @@ def test_report_publication_writes_success_last_and_never_copies_ply(
 
     assert published == destination
     for relative in (
+        "diagnostic_matrix.json",
+        "diagnostic_summary.md",
+        "historical_120k.json",
         "ablation_report.json",
         "ablation_summary.md",
         "metrics.csv",
         "environment.json",
         "staging_manifest.json",
         "psnr_plot.png",
+        "plots/fixed_view_quality.png",
+        "plots/structural_fidelity.png",
+        "plots/gaussian_count.png",
+        "plots/density_events.png",
         "experiments/legacy_control/receipt.json",
         "experiments/legacy_control/contact_005000.png",
         "_OWNERSHIP.json",
@@ -237,7 +336,10 @@ def test_report_publication_writes_success_last_and_never_copies_ply(
         assert (destination / relative).is_file(), relative
     assert not tuple(destination.rglob("*.ply"))
     success = json.loads((destination / "_SUCCESS.json").read_text())
-    assert success["meaning"] == "diagnostic_matrix_published"
+    assert success["meaning"] == "structural_diagnostic_matrix_published"
+    diagnostic = json.loads((destination / "diagnostic_matrix.json").read_text())
+    assert diagnostic["full_120k_training_started"] is False
+    assert "structural_findings" in diagnostic
 
 
 def test_partial_matrix_publishes_receipts_without_success_marker(
@@ -274,6 +376,9 @@ def test_run_training_ablation_stages_once_and_uses_the_dedicated_output_with_pr
     drive_root = tmp_path / "drive"
     input_path = drive_root / "myroom_test"
     input_path.mkdir(parents=True)
+    historical = drive_root / "myroom_test_learned_test_result"
+    historical.mkdir()
+    (historical / "run_manifest.json").write_text("{}", encoding="utf-8")
     audit = (
         drive_root
         / "myroom_test_learned_test_cache"
@@ -363,6 +468,10 @@ def test_run_training_ablation_stages_once_and_uses_the_dedicated_output_with_pr
         "myroom_test_training_ablation"
     )
     assert publish_calls[0]["environment"]["runtime_profile"] == "a100_reference"
+    assert publish_calls[0]["staged"].historical_root is not None
+    assert (
+        publish_calls[0]["staged"].historical_root / "run_manifest.json"
+    ).is_file()
     assert result.complete is True
     assert result.final_path == drive_root / "myroom_test_training_ablation"
 

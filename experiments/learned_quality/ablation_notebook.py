@@ -27,21 +27,22 @@ def build_learned_quality_ablation_notebook(
 
     cells = [
         nbformat.v4.new_markdown_cell(
-            "# Gaussian training ablation\n\n"
-            "This is a **diagnostic notebook**, not another full-quality splat run. "
-            "It requires the passing CPU cache audit and final pre-training cache for "
-            "the same input. Drive inputs are restored and verified **once** into the "
-            "session's local disk. Six deterministic 5K training variants then compare "
-            "legacy control, dense seeds, masks, depth, adaptive density, and the full "
-            "learned combination. Pairwise 2.5K variants run only when needed. The "
-            "notebook publishes `<input>_training_ablation` with reports and contact "
-            "sheets; it deliberately publishes no PLY and no viewer.",
+            "# A100 structural diagnostic matrix\n\n"
+            "This notebook diagnoses why the learned result lost recognizable room "
+            "structure. It requires the passing CPU cache audit and final pre-training "
+            "cache for the same input. Drive inputs and the historical 120K result are "
+            "staged and verified **once** on local disk. Seven deterministic 5K rows "
+            "compare legacy control, fixed topology, dense seeds, masks, depth, "
+            "adaptive density, and the full learned combination at iterations "
+            "0/100/499/500/600/1000/2500/5000. Fixed-camera and slightly perturbed "
+            "renders separate appearance fit from real 3D consistency. The diagnostic "
+            "matrix is the terminal product: it starts no full 120K training and "
+            "publishes no PLY or viewer.",
             metadata=_tag("title"),
         ),
         nbformat.v4.new_code_cell(
             'INPUT_FOLDER = ""  # @param {type:"string"}\n'
-            'RUNTIME_PROFILE = "l4_diagnostic"  # @param '
-            '["l4_diagnostic", "a100_reference"]\n',
+            'RUNTIME_PROFILE = "a100_reference"\n',
             metadata=_tag("config"),
         ),
         nbformat.v4.new_code_cell(
@@ -52,20 +53,11 @@ def build_learned_quality_ablation_notebook(
             "], check=True, capture_output=True, text=True).stdout.splitlines()[0]\n"
             "gpu_name, memory_mib = (part.strip() for part in gpu_line.rsplit(',', 1))\n"
             "vram_gib = float(memory_mib) / 1024.0\n"
-            "is_l4 = re.search(r'\\bL4\\b', gpu_name, flags=re.IGNORECASE) is not None\n"
             "is_a100 = re.search(r'\\bA100\\b', gpu_name, flags=re.IGNORECASE) is not None\n"
-            "if RUNTIME_PROFILE == 'l4_diagnostic':\n"
-            "    assert (is_l4 or is_a100) and vram_gib >= 22.0, (\n"
-            "        f'L4 or A100 with at least 22 GiB VRAM required; detected '\n"
-            "        f'{gpu_name} ({vram_gib:.1f} GiB)'\n"
-            "    )\n"
-            "elif RUNTIME_PROFILE == 'a100_reference':\n"
-            "    assert is_a100 and vram_gib >= 75.0, (\n"
-            "        f'A100 with at least 75 GiB VRAM required; detected '\n"
-            "        f'{gpu_name} ({vram_gib:.1f} GiB)'\n"
-            "    )\n"
-            "else:\n"
-            "    raise AssertionError(f'unsupported runtime profile: {RUNTIME_PROFILE}')\n"
+            "assert is_a100 and vram_gib >= 75.0, (\n"
+            "    f'A100 with at least 75 GiB VRAM required; detected '\n"
+            "    f'{gpu_name} ({vram_gib:.1f} GiB)'\n"
+            ")\n"
             "disk_gib = shutil.disk_usage('/content').free / (1024 ** 3)\n"
             "assert disk_gib >= 80.0, f'At least 80 GiB local disk required; detected {disk_gib:.1f}'\n"
             "print(json.dumps({'runtime_profile': RUNTIME_PROFILE, 'gpu': gpu_name, "
@@ -195,15 +187,20 @@ def build_learned_quality_ablation_notebook(
             "    if success.get('run_id') != receipt.get('run_id'):\n"
             "        raise RuntimeError('Ablation success marker does not match this run')\n"
             "    required = (\n"
-            "        'ablation_report.json', 'ablation_summary.md', 'metrics.csv',\n"
-            "        'psnr_plot.png', 'environment.json', 'staging_manifest.json',\n"
+            "        'diagnostic_matrix.json', 'diagnostic_summary.md',\n"
+            "        'historical_120k.json', 'metrics.csv',\n"
+            "        'plots/fixed_view_quality.png',\n"
+            "        'plots/structural_fidelity.png',\n"
+            "        'plots/gaussian_count.png', 'plots/density_events.png',\n"
+            "        'environment.json', 'staging_manifest.json',\n"
             "    )\n"
             "    missing = [name for name in required if not (actual / name).is_file()]\n"
             "    if missing:\n"
             "        raise RuntimeError(f'Published ablation report is incomplete: {missing}')\n"
-            "    print(f'Ablation report: {actual}')\n"
-            "    print(f'Diagnosis: {receipt.get(\"diagnosis\")}')\n"
+            "    print(f'Diagnostic matrix: {actual}')\n"
+            "    print(f'Primary diagnosis: {receipt.get(\"diagnosis\")}')\n"
             "    print('Diagnostic matrix and Drive publication completed successfully.')\n"
+            "    print('No full 120K training was started.')\n"
             "except BaseException as exc:\n"
             "    failure = exc\n"
             "    print(f'Run ended with {type(exc).__name__}: {exc}')\n"

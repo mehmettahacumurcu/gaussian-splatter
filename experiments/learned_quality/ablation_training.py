@@ -66,6 +66,8 @@ class StructuralSnapshot:
     sh_dc_abs_quantiles: Mapping[str, float]
     sh_rest_abs_quantiles: Mapping[str, float]
     max_anisotropy: float
+    centroid: tuple[float, float, float]
+    covariance_eigenvalues: tuple[float, float, float]
 
 
 class AblationGateFailure(RuntimeError):
@@ -97,8 +99,13 @@ def make_ablation_static_spec(
 ) -> StaticNotebookRunSpec:
     """Resolve a short, fixed-720p diagnostic without changing core losses."""
 
-    density_end = max(600, variant.n_iterations - 500)
     uses_depth = "depth" in variant.features
+    density_start = 500 if variant.density_events else variant.n_iterations
+    density_end = (
+        max(600, variant.n_iterations - 500)
+        if variant.density_events
+        else variant.n_iterations
+    )
     advanced = base_spec.quality.advanced.model_copy(
         update={
             "run_eval": False,
@@ -108,8 +115,13 @@ def make_ablation_static_spec(
             "foundation": True,
             "lambda_depth": None if uses_depth else 0.0,
             "resolution_long_edge_cap": 1_280,
-            "density_start_iter": 500,
+            "density_start_iter": density_start,
             "density_end_iter": density_end,
+            "opacity_reset_interval": (
+                base_spec.quality.advanced.opacity_reset_interval
+                if variant.density_events
+                else 0
+            ),
             "multires_schedule": [(0, 720)],
         }
     )
@@ -234,10 +246,19 @@ def collect_structural_snapshot(trainer: Any) -> StructuralSnapshot:
     finite_means = means[torch.isfinite(means).all(dim=-1)]
     if finite_means.numel() == 0:
         robust_extent = 0.0
+        center = torch.zeros(3, dtype=torch.float32)
+        covariance_eigenvalues = torch.zeros(3, dtype=torch.float32)
+        out_of_bounds_fraction = 0.0
     else:
         center = torch.median(finite_means, dim=0).values
-        radii = torch.linalg.vector_norm(finite_means - center, dim=-1)
+        centered = finite_means - center
+        radii = torch.linalg.vector_norm(centered, dim=-1)
         robust_extent = float(torch.quantile(radii, 0.995).item())
+        covariance = centered.T @ centered / max(int(centered.shape[0]), 1)
+        covariance_eigenvalues = torch.linalg.eigvalsh(covariance).clamp_min(0.0)
+        scene_extent = float(getattr(trainer, "scene_extent", robust_extent))
+        bound = max(scene_extent, 1e-12)
+        out_of_bounds_fraction = float((radii > bound).float().mean().item())
 
     finite_rows = (
         torch.isfinite(scales).all(dim=-1)
@@ -266,6 +287,7 @@ def collect_structural_snapshot(trainer: Any) -> StructuralSnapshot:
             high_anisotropy_fraction=high_anisotropy / denominator,
             oversized_fraction=oversized / denominator,
             nonfinite_count=nonfinite_count,
+            out_of_bounds_fraction=out_of_bounds_fraction,
         ),
         robust_scene_extent=robust_extent,
         opacity_quantiles=_finite_quantiles(opacities),
@@ -273,6 +295,10 @@ def collect_structural_snapshot(trainer: Any) -> StructuralSnapshot:
         sh_dc_abs_quantiles=_finite_quantiles(sh_dc.abs()),
         sh_rest_abs_quantiles=_finite_quantiles(sh_rest.abs()),
         max_anisotropy=float(_finite_quantiles(anisotropy)["q100"]),
+        centroid=tuple(float(value) for value in center.tolist()),
+        covariance_eigenvalues=tuple(
+            float(value) for value in covariance_eigenvalues.tolist()
+        ),
     )
 
 
@@ -303,6 +329,30 @@ def summarize_render_metrics(
     def bounded(value: float) -> float:
         return min(1.0, max(0.0, value))
 
+    rendered_gray = rendered.mean(dim=-1)
+    ground_truth_gray = ground_truth.mean(dim=-1)
+
+    def edge_map(value: torch.Tensor) -> torch.Tensor:
+        horizontal = F.pad((value[:, 1:] - value[:, :-1]).abs(), (0, 1, 0, 0))
+        vertical = F.pad((value[1:, :] - value[:-1, :]).abs(), (0, 0, 0, 1))
+        return torch.sqrt(horizontal.square() + vertical.square() + 1e-12)
+
+    rendered_edges = edge_map(rendered_gray)
+    target_edges = edge_map(ground_truth_gray)
+    edge_l1 = float((rendered_edges - target_edges).abs().mean().item())
+    rendered_centered = rendered_edges.flatten() - rendered_edges.mean()
+    target_centered = target_edges.flatten() - target_edges.mean()
+    denominator = torch.linalg.vector_norm(rendered_centered) * torch.linalg.vector_norm(
+        target_centered
+    )
+    if float(denominator.item()) <= 1e-12:
+        edge_correlation = 1.0 if edge_l1 <= 1e-6 else 0.0
+    else:
+        raw_correlation = float(
+            torch.dot(rendered_centered, target_centered).item() / denominator.item()
+        )
+        edge_correlation = min(1.0, max(0.0, (raw_correlation + 1.0) / 2.0))
+
     return {
         "psnr_unmasked": 100.0 if math.isinf(unmasked_psnr) else unmasked_psnr,
         "psnr_masked": (
@@ -312,6 +362,8 @@ def summarize_render_metrics(
         "ssim_masked": bounded(masked_ssim),
         "l1_unmasked": unmasked_l1,
         "l1_masked": masked_l1,
+        "edge_l1": edge_l1,
+        "edge_correlation": edge_correlation,
     }
 
 
@@ -360,6 +412,42 @@ class AblationDiagnosticCollector:
         self.checkpoints: list[AblationCheckpoint] = []
         self.decisions: list[GateDecision] = []
         self._consecutive_psnr_deficits = 0
+        self._structural_streaks: dict[str, int] = {}
+        self._lpips_metric: Any | None = None
+        self._lpips_checked = False
+
+    @staticmethod
+    def _depth_image(depth: torch.Tensor, alpha: torch.Tensor) -> Image.Image:
+        valid = torch.isfinite(depth) & (depth > 0.0) & (alpha > 0.01)
+        normalized = torch.zeros_like(depth, dtype=torch.float32)
+        if bool(valid.any()):
+            values = depth[valid].float()
+            low = torch.quantile(values, 0.02)
+            high = torch.quantile(values, 0.98)
+            span = (high - low).clamp_min(1e-6)
+            normalized[valid] = ((depth[valid].float() - low) / span).clamp(0.0, 1.0)
+        return _tensor_image(normalized.unsqueeze(-1).repeat(1, 1, 3))
+
+    def _lpips_distance(
+        self,
+        rendered: torch.Tensor,
+        ground_truth: torch.Tensor,
+    ) -> float | None:
+        if not self._lpips_checked:
+            from backend.model.losses_perceptual import LPIPSLoss
+
+            self._lpips_metric = LPIPSLoss(net="alex").to(rendered.device)
+            self._lpips_checked = True
+        if self._lpips_metric is None:
+            return None
+        value = self._lpips_metric(
+            rendered.permute(2, 0, 1),
+            ground_truth.permute(2, 0, 1),
+        )
+        if getattr(self._lpips_metric, "_available", False) is not True:
+            return None
+        result = float(value.item())
+        return result if math.isfinite(result) else None
 
     def _render_fixed_views(
         self,
@@ -367,7 +455,7 @@ class AblationDiagnosticCollector:
         resolution: tuple[int, int],
         sh_degree: int,
         iteration: int,
-    ) -> dict[str, float]:
+    ) -> dict[str, float | None]:
         from backend.model.renderer import render_view
 
         width, height = resolution
@@ -380,9 +468,18 @@ class AblationDiagnosticCollector:
                 "ssim_masked",
                 "l1_unmasked",
                 "l1_masked",
+                "edge_l1",
+                "edge_correlation",
+                "alpha_coverage",
+                "depth_finite_fraction",
+                "depth_median",
+                "perturbed_alpha_coverage",
+                "perturbed_depth_finite_fraction",
             )
         }
-        rows: list[tuple[Image.Image, Image.Image]] = []
+        lpips_values: list[float] = []
+        fixed_rows: list[tuple[Image.Image, ...]] = []
+        perturbed_rows: list[Image.Image] = []
         with torch.no_grad():
             for index in self.probe_indices:
                 frame = self.registered[index]
@@ -406,7 +503,7 @@ class AblationDiagnosticCollector:
                 else:
                     timestamp = index / max(len(self.registered) - 1, 1)
                     means, quats, scales = trainer._apply_deformation(timestamp)
-                rendered, _, _ = render_view(
+                rendered, alpha, _ = render_view(
                     means=means,
                     quats=quats,
                     scales=scales,
@@ -417,27 +514,112 @@ class AblationDiagnosticCollector:
                     width=width,
                     height=height,
                     sh_degree=sh_degree,
-                    with_depth=False,
+                    with_depth=True,
                 )
                 rgb = rendered[..., :3]
+                depth = rendered[..., 3]
                 metrics = summarize_render_metrics(rgb, gt, validity)
                 for name, value in metrics.items():
                     aggregate[name].append(value)
-                rows.append((_tensor_image(gt), _tensor_image(rgb)))
+                alpha_plane = alpha[..., 0]
+                depth_valid = (
+                    torch.isfinite(depth) & (depth > 0.0) & (alpha_plane > 0.01)
+                )
+                aggregate["alpha_coverage"].append(
+                    float((alpha_plane > 0.01).float().mean().item())
+                )
+                aggregate["depth_finite_fraction"].append(
+                    float(depth_valid.float().mean().item())
+                )
+                aggregate["depth_median"].append(
+                    float(depth[depth_valid].median().item())
+                    if bool(depth_valid.any())
+                    else 0.0
+                )
+                lpips_value = self._lpips_distance(rgb, gt)
+                if lpips_value is not None:
+                    lpips_values.append(lpips_value)
 
-        if not rows:
+                fixed_rows.append(
+                    (
+                        _tensor_image(gt),
+                        _tensor_image(rgb),
+                        _tensor_image((rgb - gt).abs()),
+                        self._depth_image(depth, alpha_plane),
+                    )
+                )
+
+                perturbed_w2c = w2c.clone()
+                perturbed_w2c[0, 3] += 0.02 * max(
+                    float(getattr(trainer, "scene_extent", 1.0)),
+                    1e-3,
+                )
+                perturbed, perturbed_alpha, _ = render_view(
+                    means=means,
+                    quats=quats,
+                    scales=scales,
+                    opacities=trainer.gs.get_opacities,
+                    colors=trainer.gs.get_colors,
+                    K=K,
+                    w2c=perturbed_w2c,
+                    width=width,
+                    height=height,
+                    sh_degree=sh_degree,
+                    with_depth=True,
+                )
+                perturbed_rgb = perturbed[..., :3]
+                perturbed_depth = perturbed[..., 3]
+                perturbed_alpha_plane = perturbed_alpha[..., 0]
+                perturbed_valid = (
+                    torch.isfinite(perturbed_depth)
+                    & (perturbed_depth > 0.0)
+                    & (perturbed_alpha_plane > 0.01)
+                )
+                aggregate["perturbed_alpha_coverage"].append(
+                    float((perturbed_alpha_plane > 0.01).float().mean().item())
+                )
+                aggregate["perturbed_depth_finite_fraction"].append(
+                    float(perturbed_valid.float().mean().item())
+                )
+                perturbed_rows.append(_tensor_image(perturbed_rgb))
+
+        if not fixed_rows:
             raise ValueError("diagnostic fixed-view set is empty")
-        row_height = max(image.height for row in rows for image in row)
-        column_width = max(image.width for row in rows for image in row)
-        contact = Image.new("RGB", (column_width * 2, row_height * len(rows)))
-        for row_index, (ground_truth, rendered) in enumerate(rows):
-            contact.paste(ground_truth, (0, row_index * row_height))
-            contact.paste(rendered, (column_width, row_index * row_height))
-        contact.save(self.output_root / f"contact_{iteration:06d}.png")
-        return {
+        row_height = max(image.height for row in fixed_rows for image in row)
+        column_width = max(image.width for row in fixed_rows for image in row)
+        fixed_contact = Image.new(
+            "RGB",
+            (column_width * 4, row_height * len(fixed_rows)),
+        )
+        for row_index, row in enumerate(fixed_rows):
+            for column_index, image in enumerate(row):
+                fixed_contact.paste(
+                    image,
+                    (column_index * column_width, row_index * row_height),
+                )
+        fixed_contact.save(
+            self.output_root / f"contact_{iteration:06d}_fixed.png"
+        )
+        fixed_contact.save(self.output_root / f"contact_{iteration:06d}.png")
+
+        perturbed_contact = Image.new(
+            "RGB",
+            (column_width, row_height * len(perturbed_rows)),
+        )
+        for row_index, image in enumerate(perturbed_rows):
+            perturbed_contact.paste(image, (0, row_index * row_height))
+        perturbed_contact.save(
+            self.output_root / f"contact_{iteration:06d}_perturbed.png"
+        )
+
+        result: dict[str, float | None] = {
             name: float(sum(values) / len(values))
             for name, values in aggregate.items()
         }
+        result["lpips_unmasked"] = (
+            float(sum(lpips_values) / len(lpips_values)) if lpips_values else None
+        )
+        return result
 
     def __call__(
         self,
@@ -464,14 +646,30 @@ class AblationDiagnosticCollector:
             l1_masked=metrics["l1_masked"],
             gaussian_count=int(trainer.gs.num_points),
             structural=structural.metrics,
+            edge_l1=float(metrics["edge_l1"]),
+            edge_correlation=float(metrics["edge_correlation"]),
+            lpips_unmasked=(
+                float(metrics["lpips_unmasked"])
+                if metrics["lpips_unmasked"] is not None
+                else None
+            ),
+            alpha_coverage=float(metrics["alpha_coverage"]),
+            depth_finite_fraction=float(metrics["depth_finite_fraction"]),
+            depth_median=float(metrics["depth_median"]),
+            perturbed_alpha_coverage=float(metrics["perturbed_alpha_coverage"]),
+            perturbed_depth_finite_fraction=float(
+                metrics["perturbed_depth_finite_fraction"]
+            ),
         )
         control = self.control_checkpoints.get(iteration)
         decision = evaluate_checkpoint(
             checkpoint,
             control=control,
             previous_psnr_deficits=self._consecutive_psnr_deficits,
+            previous_structural_streaks=self._structural_streaks,
         )
         self._consecutive_psnr_deficits = decision.consecutive_psnr_deficits
+        self._structural_streaks = dict(decision.structural_streaks)
         self.checkpoints.append(checkpoint)
         self.decisions.append(decision)
         _write_json_atomic(

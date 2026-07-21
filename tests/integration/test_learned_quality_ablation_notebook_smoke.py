@@ -34,18 +34,12 @@ def test_ablation_notebook_is_pinned_run_all_safe_and_local_first() -> None:
     sources = "\n".join(cell.source for cell in notebook.cells)
     assert re.fullmatch(r"[0-9a-f]{40}", commit)
     assert sources.count('INPUT_FOLDER = ""  # @param {type:"string"}') == 1
-    assert sources.count(
-        'RUNTIME_PROFILE = "l4_diagnostic"  # @param '
-        '["l4_diagnostic", "a100_reference"]'
-    ) == 1
+    assert sources.count('RUNTIME_PROFILE = "a100_reference"') == 1
 
     preflight = notebook.cells[2].source
     assert "nvidia-smi" in preflight
-    assert "RUNTIME_PROFILE == 'l4_diagnostic'" in preflight
-    assert "L4 or A100 with at least 22 GiB VRAM required" in preflight
-    assert "RUNTIME_PROFILE == 'a100_reference'" in preflight
     assert "A100 with at least 75 GiB VRAM required" in preflight
-    assert "unsupported runtime profile" in preflight
+    assert "L4" not in preflight
     assert sources.count("drive.mount") == 1
     assert "_training_ablation" in notebook.cells[4].source
     assert "_learned_test_cache" in notebook.cells[4].source
@@ -62,10 +56,15 @@ def test_ablation_notebook_is_pinned_run_all_safe_and_local_first() -> None:
     assert "COMMIT_SHA" in execute
     assert "environment['PYTHONUNBUFFERED'] = '1'" in execute
     assert "check=False" in execute
-    assert "ablation_report.json" in execute
-    assert "ablation_summary.md" in execute
+    assert "diagnostic_matrix.json" in execute
+    assert "diagnostic_summary.md" in execute
+    assert "historical_120k.json" in execute
     assert "metrics.csv" in execute
-    assert "psnr_plot.png" in execute
+    assert "plots/fixed_view_quality.png" in execute
+    assert "plots/structural_fidelity.png" in execute
+    assert "plots/gaussian_count.png" in execute
+    assert "plots/density_events.png" in execute
+    assert "No full 120K training was started" in execute
     assert "_SUCCESS.json" in execute
     assert "drive.flush_and_unmount()" in execute
     assert "runtime.unassign()" in execute
@@ -78,6 +77,7 @@ def test_ablation_notebook_is_pinned_run_all_safe_and_local_first() -> None:
     assert "splat.ply" not in sources
     assert "viewer.html" not in sources
     assert ".wasm" not in sources
+    assert "120000" not in sources
 
 
 def test_checked_in_ablation_notebook_matches_generator() -> None:
