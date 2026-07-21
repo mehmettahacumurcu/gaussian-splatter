@@ -5,14 +5,20 @@ import json
 import multiprocessing
 import os
 import shutil
+import subprocess
 import traceback
+import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass, is_dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from PIL import Image, ImageDraw
+from pydantic import Field, field_validator
+
+from backend.notebooks.drive_paths import normalize_input_folder
+from backend.notebooks.models import StrictModel
 
 from .ablation import (
     AblationCheckpoint,
@@ -35,6 +41,25 @@ if TYPE_CHECKING:
 
 
 GENERATOR_ID = "4dgs-studio.learned-training-ablation"
+RESULT_SUFFIX = "_training_ablation"
+
+
+class AblationPublishSpec(StrictModel):
+    replace_owned_result: bool = True
+
+
+class AblationRunSpec(StrictModel):
+    schema_version: Literal[1] = 1
+    input_folder: str
+    publish: AblationPublishSpec = Field(default_factory=AblationPublishSpec)
+
+    @field_validator("input_folder")
+    @classmethod
+    def normalize_folder(cls, value: str) -> str:
+        canonical = normalize_input_folder(value)
+        if canonical.endswith(RESULT_SUFFIX):
+            raise ValueError("choose the input folder, not an ablation output")
+        return canonical
 
 
 @dataclass(frozen=True)
@@ -87,6 +112,18 @@ class AblationMatrixResult:
         return required.issubset(self.results) and not required.intersection(
             self.errors
         )
+
+
+@dataclass(frozen=True)
+class TrainingAblationRunResult:
+    run_id: str
+    final_path: Path
+    local_root: Path
+    matrix: AblationMatrixResult
+
+    @property
+    def complete(self) -> bool:
+        return self.matrix.complete
 
 
 ExperimentExecutor = Callable[
@@ -606,3 +643,219 @@ def publish_ablation_report(
     }
     _write_json(target / marker_name, marker)
     return target
+
+
+def _git_revision(repository_root: Path) -> str:
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _default_exact_audit_validator(
+    cache_root: Path,
+    selection: object,
+    source_inventory: object,
+) -> bool:
+    from .audit import find_compatible_audit_receipts
+    from .tracks import TrackQualificationPolicy
+
+    receipts = find_compatible_audit_receipts(
+        cache_root,
+        input_digest=str(getattr(source_inventory, "digest")),
+        selection_digest=str(getattr(selection.manifest, "image_set_digest")),
+        policy=TrackQualificationPolicy(),
+        repository_root=Path(__file__).resolve().parents[2],
+    )
+    if not receipts:
+        raise RuntimeError(
+            "a matching verified CPU track-audit receipt is required before ablation"
+        )
+    return True
+
+
+def _hardware_payload(hardware: object) -> dict[str, object]:
+    if is_dataclass(hardware) and not isinstance(hardware, type):
+        return dict(asdict(hardware))
+    return {
+        name: getattr(hardware, name)
+        for name in (
+            "gpu_name",
+            "vram_gb",
+            "disk_free_gb",
+            "colmap_gpu_sift",
+        )
+        if hasattr(hardware, name)
+    }
+
+
+def run_training_ablation(
+    spec: AblationRunSpec,
+    *,
+    model_manifest_path: Path,
+    expected_source_revision: str,
+    actual_source_revision: str | None = None,
+    drive_root: Path = Path("/content/drive/MyDrive"),
+    work_root: Path = Path("/content/4dgs-ablation"),
+    discover_source: Callable[[Path], object] | None = None,
+    inspect_hardware: Callable[[object], object] | None = None,
+    store_factory: Callable[[Path, str], object] | None = None,
+    stage_inputs: Callable[..., StagedAblationInputs] | None = None,
+    exact_audit_validator: Callable[[Path, object, object], bool] | None = None,
+    execute_experiment: ExperimentExecutor | None = None,
+    publish_report: Callable[..., Path] = publish_ablation_report,
+) -> TrainingAblationRunResult:
+    """Restore the verified lineage once, then run every training from local disk."""
+
+    from backend.static_pipeline.runner import NotebookRuntimePaths
+
+    from .ablation_staging import stage_ablation_inputs
+    from .contracts import (
+        LearnedQualityRunSpec,
+        derive_learned_cache_root,
+        to_static_run_spec,
+    )
+
+    source_root = Path(__file__).resolve().parents[2]
+    revision = actual_source_revision or _git_revision(source_root)
+    if revision != expected_source_revision:
+        raise RuntimeError(
+            "checked-out source differs from the notebook pin: "
+            f"{revision} != {expected_source_revision}"
+        )
+    manifest_path = Path(model_manifest_path).resolve(strict=True)
+    mounted_drive = Path(drive_root).resolve(strict=True)
+    input_path = mounted_drive.joinpath(*Path(spec.input_folder).parts).resolve(
+        strict=True
+    )
+    if input_path.parent == input_path:
+        raise ValueError("input folder cannot be the Drive root")
+
+    if discover_source is None:
+        from backend.static_pipeline.sources import discover_source as discover
+
+        discover_source = discover
+    inventory = discover_source(input_path)
+
+    runtime_paths = NotebookRuntimePaths(
+        drive_root=mounted_drive,
+        work_root=Path(work_root).resolve(strict=False),
+    )
+    if inspect_hardware is None:
+        from backend.static_pipeline.runner import _inspect_hardware
+
+        inspect_hardware = _inspect_hardware
+    hardware = inspect_hardware(runtime_paths)
+    gpu_name = str(getattr(hardware, "gpu_name", ""))
+    vram_gb = float(getattr(hardware, "vram_gb", 0.0))
+    disk_free_gb = float(getattr(hardware, "disk_free_gb", 0.0))
+    if "A100" not in gpu_name.upper() or vram_gb < 75.0:
+        raise RuntimeError(
+            f"training ablation requires an A100 with 75+ GiB VRAM; got {gpu_name}"
+        )
+    if disk_free_gb < 40.0:
+        raise RuntimeError(
+            f"training ablation requires at least 40 GiB local disk; got {disk_free_gb}"
+        )
+
+    learned_spec = LearnedQualityRunSpec(
+        input_folder=spec.input_folder,
+        recovery_mode="round0_output_first_v1",
+    )
+    base_spec = to_static_run_spec(learned_spec)
+    cache_root = derive_learned_cache_root(input_path)
+    if store_factory is None:
+        from .cache import LearnedCheckpointStore
+
+        def default_store_factory(root: Path, digest: str) -> object:
+            return LearnedCheckpointStore(root, input_identity=digest)
+
+        store_factory = default_store_factory
+    store = store_factory(cache_root, str(getattr(inventory, "digest")))
+
+    run_id = uuid.uuid4().hex
+    local_root = Path(work_root).resolve(strict=False) / run_id
+    local_root.mkdir(parents=True, exist_ok=False)
+    report_root = local_root / "report"
+    experiments_root = local_root / "experiments"
+    progress_root = cache_root / "ablation_progress" / run_id
+    audit_exact = exact_audit_validator or _default_exact_audit_validator
+
+    def require_any_audit(active_inventory: object) -> None:
+        audits = cache_root / "audits"
+        if not audits.is_dir() or not any(audits.glob("*/_SUCCESS.json")):
+            raise RuntimeError(
+                "a verified CPU cache audit is required before training ablation"
+            )
+        if getattr(active_inventory, "digest", None) != getattr(
+            inventory, "digest", None
+        ):
+            raise ValueError("audit inventory differs from the active input")
+
+    def validate_restored(selection: object, _reconstruction: object) -> None:
+        if not audit_exact(cache_root, selection, inventory):
+            raise RuntimeError("restored selection does not have an exact CPU audit")
+
+    if stage_inputs is None:
+        stage_inputs = stage_ablation_inputs
+    from .runner import _pretraining_cache_fingerprint
+
+    staged = stage_inputs(
+        store=store,
+        source_inventory=inventory,
+        destination=local_root / "inputs",
+        drive_root=mounted_drive,
+        expected_fingerprint=lambda selection: _pretraining_cache_fingerprint(
+            inventory,
+            selection,
+            base_spec,
+            hardware,
+            manifest_path,
+        ),
+        expected_source_revision=expected_source_revision,
+        actual_source_revision=revision,
+        audit_validator=require_any_audit,
+        restored_validator=validate_restored,
+        minimum_free_bytes=35 * 1024**3,
+        run_id=run_id,
+        freeze=True,
+    )
+
+    def publish_progress(payload: dict[str, object]) -> None:
+        experiment_id = str(payload["experiment_id"])
+        _write_json(progress_root / f"{experiment_id}.json", payload)
+
+    executor = execute_experiment or ForkedExperimentExecutor(
+        report_root=report_root
+    )
+    matrix = run_ablation_matrix(
+        staged,
+        base_spec=base_spec,
+        experiments_root=experiments_root,
+        execute_experiment=executor,
+        publish_progress=publish_progress,
+    )
+    final_path = input_path.with_name(f"{input_path.name}{RESULT_SUFFIX}")
+    published = publish_report(
+        matrix,
+        staged=staged,
+        local_report_root=report_root,
+        destination=final_path,
+        run_id=run_id,
+        environment={
+            "source_revision": revision,
+            "model_manifest_path": manifest_path.as_posix(),
+            **_hardware_payload(hardware),
+        },
+        replace_owned_result=spec.publish.replace_owned_result,
+    )
+    return TrainingAblationRunResult(
+        run_id=run_id,
+        final_path=Path(published),
+        local_root=local_root,
+        matrix=matrix,
+    )

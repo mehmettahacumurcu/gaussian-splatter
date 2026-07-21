@@ -61,7 +61,13 @@ class FakeStore:
         return SimpleNamespace(selection=selection, reconstruction=reconstruction)
 
 
-def _stage(tmp_path: Path, store: FakeStore, *, freeze: bool = False):
+def _stage(
+    tmp_path: Path,
+    store: FakeStore,
+    *,
+    freeze: bool = False,
+    restored_validator=None,
+):
     inventory = SimpleNamespace(digest="c" * 64)
     audit_calls: list[object] = []
     staged = stage_ablation_inputs(
@@ -77,6 +83,7 @@ def _stage(tmp_path: Path, store: FakeStore, *, freeze: bool = False):
         available_free_bytes=2_000,
         run_id="ablation-run",
         freeze=freeze,
+        restored_validator=restored_validator,
     )
     return staged, inventory, audit_calls
 
@@ -206,3 +213,35 @@ def test_freeze_marks_the_staged_payload_read_only(tmp_path: Path) -> None:
 
     payload = staged.selection.frames_dir / "frame_000001.png"
     assert payload.stat().st_mode & 0o222 == 0
+
+
+def test_staging_validates_the_exact_restored_selection_before_freezing(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[object, object]] = []
+    staged, _, _ = _stage(
+        tmp_path,
+        FakeStore(),
+        restored_validator=lambda selection, reconstruction: calls.append(
+            (selection, reconstruction)
+        ),
+    )
+
+    assert calls == [(staged.selection, staged.reconstruction)]
+
+
+def test_failed_restored_selection_validation_removes_local_payload(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "local" / "inputs"
+
+    with pytest.raises(RuntimeError, match="audit mismatch"):
+        _stage(
+            tmp_path,
+            FakeStore(),
+            restored_validator=lambda _selection, _reconstruction: (_ for _ in ()).throw(
+                RuntimeError("audit mismatch")
+            ),
+        )
+
+    assert not destination.exists()

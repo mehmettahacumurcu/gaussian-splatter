@@ -143,6 +143,7 @@ def stage_ablation_inputs(
     run_id: str,
     available_free_bytes: int | None = None,
     freeze: bool = True,
+    restored_validator: Callable[[object, object], None] | None = None,
 ) -> StagedAblationInputs:
     if actual_source_revision != expected_source_revision:
         raise RuntimeError(
@@ -178,6 +179,8 @@ def stage_ablation_inputs(
             raise RuntimeError("verified final pretraining checkpoint is missing")
         selection = restored.selection
         reconstruction = restored.reconstruction
+        if restored_validator is not None:
+            restored_validator(selection, reconstruction)
         source_digest = getattr(source_inventory, "digest", None)
         if not isinstance(source_digest, str) or len(source_digest) != 64:
             raise ValueError("source inventory digest is invalid")

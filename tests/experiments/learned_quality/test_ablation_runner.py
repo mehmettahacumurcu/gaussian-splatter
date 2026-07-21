@@ -12,8 +12,10 @@ from experiments.learned_quality.ablation import (
 )
 from experiments.learned_quality.ablation_runner import (
     AblationMatrixResult,
+    AblationRunSpec,
     publish_ablation_report,
     run_ablation_matrix,
+    run_training_ablation,
 )
 from experiments.learned_quality.ablation_staging import StagedAblationInputs
 from experiments.learned_quality.ablation_training import AblationExperimentResult
@@ -222,3 +224,77 @@ def test_partial_matrix_publishes_receipts_without_success_marker(
 
     assert (destination / "_PARTIAL.json").is_file()
     assert not (destination / "_SUCCESS.json").exists()
+
+
+def test_run_training_ablation_stages_once_and_uses_the_dedicated_output(
+    tmp_path: Path,
+) -> None:
+    drive_root = tmp_path / "drive"
+    input_path = drive_root / "myroom_test"
+    input_path.mkdir(parents=True)
+    audit = (
+        drive_root
+        / "myroom_test_learned_test_cache"
+        / "audits"
+        / ("e" * 64)
+        / "_SUCCESS.json"
+    )
+    audit.parent.mkdir(parents=True)
+    audit.write_text("{}", encoding="utf-8")
+    work_root = tmp_path / "work"
+    model_manifest = tmp_path / "model_manifest.json"
+    model_manifest.write_text("{}", encoding="utf-8")
+    inventory = SimpleNamespace(digest="a" * 64)
+    hardware = SimpleNamespace(
+        gpu_name="NVIDIA A100-SXM4-80GB",
+        vram_gb=80.0,
+        disk_free_gb=200.0,
+        colmap_gpu_sift=True,
+    )
+    staged = _staged(tmp_path)
+    stage_calls: list[dict[str, object]] = []
+    publish_calls: list[dict[str, object]] = []
+
+    def stage_once(**kwargs):
+        stage_calls.append(kwargs)
+        kwargs["audit_validator"](inventory)
+        kwargs["restored_validator"](
+            SimpleNamespace(manifest=SimpleNamespace(image_set_digest="d" * 64)),
+            SimpleNamespace(),
+        )
+        return staged
+
+    def execute(_staged, variant, _workspace, _base_spec, _control):
+        return _result(variant.experiment_id, passed=True)
+
+    def publish(matrix, **kwargs):
+        publish_calls.append({"matrix": matrix, **kwargs})
+        kwargs["destination"].mkdir(parents=True)
+        return kwargs["destination"]
+
+    result = run_training_ablation(
+        AblationRunSpec(input_folder="myroom_test"),
+        model_manifest_path=model_manifest,
+        expected_source_revision="c" * 40,
+        actual_source_revision="c" * 40,
+        drive_root=drive_root,
+        work_root=work_root,
+        discover_source=lambda path: inventory if path == input_path else None,
+        inspect_hardware=lambda _paths: hardware,
+        store_factory=lambda _root, _digest: SimpleNamespace(),
+        stage_inputs=stage_once,
+        exact_audit_validator=lambda _cache, selection, _inventory: (
+            selection.manifest.image_set_digest == "d" * 64
+        ),
+        execute_experiment=execute,
+        publish_report=publish,
+    )
+
+    assert len(stage_calls) == 1
+    assert stage_calls[0]["destination"].name == "inputs"
+    assert len(publish_calls) == 1
+    assert publish_calls[0]["destination"] == drive_root / (
+        "myroom_test_training_ablation"
+    )
+    assert result.complete is True
+    assert result.final_path == drive_root / "myroom_test_training_ablation"
