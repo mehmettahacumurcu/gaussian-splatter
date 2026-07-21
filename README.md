@@ -93,6 +93,15 @@ python -m backend.pipeline data/test_scene/video.mp4 --scene test_scene
 
 `.ply` dosyaları [antimatter15/splat](https://antimatter15.com/splat/) gibi açık kaynak viewer'larda görüntülenebilir.
 
+## A100 learned-training diagnosis
+
+The isolated [training ablation notebook](docs/TRAINING_ABLATION_NOTEBOOK.md)
+compares the legacy control against dense seeds, masks, depth supervision,
+adaptive density, and their full learned combination. It stages verified Drive
+evidence to local Colab disk once, runs deterministic short experiments, and
+publishes reports to `<input>_training_ablation`. It does not alter the legacy
+notebook or publish a production PLY.
+
 ## HTTP API (Faz 7)
 
 Pipeline'ı CLI'dan çalıştırmak yerine HTTP üzerinden kullanabilirsin. Uygulama içi (Tauri frontend, web browser) ya da dışarıdan (curl, httpie) erişim için.
