@@ -87,6 +87,7 @@ def test_checked_in_ablation_notebook_matches_generator() -> None:
     )
     match = re.search(r"COMMIT_SHA = '([0-9a-f]{40})'", checkout.source)
     assert match is not None
+    assert match.group(1) == "14c38b1b867c2df7a81582e204cd75e78120428a"
     expected = build_learned_quality_ablation_notebook(
         commit_sha=match.group(1)
     )
