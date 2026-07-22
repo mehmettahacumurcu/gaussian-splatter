@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -161,6 +162,43 @@ def test_publication_restores_prior_result_when_promotion_fails(
     assert json.loads((destination / "_OWNERSHIP.json").read_text())[
         "generator_id"
     ] == "4dgs-studio.floor-recovery-diagnostic"
+
+
+def test_publication_cleans_replaced_backup_without_risking_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = tmp_path / "report"
+    report.mkdir()
+    (report / "candidate.ply").write_bytes(b"new")
+    destination = tmp_path / "myroom_floor_recovery_diagnostic"
+    destination.mkdir()
+    (destination / "_OWNERSHIP.json").write_text(
+        json.dumps({"generator_id": "4dgs-studio.floor-recovery-diagnostic"}),
+        encoding="utf-8",
+    )
+    (destination / "prior.txt").write_text("old", encoding="utf-8")
+    real_rmtree = shutil.rmtree
+    backup_cleanup_modes: list[bool] = []
+
+    def observe_cleanup(path, *args, **kwargs):
+        if ".backup-" in Path(path).name:
+            backup_cleanup_modes.append(bool(kwargs.get("ignore_errors")))
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", observe_cleanup)
+
+    published = publish_floor_recovery_report(
+        local_report_root=report,
+        destination=destination,
+        run_id="run-new",
+        decision=FloorRecoveryDecision(True, "passed", ()),
+    )
+
+    assert published == destination
+    assert (destination / "candidate.ply").read_bytes() == b"new"
+    assert not (destination / "prior.txt").exists()
+    assert backup_cleanup_modes == [True]
 
 
 def test_run_spec_rejects_output_folder() -> None:

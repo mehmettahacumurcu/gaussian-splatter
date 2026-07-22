@@ -213,7 +213,9 @@ def publish_floor_recovery_report(
             os.replace(backup, target)
         raise
     if backup is not None:
-        shutil.rmtree(backup)
+        # Publication is already durable at this point. A stale backup is safer than
+        # reporting failure after the new result has been installed successfully.
+        shutil.rmtree(backup, ignore_errors=True)
     return target
 
 
