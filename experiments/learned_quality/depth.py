@@ -855,7 +855,7 @@ def _resize_float32(values: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
 def _base_metric_confidence_files(
     frames: tuple[FrameArtifact, ...],
     depths: tuple[tuple[Path, str], ...],
-) -> tuple[Path, str, dict[str, tuple[str, Path, str]]]:
+) -> tuple[Path, str, dict[str, tuple[str, Path | None, str | None]]]:
     roots: set[Path] = set()
     for raw_path, _digest in depths:
         depth_path = _regular_file(raw_path, "base metric depth")
@@ -885,7 +885,7 @@ def _base_metric_confidence_files(
     ):
         raise ValueError("base DA3 metric metadata contract is invalid")
     expected = {frame.image_name: frame.frame_id for frame in frames}
-    confidence_by_name: dict[str, tuple[str, Path, str]] = {}
+    confidence_by_name: dict[str, tuple[str, Path | None, str | None]] = {}
     for raw_row in payload["artifacts"]:
         if not isinstance(raw_row, dict):
             raise ValueError("base DA3 metric artifact row is invalid")
@@ -896,11 +896,14 @@ def _base_metric_confidence_files(
             not isinstance(image_name, str)
             or image_name not in expected
             or frame_id != expected[image_name]
-            or not isinstance(confidence_relative, str)
-            or not confidence_relative
             or image_name in confidence_by_name
         ):
             raise ValueError("base DA3 confidence requires an exact frame join")
+        if confidence_relative is None:
+            confidence_by_name[image_name] = (frame_id, None, None)
+            continue
+        if not isinstance(confidence_relative, str) or not confidence_relative:
+            raise ValueError("base DA3 confidence path is invalid")
         confidence_path = metric_root.joinpath(
             *_safe_image_name(confidence_relative)
         ).resolve(strict=True)
@@ -916,6 +919,14 @@ def _base_metric_confidence_files(
         )
     if set(confidence_by_name) != set(expected):
         raise ValueError("base DA3 confidence requires an exact frame join")
+    confidence_presence = {
+        confidence_path is not None
+        for _frame_id, confidence_path, _digest in confidence_by_name.values()
+    }
+    if len(confidence_presence) != 1:
+        raise ValueError(
+            "base DA3 confidence must be present for every frame or omitted for every frame"
+        )
     return metadata_path, metadata_digest, confidence_by_name
 
 
@@ -986,9 +997,19 @@ def build_supported_depth_cloud_from_base_evidence(
         ]
         if confidence_frame_id != frame.frame_id:
             raise ValueError("base DA3 confidence frame contracts disagree")
-        confidence_map = _resize_float32(
-            _load_float32(confidence_path, "base DA3 confidence"), depth.shape
-        )
+        if confidence_path is None:
+            if confidence_digest is not None:
+                raise AssertionError("missing base DA3 confidence has a digest")
+            confidence_map = np.ones(depth.shape, dtype=np.float32)
+            confidence_map.setflags(write=False)
+            confidence_label = "implicit_unit_missing_da3_confidence"
+        else:
+            if confidence_digest is None:
+                raise AssertionError("base DA3 confidence digest is missing")
+            confidence_map = _resize_float32(
+                _load_float32(confidence_path, "base DA3 confidence"), depth.shape
+            )
+            confidence_label = "da3_metric"
         if not np.isfinite(confidence_map).all() or np.any(confidence_map < 0.0):
             raise ValueError("base DA3 confidence must be finite and nonnegative")
         camera = cameras_by_name[frame.image_name]
@@ -1057,11 +1078,12 @@ def build_supported_depth_cloud_from_base_evidence(
             (
                 (frame.path, frame.sha256),
                 (depth_path, depth_digest),
-                (confidence_path, confidence_digest),
                 (Path(mask.motion_confirmed_path), mask.motion_confirmed_sha256),
                 (Path(mask.sky_confirmed_path), mask.sky_confirmed_sha256),
             )
         )
+        if confidence_path is not None and confidence_digest is not None:
+            snapshots.append((confidence_path, confidence_digest))
         frame_rows.append(
             {"frame_id": frame.frame_id, "image_name": frame.image_name, "sha256": frame.sha256}
         )
@@ -1070,7 +1092,7 @@ def build_supported_depth_cloud_from_base_evidence(
                 "frame_id": frame.frame_id,
                 "depth_sha256": depth_digest,
                 "confidence_sha256": confidence_digest,
-                "confidence": "da3_metric",
+                "confidence": confidence_label,
             }
         )
         mask_rows.append(

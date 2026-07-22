@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+import experiments.learned_quality.depth as depth_module
 from experiments.learned_quality.contracts import FrameArtifact
 from experiments.learned_quality.da3 import (
     FinalPoseCamera,
@@ -360,8 +361,10 @@ def test_cached_validated_depth_fails_closed_because_semantics_cannot_be_recover
         )
 
 
+@pytest.mark.parametrize("confidence_mode", ("present", "missing"))
 def test_base_metric_depth_rebuilds_motion_sky_support_without_semantics(
     tmp_path: Path,
+    confidence_mode: str,
 ) -> None:
     from experiments.learned_quality.milestones import BaseEvidenceState
 
@@ -392,8 +395,13 @@ def test_base_metric_depth_rebuilds_motion_sky_support_without_semantics(
         confidence = np.full(shape, 0.8, dtype=np.float32)
         if index == 0:
             confidence[3, 3] = 0.1
-        confidence_name = f"{frame.frame_id}.confidence.npy"
-        _write_npy(metric_root / confidence_name, confidence)
+        confidence_name = (
+            f"{frame.frame_id}.confidence.npy"
+            if confidence_mode == "present"
+            else None
+        )
+        if confidence_name is not None:
+            _write_npy(metric_root / confidence_name, confidence)
         metric_rows.append(
             {
                 "image_name": frame.image_name,
@@ -445,9 +453,58 @@ def test_base_metric_depth_rebuilds_motion_sky_support_without_semantics(
     )
     assert (0, 1, 1) in selected
     assert (0, 2, 2) not in selected
-    assert (0, 3, 3) not in selected
-    assert np.all(cloud.confidence == pytest.approx(0.8))
+    assert ((0, 3, 3) not in selected) is (confidence_mode == "present")
+    expected_confidence = 0.8 if confidence_mode == "present" else 1.0
+    assert np.all(cloud.confidence == pytest.approx(expected_confidence))
     assert cloud.source_depth_digest != "c" * 64
+
+
+def test_base_metric_confidence_rejects_partial_availability(tmp_path: Path) -> None:
+    frames, final_depth, _masks, _model = _inputs(
+        tmp_path / "partial-inputs",
+        frame_count=2,
+    )
+    base_root = (tmp_path / "partial-base-evidence").resolve()
+    native_root = base_root / "metric-native"
+    metric_root = base_root / "da3-metric"
+    native_root.mkdir(parents=True)
+    metric_root.mkdir()
+    depth_rows = []
+    metric_rows = []
+    for index, (frame, artifact) in enumerate(
+        zip(frames, final_depth.artifacts, strict=True)
+    ):
+        depth_path = native_root / f"{Path(frame.image_name).stem}.depth.npy"
+        _write_npy(depth_path, np.load(artifact.depth_path, allow_pickle=False))
+        depth_rows.append((depth_path, _sha256(depth_path)))
+        confidence_name = None
+        if index == 1:
+            confidence_name = f"{frame.frame_id}.confidence.npy"
+            _write_npy(metric_root / confidence_name, np.ones((4, 6), dtype=np.float32))
+        metric_rows.append(
+            {
+                "image_name": frame.image_name,
+                "frame_id": frame.frame_id,
+                "confidence_path": confidence_name,
+            }
+        )
+    (metric_root / "metadata.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "stage": "da3_metric_sky",
+                "artifacts": metric_rows,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="present for every frame or omitted for every frame",
+    ):
+        depth_module._base_metric_confidence_files(frames, tuple(depth_rows))
 
 
 def test_supported_cloud_requires_two_additional_agreeing_views(
