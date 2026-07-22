@@ -388,6 +388,11 @@ class AblationDiagnosticCollector:
         variant: AblationVariant,
         output_root: Path,
         control_checkpoints: Mapping[int, AblationCheckpoint] | None = None,
+        checkpoint_observer: Callable[
+            [Any, int, tuple[int, int], int], Mapping[str, object]
+        ]
+        | None = None,
+        stop_on_quality: bool = True,
     ) -> None:
         from backend.preprocess.frame_alignment import join_registered_frames
         from backend.preprocess.parse_colmap import parse_cameras_from_model
@@ -409,8 +414,11 @@ class AblationDiagnosticCollector:
         self.validity = tuple(by_name[frame.image_name] for frame in registered)
         self.probe_indices = _coverage_indices(len(registered))
         self.control_checkpoints = dict(control_checkpoints or {})
+        self.checkpoint_observer = checkpoint_observer
+        self.stop_on_quality = bool(stop_on_quality)
         self.checkpoints: list[AblationCheckpoint] = []
         self.decisions: list[GateDecision] = []
+        self.extra_checkpoints: list[Mapping[str, object]] = []
         self._consecutive_psnr_deficits = 0
         self._structural_streaks: dict[str, int] = {}
         self._lpips_metric: Any | None = None
@@ -662,12 +670,31 @@ class AblationDiagnosticCollector:
             ),
         )
         control = self.control_checkpoints.get(iteration)
-        decision = evaluate_checkpoint(
-            checkpoint,
-            control=control,
-            previous_psnr_deficits=self._consecutive_psnr_deficits,
-            previous_structural_streaks=self._structural_streaks,
-        )
+        if self.stop_on_quality:
+            decision = evaluate_checkpoint(
+                checkpoint,
+                control=control,
+                previous_psnr_deficits=self._consecutive_psnr_deficits,
+                previous_structural_streaks=self._structural_streaks,
+            )
+        else:
+            nonfinite = structural.metrics.nonfinite_count > 0
+            decision = GateDecision(
+                stop=nonfinite,
+                reasons=("nonfinite_values",) if nonfinite else (),
+            )
+        extra: Mapping[str, object] | None = None
+        if self.checkpoint_observer is not None:
+            observed = self.checkpoint_observer(
+                trainer,
+                iteration,
+                resolution,
+                sh_degree,
+            )
+            if not isinstance(observed, Mapping):
+                raise TypeError("checkpoint observer must return a mapping")
+            extra = dict(observed)
+            self.extra_checkpoints.append(extra)
         self._consecutive_psnr_deficits = decision.consecutive_psnr_deficits
         self._structural_streaks = dict(decision.structural_streaks)
         self.checkpoints.append(checkpoint)
@@ -678,6 +705,7 @@ class AblationDiagnosticCollector:
                 "checkpoint": asdict(checkpoint),
                 "gate": asdict(decision),
                 "structural": asdict(structural),
+                "extra": extra,
             },
         )
         if decision.stop:

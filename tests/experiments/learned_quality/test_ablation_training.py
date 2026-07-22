@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -338,6 +339,68 @@ def test_collector_publishes_fixed_and_perturbed_structural_evidence(
     assert checkpoint.depth_finite_fraction == pytest.approx(1.0)
     assert checkpoint.perturbed_alpha_coverage == pytest.approx(1.0)
     assert checkpoint.edge_l1 >= 0.0
+
+
+def test_collector_can_publish_extra_floor_metrics_without_quality_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts, model, scene, _, _ = _fixture(tmp_path)
+    prepared = prepare_ablation_scene(
+        artifacts,
+        accepted_model_dir=model,
+        scene_dir=scene,
+        variant=_variant("legacy_control"),
+    )
+
+    def fake_render_view(**kwargs):
+        height = int(kwargs["height"])
+        width = int(kwargs["width"])
+        output = torch.zeros((height, width, 4), dtype=torch.float32)
+        output[..., 3] = 1.0
+        return output, torch.ones((height, width, 1)), {}
+
+    monkeypatch.setattr("backend.model.renderer.render_view", fake_render_view)
+    monkeypatch.setattr(
+        "experiments.learned_quality.ablation_training.evaluate_checkpoint",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("quality gate must be bypassed")
+        ),
+    )
+    count = 4
+    trainer = SimpleNamespace(
+        gs=SimpleNamespace(
+            means=torch.zeros((count, 3)),
+            quats=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(count, 1),
+            get_scales=torch.full((count, 3), 0.01),
+            get_opacities=torch.full((count, 1), 0.5),
+            get_colors=torch.zeros((count, 1, 3)),
+            sh_dc=torch.zeros((count, 1, 3)),
+            sh_rest=torch.zeros((count, 15, 3)),
+            num_points=count,
+        ),
+        device=torch.device("cpu"),
+        static_mode=True,
+        scene_extent=1.0,
+    )
+    collector = AblationDiagnosticCollector(
+        scene_dir=scene,
+        frames=prepared.original_frames,
+        validity=prepared.quality_validity,
+        variant=_variant("legacy_control"),
+        output_root=tmp_path / "diagnostics-extra",
+        checkpoint_observer=lambda *_args: {"floor_alpha_coverage": 0.25},
+        stop_on_quality=False,
+    )
+
+    collector(trainer, 0, (6, 4), 0)
+
+    assert collector.decisions[0].stop is False
+    assert collector.extra_checkpoints == [{"floor_alpha_coverage": 0.25}]
+    payload = json.loads(
+        (tmp_path / "diagnostics-extra" / "checkpoint_000000.json").read_text()
+    )
+    assert payload["extra"] == {"floor_alpha_coverage": 0.25}
 
 
 def _checkpoint(experiment_id: str, iteration: int = 500):
