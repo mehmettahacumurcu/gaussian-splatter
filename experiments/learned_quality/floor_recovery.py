@@ -247,15 +247,16 @@ def estimate_floor_plane(
             continue
         offset = -float(normal @ plane_center)
         camera_heights = cameras @ normal + offset
-        if float(np.median(camera_heights)) < 0.0:
-            normal = -normal
-            offset = -offset
-            camera_heights = -camera_heights
+        camera_height = float(np.median(camera_heights))
+        if not math.isfinite(camera_height) or camera_height <= 4.0 * tolerance:
+            # `up` already has a signed content-side convention. Flipping a plane
+            # merely because cameras lie below it turns a ceiling into a floor.
+            continue
         distances = points @ normal + offset
         inliers = np.abs(distances) <= tolerance
         positive = int(np.count_nonzero(distances > tolerance))
         negative = int(np.count_nonzero(distances < -tolerance))
-        asymmetry = (max(positive, negative) + 1.0) / (min(positive, negative) + 1.0)
+        asymmetry = (positive + 1.0) / (negative + 1.0)
         score = float(inliers.sum()) * min(asymmetry, 50.0)
         candidate = (
             score,
@@ -263,7 +264,7 @@ def estimate_floor_plane(
             offset,
             inliers,
             asymmetry,
-            float(np.median(camera_heights)),
+            camera_height,
         )
         if best is None or candidate[0] > best[0]:
             best = candidate

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -104,6 +105,37 @@ def test_floor_plane_orients_toward_cameras_and_fits_floor() -> None:
     assert plane.inlier_count >= 100
     assert plane.median_camera_height > 1.0
     assert plane.above_below_ratio >= 4.0
+
+
+def test_floor_plane_never_flips_a_ceiling_toward_the_cameras(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rng = np.random.default_rng(19)
+    floor = np.column_stack(
+        (rng.uniform(-2.0, 2.0, 450), np.zeros(450), rng.uniform(0.0, 4.0, 450))
+    )
+    ceiling = np.column_stack(
+        (
+            rng.uniform(-2.0, 2.0, 1_100),
+            np.full(1_100, 3.0),
+            rng.uniform(0.0, 4.0, 1_100),
+        )
+    )
+    interior = rng.uniform((-1.8, 0.2, 0.2), (1.8, 2.8, 3.8), size=(500, 3))
+    points = np.concatenate((floor, ceiling, interior))
+    cameras = np.array(((-1.0, 1.6, 0.5), (0.0, 1.7, 2.0), (1.0, 1.6, 3.5)))
+    monkeypatch.setattr(
+        "experiments.learned_quality.floor_recovery.estimate_world_orientation",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            up_raw=np.array((0.0, 1.0, 0.0))
+        ),
+    )
+
+    plane = estimate_floor_plane(points, cameras, policy=_policy(), seed=31)
+
+    assert np.dot(plane.normal, np.array((0.0, 1.0, 0.0))) > 0.98
+    assert abs(plane.offset) < plane.inlier_tolerance
+    assert plane.median_camera_height > 1.0
 
 
 def test_floor_hole_map_and_seeds_stay_inside_missing_patch(tmp_path: Path) -> None:

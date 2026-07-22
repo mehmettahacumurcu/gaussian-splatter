@@ -225,6 +225,21 @@ def test_run_floor_recovery_stages_once_and_uses_diagnostic_output(
     audit.write_text("{}", encoding="utf-8")
     reference_source = drive_root / "myroom_test_training_ablation"
     reference_source.mkdir()
+    (reference_source / "_SUCCESS.json").write_text(
+        json.dumps({"status": "success"}), encoding="utf-8"
+    )
+    (reference_source / "diagnostic_matrix.json").write_text(
+        json.dumps(
+            {
+                "staging": {
+                    "source_digest": "a" * 64,
+                    "pretraining_fingerprint": "b" * 64,
+                    "source_revision": A100_LEGACY_REFERENCE_REVISION,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     model_manifest = tmp_path / "model_manifest.json"
     model_manifest.write_text("{}", encoding="utf-8")
     inventory = SimpleNamespace(digest="a" * 64)
@@ -257,6 +272,7 @@ def test_run_floor_recovery_stages_once_and_uses_diagnostic_output(
 
     def restored_graph(**kwargs):
         kwargs["selection_validator"](restored_selection)
+        assert kwargs["final_pretraining_fingerprint"] == "b" * 64
         return SimpleNamespace(restored=True)
 
     monkeypatch.setattr(
@@ -267,6 +283,7 @@ def test_run_floor_recovery_stages_once_and_uses_diagnostic_output(
     def stage_once(**kwargs):
         stage_calls.append(kwargs)
         kwargs["audit_validator"](inventory)
+        assert kwargs["expected_fingerprint"](restored_selection) == "b" * 64
         assert kwargs["restore_pretraining"](tmp_path / "candidate").restored
         kwargs["restored_validator"](restored_selection, object())
         return staged
@@ -332,6 +349,23 @@ def test_run_floor_recovery_rejects_false_audit_before_large_restore(
     drive_root = tmp_path / "drive"
     input_path = drive_root / "myroom_test"
     input_path.mkdir(parents=True)
+    reference_source = drive_root / "myroom_test_training_ablation"
+    reference_source.mkdir()
+    (reference_source / "_SUCCESS.json").write_text(
+        json.dumps({"status": "success"}), encoding="utf-8"
+    )
+    (reference_source / "diagnostic_matrix.json").write_text(
+        json.dumps(
+            {
+                "staging": {
+                    "source_digest": "a" * 64,
+                    "pretraining_fingerprint": "b" * 64,
+                    "source_revision": A100_LEGACY_REFERENCE_REVISION,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     model_manifest = tmp_path / "model_manifest.json"
     model_manifest.write_text("{}", encoding="utf-8")
     inventory = SimpleNamespace(digest="a" * 64)

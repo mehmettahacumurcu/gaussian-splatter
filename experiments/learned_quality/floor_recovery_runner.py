@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -25,6 +26,7 @@ from .floor_recovery_training import FloorCheckpointMetrics, FloorTrainingResult
 GENERATOR_ID = "4dgs-studio.floor-recovery-diagnostic"
 RESULT_SUFFIX = "_floor_recovery_diagnostic"
 A100_LEGACY_REFERENCE_REVISION = "ce836c9d82bc0b17bad1cff558f99cca41e4ae28"
+_DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
 class FloorRecoveryPublishSpec(StrictModel):
@@ -245,6 +247,33 @@ def _load_json(path: Path, label: str) -> Mapping[str, object]:
     return payload
 
 
+def verified_legacy_reference_fingerprint(
+    source: Path,
+    *,
+    source_digest: str,
+) -> str:
+    """Read the small A100 matrix identity before restoring its large cache."""
+
+    root = Path(source).resolve(strict=True)
+    marker = _load_json(root / "_SUCCESS.json", "training ablation marker")
+    if marker.get("status") != "success":
+        raise RuntimeError("verified training ablation result is missing")
+    matrix = _load_json(root / "diagnostic_matrix.json", "diagnostic matrix")
+    staging = matrix.get("staging")
+    if not isinstance(staging, dict):
+        raise RuntimeError("diagnostic matrix staging metadata is missing")
+    if staging.get("source_revision") != A100_LEGACY_REFERENCE_REVISION:
+        raise RuntimeError(
+            "legacy reference producer revision differs from the verified A100 matrix"
+        )
+    if staging.get("source_digest") != source_digest:
+        raise RuntimeError("legacy reference differs from the active input")
+    fingerprint = staging.get("pretraining_fingerprint")
+    if not isinstance(fingerprint, str) or _DIGEST.fullmatch(fingerprint) is None:
+        raise RuntimeError("legacy reference pretraining fingerprint is invalid")
+    return fingerprint
+
+
 def stage_legacy_reference(
     source: Path,
     destination: Path,
@@ -256,21 +285,11 @@ def stage_legacy_reference(
     from .ablation_runner import _record_from_payload
 
     root = Path(source).resolve(strict=True)
-    if not (root / "_SUCCESS.json").is_file():
-        raise RuntimeError("verified training ablation result is missing")
-    matrix = _load_json(root / "diagnostic_matrix.json", "diagnostic matrix")
-    staging = matrix.get("staging")
-    if not isinstance(staging, dict):
-        raise RuntimeError("diagnostic matrix staging metadata is missing")
-    if staging.get("source_revision") != A100_LEGACY_REFERENCE_REVISION:
-        raise RuntimeError(
-            "legacy reference producer revision differs from the verified A100 matrix"
-        )
-    if (
-        staging.get("source_digest") != staged.source_digest
-        or staging.get("pretraining_fingerprint")
-        != staged.pretraining_fingerprint
-    ):
+    reference_fingerprint = verified_legacy_reference_fingerprint(
+        root,
+        source_digest=staged.source_digest,
+    )
+    if reference_fingerprint != staged.pretraining_fingerprint:
         raise RuntimeError("legacy reference differs from staged pretraining")
     environment = _load_json(root / "environment.json", "ablation environment")
     if environment.get("runtime_profile") != "a100_reference":
@@ -596,6 +615,14 @@ def run_floor_recovery_diagnostic(
     hardware = inspect_hardware(runtime_paths)
     validate_floor_recovery_hardware(hardware)
 
+    reference_source = input_path.with_name(
+        f"{input_path.name}_training_ablation"
+    )
+    reference_fingerprint = verified_legacy_reference_fingerprint(
+        reference_source,
+        source_digest=str(getattr(inventory, "digest")),
+    )
+
     learned_spec = LearnedQualityRunSpec(
         input_folder=spec.input_folder,
         recovery_mode="round0_output_first_v1",
@@ -666,6 +693,7 @@ def run_floor_recovery_diagnostic(
             repository_root=_REPOSITORY_ROOT,
             run_id=run_id,
             selection_validator=validate_selection,
+            final_pretraining_fingerprint=reference_fingerprint,
         )
 
     stage = stage_inputs or stage_ablation_inputs
@@ -674,13 +702,7 @@ def run_floor_recovery_diagnostic(
         source_inventory=inventory,
         destination=local_root / "inputs",
         drive_root=mounted_drive,
-        expected_fingerprint=lambda selection: _pretraining_cache_fingerprint(
-            inventory,
-            selection,
-            base_spec,
-            hardware,
-            manifest_path,
-        ),
+        expected_fingerprint=lambda _selection: reference_fingerprint,
         expected_source_revision=expected_source_revision,
         actual_source_revision=revision,
         audit_validator=require_any_audit,
@@ -692,7 +714,7 @@ def run_floor_recovery_diagnostic(
     )
     reference_root = local_root / "legacy-reference"
     legacy_checkpoints = stage_reference(
-        input_path.with_name(f"{input_path.name}_training_ablation"),
+        reference_source,
         reference_root,
         staged=staged,
     )

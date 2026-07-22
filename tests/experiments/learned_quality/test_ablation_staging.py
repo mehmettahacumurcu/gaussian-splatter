@@ -199,7 +199,8 @@ def test_output_first_restore_uses_the_complete_graph_without_legacy_restore(
     colmap_ref = MilestoneRef(CheckpointKind.COLMAP, "6" * 64)
     geometry_ref = MilestoneRef(CheckpointKind.GEOMETRY, "7" * 64)
     pretraining_ref = MilestoneRef(CheckpointKind.PRETRAINING, GRAPH_FINGERPRINT)
-    restored_kinds: list[CheckpointKind] = []
+    historical_fingerprint = "8" * 64
+    restored_refs: list[MilestoneRef] = []
 
     class FakeGraphStore:
         def restore_pretraining(self, **_kwargs: object) -> object:
@@ -215,7 +216,7 @@ def test_output_first_restore_uses_the_complete_graph_without_legacy_restore(
         ) -> MilestoneState | None:
             del external_roots
             assert source_inventory is inventory
-            restored_kinds.append(ref.kind)
+            restored_refs.append(ref)
             destination.mkdir(parents=True)
             artifact = destination / "artifact"
             artifact.mkdir()
@@ -338,12 +339,13 @@ def test_output_first_restore_uses_the_complete_graph_without_legacy_restore(
         model_manifest_path=model_manifest,
         repository_root=tmp_path,
         run_id="ablation-run",
+        final_pretraining_fingerprint=historical_fingerprint,
     )
 
     assert restored is not None
     assert restored.reconstruction is expected_reconstruction
-    assert restored.fingerprint == GRAPH_FINGERPRINT
-    assert restored_kinds == [
+    assert restored.fingerprint == historical_fingerprint
+    assert [ref.kind for ref in restored_refs] == [
         CheckpointKind.SELECTION,
         CheckpointKind.BASE_EVIDENCE,
         CheckpointKind.SEMANTIC,
@@ -352,6 +354,7 @@ def test_output_first_restore_uses_the_complete_graph_without_legacy_restore(
         CheckpointKind.GEOMETRY,
         CheckpointKind.PRETRAINING,
     ]
+    assert restored_refs[-1].fingerprint == historical_fingerprint
 
 
 def test_output_first_restore_rejects_unaudited_candidate_before_graph_restore(

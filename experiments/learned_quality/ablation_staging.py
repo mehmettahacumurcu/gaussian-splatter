@@ -232,6 +232,7 @@ def restore_output_first_pretraining(
     repository_root: Path,
     run_id: str,
     selection_validator: Callable[[object], None] | None = None,
+    final_pretraining_fingerprint: str | None = None,
 ) -> RestoredAblationPretraining | None:
     """Restore the verified output-first graph without running preprocessing."""
 
@@ -360,11 +361,17 @@ def restore_output_first_pretraining(
     if geometry is None:
         return None
 
-    pretraining_ref = _final_pretraining_milestone_ref(
-        session,
-        geometry_ref,
-        refs[CheckpointKind.MASKS],
-    )
+    if final_pretraining_fingerprint is None:
+        pretraining_ref = _final_pretraining_milestone_ref(
+            session,
+            geometry_ref,
+            refs[CheckpointKind.MASKS],
+        )
+    else:
+        pretraining_ref = MilestoneRef(
+            CheckpointKind.PRETRAINING,
+            final_pretraining_fingerprint,
+        )
     final = _restored_value(
         session,
         pretraining_ref,
