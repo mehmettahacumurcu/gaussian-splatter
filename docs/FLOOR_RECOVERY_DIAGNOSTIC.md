@@ -11,7 +11,9 @@ Use the exact same input folder for every prerequisite:
 
 1. The CPU cache-audit notebook must have printed `TRACK AUDIT PASSED`.
 2. The A100 structural diagnostic matrix must have completed and published
-   `<input>_training_ablation/_SUCCESS.json` with its legacy control.
+   `<input>_training_ablation/_SUCCESS.json` with its legacy control. The runner pins
+   and verifies the exact accepted A100 matrix producer separately from its newer
+   floor-recovery source revision.
 3. Start a fresh **A100 80 GB High-RAM** Colab runtime. L4, T4, and standard-RAM
    runtimes are deliberately rejected.
 4. Keep at least 80 GiB of free local Colab disk.
