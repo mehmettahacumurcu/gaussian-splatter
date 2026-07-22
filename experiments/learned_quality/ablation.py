@@ -97,6 +97,7 @@ class AblationCheckpoint:
     depth_median: float = 0.0
     perturbed_alpha_coverage: float = 0.0
     perturbed_depth_finite_fraction: float = 0.0
+    perturbed_depth_median: float = 0.0
 
 
 @dataclass(frozen=True)

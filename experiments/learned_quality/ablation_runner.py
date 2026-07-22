@@ -431,6 +431,7 @@ def _checkpoint_from_payload(payload: Mapping[str, object]) -> AblationCheckpoin
         perturbed_depth_finite_fraction=float(
             payload.get("perturbed_depth_finite_fraction", 0.0)
         ),
+        perturbed_depth_median=float(payload.get("perturbed_depth_median", 0.0)),
     )
 
 

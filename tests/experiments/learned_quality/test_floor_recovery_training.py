@@ -14,6 +14,7 @@ from experiments.learned_quality.contracts import LearnedQualityRunSpec, to_stat
 from experiments.learned_quality.floor_recovery_training import (
     FLOOR_RECOVERY_CHECKPOINTS,
     FloorCheckpointMetrics,
+    FloorDiagnosticProbe,
     initialize_floor_seed_slice,
     make_floor_recovery_static_spec,
     prepare_floor_recovery_scene,
@@ -139,6 +140,30 @@ def test_floor_seed_initializer_changes_only_verified_trailing_slice() -> None:
     assert torch.all(trainer.gs.sh_rest[3:] == 0.0)
 
 
+def test_floor_probe_does_not_count_low_opacity_initial_seeds_as_recovered() -> None:
+    trainer, floor_xyz, floor_rgb = _trainer()
+    initialize_floor_seed_slice(
+        trainer,
+        original_count=3,
+        floor_xyz=floor_xyz,
+        floor_rgb=floor_rgb,
+        maximum_scale=0.025,
+    )
+    probe = FloorDiagnosticProbe(
+        floor_xyz=floor_xyz,
+        plane_normal=np.array((0.0, 1.0, 0.0), dtype=np.float32),
+        plane_offset=0.0,
+        plane_tolerance=0.02,
+        maximum_scale=0.025,
+    )
+
+    payload = probe(trainer, 0, (720, 720), 3)
+
+    assert payload["occupied_hole_fraction"] == 1.0
+    assert payload["floor_alpha_coverage"] == 0.0
+    assert payload["residual_hole_fraction"] == 1.0
+
+
 def test_floor_seed_initializer_rejects_count_position_and_color_mismatch() -> None:
     trainer, floor_xyz, floor_rgb = _trainer()
     with pytest.raises(RuntimeError, match="count mismatch"):
@@ -221,7 +246,11 @@ def test_run_floor_training_requires_every_global_and_floor_checkpoint(
         acceptance=None,
     )
     checkpoints = tuple(
-        SimpleNamespace(iteration=iteration)
+        SimpleNamespace(
+            iteration=iteration,
+            depth_median=2.0,
+            perturbed_depth_median=2.0,
+        )
         for iteration in FLOOR_RECOVERY_CHECKPOINTS
     )
     floor = tuple(

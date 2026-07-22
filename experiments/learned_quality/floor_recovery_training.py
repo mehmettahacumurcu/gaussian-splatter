@@ -5,7 +5,7 @@ import json
 import math
 import os
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Mapping
 
@@ -351,7 +351,10 @@ class FloorDiagnosticProbe:
             raise RuntimeError("floor diagnostic received non-finite Gaussians")
         distances, indices = cKDTree(means).query(self.floor_xyz, k=1)
         occupied = distances <= self.radius
-        visible = occupied & (opacities[indices] > 0.01)
+        # The verified seeds intentionally start at sigmoid(-4) ~= 0.018.
+        # They are spatially present at iteration zero but must not count as a
+        # recovered floor until training raises them to useful opacity.
+        visible = occupied & (opacities[indices] > 0.10)
         alpha_coverage = float(np.mean(visible))
         plane_distance = np.abs(means[indices] @ self.normal + self.offset)
         plane_error = (
@@ -502,7 +505,23 @@ def run_floor_recovery_training(
     if collector is None or probe is None:
         raise RuntimeError("floor recovery training did not install diagnostics")
     checkpoints = tuple(collector.checkpoints)
-    floor_checkpoints = tuple(probe.checkpoints)
+    floor_checkpoints = tuple(
+        replace(
+            floor_checkpoint,
+            perturbed_depth_disagreement_ratio=(
+                max(checkpoint.depth_median, checkpoint.perturbed_depth_median)
+                / min(checkpoint.depth_median, checkpoint.perturbed_depth_median)
+                if min(checkpoint.depth_median, checkpoint.perturbed_depth_median)
+                > 0.0
+                else 1_000_000.0
+            ),
+        )
+        for checkpoint, floor_checkpoint in zip(
+            collector.checkpoints,
+            probe.checkpoints,
+            strict=True,
+        )
+    )
     observed = tuple(checkpoint.iteration for checkpoint in checkpoints)
     floor_observed = tuple(checkpoint.iteration for checkpoint in floor_checkpoints)
     if observed != FLOOR_RECOVERY_CHECKPOINTS or floor_observed != observed:

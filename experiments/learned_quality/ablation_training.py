@@ -483,6 +483,7 @@ class AblationDiagnosticCollector:
                 "depth_median",
                 "perturbed_alpha_coverage",
                 "perturbed_depth_finite_fraction",
+                "perturbed_depth_median",
             )
         }
         lpips_values: list[float] = []
@@ -589,6 +590,11 @@ class AblationDiagnosticCollector:
                 aggregate["perturbed_depth_finite_fraction"].append(
                     float(perturbed_valid.float().mean().item())
                 )
+                aggregate["perturbed_depth_median"].append(
+                    float(perturbed_depth[perturbed_valid].median().item())
+                    if bool(perturbed_valid.any())
+                    else 0.0
+                )
                 perturbed_rows.append(_tensor_image(perturbed_rgb))
 
         if not fixed_rows:
@@ -668,6 +674,7 @@ class AblationDiagnosticCollector:
             perturbed_depth_finite_fraction=float(
                 metrics["perturbed_depth_finite_fraction"]
             ),
+            perturbed_depth_median=float(metrics["perturbed_depth_median"]),
         )
         control = self.control_checkpoints.get(iteration)
         if self.stop_on_quality:

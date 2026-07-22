@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -19,8 +20,11 @@ from experiments.learned_quality.da3 import (
 from experiments.learned_quality.depth import (
     MAX_DENSE_SEEDS,
     DenseSeedPolicy,
+    DepthValidationResult,
     SupportedDepthCloud,
+    ValidatedDepthFrame,
     build_supported_depth_cloud,
+    build_supported_depth_cloud_from_validated_depth,
     validate_depth_and_fuse_seeds,
 )
 from experiments.learned_quality.masks import (
@@ -28,6 +32,7 @@ from experiments.learned_quality.masks import (
     MaskFusionEvidence,
     MaskFusionPolicy,
 )
+from tests.static_pipeline.fixtures import write_colmap_text_model
 
 
 def _sha256(path: Path) -> str:
@@ -141,7 +146,6 @@ def _inputs(
         )
         hard = hard_masks[index]
         uncertain = uncertain_masks[index]
-        empty = np.zeros(shape, dtype=bool)
         maps = {
             "semantic_confirmed": semantic_masks[index],
             "sky_confirmed": sky_masks[index],
@@ -304,6 +308,68 @@ def test_supported_cloud_excludes_confirmed_motion_and_sky(tmp_path: Path) -> No
     assert (0, 2, 2) in selected
 
 
+def test_cached_validated_depth_rebuilds_motion_sky_support_without_semantics(
+    tmp_path: Path,
+) -> None:
+    shape = (4, 6)
+    semantic = [np.zeros(shape, dtype=bool) for _ in range(3)]
+    motion = [np.zeros(shape, dtype=bool) for _ in range(3)]
+    semantic[0][1, 1] = True
+    motion[0][2, 2] = True
+    frames, final_depth, masks, _ = _inputs(
+        tmp_path / "cached-inputs",
+        semantic_masks=tuple(semantic),
+        motion_masks=tuple(motion),
+    )
+    model = write_colmap_text_model(
+        tmp_path / "cached-model",
+        tuple(frame.image_name for frame in frames),
+        (0.2, 0.3, 0.4),
+        (2, 2, 2),
+    )
+    validated_frames = tuple(
+        ValidatedDepthFrame(
+            frame=frame,
+            width=shape[1],
+            height=shape[0],
+            depth_path=artifact.depth_path,
+            depth_sha256=_sha256(artifact.depth_path),
+            valid_fraction=1.0,
+        )
+        for frame, artifact in zip(frames, final_depth.artifacts, strict=True)
+    )
+    validated = DepthValidationResult(
+        policy=_policy(),
+        frames=validated_frames,
+        dense_seeds=SimpleNamespace(),
+        source_model_digest="a" * 64,
+        source_mask_digest="b" * 64,
+        source_depth_digest="c" * 64,
+        source_frame_digest="d" * 64,
+    )
+
+    cloud = build_supported_depth_cloud_from_validated_depth(
+        frames,
+        validated,
+        masks,
+        model,
+        policy=_policy(),
+    )
+
+    selected = set(
+        zip(
+            cloud.source_frame_index.tolist(),
+            cloud.source_xy[:, 0].tolist(),
+            cloud.source_xy[:, 1].tolist(),
+            strict=True,
+        )
+    )
+    assert len(cloud.xyz) > 0
+    assert np.all(cloud.view_support >= 3)
+    assert (0, 1, 1) in selected
+    assert (0, 2, 2) not in selected
+
+
 def test_supported_cloud_requires_two_additional_agreeing_views(
     tmp_path: Path,
 ) -> None:
@@ -462,3 +528,20 @@ def test_exact_join_and_digest_faults_fail_before_output(tmp_path: Path) -> None
         )
 
     assert not output.exists()
+
+
+def test_supported_depth_provenance_cannot_exceed_camera_count() -> None:
+    with pytest.raises(ValueError, match="frame index exceeds camera count"):
+        SupportedDepthCloud(
+            xyz=np.zeros((1, 3), dtype=np.float32),
+            rgb=np.zeros((1, 3), dtype=np.uint8),
+            confidence=np.ones((1,), dtype=np.float32),
+            view_support=np.ones((1,), dtype=np.uint16),
+            source_frame_index=np.ones((1,), dtype=np.int32),
+            source_xy=np.zeros((1, 2), dtype=np.int32),
+            camera_centers=np.zeros((1, 3), dtype=np.float32),
+            source_model_digest="a" * 64,
+            source_mask_digest="b" * 64,
+            source_depth_digest="c" * 64,
+            source_frame_digest="d" * 64,
+        )

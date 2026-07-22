@@ -145,6 +145,8 @@ class SupportedDepthCloud:
             raise ValueError("supported depth confidence and support must be positive")
         if np.any(self.source_frame_index < 0) or np.any(self.source_xy < 0):
             raise ValueError("supported depth provenance must be nonnegative")
+        if np.any(self.source_frame_index >= len(self.camera_centers)):
+            raise ValueError("supported depth frame index exceeds camera count")
         for digest in (
             self.source_model_digest,
             self.source_mask_digest,
@@ -793,6 +795,183 @@ def build_supported_depth_cloud(
         xyz=np.asarray(xyz, dtype=np.float64),
         rgb=np.asarray(rgb, dtype=np.uint8),
         confidence=np.asarray(confidence, dtype=np.float64),
+        view_support=np.asarray(support, dtype=np.uint16),
+        source_frame_index=np.asarray(frame_index, dtype=np.int32),
+        source_xy=np.asarray(source_xy, dtype=np.int32),
+        camera_centers=np.asarray(camera_centers, dtype=np.float64),
+        source_model_digest=inputs.source_model_digest,
+        source_mask_digest=inputs.source_mask_digest,
+        source_depth_digest=inputs.source_depth_digest,
+        source_frame_digest=inputs.source_frame_digest,
+    )
+
+
+def build_supported_depth_cloud_from_validated_depth(
+    frames: tuple[FrameArtifact, ...],
+    validated_depth: DepthValidationResult,
+    masks: MaskFusionEvidence,
+    winner_model_dir: Path,
+    *,
+    policy: DenseSeedPolicy,
+    mask_mode: DepthMaskMode = "motion_sky",
+) -> SupportedDepthCloud:
+    """Rebuild support locally from cached validated depths and COLMAP cameras.
+
+    Final-pretraining milestones intentionally retain the validated depth arrays but
+    not the transient DA3 confidence/camera bundle. This adapter uses only registered
+    COLMAP cameras, treats a validated positive depth as confidence one, and then
+    reruns the same multi-view agreement test. It never consumes semantic masks.
+    """
+
+    from backend.preprocess.parse_colmap import parse_cameras_from_model
+
+    if not isinstance(validated_depth, DepthValidationResult):
+        raise ValueError("validated_depth must be DepthValidationResult")
+    if not isinstance(policy, DenseSeedPolicy):
+        raise ValueError("policy must be DenseSeedPolicy")
+    if mask_mode != "motion_sky":
+        raise ValueError("cached floor support permits only motion_sky masks")
+    if not isinstance(masks, MaskFusionEvidence):
+        raise ValueError("masks must be MaskFusionEvidence")
+    by_depth = {row.frame.image_name: row for row in validated_depth.frames}
+    by_mask = {row.frame.image_name: row for row in masks.frames}
+    if len(by_depth) != len(validated_depth.frames) or len(by_mask) != len(masks.frames):
+        raise ValueError("cached floor evidence contains duplicate frame names")
+    cameras_by_name = parse_cameras_from_model(winner_model_dir)
+    registered = tuple(frame for frame in frames if frame.image_name in cameras_by_name)
+    if len(registered) < policy.minimum_neighbor_support + 1:
+        raise ValueError("registered frames cannot satisfy floor support policy")
+    if any(frame.image_name not in by_depth or frame.image_name not in by_mask for frame in registered):
+        raise ValueError("cached floor evidence requires an exact registered-frame join")
+    depths: list[np.ndarray] = []
+    confidence: list[np.ndarray] = []
+    invalid: list[np.ndarray] = []
+    colors: list[np.ndarray] = []
+    cameras: list[FinalPoseCamera] = []
+    snapshots: list[tuple[Path, str]] = []
+    frame_rows: list[dict[str, object]] = []
+    depth_rows: list[dict[str, object]] = []
+    mask_rows: list[dict[str, object]] = []
+    processed: PinholeCamera | None = None
+    radius: int | None = None
+    for frame in registered:
+        depth_row = by_depth[frame.image_name]
+        mask = by_mask[frame.image_name]
+        if depth_row.frame != frame or mask.frame != frame:
+            raise ValueError("cached floor evidence frame contracts disagree")
+        depth_path = _regular_file(depth_row.depth_path, "validated floor depth")
+        depth_digest = _require_digest(depth_row.depth_sha256, "validated depth sha256")
+        if _sha256_path(depth_path) != depth_digest:
+            raise ValueError("validated floor depth digest does not match bytes")
+        depth = _load_float32(depth_path, "validated floor depth")
+        camera = cameras_by_name[frame.image_name]
+        K = np.asarray(camera["K"], dtype=np.float64)
+        w2c = np.asarray(camera["w2c"], dtype=np.float64)
+        source_width = int(camera["width"])
+        source_height = int(camera["height"])
+        scaled = K.copy()
+        scaled[0, :] *= depth.shape[1] / source_width
+        scaled[1, :] *= depth.shape[0] / source_height
+        active_processed = PinholeCamera(
+            "PINHOLE",
+            depth.shape[1],
+            depth.shape[0],
+            float(scaled[0, 0]),
+            float(scaled[1, 1]),
+            float(scaled[0, 2]),
+            float(scaled[1, 2]),
+        )
+        if processed is None:
+            processed = _validate_processed_camera(active_processed, depth.shape)
+            radius = int(
+                math.ceil(min(depth.shape) * float(policy.invalid_boundary_fraction))
+            )
+        elif active_processed != processed or depth.shape != (processed.height, processed.width):
+            raise ValueError("registered validated depths must share one scaled camera")
+        final_camera = FinalPoseCamera(
+            image_name=frame.image_name,
+            frame_id=frame.frame_id,
+            width=source_width,
+            height=source_height,
+            w2c=tuple(tuple(float(value) for value in row) for row in w2c),
+            intrinsics=tuple(tuple(float(value) for value in row) for row in scaled),
+        )
+        cameras.append(_validate_camera(final_camera, frame))
+        first = _load_binary_mask(
+            Path(mask.motion_confirmed_path),
+            mask.motion_confirmed_sha256,
+            "motion_confirmed",
+        )
+        second = _load_binary_mask(
+            Path(mask.sky_confirmed_path),
+            mask.sky_confirmed_sha256,
+            "sky_confirmed",
+        )
+        first = _resize_mask(first, depth.shape)
+        second = _resize_mask(second, depth.shape)
+        current_invalid = first | second | ~np.isfinite(depth) | (depth <= 0.0)
+        if radius and np.any(current_invalid):
+            current_invalid = ndimage.binary_dilation(
+                current_invalid,
+                structure=_disk_structure(radius),
+            )
+        current_invalid.setflags(write=False)
+        depths.append(depth)
+        confidence.append(np.ones(depth.shape, dtype=np.float32))
+        invalid.append(current_invalid)
+        colors.append(_load_color(frame.path, depth.shape))
+        snapshots.extend(
+            (
+                (frame.path, frame.sha256),
+                (depth_path, depth_digest),
+                (Path(mask.motion_confirmed_path), mask.motion_confirmed_sha256),
+                (Path(mask.sky_confirmed_path), mask.sky_confirmed_sha256),
+            )
+        )
+        frame_rows.append(
+            {"frame_id": frame.frame_id, "image_name": frame.image_name, "sha256": frame.sha256}
+        )
+        depth_rows.append({"frame_id": frame.frame_id, "depth_sha256": depth_digest})
+        mask_rows.append(
+            {
+                "frame_id": frame.frame_id,
+                "motion_confirmed_sha256": mask.motion_confirmed_sha256,
+                "sky_confirmed_sha256": mask.sky_confirmed_sha256,
+            }
+        )
+    if processed is None:
+        raise AssertionError("registered cached depths unexpectedly empty")
+    model_rows: list[dict[str, object]] = []
+    for name in _MODEL_FILES:
+        path = _regular_file(Path(winner_model_dir) / name, f"winner {name}")
+        digest = _sha256_path(path)
+        snapshots.append((path, digest))
+        model_rows.append({"name": name, "sha256": digest, "size_bytes": path.stat().st_size})
+    inputs = _ValidatedInputs(
+        frames=registered,
+        depths=tuple(depths),
+        confidence=tuple(confidence),
+        invalid=tuple(invalid),
+        colors=tuple(colors),
+        cameras=tuple(cameras),
+        processed_camera=processed,
+        snapshots=tuple(snapshots),
+        source_model_digest=_artifact_digest_payload(model_rows, "learned_quality.winner_model.v1"),
+        source_mask_digest=_artifact_digest_payload(mask_rows, "learned_quality.cached_motion_sky.v1"),
+        source_depth_digest=_artifact_digest_payload(depth_rows, "learned_quality.cached_validated_depth.v1"),
+        source_frame_digest=_artifact_digest_payload(frame_rows, "learned_quality.depth_frames.v1"),
+    )
+    xyz, rgb, confidence_rows, support, frame_index, source_xy, _ = (
+        _supported_depth_rows(inputs, policy)
+    )
+    camera_centers = []
+    for camera in inputs.cameras:
+        w2c = np.asarray(camera.w2c, dtype=np.float64)
+        camera_centers.append(-w2c[:3, 3] @ w2c[:3, :3])
+    return SupportedDepthCloud(
+        xyz=np.asarray(xyz, dtype=np.float64),
+        rgb=np.asarray(rgb, dtype=np.uint8),
+        confidence=np.asarray(confidence_rows, dtype=np.float64),
         view_support=np.asarray(support, dtype=np.uint16),
         source_frame_index=np.asarray(frame_index, dtype=np.int32),
         source_xy=np.asarray(source_xy, dtype=np.int32),
