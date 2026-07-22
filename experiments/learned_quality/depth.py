@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass
 from io import BytesIO
 from numbers import Real
 from pathlib import Path, PurePosixPath
-from typing import Final
+from typing import Final, Literal
 
 import numpy as np
 from PIL import Image
@@ -32,6 +32,7 @@ from .masks import FusedMaskFrame, MaskFusionEvidence
 
 MAX_DENSE_SEEDS: Final[int] = 1_000_000
 _MODEL_FILES: Final[tuple[str, ...]] = ("cameras.txt", "images.txt", "points3D.txt")
+DepthMaskMode = Literal["hard_uncertain", "motion_sky"]
 
 
 @dataclass(frozen=True)
@@ -101,6 +102,57 @@ class DepthValidationResult:
     source_mask_digest: str
     source_depth_digest: str
     source_frame_digest: str
+
+
+@dataclass(frozen=True)
+class SupportedDepthCloud:
+    xyz: np.ndarray
+    rgb: np.ndarray
+    confidence: np.ndarray
+    view_support: np.ndarray
+    source_frame_index: np.ndarray
+    source_xy: np.ndarray
+    camera_centers: np.ndarray
+    source_model_digest: str
+    source_mask_digest: str
+    source_depth_digest: str
+    source_frame_digest: str
+
+    def __post_init__(self) -> None:
+        count = len(self.xyz)
+        expected = (
+            (self.xyz, (count, 3), "xyz"),
+            (self.rgb, (count, 3), "rgb"),
+            (self.confidence, (count,), "confidence"),
+            (self.view_support, (count,), "view_support"),
+            (self.source_frame_index, (count,), "source_frame_index"),
+            (self.source_xy, (count, 2), "source_xy"),
+        )
+        for values, shape, label in expected:
+            if not isinstance(values, np.ndarray) or values.shape != shape:
+                raise ValueError(f"{label} must have shape {shape}")
+        if (
+            not isinstance(self.camera_centers, np.ndarray)
+            or self.camera_centers.ndim != 2
+            or self.camera_centers.shape[1:] != (3,)
+        ):
+            raise ValueError("camera_centers must have shape (N, 3)")
+        if not np.isfinite(self.xyz).all() or not np.isfinite(self.confidence).all():
+            raise ValueError("supported depth values must be finite")
+        if not np.isfinite(self.camera_centers).all():
+            raise ValueError("camera centers must be finite")
+        if np.any(self.confidence < 0.0) or np.any(self.view_support < 1):
+            raise ValueError("supported depth confidence and support must be positive")
+        if np.any(self.source_frame_index < 0) or np.any(self.source_xy < 0):
+            raise ValueError("supported depth provenance must be nonnegative")
+        for digest in (
+            self.source_model_digest,
+            self.source_mask_digest,
+            self.source_depth_digest,
+            self.source_frame_digest,
+        ):
+            if len(digest) != 64 or digest != digest.lower():
+                raise ValueError("supported depth digests must be lowercase sha256")
 
 
 @dataclass(frozen=True)
@@ -308,9 +360,13 @@ def _validate_inputs(
     masks: MaskFusionEvidence,
     winner_model_dir: Path,
     policy: DenseSeedPolicy,
+    *,
+    mask_mode: DepthMaskMode = "hard_uncertain",
 ) -> _ValidatedInputs:
     if not isinstance(policy, DenseSeedPolicy):
         raise ValueError("policy must be DenseSeedPolicy")
+    if mask_mode not in ("hard_uncertain", "motion_sky"):
+        raise ValueError("mask_mode must be hard_uncertain or motion_sky")
     if type(frames) is not tuple or len(frames) < policy.minimum_neighbor_support + 1:
         raise ValueError("frames must provide enough neighbors for support validation")
     snapshots: list[tuple[Path, str]] = []
@@ -441,29 +497,33 @@ def _validate_inputs(
     ):
         if not isinstance(mask, FusedMaskFrame):
             raise ValueError("mask frames must contain FusedMaskFrame")
-        hard = _load_binary_mask(
-            mask.hard_exclude_path,
-            mask.hard_exclude_sha256,
-            "hard_exclude",
-        )
-        uncertain = _load_binary_mask(
-            mask.uncertain_path,
-            mask.uncertain_sha256,
-            "uncertain",
-        )
-        hard_path = Path(mask.hard_exclude_path)
-        uncertain_path = Path(mask.uncertain_path)
+        if mask_mode == "hard_uncertain":
+            first_path = Path(mask.hard_exclude_path)
+            first_digest = mask.hard_exclude_sha256
+            first_label = "hard_exclude"
+            second_path = Path(mask.uncertain_path)
+            second_digest = mask.uncertain_sha256
+            second_label = "uncertain"
+        else:
+            first_path = Path(mask.motion_confirmed_path)
+            first_digest = mask.motion_confirmed_sha256
+            first_label = "motion_confirmed"
+            second_path = Path(mask.sky_confirmed_path)
+            second_digest = mask.sky_confirmed_sha256
+            second_label = "sky_confirmed"
+        first = _load_binary_mask(first_path, first_digest, first_label)
+        second = _load_binary_mask(second_path, second_digest, second_label)
         snapshots.extend(
             (
-                (hard_path, mask.hard_exclude_sha256),
-                (uncertain_path, mask.uncertain_sha256),
+                (first_path, first_digest),
+                (second_path, second_digest),
             )
         )
-        hard = _resize_mask(hard, shape)
-        uncertain = _resize_mask(uncertain, shape)
+        first = _resize_mask(first, shape)
+        second = _resize_mask(second, shape)
         current_invalid = (
-            hard
-            | uncertain
+            first
+            | second
             | ~np.isfinite(depth)
             | (depth <= 0.0)
             | ~np.isfinite(confidence_map)
@@ -479,8 +539,8 @@ def _validate_inputs(
         mask_rows.append(
             {
                 "frame_id": mask.frame.frame_id,
-                "hard_exclude_sha256": mask.hard_exclude_sha256,
-                "uncertain_sha256": mask.uncertain_sha256,
+                f"{first_label}_sha256": first_digest,
+                f"{second_label}_sha256": second_digest,
             }
         )
 
@@ -608,10 +668,12 @@ def _project_support(
     return in_bounds & valid_target & agreement & (source_depth > 0.0)
 
 
-def _candidate_seeds(
+def _supported_depth_rows(
     inputs: _ValidatedInputs,
     policy: DenseSeedPolicy,
 ) -> tuple[
+    np.ndarray,
+    np.ndarray,
     np.ndarray,
     np.ndarray,
     np.ndarray,
@@ -622,6 +684,8 @@ def _candidate_seeds(
     rgb_parts: list[np.ndarray] = []
     confidence_parts: list[np.ndarray] = []
     support_parts: list[np.ndarray] = []
+    frame_index_parts: list[np.ndarray] = []
+    source_xy_parts: list[np.ndarray] = []
     validated_depths: list[np.ndarray] = []
     for index, (depth_raw, invalid, color, camera) in enumerate(
         zip(
@@ -655,12 +719,21 @@ def _candidate_seeds(
             np.asarray(inputs.confidence[index][accepted], dtype=np.float64)
         )
         support_parts.append(np.asarray(support[accepted] + 1, dtype=np.uint16))
+        yy, xx = np.indices(depth.shape, dtype=np.int32)
+        frame_index_parts.append(
+            np.full(int(np.count_nonzero(accepted)), index, dtype=np.int32)
+        )
+        source_xy_parts.append(
+            np.stack((xx[accepted], yy[accepted]), axis=-1).astype(np.int32)
+        )
     if not xyz_parts:
         return (
             np.empty((0, 3), dtype=np.float64),
             np.empty((0, 3), dtype=np.uint8),
             np.empty((0,), dtype=np.float64),
             np.empty((0,), dtype=np.uint16),
+            np.empty((0,), dtype=np.int32),
+            np.empty((0, 2), dtype=np.int32),
             tuple(validated_depths),
         )
     return (
@@ -668,7 +741,66 @@ def _candidate_seeds(
         np.concatenate(rgb_parts),
         np.concatenate(confidence_parts),
         np.concatenate(support_parts),
+        np.concatenate(frame_index_parts),
+        np.concatenate(source_xy_parts),
         tuple(validated_depths),
+    )
+
+
+def _candidate_seeds(
+    inputs: _ValidatedInputs,
+    policy: DenseSeedPolicy,
+) -> tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    tuple[np.ndarray, ...],
+]:
+    xyz, rgb, confidence, support, _, _, validated_depths = _supported_depth_rows(
+        inputs, policy
+    )
+    return xyz, rgb, confidence, support, validated_depths
+
+
+def build_supported_depth_cloud(
+    frames: tuple[FrameArtifact, ...],
+    final_depth: PoseConditionedDepthResult,
+    masks: MaskFusionEvidence,
+    winner_model_dir: Path,
+    *,
+    policy: DenseSeedPolicy,
+    mask_mode: DepthMaskMode = "hard_uncertain",
+) -> SupportedDepthCloud:
+    """Return every multi-view-supported depth sample with exact provenance."""
+
+    inputs = _validate_inputs(
+        frames,
+        final_depth,
+        masks,
+        winner_model_dir,
+        policy,
+        mask_mode=mask_mode,
+    )
+    xyz, rgb, confidence, support, frame_index, source_xy, _ = _supported_depth_rows(
+        inputs, policy
+    )
+    camera_centers = []
+    for camera in inputs.cameras:
+        w2c = np.asarray(camera.w2c, dtype=np.float64)
+        camera_centers.append(-w2c[:3, 3] @ w2c[:3, :3])
+    return SupportedDepthCloud(
+        xyz=np.asarray(xyz, dtype=np.float64),
+        rgb=np.asarray(rgb, dtype=np.uint8),
+        confidence=np.asarray(confidence, dtype=np.float64),
+        view_support=np.asarray(support, dtype=np.uint16),
+        source_frame_index=np.asarray(frame_index, dtype=np.int32),
+        source_xy=np.asarray(source_xy, dtype=np.int32),
+        camera_centers=np.asarray(camera_centers, dtype=np.float64),
+        source_model_digest=inputs.source_model_digest,
+        source_mask_digest=inputs.source_mask_digest,
+        source_depth_digest=inputs.source_depth_digest,
+        source_frame_digest=inputs.source_frame_digest,
     )
 
 

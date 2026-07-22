@@ -19,6 +19,8 @@ from experiments.learned_quality.da3 import (
 from experiments.learned_quality.depth import (
     MAX_DENSE_SEEDS,
     DenseSeedPolicy,
+    SupportedDepthCloud,
+    build_supported_depth_cloud,
     validate_depth_and_fuse_seeds,
 )
 from experiments.learned_quality.masks import (
@@ -55,6 +57,9 @@ def _inputs(
     confidence_values: tuple[np.ndarray, ...] | None = None,
     hard_masks: tuple[np.ndarray, ...] | None = None,
     uncertain_masks: tuple[np.ndarray, ...] | None = None,
+    semantic_masks: tuple[np.ndarray, ...] | None = None,
+    sky_masks: tuple[np.ndarray, ...] | None = None,
+    motion_masks: tuple[np.ndarray, ...] | None = None,
 ) -> tuple[
     tuple[FrameArtifact, ...],
     PoseConditionedDepthResult,
@@ -74,6 +79,12 @@ def _inputs(
         hard_masks = tuple(np.zeros(shape, dtype=bool) for _ in range(frame_count))
     if uncertain_masks is None:
         uncertain_masks = tuple(np.zeros(shape, dtype=bool) for _ in range(frame_count))
+    if semantic_masks is None:
+        semantic_masks = hard_masks
+    if sky_masks is None:
+        sky_masks = tuple(np.zeros(shape, dtype=bool) for _ in range(frame_count))
+    if motion_masks is None:
+        motion_masks = tuple(np.zeros(shape, dtype=bool) for _ in range(frame_count))
     frames = []
     predictions = []
     cameras = []
@@ -132,9 +143,9 @@ def _inputs(
         uncertain = uncertain_masks[index]
         empty = np.zeros(shape, dtype=bool)
         maps = {
-            "semantic_confirmed": hard,
-            "sky_confirmed": empty,
-            "motion_confirmed": empty,
+            "semantic_confirmed": semantic_masks[index],
+            "sky_confirmed": sky_masks[index],
+            "motion_confirmed": motion_masks[index],
             "uncertain": uncertain,
             "hard_exclude": hard,
             "colmap_keep": ~hard,
@@ -223,6 +234,100 @@ def test_policy_and_hard_seed_ceiling_are_explicit() -> None:
         _policy(relative_depth_tolerance=0.0)
     with pytest.raises(ValueError):
         _policy(minimum_neighbor_support=0)
+
+
+def test_supported_cloud_preserves_provenance_and_ignores_semantic_masks(
+    tmp_path: Path,
+) -> None:
+    shape = (4, 6)
+    semantic = [np.zeros(shape, dtype=bool) for _ in range(3)]
+    semantic[0][2, 2] = True
+    frames, final_depth, masks, model = _inputs(
+        tmp_path / "inputs",
+        semantic_masks=tuple(semantic),
+    )
+
+    cloud = build_supported_depth_cloud(
+        frames,
+        final_depth,
+        masks,
+        model,
+        policy=_policy(),
+        mask_mode="motion_sky",
+    )
+
+    assert isinstance(cloud, SupportedDepthCloud)
+    assert cloud.xyz.shape == (shape[0] * shape[1] * 3, 3)
+    assert cloud.rgb.shape == cloud.xyz.shape
+    assert cloud.source_xy.shape == (len(cloud.xyz), 2)
+    assert cloud.source_frame_index.shape == (len(cloud.xyz),)
+    assert np.any(
+        (cloud.source_frame_index == 0)
+        & (cloud.source_xy[:, 0] == 2)
+        & (cloud.source_xy[:, 1] == 2)
+    )
+    assert np.all(cloud.view_support >= 3)
+    assert cloud.camera_centers.shape == (3, 3)
+
+
+def test_supported_cloud_excludes_confirmed_motion_and_sky(tmp_path: Path) -> None:
+    shape = (4, 6)
+    sky = [np.zeros(shape, dtype=bool) for _ in range(3)]
+    motion = [np.zeros(shape, dtype=bool) for _ in range(3)]
+    sky[0][0, 1] = True
+    motion[0][3, 4] = True
+    frames, final_depth, masks, model = _inputs(
+        tmp_path / "inputs",
+        sky_masks=tuple(sky),
+        motion_masks=tuple(motion),
+    )
+
+    cloud = build_supported_depth_cloud(
+        frames,
+        final_depth,
+        masks,
+        model,
+        policy=_policy(),
+        mask_mode="motion_sky",
+    )
+
+    selected = set(
+        zip(
+            cloud.source_frame_index.tolist(),
+            cloud.source_xy[:, 0].tolist(),
+            cloud.source_xy[:, 1].tolist(),
+            strict=True,
+        )
+    )
+    assert (0, 1, 0) not in selected
+    assert (0, 4, 3) not in selected
+    assert (0, 2, 2) in selected
+
+
+def test_supported_cloud_requires_two_additional_agreeing_views(
+    tmp_path: Path,
+) -> None:
+    depths = (
+        np.full((4, 6), 2.0, dtype=np.float32),
+        np.full((4, 6), 2.0, dtype=np.float32),
+        np.full((4, 6), 9.0, dtype=np.float32),
+    )
+    frames, final_depth, masks, model = _inputs(
+        tmp_path / "inputs",
+        depth_values=depths,
+    )
+
+    cloud = build_supported_depth_cloud(
+        frames,
+        final_depth,
+        masks,
+        model,
+        policy=_policy(),
+        mask_mode="motion_sky",
+    )
+
+    assert cloud.xyz.shape == (0, 3)
+    assert cloud.source_xy.shape == (0, 2)
 
 
 def test_validated_depth_zeroes_low_confidence_masks_and_dilated_boundaries(
