@@ -378,6 +378,19 @@ def _tensor_image(value: torch.Tensor, *, width: int = 320) -> Image.Image:
     return image
 
 
+@dataclass(frozen=True)
+class DiagnosticRenderView:
+    """Fixed and perturbed render tensors for a single verified probe camera."""
+
+    K: torch.Tensor
+    w2c: torch.Tensor
+    alpha: torch.Tensor
+    depth: torch.Tensor
+    perturbed_w2c: torch.Tensor
+    perturbed_alpha: torch.Tensor
+    perturbed_depth: torch.Tensor
+
+
 class AblationDiagnosticCollector:
     def __init__(
         self,
@@ -389,7 +402,8 @@ class AblationDiagnosticCollector:
         output_root: Path,
         control_checkpoints: Mapping[int, AblationCheckpoint] | None = None,
         checkpoint_observer: Callable[
-            [Any, int, tuple[int, int], int], Mapping[str, object]
+            [Any, int, tuple[int, int], int, tuple[DiagnosticRenderView, ...]],
+            Mapping[str, object],
         ]
         | None = None,
         stop_on_quality: bool = True,
@@ -463,7 +477,7 @@ class AblationDiagnosticCollector:
         resolution: tuple[int, int],
         sh_degree: int,
         iteration: int,
-    ) -> dict[str, float | None]:
+    ) -> tuple[dict[str, float | None], tuple[DiagnosticRenderView, ...]]:
         from backend.model.renderer import render_view
 
         width, height = resolution
@@ -489,6 +503,7 @@ class AblationDiagnosticCollector:
         lpips_values: list[float] = []
         fixed_rows: list[tuple[Image.Image, ...]] = []
         perturbed_rows: list[Image.Image] = []
+        render_views: list[DiagnosticRenderView] = []
         with torch.no_grad():
             for index in self.probe_indices:
                 frame = self.registered[index]
@@ -596,6 +611,17 @@ class AblationDiagnosticCollector:
                     else 0.0
                 )
                 perturbed_rows.append(_tensor_image(perturbed_rgb))
+                render_views.append(
+                    DiagnosticRenderView(
+                        K=K.detach(),
+                        w2c=w2c.detach(),
+                        alpha=alpha_plane.detach(),
+                        depth=depth.detach(),
+                        perturbed_w2c=perturbed_w2c.detach(),
+                        perturbed_alpha=perturbed_alpha_plane.detach(),
+                        perturbed_depth=perturbed_depth.detach(),
+                    )
+                )
 
         if not fixed_rows:
             raise ValueError("diagnostic fixed-view set is empty")
@@ -633,7 +659,7 @@ class AblationDiagnosticCollector:
         result["lpips_unmasked"] = (
             float(sum(lpips_values) / len(lpips_values)) if lpips_values else None
         )
-        return result
+        return result, tuple(render_views)
 
     def __call__(
         self,
@@ -642,7 +668,7 @@ class AblationDiagnosticCollector:
         resolution: tuple[int, int],
         sh_degree: int,
     ) -> None:
-        metrics = self._render_fixed_views(
+        metrics, render_views = self._render_fixed_views(
             trainer,
             resolution,
             sh_degree,
@@ -697,6 +723,7 @@ class AblationDiagnosticCollector:
                 iteration,
                 resolution,
                 sh_degree,
+                render_views,
             )
             if not isinstance(observed, Mapping):
                 raise TypeError("checkpoint observer must return a mapping")

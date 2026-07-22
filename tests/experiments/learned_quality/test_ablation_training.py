@@ -389,18 +389,26 @@ def test_collector_can_publish_extra_floor_metrics_without_quality_stop(
         validity=prepared.quality_validity,
         variant=_variant("legacy_control"),
         output_root=tmp_path / "diagnostics-extra",
-        checkpoint_observer=lambda *_args: {"floor_alpha_coverage": 0.25},
+        checkpoint_observer=lambda *_args: {
+            "floor_alpha_coverage": 0.25,
+            "render_view_count": len(_args[4]),
+        },
         stop_on_quality=False,
     )
 
     collector(trainer, 0, (6, 4), 0)
 
     assert collector.decisions[0].stop is False
-    assert collector.extra_checkpoints == [{"floor_alpha_coverage": 0.25}]
+    assert collector.extra_checkpoints == [
+        {"floor_alpha_coverage": 0.25, "render_view_count": len(collector.probe_indices)}
+    ]
     payload = json.loads(
         (tmp_path / "diagnostics-extra" / "checkpoint_000000.json").read_text()
     )
-    assert payload["extra"] == {"floor_alpha_coverage": 0.25}
+    assert payload["extra"] == {
+        "floor_alpha_coverage": 0.25,
+        "render_view_count": len(collector.probe_indices),
+    }
 
 
 def _checkpoint(experiment_id: str, iteration: int = 500):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -77,6 +78,11 @@ def test_floor_decision_requires_coverage_and_structure() -> None:
         (_global(psnr=26.5), _floor(5_000, 0.32), "psnr_deficit"),
         (_global(white=0.02), _floor(5_000, 0.32), "visible_white_fraction"),
         (_global(), _floor(5_000, 0.10), "hole_reduction"),
+        (
+            _global(),
+            dataclasses.replace(_floor(5_000, 0.32), plane_depth_relative_error=0.11),
+            "floor_plane_depth",
+        ),
     ),
 )
 def test_floor_decision_fails_closed(candidate, final_floor, failure: str) -> None:
@@ -113,6 +119,44 @@ def test_publication_is_owned_atomic_and_keeps_candidate_ply(tmp_path: Path) -> 
 
     assert published == destination
     assert (destination / "splat.ply").read_bytes() == b"ply"
+
+
+def test_publication_restores_prior_result_when_promotion_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    report = tmp_path / "report"
+    report.mkdir()
+    (report / "decision.json").write_text("{}", encoding="utf-8")
+    destination = tmp_path / "myroom_floor_recovery_diagnostic"
+    destination.mkdir()
+    (destination / "_OWNERSHIP.json").write_text(
+        json.dumps({"generator_id": "4dgs-studio.floor-recovery-diagnostic"}),
+        encoding="utf-8",
+    )
+    (destination / "_SUCCESS.json").write_text(
+        json.dumps({"status": "success", "run_id": "run-prior"}),
+        encoding="utf-8",
+    )
+    (destination / "prior.txt").write_text("keep me", encoding="utf-8")
+    real_replace = os.replace
+
+    def fail_promotion(source, target):
+        if Path(target) == destination and ".staging-" in Path(source).name:
+            raise OSError("Drive promotion failed")
+        real_replace(source, target)
+
+    monkeypatch.setattr(os, "replace", fail_promotion)
+
+    with pytest.raises(OSError, match="promotion failed"):
+        publish_floor_recovery_report(
+            local_report_root=report,
+            destination=destination,
+            run_id="run-new",
+            decision=FloorRecoveryDecision(False, "rejected", ("gate",)),
+        )
+
+    assert (destination / "prior.txt").read_text(encoding="utf-8") == "keep me"
     assert (destination / "_SUCCESS.json").is_file()
     assert json.loads((destination / "_OWNERSHIP.json").read_text())[
         "generator_id"
@@ -138,6 +182,7 @@ def test_staged_runner_rejects_weak_plane_without_training(tmp_path: Path) -> No
     reconstruction = SimpleNamespace(
         artifacts=SimpleNamespace(
             photometric=SimpleNamespace(original_frames=()),
+            base_evidence=object(),
             depth=SimpleNamespace(policy=object()),
             masks=object(),
         ),
@@ -199,11 +244,26 @@ def test_floor_recovery_hardware_requires_large_a100() -> None:
             gpu_name="NVIDIA A100-SXM4-80GB",
             vram_gb=80.0,
             disk_free_gb=100.0,
+            host_ram_gb=160.0,
         )
     )
     with pytest.raises(RuntimeError, match="A100"):
         validate_floor_recovery_hardware(
-            SimpleNamespace(gpu_name="NVIDIA L4", vram_gb=24.0, disk_free_gb=100.0)
+            SimpleNamespace(
+                gpu_name="NVIDIA L4",
+                vram_gb=24.0,
+                disk_free_gb=100.0,
+                host_ram_gb=160.0,
+            )
+        )
+    with pytest.raises(RuntimeError, match="High-RAM"):
+        validate_floor_recovery_hardware(
+            SimpleNamespace(
+                gpu_name="NVIDIA A100-SXM4-80GB",
+                vram_gb=80.0,
+                disk_free_gb=100.0,
+                host_ram_gb=83.0,
+            )
         )
 
 
@@ -248,6 +308,7 @@ def test_run_floor_recovery_stages_once_and_uses_diagnostic_output(
         vram_gb=80.0,
         disk_free_gb=200.0,
         colmap_gpu_sift=True,
+        host_ram_gb=160.0,
     )
     staged_root = tmp_path / "staged"
     staged_root.mkdir()
@@ -374,6 +435,7 @@ def test_run_floor_recovery_rejects_false_audit_before_large_restore(
         vram_gb=80.0,
         disk_free_gb=200.0,
         colmap_gpu_sift=True,
+        host_ram_gb=160.0,
     )
     selection = SimpleNamespace(
         manifest=SimpleNamespace(image_set_digest="d" * 64)
@@ -420,7 +482,9 @@ def test_legacy_reference_must_match_staged_a100_lineage(
     receipt = source / "experiments" / "legacy_control" / "receipt.json"
     receipt.parent.mkdir(parents=True)
     receipt.write_text("{}", encoding="utf-8")
-    (source / "_SUCCESS.json").write_text("{}", encoding="utf-8")
+    (source / "_SUCCESS.json").write_text(
+        json.dumps({"status": "success"}), encoding="utf-8"
+    )
     staged_root = tmp_path / "staged"
     staged_root.mkdir()
     manifest = staged_root / "manifest.json"
@@ -489,7 +553,7 @@ def test_legacy_reference_must_match_staged_a100_lineage(
     (source / "diagnostic_matrix.json").write_text(
         json.dumps(matrix), encoding="utf-8"
     )
-    with pytest.raises(RuntimeError, match="differs from staged pretraining"):
+    with pytest.raises(RuntimeError, match="differs from the active input"):
         stage_legacy_reference(
             source,
             tmp_path / "mismatched-reference",

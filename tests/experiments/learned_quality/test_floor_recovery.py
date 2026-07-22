@@ -9,6 +9,7 @@ import pytest
 
 from experiments.learned_quality.depth import SupportedDepthCloud
 from experiments.learned_quality.floor_recovery import (
+    FloorArtifactLineage,
     FloorRecoveryPolicy,
     build_floor_hole_map,
     estimate_floor_plane,
@@ -18,6 +19,17 @@ from experiments.learned_quality.floor_recovery import (
 
 def _digest(character: str) -> str:
     return character * 64
+
+
+def _lineage(**overrides: str) -> FloorArtifactLineage:
+    values = {
+        "source_revision": "1" * 40,
+        "source_digest": "2" * 64,
+        "selection_digest": "3" * 64,
+        "pretraining_fingerprint": "4" * 64,
+    }
+    values.update(overrides)
+    return FloorArtifactLineage(**values)
 
 
 def _room() -> tuple[np.ndarray, SupportedDepthCloud]:
@@ -153,6 +165,7 @@ def test_floor_hole_map_and_seeds_stay_inside_missing_patch(tmp_path: Path) -> N
         holes,
         (tmp_path / "floor-artifact").resolve(),
         policy=policy,
+        lineage=_lineage(),
     )
 
     assert holes.initial_hole_cells >= policy.minimum_component_cells
@@ -181,16 +194,58 @@ def test_floor_seed_cap_and_bytes_are_deterministic(tmp_path: Path) -> None:
     holes = build_floor_hole_map(sparse, cloud, plane, policy=policy)
 
     first = generate_floor_seed_artifact(
-        sparse, cloud, plane, holes, (tmp_path / "first").resolve(), policy=policy
+        sparse,
+        cloud,
+        plane,
+        holes,
+        (tmp_path / "first").resolve(),
+        policy=policy,
+        lineage=_lineage(),
     )
     second = generate_floor_seed_artifact(
-        sparse, cloud, plane, holes, (tmp_path / "second").resolve(), policy=policy
+        sparse,
+        cloud,
+        plane,
+        holes,
+        (tmp_path / "second").resolve(),
+        policy=policy,
+        lineage=_lineage(),
     )
 
     assert first.point_count == 20
     assert first.content_fingerprint == second.content_fingerprint
     assert first.npz_path.read_bytes() == second.npz_path.read_bytes()
     assert first.metadata_path.read_bytes() == second.metadata_path.read_bytes()
+
+
+def test_floor_seed_fingerprint_binds_source_and_pretraining_lineage(
+    tmp_path: Path,
+) -> None:
+    sparse, cloud = _room()
+    policy = _policy(maximum_seed_count=20)
+    plane = estimate_floor_plane(sparse, cloud.camera_centers, policy=policy, seed=8)
+    holes = build_floor_hole_map(sparse, cloud, plane, policy=policy)
+
+    first = generate_floor_seed_artifact(
+        sparse,
+        cloud,
+        plane,
+        holes,
+        (tmp_path / "lineage-first").resolve(),
+        policy=policy,
+        lineage=_lineage(),
+    )
+    second = generate_floor_seed_artifact(
+        sparse,
+        cloud,
+        plane,
+        holes,
+        (tmp_path / "lineage-second").resolve(),
+        policy=policy,
+        lineage=_lineage(pretraining_fingerprint="5" * 64),
+    )
+
+    assert first.content_fingerprint != second.content_fingerprint
 
 
 def test_floor_plane_and_hole_detection_fail_closed() -> None:
@@ -217,6 +272,7 @@ def test_floor_plane_and_hole_detection_fail_closed() -> None:
             holes,
             Path.cwd() / "insufficient-floor-seeds",
             policy=policy,
+            lineage=_lineage(),
         )
 
 

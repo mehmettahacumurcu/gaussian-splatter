@@ -24,6 +24,7 @@ from experiments.learned_quality.depth import (
     SupportedDepthCloud,
     ValidatedDepthFrame,
     build_supported_depth_cloud,
+    build_supported_depth_cloud_from_base_evidence,
     build_supported_depth_cloud_from_validated_depth,
     validate_depth_and_fuse_seeds,
 )
@@ -308,7 +309,7 @@ def test_supported_cloud_excludes_confirmed_motion_and_sky(tmp_path: Path) -> No
     assert (0, 2, 2) in selected
 
 
-def test_cached_validated_depth_rebuilds_motion_sky_support_without_semantics(
+def test_cached_validated_depth_fails_closed_because_semantics_cannot_be_recovered(
     tmp_path: Path,
 ) -> None:
     shape = (4, 6)
@@ -348,9 +349,52 @@ def test_cached_validated_depth_rebuilds_motion_sky_support_without_semantics(
         source_frame_digest="d" * 64,
     )
 
-    cloud = build_supported_depth_cloud_from_validated_depth(
+    with pytest.raises(ValueError, match="may contain semantic exclusions"):
+        build_supported_depth_cloud_from_validated_depth(
+            frames,
+            validated,
+            masks,
+            model,
+            policy=_policy(),
+        )
+
+
+def test_base_metric_depth_rebuilds_motion_sky_support_without_semantics(
+    tmp_path: Path,
+) -> None:
+    from experiments.learned_quality.milestones import BaseEvidenceState
+
+    shape = (4, 6)
+    semantic = [np.zeros(shape, dtype=bool) for _ in range(3)]
+    motion = [np.zeros(shape, dtype=bool) for _ in range(3)]
+    semantic[0][1, 1] = True
+    motion[0][2, 2] = True
+    frames, final_depth, masks, _ = _inputs(
+        tmp_path / "base-inputs",
+        semantic_masks=tuple(semantic),
+        motion_masks=tuple(motion),
+    )
+    model = write_colmap_text_model(
+        tmp_path / "base-model",
+        tuple(frame.image_name for frame in frames),
+        (0.2, 0.3, 0.4),
+        (2, 2, 2),
+    )
+    base = BaseEvidenceState(
+        anchors=object(),
+        depths=tuple(
+            (artifact.depth_path, _sha256(artifact.depth_path))
+            for artifact in final_depth.artifacts
+        ),
+        sky=(),
+        scene=object(),
+        track_audit=object(),
+        colmap_ref="e" * 64,
+    )
+
+    cloud = build_supported_depth_cloud_from_base_evidence(
         frames,
-        validated,
+        base,
         masks,
         model,
         policy=_policy(),
@@ -364,10 +408,11 @@ def test_cached_validated_depth_rebuilds_motion_sky_support_without_semantics(
             strict=True,
         )
     )
-    assert len(cloud.xyz) > 0
-    assert np.all(cloud.view_support >= 3)
     assert (0, 1, 1) in selected
     assert (0, 2, 2) not in selected
+    assert np.all(cloud.confidence > 0.0)
+    assert np.all(cloud.confidence < 1.0)
+    assert cloud.source_depth_digest != "c" * 64
 
 
 def test_supported_cloud_requires_two_additional_agreeing_views(

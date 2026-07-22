@@ -36,6 +36,7 @@ def test_floor_recovery_notebook_is_pinned_bounded_and_run_all_safe() -> None:
     assert sources.count('INPUT_FOLDER = ""  # @param {type:"string"}') == 1
     assert sources.count('RUNTIME_PROFILE = "a100_floor_recovery"') == 1
     assert "A100 with at least 75 GiB VRAM required" in notebook.cells[2].source
+    assert "At least 100 GiB host RAM required" in notebook.cells[2].source
     assert "L4" not in notebook.cells[2].source
     assert sources.count("drive.mount") == 1
     assert "_training_ablation" in notebook.cells[4].source

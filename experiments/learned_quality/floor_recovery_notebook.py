@@ -44,7 +44,7 @@ def build_floor_recovery_notebook(
             metadata=_tag("config"),
         ),
         nbformat.v4.new_code_cell(
-            "import json, re, shutil, subprocess\n"
+            "import json, os, re, shutil, subprocess\n"
             "gpu_line = subprocess.run([\n"
             "    'nvidia-smi', '--query-gpu=name,memory.total',\n"
             "    '--format=csv,noheader,nounits',\n"
@@ -58,8 +58,11 @@ def build_floor_recovery_notebook(
             ")\n"
             "disk_gib = shutil.disk_usage('/content').free / (1024 ** 3)\n"
             "assert disk_gib >= 80.0, f'At least 80 GiB local disk required; detected {disk_gib:.1f}'\n"
+            "host_ram_gib = os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE') / (1024 ** 3)\n"
+            "assert host_ram_gib >= 100.0, f'At least 100 GiB host RAM required; detected {host_ram_gib:.1f}'\n"
             "print(json.dumps({'runtime_profile': RUNTIME_PROFILE, 'gpu': gpu_name, "
-            "'vram_gib': round(vram_gib, 1), 'disk_free_gib': round(disk_gib, 1)}, "
+            "'vram_gib': round(vram_gib, 1), 'host_ram_gib': round(host_ram_gib, 1), "
+            "'disk_free_gib': round(disk_gib, 1)}, "
             "sort_keys=True))\n",
             metadata=_tag("preflight"),
         ),

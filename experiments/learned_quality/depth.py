@@ -815,34 +815,71 @@ def build_supported_depth_cloud_from_validated_depth(
     policy: DenseSeedPolicy,
     mask_mode: DepthMaskMode = "motion_sky",
 ) -> SupportedDepthCloud:
-    """Rebuild support locally from cached validated depths and COLMAP cameras.
+    """Reject cached arrays that may already contain semantic exclusions."""
 
-    Final-pretraining milestones intentionally retain the validated depth arrays but
-    not the transient DA3 confidence/camera bundle. This adapter uses only registered
-    COLMAP cameras, treats a validated positive depth as confidence one, and then
-    reruns the same multi-view agreement test. It never consumes semantic masks.
-    """
+    del frames, masks, winner_model_dir, policy, mask_mode
+    if not isinstance(validated_depth, DepthValidationResult):
+        raise ValueError("validated_depth must be DepthValidationResult")
+    raise ValueError(
+        "validated depth may contain semantic exclusions; use verified base evidence"
+    )
+
+
+def _metric_depth_reliability(depth: np.ndarray) -> np.ndarray:
+    """Return a deterministic edge-aware reliability score for metric depth."""
+
+    valid = np.isfinite(depth) & (depth > 0.0)
+    safe = np.where(valid, np.log(np.maximum(depth, 1e-6)), 0.0)
+    gradient_y, gradient_x = np.gradient(safe.astype(np.float64))
+    magnitude = np.hypot(gradient_x, gradient_y)
+    active = magnitude[valid]
+    scale = float(np.quantile(active, 0.75)) if len(active) else 0.0
+    if not math.isfinite(scale) or scale <= 1e-9:
+        reliability = np.full(depth.shape, 0.95, dtype=np.float64)
+    else:
+        reliability = 0.95 * np.exp(-magnitude / (4.0 * scale))
+    reliability[~valid] = 0.0
+    return np.asarray(np.clip(reliability, 0.0, 0.95), dtype=np.float32)
+
+
+def build_supported_depth_cloud_from_base_evidence(
+    frames: tuple[FrameArtifact, ...],
+    base_evidence: object,
+    masks: MaskFusionEvidence,
+    winner_model_dir: Path,
+    *,
+    policy: DenseSeedPolicy,
+    mask_mode: DepthMaskMode = "motion_sky",
+) -> SupportedDepthCloud:
+    """Rebuild motion/sky-only support from pre-semantic metric depth evidence."""
 
     from backend.preprocess.parse_colmap import parse_cameras_from_model
 
-    if not isinstance(validated_depth, DepthValidationResult):
-        raise ValueError("validated_depth must be DepthValidationResult")
+    from .milestones import BaseEvidenceState
+
+    if not isinstance(base_evidence, BaseEvidenceState):
+        raise ValueError("base_evidence must be BaseEvidenceState")
     if not isinstance(policy, DenseSeedPolicy):
         raise ValueError("policy must be DenseSeedPolicy")
     if mask_mode != "motion_sky":
-        raise ValueError("cached floor support permits only motion_sky masks")
+        raise ValueError("floor support permits only motion_sky masks")
     if not isinstance(masks, MaskFusionEvidence):
         raise ValueError("masks must be MaskFusionEvidence")
-    by_depth = {row.frame.image_name: row for row in validated_depth.frames}
+    if type(frames) is not tuple or len(base_evidence.depths) != len(frames):
+        raise ValueError("base metric depth must join every source frame")
+    by_depth = {
+        frame.image_name: row
+        for frame, row in zip(frames, base_evidence.depths, strict=True)
+    }
     by_mask = {row.frame.image_name: row for row in masks.frames}
-    if len(by_depth) != len(validated_depth.frames) or len(by_mask) != len(masks.frames):
-        raise ValueError("cached floor evidence contains duplicate frame names")
+    if len(by_depth) != len(frames) or len(by_mask) != len(masks.frames):
+        raise ValueError("base floor evidence contains duplicate frame names")
     cameras_by_name = parse_cameras_from_model(winner_model_dir)
     registered = tuple(frame for frame in frames if frame.image_name in cameras_by_name)
     if len(registered) < policy.minimum_neighbor_support + 1:
         raise ValueError("registered frames cannot satisfy floor support policy")
     if any(frame.image_name not in by_depth or frame.image_name not in by_mask for frame in registered):
-        raise ValueError("cached floor evidence requires an exact registered-frame join")
+        raise ValueError("base floor evidence requires an exact registered-frame join")
     depths: list[np.ndarray] = []
     confidence: list[np.ndarray] = []
     invalid: list[np.ndarray] = []
@@ -855,15 +892,16 @@ def build_supported_depth_cloud_from_validated_depth(
     processed: PinholeCamera | None = None
     radius: int | None = None
     for frame in registered:
-        depth_row = by_depth[frame.image_name]
+        depth_path, raw_depth_digest = by_depth[frame.image_name]
         mask = by_mask[frame.image_name]
-        if depth_row.frame != frame or mask.frame != frame:
-            raise ValueError("cached floor evidence frame contracts disagree")
-        depth_path = _regular_file(depth_row.depth_path, "validated floor depth")
-        depth_digest = _require_digest(depth_row.depth_sha256, "validated depth sha256")
+        if mask.frame != frame:
+            raise ValueError("base floor evidence frame contracts disagree")
+        depth_path = _regular_file(depth_path, "base metric depth")
+        depth_digest = _require_digest(raw_depth_digest, "base metric depth sha256")
         if _sha256_path(depth_path) != depth_digest:
-            raise ValueError("validated floor depth digest does not match bytes")
-        depth = _load_float32(depth_path, "validated floor depth")
+            raise ValueError("base metric depth digest does not match bytes")
+        depth = _load_float32(depth_path, "base metric depth")
+        confidence_map = _metric_depth_reliability(depth)
         camera = cameras_by_name[frame.image_name]
         K = np.asarray(camera["K"], dtype=np.float64)
         w2c = np.asarray(camera["w2c"], dtype=np.float64)
@@ -887,7 +925,7 @@ def build_supported_depth_cloud_from_validated_depth(
                 math.ceil(min(depth.shape) * float(policy.invalid_boundary_fraction))
             )
         elif active_processed != processed or depth.shape != (processed.height, processed.width):
-            raise ValueError("registered validated depths must share one scaled camera")
+            raise ValueError("registered base depths must share one scaled camera")
         final_camera = FinalPoseCamera(
             image_name=frame.image_name,
             frame_id=frame.frame_id,
@@ -909,7 +947,13 @@ def build_supported_depth_cloud_from_validated_depth(
         )
         first = _resize_mask(first, depth.shape)
         second = _resize_mask(second, depth.shape)
-        current_invalid = first | second | ~np.isfinite(depth) | (depth <= 0.0)
+        current_invalid = (
+            first
+            | second
+            | ~np.isfinite(depth)
+            | (depth <= 0.0)
+            | (confidence_map < float(policy.minimum_confidence))
+        )
         if radius and np.any(current_invalid):
             current_invalid = ndimage.binary_dilation(
                 current_invalid,
@@ -917,7 +961,7 @@ def build_supported_depth_cloud_from_validated_depth(
             )
         current_invalid.setflags(write=False)
         depths.append(depth)
-        confidence.append(np.ones(depth.shape, dtype=np.float32))
+        confidence.append(confidence_map)
         invalid.append(current_invalid)
         colors.append(_load_color(frame.path, depth.shape))
         snapshots.extend(
@@ -931,7 +975,13 @@ def build_supported_depth_cloud_from_validated_depth(
         frame_rows.append(
             {"frame_id": frame.frame_id, "image_name": frame.image_name, "sha256": frame.sha256}
         )
-        depth_rows.append({"frame_id": frame.frame_id, "depth_sha256": depth_digest})
+        depth_rows.append(
+            {
+                "frame_id": frame.frame_id,
+                "depth_sha256": depth_digest,
+                "reliability": "metric_depth_gradient.v1",
+            }
+        )
         mask_rows.append(
             {
                 "frame_id": frame.frame_id,
@@ -940,7 +990,7 @@ def build_supported_depth_cloud_from_validated_depth(
             }
         )
     if processed is None:
-        raise AssertionError("registered cached depths unexpectedly empty")
+        raise AssertionError("registered base depths unexpectedly empty")
     model_rows: list[dict[str, object]] = []
     for name in _MODEL_FILES:
         path = _regular_file(Path(winner_model_dir) / name, f"winner {name}")
@@ -957,8 +1007,8 @@ def build_supported_depth_cloud_from_validated_depth(
         processed_camera=processed,
         snapshots=tuple(snapshots),
         source_model_digest=_artifact_digest_payload(model_rows, "learned_quality.winner_model.v1"),
-        source_mask_digest=_artifact_digest_payload(mask_rows, "learned_quality.cached_motion_sky.v1"),
-        source_depth_digest=_artifact_digest_payload(depth_rows, "learned_quality.cached_validated_depth.v1"),
+        source_mask_digest=_artifact_digest_payload(mask_rows, "learned_quality.base_motion_sky.v1"),
+        source_depth_digest=_artifact_digest_payload(depth_rows, "learned_quality.base_metric_depth.v1"),
         source_frame_digest=_artifact_digest_payload(frame_rows, "learned_quality.depth_frames.v1"),
     )
     xyz, rgb, confidence_rows, support, frame_index, source_xy, _ = (

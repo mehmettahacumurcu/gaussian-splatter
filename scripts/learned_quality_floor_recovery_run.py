@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from pathlib import Path
@@ -11,6 +12,7 @@ from typing import Any
 
 
 RESULT_PATH = Path("/content/learned_floor_recovery_result.json")
+FAILURE_DRIVE_ROOT = Path("/content/drive/MyDrive")
 _GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -68,6 +70,33 @@ def _result_payload(result: Any) -> dict[str, object]:
     }
 
 
+def _publish_durable_failure(spec: object, error: Exception) -> Path:
+    input_folder = str(getattr(spec, "input_folder"))
+    input_name = Path(input_folder).name
+    destination = (
+        FAILURE_DRIVE_ROOT
+        / f"{input_name}_floor_recovery_diagnostic_failures"
+        / f"{uuid.uuid4().hex}.json"
+    )
+    payload = {
+        "schema_version": 1,
+        "status": "failed",
+        "input_folder": input_folder,
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+        "full_120k_training_started": False,
+    }
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f".{destination.name}.tmp")
+    temporary.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    os.replace(temporary, destination)
+    return destination
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -102,13 +131,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             expected_source_revision=args.source_revision,
         )
     except Exception as error:
-        _write_receipt(
-            {
-                "status": "failed",
-                "error_type": type(error).__name__,
-                "error_message": str(error),
-            }
-        )
+        payload: dict[str, object] = {
+            "status": "failed",
+            "error_type": type(error).__name__,
+            "error_message": str(error),
+            "full_120k_training_started": False,
+        }
+        try:
+            payload["durable_failure_path"] = str(
+                _publish_durable_failure(spec, error)
+            )
+        except Exception as publication_error:
+            payload["durable_failure_error"] = (
+                f"{type(publication_error).__name__}: {publication_error}"
+            )
+        _write_receipt(payload)
         return 1
 
     payload = _result_payload(result)

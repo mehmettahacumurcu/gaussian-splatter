@@ -41,6 +41,7 @@ class HardwareInfo:
     colmap_gpu_sift: bool | None = None
     colmap_available: bool = True
     ffmpeg_available: bool = True
+    host_ram_gb: float | None = None
 
 
 @dataclass(frozen=True)
@@ -230,6 +231,13 @@ def _inspect_hardware(paths: NotebookRuntimePaths) -> HardwareInfo:
             paths.work_root / f".colmap-gpu-probe-{uuid.uuid4().hex}",
         )
     disk_free_gb = shutil.disk_usage(paths.work_root).free / (1024**3)
+    host_ram_gb: float | None = None
+    try:
+        host_ram_gb = (
+            os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / (1024**3)
+        )
+    except (AttributeError, OSError, TypeError, ValueError):
+        pass
     return HardwareInfo(
         gpu_name,
         vram_gb,
@@ -238,6 +246,7 @@ def _inspect_hardware(paths: NotebookRuntimePaths) -> HardwareInfo:
         colmap_gpu_sift,
         colmap_executable is not None,
         ffmpeg_executable is not None,
+        host_ram_gb,
     )
 
 

@@ -114,6 +114,7 @@ def decide_floor_recovery(
         ("oversized_fraction", structural.oversized_fraction <= 0.01),
         ("out_of_bounds_fraction", structural.out_of_bounds_fraction <= 0.001),
         ("nonfinite_values", structural.nonfinite_count == 0),
+        ("floor_plane_depth", final_floor.plane_depth_relative_error <= 0.10),
         (
             "perturbed_floor_depth",
             final_floor.perturbed_depth_disagreement_ratio <= 1.10,
@@ -180,6 +181,7 @@ def publish_floor_recovery_report(
     staging = Path(
         tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent)
     )
+    backup: Path | None = None
     try:
         for child in source.iterdir():
             destination_child = staging / child.name
@@ -202,11 +204,16 @@ def publish_floor_recovery_report(
             },
         )
         if os.path.lexists(target):
-            shutil.rmtree(target)
+            backup = target.with_name(f".{target.name}.backup-{uuid.uuid4().hex}")
+            os.replace(target, backup)
         os.replace(staging, target)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
+        if backup is not None and os.path.lexists(backup) and not os.path.lexists(target):
+            os.replace(backup, target)
         raise
+    if backup is not None:
+        shutil.rmtree(backup)
     return target
 
 
@@ -225,6 +232,8 @@ def validate_floor_recovery_hardware(hardware: object) -> None:
     gpu_name = str(getattr(hardware, "gpu_name", ""))
     vram_gb = float(getattr(hardware, "vram_gb", 0.0))
     disk_free_gb = float(getattr(hardware, "disk_free_gb", 0.0))
+    raw_host_ram_gb = getattr(hardware, "host_ram_gb", None)
+    host_ram_gb = float(raw_host_ram_gb) if raw_host_ram_gb is not None else 0.0
     if "A100" not in gpu_name.upper() or vram_gb < 75.0:
         raise RuntimeError(
             "floor recovery requires an A100 with 75+ GiB VRAM; "
@@ -234,6 +243,11 @@ def validate_floor_recovery_hardware(hardware: object) -> None:
         raise RuntimeError(
             "floor recovery requires at least 40 GiB local disk; "
             f"got {disk_free_gb:g} GiB"
+        )
+    if host_ram_gb < 100.0:
+        raise RuntimeError(
+            "floor recovery requires a High-RAM runtime with at least 100 GiB "
+            f"host RAM; got {host_ram_gb:g} GiB"
         )
 
 
@@ -397,6 +411,7 @@ def run_floor_recovery_from_staged(
     from backend.static_pipeline.training import PreparedTrainingInput
 
     from .floor_recovery import (
+        FloorArtifactLineage,
         build_floor_hole_map,
         estimate_floor_plane,
         generate_floor_seed_artifact,
@@ -413,9 +428,9 @@ def run_floor_recovery_from_staged(
     accepted_model = Path(reconstruction.accepted_model_dir)
     sparse_xyz, _, _, _ = load_points3d_from_model(accepted_model)
     if build_cloud is None:
-        from .depth import build_supported_depth_cloud_from_validated_depth
+        from .depth import build_supported_depth_cloud_from_base_evidence
 
-        build_cloud = build_supported_depth_cloud_from_validated_depth
+        build_cloud = build_supported_depth_cloud_from_base_evidence
     if fit_plane is None:
         fit_plane = estimate_floor_plane
     if map_holes is None:
@@ -435,7 +450,7 @@ def run_floor_recovery_from_staged(
         frames = tuple(artifacts.photometric.original_frames)
         cloud = build_cloud(
             frames,
-            artifacts.depth,
+            artifacts.base_evidence,
             artifacts.masks,
             accepted_model,
             policy=artifacts.depth.policy,
@@ -449,6 +464,12 @@ def run_floor_recovery_from_staged(
             plane,
             holes,
             root / "floor-artifact",
+            lineage=FloorArtifactLineage(
+                source_revision=staged.source_revision,
+                source_digest=staged.source_digest,
+                selection_digest=reconstruction.selected_manifest.image_set_digest,
+                pretraining_fingerprint=staged.pretraining_fingerprint,
+            ),
         )
     except ValueError as exc:
         message = str(exc)
@@ -580,7 +601,6 @@ def run_floor_recovery_diagnostic(
         _CPU_AUDIT_PYTHON_VERSION,
         _CPU_AUDIT_SELECTION_PRODUCER_SHA256,
         _REPOSITORY_ROOT,
-        _pretraining_cache_fingerprint,
         _selection_milestone_ref,
     )
 

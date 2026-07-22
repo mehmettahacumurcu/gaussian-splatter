@@ -112,7 +112,13 @@ def test_runner_exception_writes_failure_receipt(
     manifest = tmp_path / "model_manifest.json"
     manifest.write_text("{}", encoding="utf-8")
     receipt = tmp_path / "result.json"
+    failure_root = tmp_path / "drive"
     monkeypatch.setattr(learned_quality_floor_recovery_run, "RESULT_PATH", receipt)
+    monkeypatch.setattr(
+        learned_quality_floor_recovery_run,
+        "FAILURE_DRIVE_ROOT",
+        failure_root,
+    )
 
     def fail(*_args, **_kwargs):
         raise RuntimeError("staging exploded")
@@ -138,3 +144,7 @@ def test_runner_exception_writes_failure_receipt(
     payload = json.loads(receipt.read_text())
     assert payload["status"] == "failed"
     assert payload["error_message"] == "staging exploded"
+    failure_path = Path(payload["durable_failure_path"])
+    assert failure_path.is_file()
+    assert failure_path.is_relative_to(failure_root)
+    assert json.loads(failure_path.read_text(encoding="utf-8"))["status"] == "failed"

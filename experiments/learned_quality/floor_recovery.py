@@ -26,6 +26,35 @@ FLOOR_RECOVERY_SCHEMA: Final[str] = "learned_quality.floor_recovery.v1"
 MAX_FLOOR_SEEDS: Final[int] = 150_000
 
 
+def _hex_digest(value: object, length: int, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != length
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise ValueError(f"{label} must be a lowercase hexadecimal digest")
+    return value
+
+
+@dataclass(frozen=True)
+class FloorArtifactLineage:
+    source_revision: str
+    source_digest: str
+    selection_digest: str
+    pretraining_fingerprint: str
+
+    def __post_init__(self) -> None:
+        _hex_digest(self.source_revision, 40, "source_revision")
+        _hex_digest(self.source_digest, 64, "source_digest")
+        _hex_digest(self.selection_digest, 64, "selection_digest")
+        _hex_digest(
+            self.pretraining_fingerprint,
+            64,
+            "pretraining_fingerprint",
+        )
+
+
 def _finite_number(value: object, label: str, *, positive: bool = False) -> float:
     if isinstance(value, bool) or not isinstance(value, Real):
         raise ValueError(f"{label} must be a finite number")
@@ -437,6 +466,7 @@ def generate_floor_seed_artifact(
     output_dir: Path,
     *,
     policy: FloorRecoveryPolicy = FloorRecoveryPolicy(),
+    lineage: FloorArtifactLineage,
 ) -> FloorSeedArtifact:
     sparse = _validated_points(sparse_points, "sparse_points", minimum=3)
     target = Path(output_dir)
@@ -514,6 +544,7 @@ def generate_floor_seed_artifact(
     fingerprint = hashlib.sha256()
     fingerprint.update(FLOOR_RECOVERY_SCHEMA.encode("ascii"))
     fingerprint.update(_json_bytes(asdict(policy)))
+    fingerprint.update(_json_bytes(asdict(lineage)))
     fingerprint.update(_json_bytes(_plane_payload(plane)))
     fingerprint.update(
         _json_bytes(
@@ -581,6 +612,7 @@ def generate_floor_seed_artifact(
                     "point_count": int(len(fused_xyz)),
                     "policy": asdict(policy),
                     "schema": FLOOR_RECOVERY_SCHEMA,
+                    "lineage": asdict(lineage),
                     "source_digests": {
                         "depth": cloud.source_depth_digest,
                         "frames": cloud.source_frame_digest,
