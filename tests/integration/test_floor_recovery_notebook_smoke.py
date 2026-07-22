@@ -13,7 +13,7 @@ from experiments.learned_quality.floor_recovery_notebook import (
 
 ROOT = Path(__file__).resolve().parents[2]
 GENERATED = ROOT / "colab" / "learned_quality_floor_recovery.ipynb"
-PINNED_CODE_COMMIT = "0a81788324baad843fb645f0c91dbe16ebd66389"
+PINNED_CODE_COMMIT = "399c0ee5065c0670542354fbdb3ba0fa836016a5"
 
 
 def test_floor_recovery_notebook_is_pinned_bounded_and_run_all_safe() -> None:
