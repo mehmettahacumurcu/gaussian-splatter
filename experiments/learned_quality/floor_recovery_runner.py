@@ -24,6 +24,7 @@ from .floor_recovery_training import FloorCheckpointMetrics, FloorTrainingResult
 
 GENERATOR_ID = "4dgs-studio.floor-recovery-diagnostic"
 RESULT_SUFFIX = "_floor_recovery_diagnostic"
+A100_LEGACY_REFERENCE_REVISION = "ce836c9d82bc0b17bad1cff558f99cca41e4ae28"
 
 
 class FloorRecoveryPublishSpec(StrictModel):
@@ -261,11 +262,14 @@ def stage_legacy_reference(
     staging = matrix.get("staging")
     if not isinstance(staging, dict):
         raise RuntimeError("diagnostic matrix staging metadata is missing")
+    if staging.get("source_revision") != A100_LEGACY_REFERENCE_REVISION:
+        raise RuntimeError(
+            "legacy reference producer revision differs from the verified A100 matrix"
+        )
     if (
         staging.get("source_digest") != staged.source_digest
         or staging.get("pretraining_fingerprint")
         != staged.pretraining_fingerprint
-        or staging.get("source_revision") != staged.source_revision
     ):
         raise RuntimeError("legacy reference differs from staged pretraining")
     environment = _load_json(root / "environment.json", "ablation environment")

@@ -10,6 +10,7 @@ import pytest
 
 from experiments.learned_quality.ablation import AblationCheckpoint, StructuralMetrics
 from experiments.learned_quality.floor_recovery_runner import (
+    A100_LEGACY_REFERENCE_REVISION,
     FloorRecoveryDecision,
     FloorRecoveryRunResult,
     FloorRecoveryRunSpec,
@@ -396,14 +397,14 @@ def test_legacy_reference_must_match_staged_a100_lineage(
         reconstruction=object(),
         source_digest="a" * 64,
         pretraining_fingerprint="b" * 64,
-        source_revision="c" * 40,
+        source_revision="d" * 40,
         manifest_path=manifest,
     )
     matrix = {
         "staging": {
             "source_digest": staged.source_digest,
             "pretraining_fingerprint": staged.pretraining_fingerprint,
-            "source_revision": staged.source_revision,
+            "source_revision": A100_LEGACY_REFERENCE_REVISION,
         }
     }
     (source / "diagnostic_matrix.json").write_text(
@@ -438,6 +439,18 @@ def test_legacy_reference_must_match_staged_a100_lineage(
         tmp_path / "reference" / "experiments" / "legacy_control" / "receipt.json"
     ).is_file()
 
+    matrix["staging"]["source_revision"] = "e" * 40
+    (source / "diagnostic_matrix.json").write_text(
+        json.dumps(matrix), encoding="utf-8"
+    )
+    with pytest.raises(RuntimeError, match="producer revision"):
+        stage_legacy_reference(
+            source,
+            tmp_path / "wrong-reference-producer",
+            staged=staged,
+        )
+
+    matrix["staging"]["source_revision"] = A100_LEGACY_REFERENCE_REVISION
     matrix["staging"]["source_digest"] = "f" * 64
     (source / "diagnostic_matrix.json").write_text(
         json.dumps(matrix), encoding="utf-8"
