@@ -12,6 +12,7 @@ experiment, and a production video→world runner.
 | `colmap_cuda_build.ipynb` | CUDA COLMAP feasibility — install or build a headless GPU-SIFT COLMAP, run a GPU vs CPU timing experiment on a real scene, persist the artifact to Drive. Feeds `bootstrap.sh --colmap-cuda` (now wired). | ~10–45 min |
 | `learned_quality_cache_audit.ipynb` | CPU-only safety gate: restores frame selection, verifies the owned COLMAP cache, qualifies tracks, and publishes the receipt required by the learned A100 run. | CPU only |
 | `learned_quality_a100_experiment.ipynb` | Maximum-quality learned preprocessing and 120k-iteration Gaussian training, resumable from verified Drive milestones. Run the CPU audit first. | Several hours |
+| `learned_quality_floor_recovery.ipynb` | Final bounded floor-hole diagnostic: restores the verified lineage once and compares one automatic 5k floor-seed arm with the preserved A100 legacy control. Never starts 120k or overwrites a production result. | ~1-3 h including Drive staging |
 
 ## Verified results
 
@@ -155,6 +156,21 @@ The notebook stops after publishing `<input_folder>_training_ablation`. It never
 a full 120K training run and never publishes a replacement PLY. Review
 `diagnostic_summary.md`, `diagnostic_matrix.json`, and the plots under `plots/` before
 changing the production pipeline.
+
+## Final bounded floor-recovery test
+
+After the CPU track audit and A100 structural diagnostic matrix have both completed for
+the same input, run `learned_quality_floor_recovery.ipynb` in a fresh **A100 80 GB
+High-RAM** runtime. Set `INPUT_FOLDER`, choose **Runtime -> Run all**, and let the final
+cell publish `<input_folder>_floor_recovery_diagnostic`.
+
+The notebook stages the verified lineage once, automatically fits a reliable floor
+plane, finds empty floor cells, and trains one 5k candidate with at most 150,000
+low-opacity floor seeds. It ignores semantic masks, excludes confirmed motion and sky,
+uses the proven legacy density schedule, and stops after the comparison. A completed
+diagnostic may be either accepted or safely rejected; read `decision.json`. Production
+results are never replaced. See `docs/FLOOR_RECOVERY_DIAGNOSTIC.md` for exact gates,
+monitoring commands, and output interpretation.
 
 ## Shared pieces
 

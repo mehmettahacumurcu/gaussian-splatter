@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import json
+import re
+from pathlib import Path
+
+import nbformat
+
 from experiments.learned_quality.floor_recovery_notebook import (
     build_floor_recovery_notebook,
 )
+
+
+ROOT = Path(__file__).resolve().parents[2]
+GENERATED = ROOT / "colab" / "learned_quality_floor_recovery.ipynb"
+PINNED_CODE_COMMIT = "0290a913662473aa9bd8ed5dabf5d8f505ce42bb"
 
 
 def test_floor_recovery_notebook_is_pinned_bounded_and_run_all_safe() -> None:
@@ -57,3 +68,17 @@ def test_floor_recovery_notebook_is_pinned_bounded_and_run_all_safe() -> None:
     assert "viewer.html" not in sources
     assert ".wasm" not in sources
     assert "120000" not in sources
+
+
+def test_checked_in_floor_recovery_notebook_matches_generator() -> None:
+    checked_in = nbformat.read(GENERATED, as_version=4)
+    checkout = next(
+        cell for cell in checked_in.cells if "checkout" in cell.metadata.get("tags", [])
+    )
+    match = re.search(r"COMMIT_SHA = ['\"]([0-9a-f]{40})['\"]", checkout.source)
+
+    assert match is not None
+    assert match.group(1) == PINNED_CODE_COMMIT
+
+    expected = build_floor_recovery_notebook(commit_sha=PINNED_CODE_COMMIT)
+    assert json.loads(nbformat.writes(checked_in)) == json.loads(nbformat.writes(expected))
