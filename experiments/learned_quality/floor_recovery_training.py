@@ -21,7 +21,7 @@ from .ablation_training import (
 )
 from .contracts import FrameArtifact, LearnedArtifacts
 from .floor_recovery import FLOOR_RECOVERY_SCHEMA, FloorSeedArtifact
-from .training import _atomic_copy, _augment_points3d, _validate_evidence
+from .training import _atomic_copy, _validate_evidence
 
 if TYPE_CHECKING:
     from backend.notebooks.models import StaticNotebookRunSpec
@@ -207,7 +207,7 @@ def _validated_floor_artifact(
         raise ValueError("floor geometry metadata must be finite")
     if tolerance <= 0.0 or cell_width <= 0.0:
         raise ValueError("floor geometry scales must be positive")
-    return xyz, rgb, normal, offset, tolerance, min(0.025, 0.5 * cell_width)
+    return xyz, rgb, normal, offset, tolerance, min(0.025, 0.25 * cell_width)
 
 
 def _point_count(path: Path) -> int:
@@ -228,7 +228,7 @@ def prepare_floor_recovery_scene(
     scene_dir: Path,
     floor_artifact: FloorSeedArtifact,
 ) -> PreparedFloorRecoveryScene:
-    """Stage legacy RGB/depth and append only the verified floor seed rows."""
+    """Stage legacy RGB/depth while leaving the accepted sparse model untouched."""
 
     scene = Path(scene_dir)
     evidence = _validate_evidence(artifacts, Path(accepted_model_dir), scene)
@@ -251,9 +251,6 @@ def prepare_floor_recovery_scene(
         _atomic_copy(source, depth_dir / f"{Path(frame.image_name).stem}_depth.npy")
     points_path = scene / "colmap" / "sparse" / "0" / "points3D.txt"
     original_count = _point_count(points_path)
-    _augment_points3d(points_path, xyz, rgb)
-    if _point_count(points_path) != original_count + len(xyz):
-        raise RuntimeError("floor seed augmentation count mismatch")
     return PreparedFloorRecoveryScene(
         scene_dir=scene,
         original_frames=evidence.original_frames,
@@ -278,7 +275,7 @@ def initialize_floor_seed_slice(
     floor_rgb: np.ndarray,
     maximum_scale: float,
 ) -> None:
-    """Verify and safely initialize only the appended floor Gaussian slice."""
+    """Append verified floor seeds after legacy Gaussian initialization."""
 
     if type(original_count) is not int or original_count < 1:
         raise ValueError("original_count must be a positive plain integer")
@@ -294,12 +291,69 @@ def initialize_floor_seed_slice(
     required = ("means", "scales", "quats", "opacities", "sh_dc", "sh_rest")
     if gs is None or any(not hasattr(gs, name) for name in required):
         raise TypeError("trainer must expose a complete Gaussian model")
-    expected_count = original_count + len(xyz)
-    if int(gs.num_points) != expected_count:
+    if int(gs.num_points) != original_count:
         raise RuntimeError(
             "floor seed initialization count mismatch: "
-            f"{gs.num_points} != {expected_count}"
+            f"{gs.num_points} != {original_count}"
         )
+    optimizer = getattr(trainer, "optimizer", None)
+    append = getattr(gs, "_append_keep_optimizer", None)
+    if optimizer is None or not callable(append):
+        raise TypeError("trainer must expose optimizer-aware Gaussian append")
+    original_tensors = {
+        name: getattr(gs, name).detach().clone() for name in required
+    }
+    original_static = (
+        gs.is_static.detach().clone() if hasattr(gs, "is_static") else None
+    )
+    original_background = (
+        gs.is_background.detach().clone() if hasattr(gs, "is_background") else None
+    )
+    device = gs.means.device
+    means = torch.as_tensor(xyz, dtype=gs.means.dtype, device=device)
+    scales = torch.full(
+        (len(xyz), 3),
+        math.log(float(maximum_scale)),
+        dtype=gs.scales.dtype,
+        device=device,
+    )
+    quats = torch.zeros(
+        (len(xyz), 4), dtype=gs.quats.dtype, device=device
+    )
+    quats[:, 0] = 1.0
+    opacities = torch.full(
+        (len(xyz), 1), -4.0, dtype=gs.opacities.dtype, device=device
+    )
+    rgb_values = torch.as_tensor(rgb, dtype=gs.sh_dc.dtype, device=device).div(255.0)
+    sh_dc = ((rgb_values - 0.5) / 0.28209479177387814).unsqueeze(1)
+    sh_rest = torch.zeros(
+        (len(xyz),) + tuple(gs.sh_rest.shape[1:]),
+        dtype=gs.sh_rest.dtype,
+        device=device,
+    )
+    append(
+        optimizer,
+        means,
+        scales,
+        quats,
+        opacities,
+        sh_dc,
+        sh_rest,
+    )
+    expected_count = original_count + len(xyz)
+    if int(gs.num_points) != expected_count:
+        raise RuntimeError("floor seed append count mismatch")
+    for name, expected in original_tensors.items():
+        if not torch.equal(getattr(gs, name).detach()[:original_count], expected):
+            raise RuntimeError(f"floor seed append mutated original {name}")
+    if original_static is not None and not torch.equal(
+        gs.is_static[:original_count], original_static
+    ):
+        raise RuntimeError("floor seed append mutated original static flags")
+    if original_background is not None and not torch.equal(
+        gs.is_background[:original_count], original_background
+    ):
+        raise RuntimeError("floor seed append mutated original background flags")
     seed_slice = slice(original_count, expected_count)
     actual_xyz = gs.means.detach()[seed_slice].float().cpu().numpy()
     if not np.allclose(actual_xyz, xyz, rtol=0.0, atol=1e-5):
@@ -314,12 +368,8 @@ def initialize_floor_seed_slice(
     tensors = tuple(getattr(gs, name) for name in required)
     if any(not bool(torch.isfinite(value.detach()).all()) for value in tensors):
         raise RuntimeError("Gaussian initialization contains non-finite values")
-    with torch.no_grad():
-        gs.opacities[seed_slice].fill_(-4.0)
-        gs.scales[seed_slice].clamp_(max=math.log(float(maximum_scale)))
-        gs.quats[seed_slice].zero_()
-        gs.quats[seed_slice, 0] = 1.0
-        gs.sh_rest[seed_slice].zero_()
+    if not bool(torch.all(gs.get_scales[seed_slice] <= maximum_scale + 1e-7)):
+        raise RuntimeError("floor seed scales exceed the verified maximum")
 
 
 class FloorDiagnosticProbe:

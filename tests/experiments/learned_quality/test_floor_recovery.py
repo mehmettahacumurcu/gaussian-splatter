@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -77,6 +76,9 @@ def _room() -> tuple[np.ndarray, SupportedDepthCloud]:
             ((-1.0, 1.7, -0.5), (0.0, 1.7, -0.5), (1.0, 1.7, -0.5)),
             dtype=np.float64,
         ),
+        camera_up_vectors=np.tile(
+            np.array(((0.0, 1.0, 0.0),), dtype=np.float64), (3, 1)
+        ),
         source_model_digest=_digest("a"),
         source_mask_digest=_digest("b"),
         source_depth_digest=_digest("c"),
@@ -108,6 +110,7 @@ def test_floor_plane_orients_toward_cameras_and_fits_floor() -> None:
     plane = estimate_floor_plane(
         sparse,
         cloud.camera_centers,
+        camera_up_vectors=cloud.camera_up_vectors,
         policy=_policy(),
         seed=8,
     )
@@ -119,9 +122,7 @@ def test_floor_plane_orients_toward_cameras_and_fits_floor() -> None:
     assert plane.above_below_ratio >= 4.0
 
 
-def test_floor_plane_never_flips_a_ceiling_toward_the_cameras(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_floor_plane_never_accepts_a_dominant_ceiling_as_up() -> None:
     rng = np.random.default_rng(19)
     floor = np.column_stack(
         (rng.uniform(-2.0, 2.0, 450), np.zeros(450), rng.uniform(0.0, 4.0, 450))
@@ -136,14 +137,17 @@ def test_floor_plane_never_flips_a_ceiling_toward_the_cameras(
     interior = rng.uniform((-1.8, 0.2, 0.2), (1.8, 2.8, 3.8), size=(500, 3))
     points = np.concatenate((floor, ceiling, interior))
     cameras = np.array(((-1.0, 1.6, 0.5), (0.0, 1.7, 2.0), (1.0, 1.6, 3.5)))
-    monkeypatch.setattr(
-        "experiments.learned_quality.floor_recovery.estimate_world_orientation",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            up_raw=np.array((0.0, 1.0, 0.0))
-        ),
+    camera_ups = np.tile(
+        np.array(((0.0, 1.0, 0.0),), dtype=np.float64), (len(cameras), 1)
     )
 
-    plane = estimate_floor_plane(points, cameras, policy=_policy(), seed=31)
+    plane = estimate_floor_plane(
+        points,
+        cameras,
+        camera_up_vectors=camera_ups,
+        policy=_policy(),
+        seed=31,
+    )
 
     assert np.dot(plane.normal, np.array((0.0, 1.0, 0.0))) > 0.98
     assert abs(plane.offset) < plane.inlier_tolerance
@@ -154,7 +158,11 @@ def test_floor_hole_map_and_seeds_stay_inside_missing_patch(tmp_path: Path) -> N
     sparse, cloud = _room()
     policy = _policy()
     plane = estimate_floor_plane(
-        sparse, cloud.camera_centers, policy=policy, seed=8
+        sparse,
+        cloud.camera_centers,
+        camera_up_vectors=cloud.camera_up_vectors,
+        policy=policy,
+        seed=8,
     )
     holes = build_floor_hole_map(sparse, cloud, plane, policy=policy)
 
@@ -189,7 +197,11 @@ def test_floor_seed_cap_and_bytes_are_deterministic(tmp_path: Path) -> None:
     sparse, cloud = _room()
     policy = _policy(maximum_seed_count=20)
     plane = estimate_floor_plane(
-        sparse, cloud.camera_centers, policy=policy, seed=8
+        sparse,
+        cloud.camera_centers,
+        camera_up_vectors=cloud.camera_up_vectors,
+        policy=policy,
+        seed=8,
     )
     holes = build_floor_hole_map(sparse, cloud, plane, policy=policy)
 
@@ -223,7 +235,13 @@ def test_floor_seed_fingerprint_binds_source_and_pretraining_lineage(
 ) -> None:
     sparse, cloud = _room()
     policy = _policy(maximum_seed_count=20)
-    plane = estimate_floor_plane(sparse, cloud.camera_centers, policy=policy, seed=8)
+    plane = estimate_floor_plane(
+        sparse,
+        cloud.camera_centers,
+        camera_up_vectors=cloud.camera_up_vectors,
+        policy=policy,
+        seed=8,
+    )
     holes = build_floor_hole_map(sparse, cloud, plane, policy=policy)
 
     first = generate_floor_seed_artifact(
@@ -254,6 +272,10 @@ def test_floor_plane_and_hole_detection_fail_closed() -> None:
         estimate_floor_plane(
             np.stack((np.arange(200), np.zeros(200), np.zeros(200)), axis=-1),
             cameras,
+            camera_up_vectors=np.tile(
+                np.array(((0.0, 1.0, 0.0),), dtype=np.float64),
+                (len(cameras), 1),
+            ),
             policy=_policy(),
             seed=1,
         )
@@ -261,7 +283,11 @@ def test_floor_plane_and_hole_detection_fail_closed() -> None:
     sparse, cloud = _room()
     policy = _policy(minimum_seed_count=10_000, maximum_seed_count=10_000)
     plane = estimate_floor_plane(
-        sparse, cloud.camera_centers, policy=policy, seed=8
+        sparse,
+        cloud.camera_centers,
+        camera_up_vectors=cloud.camera_up_vectors,
+        policy=policy,
+        seed=8,
     )
     holes = build_floor_hole_map(sparse, cloud, plane, policy=policy)
     with pytest.raises(ValueError, match="no_recoverable_floor_hole"):

@@ -121,7 +121,11 @@ def test_runner_exception_writes_failure_receipt(
     )
 
     def fail(*_args, **_kwargs):
-        raise RuntimeError("staging exploded")
+        error = RuntimeError("staging exploded")
+        error.floor_recovery_completed_stage = "input_restore"
+        error.floor_recovery_input_fingerprints = {"source_digest": "a" * 64}
+        error.floor_recovery_evidence_paths = (str(tmp_path / "evidence"),)
+        raise error
 
     monkeypatch.setattr(
         learned_quality_floor_recovery_run,
@@ -147,4 +151,9 @@ def test_runner_exception_writes_failure_receipt(
     failure_path = Path(payload["durable_failure_path"])
     assert failure_path.is_file()
     assert failure_path.is_relative_to(failure_root)
-    assert json.loads(failure_path.read_text(encoding="utf-8"))["status"] == "failed"
+    durable = json.loads(failure_path.read_text(encoding="utf-8"))
+    assert durable["status"] == "failed"
+    assert durable["source_revision"] == PIN
+    assert durable["completed_stage"] == "input_restore"
+    assert durable["input_fingerprints"] == {"source_digest": "a" * 64}
+    assert durable["evidence_paths"] == [str(tmp_path / "evidence")]

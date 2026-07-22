@@ -230,11 +230,34 @@ def estimate_floor_plane(
     sparse_points: np.ndarray,
     camera_centers: np.ndarray,
     *,
+    camera_up_vectors: np.ndarray,
     policy: FloorRecoveryPolicy = FloorRecoveryPolicy(),
     seed: int = 0,
 ) -> FloorPlane:
     points = _validated_points(sparse_points, "sparse_points", minimum=3)
     cameras = _validated_points(camera_centers, "camera_centers", minimum=2)
+    camera_ups = _validated_points(
+        camera_up_vectors, "camera_up_vectors", minimum=2
+    )
+    if camera_ups.shape != cameras.shape:
+        raise ValueError("camera_up_vectors must match camera_centers")
+    camera_up_lengths = np.linalg.norm(camera_ups, axis=1, keepdims=True)
+    if np.any(camera_up_lengths <= 1e-6):
+        raise ValueError("camera up vectors must be nonzero")
+    camera_ups = camera_ups / camera_up_lengths
+    robust_camera_up = np.median(camera_ups, axis=0)
+    robust_camera_up_length = float(np.linalg.norm(robust_camera_up))
+    if robust_camera_up_length <= 0.25:
+        raise ValueError(
+            "could not find a reliable floor plane: camera up vectors "
+            "do not establish a reliable sign"
+        )
+    robust_camera_up /= robust_camera_up_length
+    if float(np.median(camera_ups @ robust_camera_up)) < 0.5:
+        raise ValueError(
+            "could not find a reliable floor plane: camera up vectors "
+            "do not establish a reliable sign"
+        )
     if type(seed) is not int:
         raise ValueError("seed must be a plain integer")
     center = np.median(points, axis=0)
@@ -248,6 +271,13 @@ def estimate_floor_plane(
         raise ValueError("could not find a reliable floor plane")
     orientation = estimate_world_orientation(points, seed=seed)
     up = _unit_vector(orientation.up_raw, "estimated up")
+    if abs(float(up @ robust_camera_up)) < math.cos(math.radians(45.0)):
+        raise ValueError(
+            "could not find a reliable floor plane: scene orientation "
+            "disagrees with camera up vectors"
+        )
+    if float(up @ robust_camera_up) < 0.0:
+        up = -up
     cosine_limit = math.cos(math.radians(float(policy.maximum_up_angle_degrees)))
     rng = np.random.default_rng(seed)
     best: tuple[float, np.ndarray, float, np.ndarray, float, float] | None = None

@@ -70,7 +70,12 @@ def _result_payload(result: Any) -> dict[str, object]:
     }
 
 
-def _publish_durable_failure(spec: object, error: Exception) -> Path:
+def _publish_durable_failure(
+    spec: object,
+    error: Exception,
+    *,
+    source_revision: str,
+) -> Path:
     input_folder = str(getattr(spec, "input_folder"))
     input_name = Path(input_folder).name
     destination = (
@@ -82,6 +87,16 @@ def _publish_durable_failure(spec: object, error: Exception) -> Path:
         "schema_version": 1,
         "status": "failed",
         "input_folder": input_folder,
+        "source_revision": source_revision,
+        "completed_stage": getattr(
+            error, "floor_recovery_completed_stage", None
+        ),
+        "input_fingerprints": getattr(
+            error, "floor_recovery_input_fingerprints", {}
+        ),
+        "evidence_paths": list(
+            getattr(error, "floor_recovery_evidence_paths", ())
+        ),
         "error_type": type(error).__name__,
         "error_message": str(error),
         "full_120k_training_started": False,
@@ -139,7 +154,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         }
         try:
             payload["durable_failure_path"] = str(
-                _publish_durable_failure(spec, error)
+                _publish_durable_failure(
+                    spec,
+                    error,
+                    source_revision=args.source_revision,
+                )
             )
         except Exception as publication_error:
             payload["durable_failure_error"] = (

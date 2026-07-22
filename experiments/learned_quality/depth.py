@@ -113,6 +113,7 @@ class SupportedDepthCloud:
     source_frame_index: np.ndarray
     source_xy: np.ndarray
     camera_centers: np.ndarray
+    camera_up_vectors: np.ndarray
     source_model_digest: str
     source_mask_digest: str
     source_depth_digest: str
@@ -137,10 +138,19 @@ class SupportedDepthCloud:
             or self.camera_centers.shape[1:] != (3,)
         ):
             raise ValueError("camera_centers must have shape (N, 3)")
+        if (
+            not isinstance(self.camera_up_vectors, np.ndarray)
+            or self.camera_up_vectors.shape != self.camera_centers.shape
+        ):
+            raise ValueError("camera_up_vectors must match camera_centers")
         if not np.isfinite(self.xyz).all() or not np.isfinite(self.confidence).all():
             raise ValueError("supported depth values must be finite")
-        if not np.isfinite(self.camera_centers).all():
-            raise ValueError("camera centers must be finite")
+        if not np.isfinite(self.camera_centers).all() or not np.isfinite(
+            self.camera_up_vectors
+        ).all():
+            raise ValueError("camera geometry must be finite")
+        if np.any(np.linalg.norm(self.camera_up_vectors, axis=1) <= 1e-6):
+            raise ValueError("camera up vectors must be nonzero")
         if np.any(self.confidence < 0.0) or np.any(self.view_support < 1):
             raise ValueError("supported depth confidence and support must be positive")
         if np.any(self.source_frame_index < 0) or np.any(self.source_xy < 0):
@@ -788,9 +798,11 @@ def build_supported_depth_cloud(
         inputs, policy
     )
     camera_centers = []
+    camera_up_vectors = []
     for camera in inputs.cameras:
         w2c = np.asarray(camera.w2c, dtype=np.float64)
         camera_centers.append(-w2c[:3, 3] @ w2c[:3, :3])
+        camera_up_vectors.append(-w2c[1, :3])
     return SupportedDepthCloud(
         xyz=np.asarray(xyz, dtype=np.float64),
         rgb=np.asarray(rgb, dtype=np.uint8),
@@ -799,6 +811,7 @@ def build_supported_depth_cloud(
         source_frame_index=np.asarray(frame_index, dtype=np.int32),
         source_xy=np.asarray(source_xy, dtype=np.int32),
         camera_centers=np.asarray(camera_centers, dtype=np.float64),
+        camera_up_vectors=np.asarray(camera_up_vectors, dtype=np.float64),
         source_model_digest=inputs.source_model_digest,
         source_mask_digest=inputs.source_mask_digest,
         source_depth_digest=inputs.source_depth_digest,
@@ -825,21 +838,85 @@ def build_supported_depth_cloud_from_validated_depth(
     )
 
 
-def _metric_depth_reliability(depth: np.ndarray) -> np.ndarray:
-    """Return a deterministic edge-aware reliability score for metric depth."""
-
-    valid = np.isfinite(depth) & (depth > 0.0)
-    safe = np.where(valid, np.log(np.maximum(depth, 1e-6)), 0.0)
-    gradient_y, gradient_x = np.gradient(safe.astype(np.float64))
-    magnitude = np.hypot(gradient_x, gradient_y)
-    active = magnitude[valid]
-    scale = float(np.quantile(active, 0.75)) if len(active) else 0.0
-    if not math.isfinite(scale) or scale <= 1e-9:
-        reliability = np.full(depth.shape, 0.95, dtype=np.float64)
+def _resize_float32(values: np.ndarray, shape: tuple[int, int]) -> np.ndarray:
+    if values.shape == shape:
+        resized = np.array(values, dtype=np.float32, copy=True)
     else:
-        reliability = 0.95 * np.exp(-magnitude / (4.0 * scale))
-    reliability[~valid] = 0.0
-    return np.asarray(np.clip(reliability, 0.0, 0.95), dtype=np.float32)
+        height, width = shape
+        image = Image.fromarray(np.asarray(values, dtype=np.float32), mode="F")
+        resized = np.asarray(
+            image.resize((width, height), resample=Image.Resampling.BILINEAR),
+            dtype=np.float32,
+        ).copy()
+    resized.setflags(write=False)
+    return resized
+
+
+def _base_metric_confidence_files(
+    frames: tuple[FrameArtifact, ...],
+    depths: tuple[tuple[Path, str], ...],
+) -> tuple[Path, str, dict[str, tuple[str, Path, str]]]:
+    roots: set[Path] = set()
+    for raw_path, _digest in depths:
+        depth_path = _regular_file(raw_path, "base metric depth")
+        if depth_path.parent.name != "metric-native":
+            raise ValueError("base metric depth must belong to metric-native")
+        roots.add(depth_path.parent.parent.resolve(strict=True))
+    if len(roots) != 1:
+        raise ValueError("base metric depths must belong to exactly one root")
+    base_root = roots.pop()
+    metric_root = (base_root / "da3-metric").resolve(strict=True)
+    if not metric_root.is_dir() or metric_root.is_symlink():
+        raise ValueError("base DA3 metric artifact root is invalid")
+    metadata_path = _regular_file(
+        (metric_root / "metadata.json").resolve(strict=True),
+        "base DA3 metric metadata",
+    )
+    metadata_digest = _sha256_path(metadata_path)
+    try:
+        payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("base DA3 metric metadata is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != 1
+        or payload.get("stage") != "da3_metric_sky"
+        or not isinstance(payload.get("artifacts"), list)
+    ):
+        raise ValueError("base DA3 metric metadata contract is invalid")
+    expected = {frame.image_name: frame.frame_id for frame in frames}
+    confidence_by_name: dict[str, tuple[str, Path, str]] = {}
+    for raw_row in payload["artifacts"]:
+        if not isinstance(raw_row, dict):
+            raise ValueError("base DA3 metric artifact row is invalid")
+        image_name = raw_row.get("image_name")
+        frame_id = raw_row.get("frame_id")
+        confidence_relative = raw_row.get("confidence_path")
+        if (
+            not isinstance(image_name, str)
+            or image_name not in expected
+            or frame_id != expected[image_name]
+            or not isinstance(confidence_relative, str)
+            or not confidence_relative
+            or image_name in confidence_by_name
+        ):
+            raise ValueError("base DA3 confidence requires an exact frame join")
+        confidence_path = metric_root.joinpath(
+            *_safe_image_name(confidence_relative)
+        ).resolve(strict=True)
+        try:
+            confidence_path.relative_to(metric_root)
+        except ValueError as exc:
+            raise ValueError("base DA3 confidence escapes its artifact root") from exc
+        confidence_path = _regular_file(confidence_path, "base DA3 confidence")
+        confidence_by_name[image_name] = (
+            frame_id,
+            confidence_path,
+            _sha256_path(confidence_path),
+        )
+    if set(confidence_by_name) != set(expected):
+        raise ValueError("base DA3 confidence requires an exact frame join")
+    return metadata_path, metadata_digest, confidence_by_name
 
 
 def build_supported_depth_cloud_from_base_evidence(
@@ -880,12 +957,15 @@ def build_supported_depth_cloud_from_base_evidence(
         raise ValueError("registered frames cannot satisfy floor support policy")
     if any(frame.image_name not in by_depth or frame.image_name not in by_mask for frame in registered):
         raise ValueError("base floor evidence requires an exact registered-frame join")
+    metadata_path, metadata_digest, confidence_by_name = (
+        _base_metric_confidence_files(frames, base_evidence.depths)
+    )
     depths: list[np.ndarray] = []
     confidence: list[np.ndarray] = []
     invalid: list[np.ndarray] = []
     colors: list[np.ndarray] = []
     cameras: list[FinalPoseCamera] = []
-    snapshots: list[tuple[Path, str]] = []
+    snapshots: list[tuple[Path, str]] = [(metadata_path, metadata_digest)]
     frame_rows: list[dict[str, object]] = []
     depth_rows: list[dict[str, object]] = []
     mask_rows: list[dict[str, object]] = []
@@ -901,7 +981,16 @@ def build_supported_depth_cloud_from_base_evidence(
         if _sha256_path(depth_path) != depth_digest:
             raise ValueError("base metric depth digest does not match bytes")
         depth = _load_float32(depth_path, "base metric depth")
-        confidence_map = _metric_depth_reliability(depth)
+        confidence_frame_id, confidence_path, confidence_digest = confidence_by_name[
+            frame.image_name
+        ]
+        if confidence_frame_id != frame.frame_id:
+            raise ValueError("base DA3 confidence frame contracts disagree")
+        confidence_map = _resize_float32(
+            _load_float32(confidence_path, "base DA3 confidence"), depth.shape
+        )
+        if not np.isfinite(confidence_map).all() or np.any(confidence_map < 0.0):
+            raise ValueError("base DA3 confidence must be finite and nonnegative")
         camera = cameras_by_name[frame.image_name]
         K = np.asarray(camera["K"], dtype=np.float64)
         w2c = np.asarray(camera["w2c"], dtype=np.float64)
@@ -968,6 +1057,7 @@ def build_supported_depth_cloud_from_base_evidence(
             (
                 (frame.path, frame.sha256),
                 (depth_path, depth_digest),
+                (confidence_path, confidence_digest),
                 (Path(mask.motion_confirmed_path), mask.motion_confirmed_sha256),
                 (Path(mask.sky_confirmed_path), mask.sky_confirmed_sha256),
             )
@@ -979,7 +1069,8 @@ def build_supported_depth_cloud_from_base_evidence(
             {
                 "frame_id": frame.frame_id,
                 "depth_sha256": depth_digest,
-                "reliability": "metric_depth_gradient.v1",
+                "confidence_sha256": confidence_digest,
+                "confidence": "da3_metric",
             }
         )
         mask_rows.append(
@@ -1015,9 +1106,11 @@ def build_supported_depth_cloud_from_base_evidence(
         _supported_depth_rows(inputs, policy)
     )
     camera_centers = []
+    camera_up_vectors = []
     for camera in inputs.cameras:
         w2c = np.asarray(camera.w2c, dtype=np.float64)
         camera_centers.append(-w2c[:3, 3] @ w2c[:3, :3])
+        camera_up_vectors.append(-w2c[1, :3])
     return SupportedDepthCloud(
         xyz=np.asarray(xyz, dtype=np.float64),
         rgb=np.asarray(rgb, dtype=np.uint8),
@@ -1026,6 +1119,7 @@ def build_supported_depth_cloud_from_base_evidence(
         source_frame_index=np.asarray(frame_index, dtype=np.int32),
         source_xy=np.asarray(source_xy, dtype=np.int32),
         camera_centers=np.asarray(camera_centers, dtype=np.float64),
+        camera_up_vectors=np.asarray(camera_up_vectors, dtype=np.float64),
         source_model_digest=inputs.source_model_digest,
         source_mask_digest=inputs.source_mask_digest,
         source_depth_digest=inputs.source_depth_digest,

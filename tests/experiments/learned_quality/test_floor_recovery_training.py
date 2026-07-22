@@ -39,14 +39,11 @@ def _trainer() -> tuple[SimpleNamespace, np.ndarray, np.ndarray]:
     floor_rgb = np.array(
         ((110, 100, 90), (120, 110, 100), (130, 120, 110)), dtype=np.uint8
     )
-    points = torch.from_numpy(np.concatenate((original, floor_xyz)))
-    colors = torch.from_numpy(
-        np.concatenate(
-            (np.full((len(original), 3), 0.5, dtype=np.float32), floor_rgb / 255.0)
-        )
-    ).float()
+    points = torch.from_numpy(original)
+    colors = torch.full((len(original), 3), 0.5, dtype=torch.float32)
     gs = GaussianModel(points, init_colors=colors, sh_degree=3, fourier_K=0)
-    return SimpleNamespace(gs=gs), floor_xyz, floor_rgb
+    optimizer = torch.optim.Adam(gs.parameters(), lr=1e-3)
+    return SimpleNamespace(gs=gs, optimizer=optimizer), floor_xyz, floor_rgb
 
 
 def _snapshot_original(gs: GaussianModel, count: int) -> dict[str, torch.Tensor]:
@@ -212,7 +209,7 @@ def test_floor_probe_measures_rendered_floor_alpha_and_plane_depth() -> None:
     assert payload["perturbed_depth_disagreement_ratio"] == pytest.approx(1.0)
 
 
-def test_floor_seed_initializer_rejects_count_position_and_color_mismatch() -> None:
+def test_floor_seed_initializer_rejects_count_and_optimizer_mismatch() -> None:
     trainer, floor_xyz, floor_rgb = _trainer()
     with pytest.raises(RuntimeError, match="count mismatch"):
         initialize_floor_seed_slice(
@@ -224,22 +221,13 @@ def test_floor_seed_initializer_rejects_count_position_and_color_mismatch() -> N
         )
 
     trainer, floor_xyz, floor_rgb = _trainer()
-    with pytest.raises(RuntimeError, match="slice does not match"):
-        initialize_floor_seed_slice(
-            trainer,
-            original_count=3,
-            floor_xyz=floor_xyz[::-1].copy(),
-            floor_rgb=floor_rgb,
-            maximum_scale=0.025,
-        )
-
-    trainer, floor_xyz, floor_rgb = _trainer()
-    with pytest.raises(RuntimeError, match="colors do not match"):
+    trainer.optimizer = None
+    with pytest.raises(TypeError, match="optimizer-aware"):
         initialize_floor_seed_slice(
             trainer,
             original_count=3,
             floor_xyz=floor_xyz,
-            floor_rgb=floor_rgb[::-1].copy(),
+            floor_rgb=floor_rgb,
             maximum_scale=0.025,
         )
 
@@ -265,7 +253,7 @@ def test_floor_recovery_randomness_is_reproducible() -> None:
     assert first == second
 
 
-def test_floor_scene_uses_legacy_rgb_depth_and_only_appends_verified_seeds(
+def test_floor_scene_keeps_legacy_sparse_model_and_stages_verified_seeds(
     tmp_path: Path,
 ) -> None:
     artifacts, model, scene, originals, _ = _fixture(tmp_path)
@@ -280,6 +268,7 @@ def test_floor_scene_uses_legacy_rgb_depth_and_only_appends_verified_seeds(
     assert prepared.adaptive_density is False
     assert prepared.original_frames == originals
     assert prepared.floor_xyz.shape == (2, 3)
+    assert prepared.maximum_scale == pytest.approx(0.01)
     assert len(tuple(prepared.depth_dir.glob("*_depth.npy"))) == 2
     rows = [
         line
@@ -288,7 +277,7 @@ def test_floor_scene_uses_legacy_rgb_depth_and_only_appends_verified_seeds(
         ).read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.startswith("#")
     ]
-    assert len(rows) == prepared.original_point_count + 2
+    assert len(rows) == prepared.original_point_count
 
 
 def test_run_floor_training_requires_every_global_and_floor_checkpoint(

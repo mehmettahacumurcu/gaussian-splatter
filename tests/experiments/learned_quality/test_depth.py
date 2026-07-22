@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -374,6 +375,43 @@ def test_base_metric_depth_rebuilds_motion_sky_support_without_semantics(
         semantic_masks=tuple(semantic),
         motion_masks=tuple(motion),
     )
+    base_root = (tmp_path / "base-evidence").resolve()
+    native_root = base_root / "metric-native"
+    metric_root = base_root / "da3-metric"
+    native_root.mkdir(parents=True)
+    metric_root.mkdir()
+    depth_rows = []
+    metric_rows = []
+    for index, (frame, artifact) in enumerate(
+        zip(frames, final_depth.artifacts, strict=True)
+    ):
+        depth_path = native_root / f"{Path(frame.image_name).stem}.depth.npy"
+        depth_values = np.load(artifact.depth_path, allow_pickle=False)
+        _write_npy(depth_path, np.asarray(depth_values, dtype=np.float32))
+        depth_rows.append((depth_path, _sha256(depth_path)))
+        confidence = np.full(shape, 0.8, dtype=np.float32)
+        if index == 0:
+            confidence[3, 3] = 0.1
+        confidence_name = f"{frame.frame_id}.confidence.npy"
+        _write_npy(metric_root / confidence_name, confidence)
+        metric_rows.append(
+            {
+                "image_name": frame.image_name,
+                "frame_id": frame.frame_id,
+                "confidence_path": confidence_name,
+            }
+        )
+    (metric_root / "metadata.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "stage": "da3_metric_sky",
+                "artifacts": metric_rows,
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
     model = write_colmap_text_model(
         tmp_path / "base-model",
         tuple(frame.image_name for frame in frames),
@@ -382,10 +420,7 @@ def test_base_metric_depth_rebuilds_motion_sky_support_without_semantics(
     )
     base = BaseEvidenceState(
         anchors=object(),
-        depths=tuple(
-            (artifact.depth_path, _sha256(artifact.depth_path))
-            for artifact in final_depth.artifacts
-        ),
+        depths=tuple(depth_rows),
         sky=(),
         scene=object(),
         track_audit=object(),
@@ -410,8 +445,8 @@ def test_base_metric_depth_rebuilds_motion_sky_support_without_semantics(
     )
     assert (0, 1, 1) in selected
     assert (0, 2, 2) not in selected
-    assert np.all(cloud.confidence > 0.0)
-    assert np.all(cloud.confidence < 1.0)
+    assert (0, 3, 3) not in selected
+    assert np.all(cloud.confidence == pytest.approx(0.8))
     assert cloud.source_depth_digest != "c" * 64
 
 
@@ -585,6 +620,7 @@ def test_supported_depth_provenance_cannot_exceed_camera_count() -> None:
             source_frame_index=np.ones((1,), dtype=np.int32),
             source_xy=np.zeros((1, 2), dtype=np.int32),
             camera_centers=np.zeros((1, 3), dtype=np.float32),
+            camera_up_vectors=np.array(((0.0, 1.0, 0.0),), dtype=np.float32),
             source_model_digest="a" * 64,
             source_mask_digest="b" * 64,
             source_depth_digest="c" * 64,

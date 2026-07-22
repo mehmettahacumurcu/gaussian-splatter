@@ -262,7 +262,10 @@ def test_staged_runner_rejects_weak_plane_without_training(tmp_path: Path) -> No
         destination=tmp_path / "myroom_floor_recovery_diagnostic",
         run_id="run-reject",
         build_cloud=lambda *_args, **_kwargs: SimpleNamespace(
-            camera_centers=np.zeros((3, 3))
+            camera_centers=np.zeros((3, 3)),
+            camera_up_vectors=np.tile(
+                np.array(((0.0, 1.0, 0.0),)), (3, 1)
+            ),
         ),
         fit_plane=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             ValueError("could not find a reliable floor plane")
@@ -274,6 +277,22 @@ def test_staged_runner_rejects_weak_plane_without_training(tmp_path: Path) -> No
     assert result.decision is not None
     assert result.decision.reason == "unreliable_floor_plane"
     assert training_calls == 0
+    comparison = json.loads(
+        (
+            tmp_path
+            / "myroom_floor_recovery_diagnostic"
+            / "comparison.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert comparison["comparison_contract"] == {
+        "candidate_global_seed": 1701,
+        "candidate_count": 1,
+        "legacy_reference": "preserved_historical_a100_5k",
+        "legacy_global_rng_replayable": False,
+        "interpretation": (
+            "historical tolerance baseline, not a matched-seed causal control"
+        ),
+    }
 
 
 def test_floor_recovery_hardware_requires_large_a100() -> None:

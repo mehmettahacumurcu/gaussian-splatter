@@ -29,6 +29,25 @@ A100_LEGACY_REFERENCE_REVISION = "ce836c9d82bc0b17bad1cff558f99cca41e4ae28"
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 
 
+def _annotate_failure(
+    error: Exception,
+    *,
+    completed_stage: str,
+    input_fingerprints: Mapping[str, str],
+    evidence_paths: tuple[Path, ...] = (),
+) -> None:
+    """Attach durable diagnostic context without replacing the original error."""
+
+    try:
+        error.floor_recovery_completed_stage = completed_stage  # type: ignore[attr-defined]
+        error.floor_recovery_input_fingerprints = dict(input_fingerprints)  # type: ignore[attr-defined]
+        error.floor_recovery_evidence_paths = tuple(  # type: ignore[attr-defined]
+            str(path) for path in evidence_paths if path.exists()
+        )
+    except (AttributeError, TypeError):
+        return
+
+
 class FloorRecoveryPublishSpec(StrictModel):
     replace_owned_result: bool = True
 
@@ -365,6 +384,15 @@ def _prepare_report(
         "schema_version": 1,
         "legacy": asdict(legacy),
         "decision": asdict(decision),
+        "comparison_contract": {
+            "candidate_global_seed": 1701,
+            "candidate_count": 1,
+            "legacy_reference": "preserved_historical_a100_5k",
+            "legacy_global_rng_replayable": False,
+            "interpretation": (
+                "historical tolerance baseline, not a matched-seed causal control"
+            ),
+        },
         "staging": {
             "source_digest": staged.source_digest,
             "pretraining_fingerprint": staged.pretraining_fingerprint,
@@ -384,7 +412,10 @@ def _prepare_report(
     (root / "diagnostic_summary.md").write_text(
         "# Automatic floor-hole recovery\n\n"
         f"Decision: **{decision.reason}**\n\n"
-        f"Failures: {', '.join(decision.failures) if decision.failures else 'none'}\n",
+        f"Failures: {', '.join(decision.failures) if decision.failures else 'none'}\n\n"
+        "Reference note: the preserved A100 5K legacy run is a historical "
+        "tolerance baseline. Its global RNG state was not recorded, so this is "
+        "not a matched-seed causal comparison.\n",
         encoding="utf-8",
         newline="\n",
     )
@@ -458,7 +489,12 @@ def run_floor_recovery_from_staged(
             policy=artifacts.depth.policy,
             mask_mode="motion_sky",
         )
-        plane = fit_plane(sparse_xyz, cloud.camera_centers, seed=1701)
+        plane = fit_plane(
+            sparse_xyz,
+            cloud.camera_centers,
+            camera_up_vectors=cloud.camera_up_vectors,
+            seed=1701,
+        )
         holes = map_holes(sparse_xyz, cloud, plane)
         floor_artifact = make_seeds(
             sparse_xyz,
@@ -719,37 +755,75 @@ def run_floor_recovery_diagnostic(
         )
 
     stage = stage_inputs or stage_ablation_inputs
-    staged = stage(
-        store=store,
-        source_inventory=inventory,
-        destination=local_root / "inputs",
-        drive_root=mounted_drive,
-        expected_fingerprint=lambda _selection: reference_fingerprint,
-        expected_source_revision=expected_source_revision,
-        actual_source_revision=revision,
-        audit_validator=require_any_audit,
-        restored_validator=validate_restored,
-        minimum_free_bytes=35 * 1024**3,
-        run_id=run_id,
-        freeze=True,
-        restore_pretraining=restore_graph,
-    )
+    fingerprints = {
+        "source_digest": str(getattr(inventory, "digest")),
+        "pretraining_fingerprint": reference_fingerprint,
+        "source_revision": revision,
+    }
+    try:
+        staged = stage(
+            store=store,
+            source_inventory=inventory,
+            destination=local_root / "inputs",
+            drive_root=mounted_drive,
+            expected_fingerprint=lambda _selection: reference_fingerprint,
+            expected_source_revision=expected_source_revision,
+            actual_source_revision=revision,
+            audit_validator=require_any_audit,
+            restored_validator=validate_restored,
+            minimum_free_bytes=35 * 1024**3,
+            run_id=run_id,
+            freeze=True,
+            restore_pretraining=restore_graph,
+        )
+    except Exception as error:
+        _annotate_failure(
+            error,
+            completed_stage="source_preflight",
+            input_fingerprints=fingerprints,
+            evidence_paths=(local_root,),
+        )
+        raise
     reference_root = local_root / "legacy-reference"
-    legacy_checkpoints = stage_reference(
-        reference_source,
-        reference_root,
-        staged=staged,
-    )
+    try:
+        legacy_checkpoints = stage_reference(
+            reference_source,
+            reference_root,
+            staged=staged,
+        )
+    except Exception as error:
+        _annotate_failure(
+            error,
+            completed_stage="input_restore",
+            input_fingerprints=fingerprints,
+            evidence_paths=(local_root / "inputs",),
+        )
+        raise
     destination = validate_result_target(
         input_path.with_name(f"{input_path.name}{RESULT_SUFFIX}")
     )
-    return execute_staged(
-        staged,
-        base_spec=base_spec,
-        local_root=local_root,
-        reference_root=reference_root,
-        legacy_checkpoints=legacy_checkpoints,
-        destination=destination,
-        run_id=run_id,
-        replace_owned_result=spec.publish.replace_owned_result,
-    )
+    try:
+        return execute_staged(
+            staged,
+            base_spec=base_spec,
+            local_root=local_root,
+            reference_root=reference_root,
+            legacy_checkpoints=legacy_checkpoints,
+            destination=destination,
+            run_id=run_id,
+            replace_owned_result=spec.publish.replace_owned_result,
+        )
+    except Exception as error:
+        _annotate_failure(
+            error,
+            completed_stage="legacy_reference_restore",
+            input_fingerprints=fingerprints,
+            evidence_paths=(
+                local_root / "inputs",
+                reference_root,
+                local_root / "report",
+                local_root / "floor-artifact",
+                local_root / "experiments",
+            ),
+        )
+        raise
