@@ -30,7 +30,8 @@ substantially more room structure than the learned 120K output. Its relevant
 training properties were:
 
 - legacy COLMAP initialization;
-- pure photometric reconstruction objective;
+- the same shared Ultra reconstruction objective, including its existing
+  photometric, LPIPS, and anisotropy terms;
 - no learned depth supervision;
 - no learned masks in the training loss;
 - no learned dense seeds;
@@ -54,7 +55,7 @@ This notebook will not:
 
 - run the full learned-quality reconstruction pipeline;
 - recompute frame selection, COLMAP, depth, flow, semantics, or masks;
-- introduce learned losses, learned seeds, or learned density behavior;
+- introduce learned-quality depth/mask/seed/density behavior;
 - continue from the 5K PLY with a fresh optimizer;
 - start a second trainer for any checkpoint;
 - run the PLY polish stage;
@@ -119,9 +120,9 @@ resolution and total duration changed:
 | Training resolution | Native 1920x1080 |
 | Native-resolution mode | Enabled |
 | Camera sampling seed | 1701 |
-| Loss | L1 + existing legacy SSIM term |
+| Loss | Exact successful legacy-control objective |
 | Learned depth loss | Disabled |
-| LPIPS loss | Disabled |
+| Shared Ultra LPIPS/anisotropy | Preserved unchanged |
 | Learned masks | Disabled |
 | Learned dense seeds | Disabled |
 | Deformation | Disabled |
@@ -228,7 +229,8 @@ Implementation starts with failing tests that prove:
 
 1. the profile is native 1920x1080 and exactly 30,000 iterations;
 2. density stops at 4,500 and only the 3,000 opacity reset is possible;
-3. learned features and polish are disabled;
+3. learned-quality features and polish are disabled while the successful
+   shared legacy-control loss settings remain unchanged;
 4. a single trainer instance serves all six export boundaries;
 5. exports use exact zero-padded filenames;
 6. PLY and resumable checkpoint writes are atomic;
