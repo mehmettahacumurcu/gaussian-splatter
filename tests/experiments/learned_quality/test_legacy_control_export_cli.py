@@ -187,7 +187,11 @@ def test_runner_exception_writes_durable_failure_receipt(
     )
 
     def fail(*_args: object, **_kwargs: object) -> object:
-        raise RuntimeError("polish exploded")
+        error = RuntimeError("polish exploded")
+        error.legacy_control_ply_rescue_path = str(
+            tmp_path / "myroom_test_legacy_control_5k_result"
+        )
+        raise error
 
     monkeypatch.setattr(
         learned_quality_legacy_control_export_run,
@@ -210,6 +214,9 @@ def test_runner_exception_writes_durable_failure_receipt(
     payload = json.loads(receipt.read_text())
     assert payload["status"] == "failed"
     assert payload["error_message"] == "polish exploded"
+    assert payload["ply_rescue_path"] == str(
+        tmp_path / "myroom_test_legacy_control_5k_result"
+    )
     failure_path = Path(payload["durable_failure_path"])
     assert failure_path.is_file()
     durable = json.loads(failure_path.read_text())

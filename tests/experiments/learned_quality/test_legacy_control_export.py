@@ -14,6 +14,7 @@ from backend.static_pipeline.contracts import (
     SelectionManifest,
     SelectionPolicy,
 )
+from experiments.learned_quality import legacy_control_export as export_module
 from experiments.learned_quality.ablation import (
     AblationCheckpoint,
     StructuralMetrics,
@@ -179,6 +180,34 @@ def test_publication_preserves_both_plys_and_writes_completion_last(
     assert success["status"] == "success"
     assert success["raw_ply"] == "raw_legacy_control_5k.ply"
     assert success["polished_ply"] == "polished_legacy_control_5k.ply"
+
+
+def test_ply_rescue_is_durable_before_report_publication(tmp_path: Path) -> None:
+    raw = tmp_path / "raw.ply"
+    polished = tmp_path / "polished.ply"
+    raw.write_bytes(b"raw")
+    polished.write_bytes(b"polished")
+    destination = tmp_path / "myroom_test_legacy_control_5k_result"
+
+    rescued = export_module.publish_legacy_control_ply_rescue(
+        raw_ply_path=raw,
+        polished_ply_path=polished,
+        destination=destination,
+        run_id="legacy-run",
+        polish_accepted=False,
+        polish_reasons=("mean_psnr_drop",),
+        failure=TypeError("cannot pickle mappingproxy"),
+    )
+
+    assert rescued == destination
+    assert (rescued / export_module.RAW_PLY_NAME).read_bytes() == b"raw"
+    assert (rescued / export_module.POLISHED_PLY_NAME).read_bytes() == b"polished"
+    assert not (rescued / "_SUCCESS.json").exists()
+    partial = json.loads((rescued / "_PARTIAL.json").read_text())
+    assert partial["status"] == "ply_rescue"
+    assert partial["error_type"] == "TypeError"
+    assert partial["polish_accepted"] is False
+    assert partial["polish_reasons"] == ["mean_psnr_drop"]
 
 
 def test_publication_refuses_to_replace_unowned_result(tmp_path: Path) -> None:
@@ -536,6 +565,70 @@ def test_staged_runner_executes_only_one_legacy_control_and_publishes_both(
     )
     assert result.polish_accepted is False
     assert result.polish_reasons == ("mean_psnr_drop",)
+
+
+def test_staged_runner_rescues_both_plys_when_report_generation_fails(
+    tmp_path: Path,
+) -> None:
+    reconstruction = _rejected_reconstruction(tmp_path)
+    reconstruction.frames_dir = tmp_path / "frames"
+    staged = SimpleNamespace(
+        root=tmp_path / "inputs",
+        reconstruction=reconstruction,
+        source_digest="c" * 64,
+        pretraining_fingerprint="d" * 64,
+        source_revision="source-revision",
+    )
+    staged.root.mkdir()
+    training = _training_result(tmp_path)
+    candidate = tmp_path / "polish-source" / "candidate.ply"
+    candidate.parent.mkdir()
+    candidate.write_bytes(b"polished-ply")
+    polish = PolishReport(
+        accepted=False,
+        raw_path=training.raw_ply_path,
+        candidate_path=candidate,
+        selected_path=training.raw_ply_path,
+        original_count=100,
+        kept_count=90,
+        opacity_mass_loss=0.02,
+        render_metrics={"mean_psnr_drop_db": 0.5},
+        reasons=("mean_psnr_drop",),
+    )
+
+    def materialize(_staged: object, **_kwargs: object) -> SimpleNamespace:
+        root = tmp_path / "experiment"
+        scene = root / "scene"
+        output = root / "output"
+        scene.mkdir(parents=True)
+        output.mkdir()
+        return SimpleNamespace(root=root, scene_root=scene, output_root=output)
+
+    def report_failure(*_args: object, **_kwargs: object) -> Path:
+        raise TypeError("cannot pickle mappingproxy")
+
+    destination = tmp_path / "myroom_test_legacy_control_5k_result"
+    with pytest.raises(TypeError, match="cannot pickle mappingproxy"):
+        run_legacy_control_export_from_staged(
+            staged,
+            base_spec=SimpleNamespace(),
+            local_root=tmp_path / "run",
+            historical_checkpoints=training.checkpoints,
+            destination=destination,
+            run_id="legacy-run",
+            materialize_workspace=materialize,
+            execute_experiment=lambda *_args, **_kwargs: training,
+            polish_runner=lambda *_args, **_kwargs: polish,
+            prepare_report=report_failure,
+        )
+
+    assert (destination / export_module.RAW_PLY_NAME).read_bytes() == b"raw-ply"
+    assert (destination / export_module.POLISHED_PLY_NAME).read_bytes() == (
+        b"polished-ply"
+    )
+    assert json.loads((destination / "_PARTIAL.json").read_text())["status"] == (
+        "ply_rescue"
+    )
 
 
 def test_outer_runner_stages_verified_lineage_once_and_uses_isolated_result(

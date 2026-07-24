@@ -440,22 +440,61 @@ def run_legacy_control_export_from_staged(
         reconstruction,
         output_root=root / "polish",
     )
-    report_root = prepare_report(
-        root / "report",
-        staged=staged,
-        training=training,
-        polish=polish,
-        diagnostic_root=diagnostic_root,
-        historical_checkpoints=historical,
-    )
-    final_path = Path(
-        publish(
-            local_report_root=report_root,
-            destination=destination,
-            run_id=run_id,
-            replace_owned_result=replace_owned_result,
+    try:
+        report_root = prepare_report(
+            root / "report",
+            staged=staged,
+            training=training,
+            polish=polish,
+            diagnostic_root=diagnostic_root,
+            historical_checkpoints=historical,
         )
-    )
+        final_path = Path(
+            publish(
+                local_report_root=report_root,
+                destination=destination,
+                run_id=run_id,
+                replace_owned_result=replace_owned_result,
+            )
+        )
+    except BaseException as failure:
+        try:
+            rescue_path = publish_legacy_control_ply_rescue(
+                raw_ply_path=Path(training.raw_ply_path),
+                polished_ply_path=Path(polish.candidate_path),
+                destination=destination,
+                run_id=run_id,
+                polish_accepted=polish.accepted,
+                polish_reasons=polish.reasons,
+                failure=failure,
+            )
+        except BaseException as rescue_failure:
+            print(
+                json.dumps(
+                    {
+                        "event": "legacy_control_ply_rescue_failed",
+                        "error_type": type(rescue_failure).__name__,
+                        "error_message": str(rescue_failure),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        else:
+            setattr(failure, "legacy_control_ply_rescue_path", str(rescue_path))
+            print(
+                json.dumps(
+                    {
+                        "event": "legacy_control_ply_rescue_published",
+                        "path": str(rescue_path),
+                        "raw_ply": RAW_PLY_NAME,
+                        "polished_ply": POLISHED_PLY_NAME,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+        raise
     return LegacyControlExportResult(
         run_id=run_id,
         final_path=final_path,
@@ -529,6 +568,90 @@ def publish_legacy_control_export(
                 "meaning": "legacy_control_5k_dual_ply_published",
                 "raw_ply": RAW_PLY_NAME,
                 "polished_ply": POLISHED_PLY_NAME,
+            },
+        )
+        if os.path.lexists(target):
+            backup = target.with_name(f".{target.name}.backup-{uuid.uuid4().hex}")
+            os.replace(target, backup)
+        os.replace(staging, target)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        if (
+            backup is not None
+            and os.path.lexists(backup)
+            and not os.path.lexists(target)
+        ):
+            os.replace(backup, target)
+        raise
+    if backup is not None:
+        shutil.rmtree(backup, ignore_errors=True)
+    return target
+
+
+def publish_legacy_control_ply_rescue(
+    *,
+    raw_ply_path: Path,
+    polished_ply_path: Path,
+    destination: Path,
+    run_id: str,
+    polish_accepted: bool,
+    polish_reasons: Sequence[str],
+    failure: BaseException,
+) -> Path:
+    """Durably preserve both completed PLYs when later reporting fails."""
+
+    raw = Path(raw_ply_path).resolve(strict=True)
+    polished = Path(polished_ply_path).resolve(strict=True)
+    if raw.stat().st_size <= 0 or polished.stat().st_size <= 0:
+        raise ValueError("raw and polished rescue PLYs must be non-empty")
+    raw_sha256 = _sha256_file(raw)
+    polished_sha256 = _sha256_file(polished)
+    if raw_sha256 == polished_sha256:
+        raise ValueError("polished rescue candidate must differ from the raw PLY")
+
+    requested = _validate_result_target(destination)
+    target = requested
+    if os.path.lexists(requested):
+        try:
+            owner = json.loads(
+                (requested / "_OWNERSHIP.json").read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "refusing to replace an unowned legacy-control export"
+            ) from exc
+        if owner.get("generator_id") != GENERATOR_ID:
+            raise RuntimeError("refusing to replace an unowned legacy-control export")
+        if (requested / "_SUCCESS.json").is_file():
+            target = requested.with_name(f"{requested.name}_failures") / run_id
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent)
+    )
+    backup: Path | None = None
+    try:
+        shutil.copy2(raw, staging / RAW_PLY_NAME)
+        shutil.copy2(polished, staging / POLISHED_PLY_NAME)
+        _write_json(
+            staging / "_OWNERSHIP.json",
+            {"schema_version": 1, "generator_id": GENERATOR_ID, "run_id": run_id},
+        )
+        _write_json(
+            staging / "_PARTIAL.json",
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "status": "ply_rescue",
+                "meaning": "completed_legacy_control_5k_plys_preserved",
+                "raw_ply": RAW_PLY_NAME,
+                "raw_sha256": raw_sha256,
+                "polished_ply": POLISHED_PLY_NAME,
+                "polished_sha256": polished_sha256,
+                "polish_accepted": bool(polish_accepted),
+                "polish_reasons": list(polish_reasons),
+                "error_type": type(failure).__name__,
+                "error_message": str(failure),
             },
         )
         if os.path.lexists(target):

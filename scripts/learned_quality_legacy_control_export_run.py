@@ -103,6 +103,9 @@ def _publish_durable_failure(
         "error_message": str(error),
         "full_120k_training_started": False,
     }
+    rescue_path = getattr(error, "legacy_control_ply_rescue_path", None)
+    if isinstance(rescue_path, str) and rescue_path:
+        payload["ply_rescue_path"] = rescue_path
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f".{destination.name}.tmp")
     temporary.write_text(
@@ -155,6 +158,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "error_message": str(error),
             "full_120k_training_started": False,
         }
+        rescue_path = getattr(error, "legacy_control_ply_rescue_path", None)
+        if isinstance(rescue_path, str) and rescue_path:
+            payload["ply_rescue_path"] = rescue_path
         try:
             payload["durable_failure_path"] = str(
                 _publish_durable_failure(
