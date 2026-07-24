@@ -38,3 +38,11 @@ The implementation is split into:
 
 See [the operator guide](../../docs/TRAINING_ABLATION_NOTEBOOK.md) for the exact
 Colab sequence and output semantics.
+
+Use `colab/learned_quality_legacy_control_5k.ipynb` after the diagnostic matrix
+when the goal is to inspect the proven legacy-control arm itself. It runs one
+deterministic 5K training, preserves the raw trainer PLY byte-for-byte, invokes
+the unchanged production PLY polisher, and publishes both the raw and polished
+candidate with the complete polish report under
+`<input>_legacy_control_5k_result`. A polish rejection does not discard the
+candidate in this isolated comparison, and no full 120K training is started.

@@ -13,6 +13,7 @@ experiment, and a production video→world runner.
 | `learned_quality_cache_audit.ipynb` | CPU-only safety gate: restores frame selection, verifies the owned COLMAP cache, qualifies tracks, and publishes the receipt required by the learned A100 run. | CPU only |
 | `learned_quality_a100_experiment.ipynb` | Maximum-quality learned preprocessing and 120k-iteration Gaussian training, resumable from verified Drive milestones. Run the CPU audit first. | Several hours |
 | `learned_quality_floor_recovery.ipynb` | Final bounded floor-hole diagnostic: restores the verified lineage once and compares one automatic 5k floor-seed arm with the preserved A100 legacy control. Never starts 120k or overwrites a production result. | ~1-3 h including Drive staging |
+| `learned_quality_legacy_control_5k.ipynb` | Reproduce the passing legacy-control 5K arm once, then publish the byte-identical raw trainer PLY beside the production-polish candidate and its acceptance report. Never starts 120K. | ~1-2 h including one Drive staging pass |
 
 ## Verified results
 
@@ -171,6 +172,34 @@ uses the proven legacy density schedule, and stops after the comparison. A compl
 diagnostic may be either accepted or safely rejected; read `decision.json`. Production
 results are never replaced. See `docs/FLOOR_RECOVERY_DIAGNOSTIC.md` for exact gates,
 monitoring commands, and output interpretation.
+
+## Legacy-control 5K raw versus polished PLY
+
+Use `learned_quality_legacy_control_5k.ipynb` when you want a directly viewable
+before/after comparison of the configuration that passed the structural diagnostic.
+It requires the same passing CPU track audit, verified final pre-training cache, and
+completed A100 diagnostic matrix. Run it in a fresh **A100 80 GB High-RAM** runtime,
+enter the original input folder (for example `myroom_test`), and choose
+**Runtime -> Run all**.
+
+The notebook stages the verified lineage once and trains exactly one deterministic
+5K legacy-control arm. It publishes:
+
+```text
+MyDrive/<input>_legacy_control_5k_result/
+  raw_legacy_control_5k.ply
+  polished_legacy_control_5k.ply
+  polish_report.json
+  metrics.jsonl
+  contact_005000.png
+```
+
+The raw file is copied byte-for-byte from the trainer. The polished file is the
+candidate produced by the unchanged production polisher, which removes unsafe
+low-opacity, oversized, highly anisotropic, and sparse-bound outliers and applies
+the guarded outer-crop fade. Render gates still decide whether that candidate is
+accepted. The candidate is retained for this diagnostic even when rejected, and
+`polish_report.json` explains why. Neither file replaces a production result.
 
 ## Shared pieces
 
