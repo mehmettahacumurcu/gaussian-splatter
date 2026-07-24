@@ -378,6 +378,38 @@ def test_pipeline_runner_preserves_the_original_5k_sh_schedule() -> None:
     assert captured["skip_internal_checkpoints"] is True
 
 
+def test_pipeline_runner_reads_the_gaussian_cap_from_density_controller() -> None:
+    captured: dict[str, object] = {}
+
+    def pipeline(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"training": "complete"}
+
+    adapter = LegacyControlLongPipelineRunner(
+        SimpleNamespace(
+            artifacts=object(),
+            accepted_model_dir=Path("accepted"),
+        ),
+        pipeline_runner=pipeline,
+        variant=SimpleNamespace(),
+        snapshot_writer=object(),
+        camera_generator=object(),
+        prepare_scene=lambda *_args, **_kwargs: object(),
+    )
+
+    adapter(video_path=Path("scene/video.mp4"))
+    customizer = captured["trainer_customizer"]
+    trainer = SimpleNamespace(
+        density_start_iter=500,
+        density_end_iter=4_500,
+        density_interval=100,
+        opacity_reset_interval=3_000,
+        density=SimpleNamespace(max_gaussians=6_000_000),
+    )
+
+    customizer(trainer)
+
+
 def test_staged_run_reaches_every_boundary_with_the_preserved_sh_schedule(
     tmp_path: Path,
 ) -> None:
@@ -407,7 +439,7 @@ def test_staged_run_reaches_every_boundary_with_the_preserved_sh_schedule(
     trainer.density_end_iter = 4_500
     trainer.density_interval = 100
     trainer.opacity_reset_interval = 3_000
-    trainer.max_gaussians = 6_000_000
+    trainer.density = SimpleNamespace(max_gaussians=6_000_000)
     pipeline_calls: list[dict[str, object]] = []
     validated_calls: list[dict[str, object]] = []
 

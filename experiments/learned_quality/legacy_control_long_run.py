@@ -425,7 +425,11 @@ class LegacyControlLongPipelineRunner:
             observed = {
                 name: int(getattr(trainer, name))
                 for name in expected
+                if name != "max_gaussians"
             }
+            observed["max_gaussians"] = int(
+                getattr(getattr(trainer, "density"), "max_gaussians")
+            )
             if observed != expected:
                 raise RuntimeError(
                     f"legacy-control trainer contract changed: {observed}"
