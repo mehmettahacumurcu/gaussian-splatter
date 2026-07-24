@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import json
+import re
+from pathlib import Path
+
+import nbformat
+
 from experiments.learned_quality.legacy_control_long_run_notebook import (
     build_legacy_control_long_run_notebook,
 )
+
+
+ROOT = Path(__file__).resolve().parents[2]
+GENERATED = ROOT / "colab" / "learned_quality_legacy_control_1080p_30k.ipynb"
+PINNED_CODE_COMMIT = "883396a5323bf6ca79e427ad320e5cff292fd115"
 
 
 def test_local_30k_notebook_is_pinned_native_and_keeps_session_alive() -> None:
@@ -70,3 +81,20 @@ def test_local_30k_notebook_is_pinned_native_and_keeps_session_alive() -> None:
     for cell in notebook.cells:
         if cell.cell_type == "code":
             compile(cell.source, f"<notebook:{cell.id}>", "exec")
+
+
+def test_checked_in_local_30k_notebook_matches_generator() -> None:
+    checked_in = nbformat.read(GENERATED, as_version=4)
+    checkout = next(
+        cell for cell in checked_in.cells if "checkout" in cell.metadata.get("tags", [])
+    )
+    match = re.search(r"COMMIT_SHA = ['\"]([0-9a-f]{40})['\"]", checkout.source)
+
+    assert match is not None
+    assert match.group(1) == PINNED_CODE_COMMIT
+    expected = build_legacy_control_long_run_notebook(
+        commit_sha=PINNED_CODE_COMMIT
+    )
+    assert json.loads(nbformat.writes(checked_in)) == json.loads(
+        nbformat.writes(expected)
+    )
