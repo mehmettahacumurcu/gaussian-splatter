@@ -13,7 +13,7 @@ from experiments.learned_quality.legacy_control_long_run_notebook import (
 
 ROOT = Path(__file__).resolve().parents[2]
 GENERATED = ROOT / "colab" / "learned_quality_legacy_control_1080p_30k.ipynb"
-PINNED_CODE_COMMIT = "883396a5323bf6ca79e427ad320e5cff292fd115"
+PINNED_CODE_COMMIT = "0b46f884c048cda6ecf5995426c983eb34c0524a"
 
 
 def test_local_30k_notebook_is_pinned_native_and_keeps_session_alive() -> None:
