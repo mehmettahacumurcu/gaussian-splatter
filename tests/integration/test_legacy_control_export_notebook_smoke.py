@@ -13,7 +13,7 @@ from experiments.learned_quality.legacy_control_export_notebook import (
 
 ROOT = Path(__file__).resolve().parents[2]
 GENERATED = ROOT / "colab" / "learned_quality_legacy_control_5k.ipynb"
-PINNED_CODE_COMMIT = "cc3f1a04b0a2e7ce96a07ded64a9dfb107977e28"
+PINNED_CODE_COMMIT = "bc24245fbaa3b605b1cd2b22b7ba0c184ccdef49"
 
 
 def test_legacy_control_export_notebook_is_pinned_bounded_and_run_all_safe() -> None:
