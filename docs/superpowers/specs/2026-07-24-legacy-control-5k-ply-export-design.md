@@ -2,17 +2,18 @@
 
 **Date:** 2026-07-24
 
-**Status:** Proposed
+**Status:** Approved
 
 ## Objective
 
 Provide one bounded A100 notebook that exactly reproduces the passing
-`legacy_control` row from the completed structural diagnostic and preserves its
-raw 5,000-iteration PLY for free-view inspection.
+`legacy_control` row from the completed structural diagnostic and preserves
+both its raw 5,000-iteration PLY and a production-algorithm polish candidate
+for free-view inspection.
 
 The notebook is an export experiment, not a production run. It must never run
-the full learned feature stack, the complete diagnostic matrix, PLY polish, or
-120,000 iterations.
+the full learned feature stack, the complete diagnostic matrix, or 120,000
+iterations.
 
 ## Reproduced Candidate
 
@@ -56,8 +57,11 @@ The notebook:
 7. runs only `legacy_control`;
 8. prints checkpoint metrics at 0, 100, 499, 500, 600, 1,000, 2,500, and
    5,000;
-9. publishes the raw PLY and compact evidence atomically;
-10. flushes Drive and releases the runtime on success or failure.
+9. runs the production polish filter against a diagnostic acceptance proxy
+   without changing the restored reconstruction or production gates;
+10. publishes the raw PLY, the polish candidate, and compact comparison
+    evidence atomically;
+11. flushes Drive and releases the runtime on success or failure.
 
 ## Drive Inputs and Provenance
 
@@ -83,7 +87,9 @@ The result is isolated from both production result folders:
 ```text
 MyDrive/<input>_legacy_control_5k_result/
   _SUCCESS.json
-  splat.ply
+  raw_legacy_control_5k.ply
+  polished_legacy_control_5k.ply
+  polish_report.json
   receipt.json
   metrics.jsonl
   run_manifest.json
@@ -93,8 +99,22 @@ MyDrive/<input>_legacy_control_5k_result/
   provenance.json
 ```
 
-`splat.ply` is the trainer's raw iteration-5,000 PLY. No polish or geometry
-acceptance wrapper may alter it.
+`raw_legacy_control_5k.ply` is the trainer's raw iteration-5,000 PLY and must
+be preserved byte-for-byte.
+
+`polished_legacy_control_5k.ply` is the candidate emitted by the existing
+production `polish_static_ply` algorithm. The restored output-first Round-0
+geometry did not pass the production reconstruction gate, so the isolated
+exporter must construct an in-memory diagnostic acceptance proxy that changes
+only `GateDecision.passed`, `GateDecision.failures`, and
+`GateDecision.retry_recommended`. The original reconstruction contract remains
+unchanged and its strict failures are recorded in `polish_report.json`.
+
+The exporter publishes the candidate even when the polish regression gate
+rejects it and would normally select the raw PLY. This is deliberate: the
+purpose is manual raw-versus-polished comparison, not production selection.
+If polish cannot produce a structurally valid non-empty candidate, the export
+fails rather than publishing a fake or duplicate polished file.
 
 Publication uses a temporary sibling directory followed by an atomic owned
 replacement. It may replace only a folder carrying this exporter’s ownership
@@ -112,7 +132,10 @@ Success requires:
 - all eight diagnostic checkpoints;
 - completion at exactly 5,000 iterations;
 - the existing `legacy_control` gate to pass;
-- a finite, structurally valid static PLY;
+- finite, structurally valid raw and polish-candidate PLYs;
+- a byte-identical published raw PLY;
+- a polish report containing the original geometry failures, removal counts,
+  opacity-mass loss, render deltas, acceptance decision, and rejection reasons;
 - successful publication of every required file.
 
 If cache, provenance, training, gate, PLY validation, or publication fails, the
@@ -129,7 +152,8 @@ Add a focused contract, runner, CLI, and notebook generator under the existing
 - `primary_variants()` to select `legacy_control`;
 - `run_ablation_experiment()` for the exact training path;
 - existing diagnostic contact-sheet generation;
-- existing static PLY validation and atomic copy helpers;
+- existing production PLY polish, static PLY validation, and atomic copy
+  helpers;
 - existing notebook bootstrap, manifest verification, Drive flushing, and
   runtime-release patterns.
 
@@ -146,9 +170,14 @@ CPU tests must prove:
 - staging is local and performed once;
 - the historical receipt must match the active source and selection;
 - the raw PLY is preserved byte-for-byte;
+- the polish candidate is distinct, structurally valid, and is preserved even
+  when its regression gate rejects it;
+- only the isolated diagnostic proxy can bypass reconstruction acceptance;
+- the original reconstruction decision and strict failures are not mutated;
+- the comparison report exposes Gaussian counts, opacity loss, render deltas,
+  polish acceptance, and rejection reasons;
 - all required evidence is published atomically;
 - unrelated result folders cannot be overwritten;
-- no full matrix, learned-feature arm, polish step, or 120K path is reachable;
+- no full matrix, learned-feature arm, or 120K path is reachable;
 - notebook source pin, A100 preflight, unbuffered output, Drive flush, and
   runtime release are present.
-
