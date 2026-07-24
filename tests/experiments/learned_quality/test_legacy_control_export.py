@@ -19,6 +19,7 @@ from experiments.learned_quality.ablation import (
     StructuralMetrics,
 )
 from experiments.learned_quality.ablation_training import AblationExperimentResult
+from experiments.learned_quality.contracts import GeometryAcceptance
 from experiments.learned_quality.legacy_control_export import (
     GENERATOR_ID,
     LegacyControlExportRunSpec,
@@ -80,10 +81,28 @@ def _rejected_reconstruction(tmp_path: Path) -> SimpleNamespace:
         attempts=(),
         decisions=(decision,),
     )
+    acceptance = GeometryAcceptance(
+        policy_version="output-first-v1",
+        mode="best_effort",
+        selection_digest=manifest.image_set_digest,
+        model_hashes={
+            "cameras.txt": "c" * 64,
+            "images.txt": "d" * 64,
+            "points3D.txt": "e" * 64,
+        },
+        strict_failures=decision.failures,
+        metrics=metrics,
+        checks={
+            "registered_ratio": False,
+            "valid_model": True,
+        },
+        colmap_fingerprint="f" * 64,
+    )
     return SimpleNamespace(
         bundle=bundle,
         accepted_model_dir=model,
         selected_manifest=manifest,
+        acceptance=acceptance,
     )
 
 
@@ -372,6 +391,17 @@ def test_report_preserves_rejected_candidate_and_explains_geometry_override(
     assert payload["opacity_mass_loss"] == 0.02
     assert payload["reasons"] == ["mean_psnr_drop"]
     assert payload["render_metrics"]["mean_psnr_drop_db"] == 0.5
+    assert payload["geometry_acceptance"]["policy_version"] == "output-first-v1"
+    assert payload["geometry_acceptance"]["mode"] == "best_effort"
+    assert payload["geometry_acceptance"]["model_hashes"] == {
+        "cameras.txt": "c" * 64,
+        "images.txt": "d" * 64,
+        "points3D.txt": "e" * 64,
+    }
+    assert payload["geometry_acceptance"]["checks"] == {
+        "registered_ratio": False,
+        "valid_model": True,
+    }
     receipt = json.loads((report_root / "receipt.json").read_text())
     assert receipt["status"] == "success"
     assert receipt["iterations"] == 5_000

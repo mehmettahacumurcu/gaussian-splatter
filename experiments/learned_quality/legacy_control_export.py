@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -171,13 +171,18 @@ def _validate_result_target(path: Path) -> Path:
 
 def _jsonable(value: object) -> object:
     if is_dataclass(value) and not isinstance(value, type):
-        return _jsonable(asdict(value))
+        return {
+            field.name: _jsonable(getattr(value, field.name))
+            for field in fields(value)
+        }
     if isinstance(value, Path):
         return value.as_posix()
     if isinstance(value, Mapping):
         return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
         return [_jsonable(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return [_jsonable(item) for item in sorted(value, key=repr)]
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     raise TypeError(f"value is not JSON serializable: {type(value).__name__}")
