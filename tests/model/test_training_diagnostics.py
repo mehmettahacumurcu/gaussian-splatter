@@ -84,6 +84,7 @@ def test_train_diagnostic_extensions_are_default_off() -> None:
     assert parameters["camera_generator"].default is None
     assert parameters["diagnostic_iterations"].default is None
     assert parameters["diagnostic_callback"].default is None
+    assert parameters["sh_progressive_horizon_iters"].default is None
 
 
 def test_pipeline_accepts_only_the_explicit_diagnostic_extensions() -> None:
@@ -93,8 +94,16 @@ def test_pipeline_accepts_only_the_explicit_diagnostic_extensions() -> None:
         "camera_generator": generator,
         "diagnostic_iterations": (500, 1_000),
         "diagnostic_callback": callback,
+        "sh_progressive_horizon_iters": 5_000,
     }
 
     assert _validated_trainer_train_kwargs(values) == values
     with pytest.raises(ValueError, match="unknown"):
         _validated_trainer_train_kwargs({**values, "diagnostic_output": "unsafe"})
+
+
+def test_train_uses_explicit_progressive_sh_horizon_when_provided() -> None:
+    source = inspect.getsource(Trainer4DGS.train)
+
+    assert source.count("sh_schedule_horizon") >= 5
+    assert "progressive_sh_degree(it, n_iters" not in source

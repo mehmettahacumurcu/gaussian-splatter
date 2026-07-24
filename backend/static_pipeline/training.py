@@ -322,6 +322,8 @@ def run_validated_training(
     source_long_edge: int | None = None,
     pipeline_runner: PipelineRunner | None = None,
     reconstruction_validator: ReconstructionValidator | None = None,
+    require_pipeline_export: bool = True,
+    write_run_manifest: bool = True,
 ) -> TrainingResult:
     validated = _validate_inputs(
         prepared,
@@ -386,12 +388,13 @@ def run_validated_training(
     )
 
     run_manifest_path = validated.scene_dir / "run_manifest.json"
-    _write_run_manifest(
-        run_manifest_path,
-        prepared,
-        validated.manifest,
-        resolved,
-    )
+    if write_run_manifest:
+        _write_run_manifest(
+            run_manifest_path,
+            prepared,
+            validated.manifest,
+            resolved,
+        )
 
     raw_ply_path = validated.scene_dir / "output" / "ply" / "frame_0000.ply"
     if os.path.lexists(raw_ply_path):
@@ -405,19 +408,20 @@ def run_validated_training(
         cfg=cfg,
         force_preprocess=False,
         skip_training=False,
-        skip_export=False,
+        skip_export=not require_pipeline_export,
         skip_foundation=not resolved.foundation,
     )
-    try:
-        output_metadata = os.lstat(raw_ply_path)
-    except OSError as exc:
-        raise FileNotFoundError(
-            f"training did not create a new frame_0000.ply: {raw_ply_path}"
-        ) from exc
-    if not stat.S_ISREG(output_metadata.st_mode):
-        raise ValueError(
-            f"training output is not a regular non-symlink file: {raw_ply_path}"
-        )
+    if require_pipeline_export:
+        try:
+            output_metadata = os.lstat(raw_ply_path)
+        except OSError as exc:
+            raise FileNotFoundError(
+                f"training did not create a new frame_0000.ply: {raw_ply_path}"
+            ) from exc
+        if not stat.S_ISREG(output_metadata.st_mode):
+            raise ValueError(
+                f"training output is not a regular non-symlink file: {raw_ply_path}"
+            )
     if not isinstance(status, Mapping):
         raise TypeError("pipeline runner must return a status mapping")
 

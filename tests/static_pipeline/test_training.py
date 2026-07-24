@@ -372,6 +372,26 @@ def test_explicit_foundation_false_is_forwarded_to_runner(tmp_path: Path) -> Non
     assert manifest["foundation"] is False
 
 
+def test_local_snapshot_training_does_not_require_a_pipeline_export(
+    tmp_path: Path,
+) -> None:
+    prepared = _prepared(tmp_path)
+    runner = RecordingRunner(create_ply=False, status={"training": "done"})
+
+    result = run_validated_training(
+        prepared,
+        _spec(),
+        pipeline_runner=runner,
+        require_pipeline_export=False,
+        write_run_manifest=False,
+    )
+
+    assert runner.calls[0]["skip_export"] is True
+    assert result.status == {"training": "done"}
+    assert not result.raw_ply_path.exists()
+    assert not result.run_manifest_path.exists()
+
+
 def test_ultra_snapshot_uses_accepted_colmap_native_resolution(tmp_path: Path) -> None:
     prepared = _prepared(tmp_path)
     runner = RecordingRunner()

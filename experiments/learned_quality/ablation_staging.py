@@ -413,6 +413,7 @@ def stage_ablation_inputs(
     freeze: bool = True,
     restored_validator: Callable[[object, object], None] | None = None,
     restore_pretraining: Callable[[Path], object | None] | None = None,
+    probe_drive_publication: bool = True,
 ) -> StagedAblationInputs:
     if actual_source_revision != expected_source_revision:
         raise RuntimeError(
@@ -436,7 +437,7 @@ def stage_ablation_inputs(
 
     audit_validator(source_inventory)
     probe = getattr(store, "probe_drive_publication", None)
-    if probe is not None:
+    if probe_drive_publication and probe is not None:
         probe(run_id=run_id)
     try:
         if restore_pretraining is None:

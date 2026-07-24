@@ -127,6 +127,33 @@ def test_staging_restores_and_verifies_the_drive_payload_exactly_once(
     assert manifest["drive_reads_permitted_after_staging"] is False
 
 
+def test_staging_can_restore_without_mutating_drive_with_a_probe(
+    tmp_path: Path,
+) -> None:
+    store = FakeStore()
+    inventory = SimpleNamespace(digest="c" * 64)
+
+    staged = stage_ablation_inputs(
+        store=store,
+        source_inventory=inventory,
+        destination=tmp_path / "local" / "inputs",
+        drive_root=tmp_path / "drive",
+        expected_fingerprint=lambda _selection: FINGERPRINT,
+        expected_source_revision=PIN,
+        actual_source_revision=PIN,
+        audit_validator=lambda _inventory: None,
+        minimum_free_bytes=1_000,
+        available_free_bytes=2_000,
+        run_id="ablation-run",
+        freeze=False,
+        probe_drive_publication=False,
+    )
+
+    assert staged.root.is_dir()
+    assert store.probes == 0
+    assert store.restores == 1
+
+
 def test_staging_accepts_a_graph_restorer_and_records_its_real_fingerprint(
     tmp_path: Path,
 ) -> None:

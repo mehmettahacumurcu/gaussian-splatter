@@ -152,6 +152,8 @@ def build_resume_checkpoint(
     n_iters: int,
     camera_generator: torch.Generator,
 ) -> dict[str, object]:
+    from backend.model.trainer import progressive_sh_degree
+
     optimizer = getattr(trainer, "optimizer", None)
     if optimizer is None or not hasattr(optimizer, "state_dict"):
         raise RuntimeError("trainer optimizer state is unavailable")
@@ -164,6 +166,7 @@ def build_resume_checkpoint(
     cuda_rng_state: Sequence[torch.Tensor] = ()
     if torch.cuda.is_available():
         cuda_rng_state = tuple(state.cpu() for state in torch.cuda.get_rng_state_all())
+    maximum_sh_degree = int(trainer.gs.sh_degree)
     return {
         "schema_version": 1,
         "iter": int(iteration),
@@ -178,7 +181,14 @@ def build_resume_checkpoint(
         "python_random_state": random.getstate(),
         "numpy_random_state": np.random.get_state(),
         "scene_extent": float(trainer.scene_extent),
-        "sh_degree": int(trainer.gs.sh_degree),
+        "sh_degree": maximum_sh_degree,
+        "active_sh_degree": progressive_sh_degree(
+            int(iteration),
+            5_000,
+            maximum_sh_degree,
+        ),
+        "sh_progressive_schedule": True,
+        "sh_progressive_horizon_iters": 5_000,
     }
 
 
@@ -191,6 +201,20 @@ def _regular_nonempty_file(path: Path, *, label: str) -> None:
         raise RuntimeError(f"{label} is not a non-empty regular file: {path}")
 
 
+def _require_finite_tensors(value: object, *, label: str) -> None:
+    if torch.is_tensor(value):
+        if value.is_floating_point() and not bool(torch.isfinite(value).all()):
+            raise ValueError(f"{label} contains a non-finite tensor")
+        return
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            _require_finite_tensors(child, label=f"{label}.{key}")
+        return
+    if isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            _require_finite_tensors(child, label=f"{label}[{index}]")
+
+
 class LocalSnapshotWriter:
     def __init__(
         self,
@@ -198,6 +222,7 @@ class LocalSnapshotWriter:
         output_root: Path,
         camera_generator: torch.Generator,
         exporter: Callable[..., Sequence[Path]] | None = None,
+        ply_validator: Callable[[Path], object] | None = None,
         checkpoint_saver: Callable[[object, Path], None] | None = None,
         free_bytes: Callable[[Path], int] | None = None,
         minimum_free_bytes: int = MINIMUM_SNAPSHOT_FREE_BYTES,
@@ -206,10 +231,15 @@ class LocalSnapshotWriter:
             from backend.export.to_splat import export_to_ply
 
             exporter = export_to_ply
+        if ply_validator is None:
+            from backend.static_pipeline.polish import validate_static_ply
+
+            ply_validator = validate_static_ply
         self.output_root = Path(output_root).resolve(strict=False)
         self.output_root.mkdir(parents=True, exist_ok=True)
         self.camera_generator = camera_generator
         self.exporter = exporter
+        self.ply_validator = ply_validator
         self.checkpoint_saver = checkpoint_saver or torch.save
         self.free_bytes = free_bytes or (
             lambda path: int(shutil.disk_usage(path).free)
@@ -253,8 +283,18 @@ class LocalSnapshotWriter:
             raise ValueError(
                 "snapshot export requires exact 1920x1080 training resolution"
             )
-        if int(sh_degree) != int(trainer.gs.sh_degree):
-            raise ValueError("snapshot SH degree differs from the trainer")
+        from backend.model.trainer import progressive_sh_degree
+
+        expected_sh_degree = progressive_sh_degree(
+            iteration,
+            5_000,
+            int(trainer.gs.sh_degree),
+        )
+        if int(sh_degree) != expected_sh_degree:
+            raise ValueError(
+                "snapshot SH degree differs from the preserved 5K schedule: "
+                f"{sh_degree} != {expected_sh_degree}"
+            )
         available = int(self.free_bytes(self.output_root))
         if available < self.minimum_free_bytes:
             raise RuntimeError(
@@ -273,7 +313,13 @@ class LocalSnapshotWriter:
         if os.path.lexists(ply_target) or os.path.lexists(checkpoint_target):
             raise FileExistsError(f"snapshot boundary already exists: {iteration}")
 
-        temporary_ply_root = ply_root / f".ply-{iteration:06d}-{uuid.uuid4().hex}"
+        temporary_ply_root = (
+            ply_root / f".ply-{iteration:06d}-{uuid.uuid4().hex}"
+        )
+        temporary_checkpoint = checkpoint_root / (
+            f".{checkpoint_target.name}.tmp-{uuid.uuid4().hex}"
+        )
+        published: list[Path] = []
         try:
             written = tuple(
                 Path(path)
@@ -288,33 +334,42 @@ class LocalSnapshotWriter:
             )
             if len(written) != 1:
                 raise RuntimeError("static snapshot export must produce one PLY")
-            _regular_nonempty_file(written[0], label="temporary PLY snapshot")
-            os.replace(written[0], ply_target)
-            _regular_nonempty_file(ply_target, label="PLY snapshot")
-        finally:
-            shutil.rmtree(temporary_ply_root, ignore_errors=True)
+            temporary_ply = written[0]
+            _regular_nonempty_file(
+                temporary_ply,
+                label="temporary PLY snapshot",
+            )
+            self.ply_validator(temporary_ply)
 
-        payload = build_resume_checkpoint(
-            trainer,
-            iteration=iteration,
-            n_iters=30_000,
-            camera_generator=self.camera_generator,
-        )
-        temporary_checkpoint = checkpoint_root / (
-            f".{checkpoint_target.name}.tmp-{uuid.uuid4().hex}"
-        )
-        try:
+            payload = build_resume_checkpoint(
+                trainer,
+                iteration=iteration,
+                n_iters=30_000,
+                camera_generator=self.camera_generator,
+            )
+            _require_finite_tensors(payload, label="training checkpoint")
             self.checkpoint_saver(payload, temporary_checkpoint)
             _regular_nonempty_file(
                 temporary_checkpoint,
                 label="temporary training checkpoint",
             )
+
+            os.replace(temporary_ply, ply_target)
+            published.append(ply_target)
             os.replace(temporary_checkpoint, checkpoint_target)
+            published.append(checkpoint_target)
+            _regular_nonempty_file(ply_target, label="PLY snapshot")
             _regular_nonempty_file(
                 checkpoint_target,
                 label="training checkpoint",
             )
+        except BaseException:
+            for path in reversed(published):
+                if os.path.lexists(path):
+                    path.unlink()
+            raise
         finally:
+            shutil.rmtree(temporary_ply_root, ignore_errors=True)
             if os.path.lexists(temporary_checkpoint):
                 temporary_checkpoint.unlink()
         print(
@@ -378,11 +433,14 @@ class LegacyControlLongPipelineRunner:
 
         forwarded = dict(kwargs)
         forwarded["skip_foundation"] = True
+        forwarded["skip_export"] = True
+        forwarded["skip_internal_checkpoints"] = True
         forwarded["trainer_customizer"] = verify_trainer
         forwarded["trainer_train_kwargs"] = {
             "camera_generator": self.camera_generator,
             "diagnostic_iterations": CHECKPOINT_ITERATIONS,
             "diagnostic_callback": self.snapshot_writer,
+            "sh_progressive_horizon_iters": 5_000,
         }
         status = self.pipeline_runner(**forwarded)
         if not isinstance(status, Mapping):
@@ -425,6 +483,7 @@ def run_legacy_control_long_from_staged(
     pipeline_runner: Callable[..., Mapping[str, object]] | None = None,
     validated_training_runner: Callable[..., TrainingResult] | None = None,
     snapshot_writer_factory: Callable[..., LocalSnapshotWriter] = LocalSnapshotWriter,
+    prepare_scene: Callable[..., object] = prepare_ablation_scene,
 ) -> LegacyControlLongRunResult:
     root = Path(local_root).resolve(strict=True)
     reconstruction = staged.reconstruction
@@ -464,6 +523,7 @@ def run_legacy_control_long_from_staged(
         variant=variant,
         snapshot_writer=snapshots,
         camera_generator=generator,
+        prepare_scene=prepare_scene,
     )
     training_kwargs: dict[str, object] = {
         "source_long_edge": 1_920,
@@ -479,6 +539,8 @@ def run_legacy_control_long_from_staged(
     validated_training_runner(
         prepared,
         make_legacy_control_long_spec(base_spec),
+        require_pipeline_export=False,
+        write_run_manifest=False,
         **training_kwargs,
     )
     result = LegacyControlLongRunResult(
@@ -673,6 +735,7 @@ def run_legacy_control_long(
         run_id=run_id,
         freeze=True,
         restore_pretraining=restore_graph,
+        probe_drive_publication=False,
     )
     result = execute_staged(
         staged,

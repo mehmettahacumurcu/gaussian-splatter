@@ -73,6 +73,7 @@ _EXPERIMENT_TRAIN_KWARGS = frozenset(
         "camera_generator",
         "diagnostic_iterations",
         "diagnostic_callback",
+        "sh_progressive_horizon_iters",
     }
 )
 _EXPLICIT_PIPELINE_TRAIN_KWARGS = frozenset(
@@ -135,6 +136,7 @@ def run_pipeline(
     cancel_check: Callable[[], bool] | None = None,
     trainer_customizer: Callable[[Trainer4DGS], None] | None = None,
     trainer_train_kwargs: dict[str, Any] | None = None,
+    skip_internal_checkpoints: bool = False,
 ) -> dict:
     """
     Returns: { phase: durum }
@@ -1161,7 +1163,7 @@ def run_pipeline(
         frame_paths, K_first, w2c_list,
         n_iters=cfg.train.n_iters,
         image_size=cfg.train.image_resolution,
-        ckpt_dir=paths["output"] / "ckpt",
+        ckpt_dir=None if skip_internal_checkpoints else paths["output"] / "ckpt",
         ckpt_interval=cfg.train.ckpt_interval,
         log_interval=cfg.train.log_interval,
         progress_callback=_train_progress,

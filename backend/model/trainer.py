@@ -1239,6 +1239,7 @@ class Trainer4DGS:
         static_mode: bool = False,
         # 4D Quality v6.1 — runtime knobs
         sh_progressive_schedule: bool = False,
+        sh_progressive_horizon_iters: int | None = None,
         lambda_accel: float = 0.0,
         cam_grad_clip_norm: float = 0.0,
         mip_scale_floor_frac: float = 0.0,
@@ -1277,13 +1278,28 @@ class Trainer4DGS:
             print(f"\n[trainer.STATIC] Static 3DGS modu — 4D dynamic features kapalı")
         # 4D Quality v6.1 — runtime knobs
         self.sh_progressive_schedule = bool(sh_progressive_schedule)
+        if sh_progressive_horizon_iters is None:
+            sh_schedule_horizon = n_iters
+        elif (
+            type(sh_progressive_horizon_iters) is not int
+            or not 1 <= sh_progressive_horizon_iters <= n_iters
+        ):
+            raise ValueError(
+                "sh_progressive_horizon_iters must be an integer inside "
+                "the training run"
+            )
+        else:
+            sh_schedule_horizon = sh_progressive_horizon_iters
         self.lambda_accel = float(lambda_accel)
         self.cam_grad_clip_norm = float(cam_grad_clip_norm)
         self.mip_scale_floor_frac = float(mip_scale_floor_frac)
         self.dynamic_densify_scale = float(dynamic_densify_scale)
         if self.sh_progressive_schedule:
-            print(f"[trainer.v6.1] SH progressive schedule aktif "
-                  f"(0→{self.gs.sh_degree} degree over n_iters)")
+            print(
+                f"[trainer.v6.1] SH progressive schedule aktif "
+                f"(0→{self.gs.sh_degree} degree over "
+                f"{sh_schedule_horizon} iter)"
+            )
         if self.lambda_accel > 0:
             print(f"[trainer.v6.1] 2nd-order accel reg aktif (λ={self.lambda_accel})")
         if self.mip_scale_floor_frac > 0:
@@ -1635,7 +1651,7 @@ class Trainer4DGS:
             _train_idx_pool = None  # sample uniformly from [0, T)
 
         initial_diagnostic_sh_degree = (
-            progressive_sh_degree(0, n_iters, self.gs.sh_degree)
+            progressive_sh_degree(0, sh_schedule_horizon, self.gs.sh_degree)
             if self.sh_progressive_schedule
             else self.gs.sh_degree
         )
@@ -1671,7 +1687,11 @@ class Trainer4DGS:
 
             # 4D Quality v6.1 — Madde 11: Adaptive SH degree
             if self.sh_progressive_schedule:
-                active_sh_degree = progressive_sh_degree(it, n_iters, self.gs.sh_degree)
+                active_sh_degree = progressive_sh_degree(
+                    it,
+                    sh_schedule_horizon,
+                    self.gs.sh_degree,
+                )
             else:
                 active_sh_degree = self.gs.sh_degree
 

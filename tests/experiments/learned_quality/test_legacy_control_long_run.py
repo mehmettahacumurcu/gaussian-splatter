@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from backend.notebooks.training_config import resolve_static_training_config
+from backend.static_pipeline.training import TrainingResult
 from experiments.learned_quality.ablation_training import make_ablation_static_spec
 from experiments.learned_quality.contracts import (
     LearnedQualityRunSpec,
@@ -17,6 +18,7 @@ from experiments.learned_quality.legacy_control_export import (
 )
 from experiments.learned_quality.legacy_control_long_run import (
     CHECKPOINT_ITERATIONS,
+    LegacyControlLongPipelineRunner,
     LegacyControlLongRunResult,
     LegacyControlLongRunSpec,
     LocalSnapshotWriter,
@@ -24,6 +26,7 @@ from experiments.learned_quality.legacy_control_long_run import (
     make_legacy_control_long_spec,
     require_native_1080p,
     run_legacy_control_long,
+    run_legacy_control_long_from_staged,
     validate_legacy_control_long_hardware,
 )
 
@@ -182,6 +185,9 @@ def test_resume_checkpoint_contains_optimizer_and_rng_state() -> None:
     assert payload["torch_rng_state"].dtype == torch.uint8
     assert payload["scene_extent"] == 2.5
     assert payload["sh_degree"] == 3
+    assert payload["active_sh_degree"] == 3
+    assert payload["sh_progressive_schedule"] is True
+    assert payload["sh_progressive_horizon_iters"] == 5_000
 
 
 def test_snapshot_writer_exports_exact_atomic_boundaries_and_preserves_earlier(
@@ -215,6 +221,7 @@ def test_snapshot_writer_exports_exact_atomic_boundaries_and_preserves_earlier(
         output_root=tmp_path,
         camera_generator=generator,
         exporter=exporter,
+        ply_validator=lambda path: path,
         checkpoint_saver=saver,
         free_bytes=lambda _path: 200 * 1024**3,
     )
@@ -251,6 +258,7 @@ def test_snapshot_writer_exports_exact_atomic_boundaries_and_preserves_earlier(
         exporter=lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RuntimeError("export failed")
         ),
+        ply_validator=lambda path: path,
         checkpoint_saver=saver,
         free_bytes=lambda _path: 200 * 1024**3,
     )
@@ -261,6 +269,220 @@ def test_snapshot_writer_exports_exact_atomic_boundaries_and_preserves_earlier(
         failed(trainer, 10_000, (1_920, 1_080), 3)
     assert earlier.read_bytes() == b"earlier"
     assert not (failed.output_root / "ply" / "legacy_control_010000.ply").exists()
+
+
+def test_snapshot_writer_does_not_publish_a_partial_boundary(
+    tmp_path: Path,
+) -> None:
+    trainer = _fake_trainer()
+    generator = torch.Generator(device="cpu").manual_seed(1701)
+
+    def exporter(
+        _gs: object,
+        _deform: object,
+        output_dir: Path,
+        **_kwargs: object,
+    ) -> list[Path]:
+        output = Path(output_dir)
+        output.mkdir(parents=True)
+        ply = output / "frame_0000.ply"
+        ply.write_bytes(b"ply")
+        return [ply]
+
+    writer = LocalSnapshotWriter(
+        output_root=tmp_path,
+        camera_generator=generator,
+        exporter=exporter,
+        ply_validator=lambda path: path,
+        checkpoint_saver=lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("checkpoint failed")
+        ),
+        free_bytes=lambda _path: 200 * 1024**3,
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint failed"):
+        writer(trainer, 5_000, (1_920, 1_080), 3)
+
+    assert not (tmp_path / "ply" / "legacy_control_005000.ply").exists()
+    assert not (
+        tmp_path / "checkpoints" / "legacy_control_005000.pt"
+    ).exists()
+
+
+def test_snapshot_writer_rejects_nonfinite_training_state(
+    tmp_path: Path,
+) -> None:
+    trainer = _fake_trainer()
+    trainer.gs.state_for_save = lambda: {
+        "means": torch.tensor([[float("nan"), 0.0, 0.0]])
+    }
+    generator = torch.Generator(device="cpu").manual_seed(1701)
+
+    def exporter(
+        _gs: object,
+        _deform: object,
+        output_dir: Path,
+        **_kwargs: object,
+    ) -> list[Path]:
+        output = Path(output_dir)
+        output.mkdir(parents=True)
+        ply = output / "frame_0000.ply"
+        ply.write_bytes(b"ply")
+        return [ply]
+
+    writer = LocalSnapshotWriter(
+        output_root=tmp_path,
+        camera_generator=generator,
+        exporter=exporter,
+        ply_validator=lambda path: path,
+        checkpoint_saver=lambda _payload, path: Path(path).write_bytes(b"x"),
+        free_bytes=lambda _path: 200 * 1024**3,
+    )
+
+    with pytest.raises(ValueError, match="non-finite tensor"):
+        writer(trainer, 5_000, (1_920, 1_080), 3)
+
+    assert not (tmp_path / "ply" / "legacy_control_005000.ply").exists()
+    assert not (
+        tmp_path / "checkpoints" / "legacy_control_005000.pt"
+    ).exists()
+
+
+def test_pipeline_runner_preserves_the_original_5k_sh_schedule() -> None:
+    captured: dict[str, object] = {}
+
+    def pipeline(**kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"training": "complete"}
+
+    adapter = LegacyControlLongPipelineRunner(
+        SimpleNamespace(
+            artifacts=object(),
+            accepted_model_dir=Path("accepted"),
+        ),
+        pipeline_runner=pipeline,
+        variant=SimpleNamespace(),
+        snapshot_writer=object(),
+        camera_generator=object(),
+        prepare_scene=lambda *_args, **_kwargs: object(),
+    )
+
+    assert adapter(video_path=Path("scene/video.mp4")) == {
+        "training": "complete"
+    }
+    train_kwargs = captured["trainer_train_kwargs"]
+    assert isinstance(train_kwargs, dict)
+    assert train_kwargs["sh_progressive_horizon_iters"] == 5_000
+    assert train_kwargs["diagnostic_iterations"] == CHECKPOINT_ITERATIONS
+    assert captured["skip_export"] is True
+    assert captured["skip_internal_checkpoints"] is True
+
+
+def test_staged_run_reaches_every_boundary_with_the_preserved_sh_schedule(
+    tmp_path: Path,
+) -> None:
+    from backend.model.trainer import progressive_sh_degree
+
+    root = tmp_path / "run"
+    root.mkdir()
+    frames = tmp_path / "frames"
+    model = tmp_path / "model"
+    frames.mkdir()
+    model.mkdir()
+    reconstruction = SimpleNamespace(
+        frames_dir=frames,
+        accepted_model_dir=model,
+        bundle=object(),
+        selected_manifest=SimpleNamespace(image_set_digest="d" * 64),
+        artifacts=object(),
+        acceptance=None,
+    )
+    staged = SimpleNamespace(
+        reconstruction=reconstruction,
+        source_digest="c" * 64,
+    )
+    trainer = _fake_trainer()
+    trainer.device = "cuda"
+    trainer.density_start_iter = 500
+    trainer.density_end_iter = 4_500
+    trainer.density_interval = 100
+    trainer.opacity_reset_interval = 3_000
+    trainer.max_gaussians = 6_000_000
+    pipeline_calls: list[dict[str, object]] = []
+    validated_calls: list[dict[str, object]] = []
+
+    def exporter(
+        _gs: object,
+        _deform: object,
+        output_dir: Path,
+        **_kwargs: object,
+    ) -> list[Path]:
+        output = Path(output_dir)
+        output.mkdir(parents=True)
+        ply = output / "frame_0000.ply"
+        ply.write_bytes(b"ply")
+        return [ply]
+
+    def writer_factory(**kwargs: object) -> LocalSnapshotWriter:
+        return LocalSnapshotWriter(
+            **kwargs,
+            exporter=exporter,
+            ply_validator=lambda path: path,
+            checkpoint_saver=lambda _payload, path: Path(path).write_bytes(b"pt"),
+            free_bytes=lambda _path: 200 * 1024**3,
+        )
+
+    def pipeline(**kwargs: object) -> dict[str, object]:
+        pipeline_calls.append(kwargs)
+        kwargs["trainer_customizer"](trainer)
+        train_kwargs = kwargs["trainer_train_kwargs"]
+        assert train_kwargs["sh_progressive_horizon_iters"] == 5_000
+        callback = train_kwargs["diagnostic_callback"]
+        for iteration in train_kwargs["diagnostic_iterations"]:
+            callback(
+                trainer,
+                iteration,
+                (1_920, 1_080),
+                progressive_sh_degree(iteration, 5_000, 3),
+            )
+        return {"training": "done", "export": "skipped"}
+
+    def validated(
+        prepared: object,
+        spec: object,
+        **kwargs: object,
+    ) -> TrainingResult:
+        validated_calls.append({"prepared": prepared, "spec": spec, **kwargs})
+        status = kwargs["pipeline_runner"](
+            video_path=Path(prepared.data_root) / "scene" / "video.mp4"
+        )
+        return TrainingResult(
+            raw_ply_path=root / "unused.ply",
+            status=status,
+            resolved_config=SimpleNamespace(),
+            run_manifest_path=root / "unused.json",
+        )
+
+    result = run_legacy_control_long_from_staged(
+        staged,
+        base_spec=_base_spec(),
+        local_root=root,
+        run_id="run-id",
+        camera_parser=lambda _path: {
+            "frame.png": {"width": 1_920, "height": 1_080}
+        },
+        pipeline_runner=pipeline,
+        validated_training_runner=validated,
+        snapshot_writer_factory=writer_factory,
+        prepare_scene=lambda *_args, **_kwargs: None,
+    )
+
+    assert len(validated_calls) == len(pipeline_calls) == 1
+    assert validated_calls[0]["require_pipeline_export"] is False
+    assert validated_calls[0]["write_run_manifest"] is False
+    assert pipeline_calls[0]["skip_export"] is True
+    assert pipeline_calls[0]["skip_internal_checkpoints"] is True
+    assert len(result.ply_paths) == len(result.checkpoint_paths) == 6
 
 
 def test_outer_run_stages_once_and_returns_only_local_snapshots(
@@ -338,6 +560,7 @@ def test_outer_run_stages_once_and_returns_only_local_snapshots(
     assert Path(stage_calls[0]["destination"]).is_relative_to(work)
     assert not Path(stage_calls[0]["destination"]).is_relative_to(drive)
     assert stage_calls[0]["minimum_free_bytes"] == 100 * 1024**3
+    assert stage_calls[0]["probe_drive_publication"] is False
     assert result.local_root.is_relative_to(work)
     assert all(path.is_relative_to(work) for path in result.ply_paths)
     assert all(path.is_relative_to(work) for path in result.checkpoint_paths)

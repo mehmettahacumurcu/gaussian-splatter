@@ -148,6 +148,7 @@ def test_train_and_pipeline_extension_defaults_are_none() -> None:
     assert train["density_quality_probe"].default is None
     assert pipeline["trainer_customizer"].default is None
     assert pipeline["trainer_train_kwargs"].default is None
+    assert pipeline["skip_internal_checkpoints"].default is False
 
 
 def test_customizer_is_called_only_when_supplied() -> None:
