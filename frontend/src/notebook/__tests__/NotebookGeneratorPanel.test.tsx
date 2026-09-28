@@ -1,13 +1,15 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import { generateStaticNotebook, getStaticNotebookPresets } from "../../api";
+import { generateStaticNotebook, getStaticNotebookPresets, generatePipelineNotebook, getPipelineNotebookPresets } from "../../api";
 import { NotebookGeneratorPanel } from "../NotebookGeneratorPanel";
 import type { StaticNotebookPresetsResponse } from "../types";
 
 vi.mock("../../api", () => ({
   getStaticNotebookPresets: vi.fn(),
   generateStaticNotebook: vi.fn(),
+  generatePipelineNotebook: vi.fn(),
+  getPipelineNotebookPresets: vi.fn(),
 }));
 
 const PRESETS: StaticNotebookPresetsResponse = {
@@ -40,6 +42,12 @@ const PRESETS: StaticNotebookPresetsResponse = {
 };
 
 beforeEach(() => {
+  const recipe = { iterations: 30000, max_gaussians: 1000000, min_vram: 14, recipe: "medium" };
+  vi.mocked(getPipelineNotebookPresets).mockResolvedValue({ template_version: 1, presets: {
+    hybrid: { baseline: recipe, quality: recipe, ultra: recipe },
+    spirula: { baseline: recipe, quality: { ...recipe, iterations: 60000, max_gaussians: 6000000 }, ultra: recipe },
+  }});
+  vi.mocked(generatePipelineNotebook).mockResolvedValue({ blob: new Blob(["notebook"]), filename: "room_spirula.ipynb" });
   vi.mocked(getStaticNotebookPresets).mockResolvedValue(PRESETS);
   vi.mocked(generateStaticNotebook).mockResolvedValue({
     blob: new Blob(["notebook"]),
@@ -57,6 +65,30 @@ beforeEach(() => {
 });
 
 describe("NotebookGeneratorPanel", () => {
+  it("generates Spirula with selected input and training overrides", async () => {
+    render(<NotebookGeneratorPanel />);
+    fireEvent.change(screen.getByLabelText("Pipeline"), { target: { value: "spirula" } });
+    await screen.findByPlaceholderText("30000");
+    fireEvent.change(screen.getByLabelText("MyDrive path"), { target: { value: "captures/room.MOV" } });
+    fireEvent.change(screen.getByLabelText("Training preset"), { target: { value: "quality" } });
+    fireEvent.change(screen.getByLabelText("Training steps"), { target: { value: "65000" } });
+    fireEvent.change(screen.getByLabelText("Extraction target FPS"), { target: { value: "8" } });
+    fireEvent.click(screen.getByRole("button", { name: "Generate and download notebook" }));
+    await waitFor(() => expect(generatePipelineNotebook).toHaveBeenCalledWith(expect.objectContaining({
+      pipeline: "spirula", input_mode: "video", input_path: "captures/room.MOV", preset: "quality", iterations: 65000, fps: 8,
+    })));
+    expect(generateStaticNotebook).not.toHaveBeenCalled();
+  });
+
+  it("hybrid accepts prepared datasets and hides video preprocessing controls", async () => {
+    render(<NotebookGeneratorPanel />);
+    fireEvent.change(screen.getByLabelText("Pipeline"), { target: { value: "hybrid" } });
+    await screen.findByPlaceholderText("30000");
+    expect(screen.getByLabelText("Input type")).toHaveValue("dataset_zip");
+    expect(screen.queryByLabelText("Extraction target FPS")).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Video" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("COLMAP model folder")).toHaveValue("0");
+  });
   it("renders approved order with Smart and Balanced defaults", async () => {
     render(<NotebookGeneratorPanel />);
     await screen.findByText("Balanced / L4");

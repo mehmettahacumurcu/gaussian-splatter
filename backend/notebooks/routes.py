@@ -10,8 +10,24 @@ from .builder import (
 from .models import StaticNotebookRunSpec
 from .presets import get_static_preset_manifest
 from .source import resolve_notebook_source
+from .pipeline_library import PRESETS, PipelineNotebookSpec, build_pipeline_notebook, pipeline_filename
 
 static_notebook_router = APIRouter(prefix="/notebooks/static", tags=["notebooks"])
+
+
+@static_notebook_router.get("/pipelines")
+def pipeline_notebook_presets():
+    return {"template_version": 1, "presets": PRESETS}
+
+
+@static_notebook_router.post("/pipeline")
+def generate_pipeline_notebook(spec: PipelineNotebookSpec) -> Response:
+    notebook = build_pipeline_notebook(spec, source=resolve_notebook_source())
+    return Response(
+        content=serialize_notebook(notebook),
+        media_type="application/x-ipynb+json",
+        headers={"Content-Disposition": f'attachment; filename="{pipeline_filename(spec)}"'},
+    )
 
 
 @static_notebook_router.get("/presets")

@@ -411,10 +411,24 @@ export function parseAttachmentFilename(header: string | null): string | null {
   return sanitizeAttachmentFilename(value);
 }
 
+export async function getPipelineNotebookPresets(): Promise<import("./notebook/PipelineNotebookPanel").PipelinePresets> {
+  return fetchJson("/notebooks/static/pipelines");
+}
+
+export async function generatePipelineNotebook(
+  spec: import("./notebook/PipelineNotebookPanel").PipelineNotebookSpec,
+): Promise<GeneratedNotebook> {
+  return downloadNotebook("/notebooks/static/pipeline", spec);
+}
+
 export async function generateStaticNotebook(
   spec: StaticNotebookRunSpec,
 ): Promise<GeneratedNotebook> {
-  const response = await fetch(`${getApiBase()}/notebooks/static`, {
+  return downloadNotebook("/notebooks/static", spec);
+}
+
+async function downloadNotebook(path: string, spec: unknown): Promise<GeneratedNotebook> {
+  const response = await fetch(`${getApiBase()}${path}`, {
     method: "POST",
     headers: authHeaders({
       "Content-Type": "application/json",

@@ -55,3 +55,19 @@ def test_generate_route_rejects_invalid_body(monkeypatch) -> None:
         json={"schema_version": 1, "input_folder": "../escape"},
     )
     assert response.status_code == 422
+
+
+def test_pipeline_catalog_and_download(monkeypatch):
+    client = _client(monkeypatch)
+    catalog = client.get('/notebooks/static/pipelines').json()
+    assert catalog['presets']['spirula']['quality']['max_gaussians'] == 6000000
+    response = client.post('/notebooks/static/pipeline', json={
+        'pipeline': 'spirula', 'input_mode': 'video', 'input_path': 'captures/room.MOV',
+        'preset': 'quality', 'iterations': 65000})
+    assert response.status_code == 200
+    assert 'room_spirula_quality.ipynb' in response.headers['content-disposition']
+    notebook = nbformat.reads(response.text, 4)
+    assert notebook.metadata.pipeline.spec.iterations == 65000
+    response = client.post('/notebooks/static/pipeline', json={
+        'pipeline': 'hybrid', 'input_mode': 'video', 'input_path': 'captures/room.MOV'})
+    assert response.status_code == 422

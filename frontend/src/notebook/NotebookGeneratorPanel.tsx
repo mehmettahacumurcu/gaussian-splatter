@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useReducer } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
+import { PipelineNotebookPanel } from "./PipelineNotebookPanel";
 import { generateStaticNotebook, getStaticNotebookPresets } from "../api";
 import { resolveDriveFolder } from "./drivePath";
 import { DriveFolderSection } from "./DriveFolderSection";
@@ -17,6 +18,20 @@ import type { NotebookAdvancedDraft, StaticNotebookRunSpec } from "./types";
 import "./notebook.css";
 
 export function NotebookGeneratorPanel() {
+  const [pipeline, setPipeline] = useState<"native" | "hybrid" | "spirula">("native");
+  return <>
+    <div className="nb-pipeline-picker">
+      <label>Pipeline<select value={pipeline} onChange={(e) => setPipeline(e.target.value as typeof pipeline)}>
+        <option value="native">Our preprocessing + our trainer</option>
+        <option value="hybrid">Spirula dataset + our trainer</option>
+        <option value="spirula">Spirula preprocessing + Spirula trainer</option>
+      </select></label>
+    </div>
+    {pipeline === "native" ? <NativeNotebookGeneratorPanel /> : <PipelineNotebookPanel key={pipeline} pipeline={pipeline} />}
+  </>;
+}
+
+function NativeNotebookGeneratorPanel() {
   const [state, dispatch] = useReducer(
     notebookReducer,
     undefined,
