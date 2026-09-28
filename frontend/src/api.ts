@@ -415,6 +415,22 @@ export async function getPipelineNotebookPresets(): Promise<import("./notebook/P
   return fetchJson("/notebooks/static/pipelines");
 }
 
+export async function getPreprocessCatalog(): Promise<import('./notebook/preprocessTypes').PreprocessCatalog> {
+  return fetchJson('/notebooks/static/preprocess');
+}
+
+export async function validatePreprocessPreset(spec: unknown): Promise<import('./notebook/preprocessTypes').PreprocessSpec> {
+  const response = await fetch(`${getApiBase()}/notebooks/static/preprocess/validate`, {
+    method: 'POST', headers: authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(spec),
+  });
+  if (!response.ok) throw new Error(`Hazır ayar geçersiz: ${await response.text()}`);
+  return response.json();
+}
+
+export async function generatePreprocessNotebook(spec: import('./notebook/preprocessTypes').PreprocessSpec): Promise<GeneratedNotebook> {
+  return downloadNotebook('/notebooks/static/preprocess', spec);
+}
+
 export async function generatePipelineNotebook(
   spec: import("./notebook/PipelineNotebookPanel").PipelineNotebookSpec,
 ): Promise<GeneratedNotebook> {

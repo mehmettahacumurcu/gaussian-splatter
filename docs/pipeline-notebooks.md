@@ -7,6 +7,9 @@ Open the existing **Notebook Generator** screen and select a pipeline:
 | Our preprocessing + our trainer | MyDrive capture folder | Existing static pipeline and quality profiles |
 | Spirula dataset + our trainer | Dataset ZIP or folder | Import existing images and COLMAP cameras/points, then train our model; no SfM rerun |
 | Spirula preprocessing + Spirula trainer | Video, dataset ZIP or folder | Pinned Spirula installation, SfM if needed, geometry and training |
+| Spirula dataset hazırlama | Videos and photo folders | Preprocessing only; detailed camera/mask/geometry controls, dataset ZIP and quality report |
+
+See [Spirula preprocessing](spirula-preprocessing.md) for the preparation-only screen, reusable settings files and output layout.
 
 Paths are relative to MyDrive, for example `GaussianTests/inputs/room.MOV` or
 `GaussianTests/inputs/room.zip`. Do not enter a Windows path or a Drive sharing URL.

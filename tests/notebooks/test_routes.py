@@ -71,3 +71,20 @@ def test_pipeline_catalog_and_download(monkeypatch):
     response = client.post('/notebooks/static/pipeline', json={
         'pipeline': 'hybrid', 'input_mode': 'video', 'input_path': 'captures/room.MOV'})
     assert response.status_code == 422
+
+
+def test_preprocessing_download_and_preset_validation(monkeypatch):
+    client = _client(monkeypatch)
+    catalog = client.get('/notebooks/static/preprocess').json()
+    assert catalog['fields']['geometry_model']['when'] == 'generate_geometry'
+    payload = {'inputs': [{'kind': 'photos', 'path': 'MyDrive/captures/room'}],
+               'settings': {'quality': 'extreme', 'generate_geometry': False}}
+    validated = client.post('/notebooks/static/preprocess/validate', json=payload)
+    assert validated.status_code == 200
+    assert validated.json()['inputs'][0]['path'] == 'captures/room'
+    response = client.post('/notebooks/static/preprocess', json=payload)
+    assert response.status_code == 200
+    notebook = nbformat.reads(response.text, 4)
+    assert notebook.metadata.pipeline.id == 'spirula_preprocess'
+    assert 'preprocessing.ipynb' in response.headers['content-disposition']
+    assert client.post('/notebooks/static/preprocess', json={**payload, 'training_steps': 30000}).status_code == 422

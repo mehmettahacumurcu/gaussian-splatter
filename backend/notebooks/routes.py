@@ -11,8 +11,28 @@ from .models import StaticNotebookRunSpec
 from .presets import get_static_preset_manifest
 from .source import resolve_notebook_source
 from .pipeline_library import PRESETS, PipelineNotebookSpec, build_pipeline_notebook, pipeline_filename
+from .spirula_preprocess import (
+    PreprocessSpec, build_preprocess_notebook, preprocess_catalog, preprocess_filename,
+)
 
 static_notebook_router = APIRouter(prefix="/notebooks/static", tags=["notebooks"])
+
+
+@static_notebook_router.get('/preprocess')
+def spirula_preprocess_catalog():
+    return preprocess_catalog()
+
+
+@static_notebook_router.post('/preprocess/validate')
+def validate_spirula_preprocess_preset(spec: PreprocessSpec):
+    return spec.model_dump()
+
+
+@static_notebook_router.post('/preprocess')
+def generate_spirula_preprocess_notebook(spec: PreprocessSpec) -> Response:
+    notebook = build_preprocess_notebook(spec, source=resolve_notebook_source())
+    return Response(content=serialize_notebook(notebook), media_type='application/x-ipynb+json',
+                    headers={'Content-Disposition': f'attachment; filename="{preprocess_filename(spec)}"'})
 
 
 @static_notebook_router.get("/pipelines")
