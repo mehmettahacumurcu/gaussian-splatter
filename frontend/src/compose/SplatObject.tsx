@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, type RefObject } from "react";
 import type { ThreeEvent } from "@react-three/fiber";
 import * as THREE from "three";
 import {
@@ -19,6 +19,8 @@ interface Props {
   url: string;
   selected: boolean;
   registry: ObjectRegistry;
+  /** True while a gizmo drag/click is in progress: clicks must not change selection. */
+  gizmoBusy: RefObject<boolean>;
   onSelect: (id: string) => void;
   onError: (id: string, message: string) => void;
 }
@@ -31,13 +33,29 @@ const noRaycast: THREE.Object3D["raycast"] = () => {};
 const CLICK_SLOP = 4;
 
 /**
+ * SplatMesh.dispose() only frees the packed splat buffers; also free the SH
+ * textures (PackedSplats.extra.sh{1,2,3}Texture, DynoUsampler2DArray wrappers)
+ * and the edit SDF texture (private SplatMesh.rgbaDisplaceEdits.sdfTexture).
+ */
+function disposeSplatMesh(mesh: SplatMesh) {
+  const extra = mesh.packedSplats?.extra as Record<string, { value?: unknown } | undefined> | undefined;
+  for (const key of ["sh1Texture", "sh2Texture", "sh3Texture"]) {
+    const tex = extra?.[key]?.value;
+    if (tex instanceof THREE.Texture) tex.dispose();
+  }
+  const edits = (mesh as unknown as { rgbaDisplaceEdits?: { sdfTexture?: THREE.Texture } | null }).rgbaDisplaceEdits;
+  edits?.sdfTexture?.dispose();
+  mesh.dispose();
+}
+
+/**
  * Splat with crop (mesh-local SplatEdit) and colour matrix (objectModifier).
  *
  * The SplatMesh sits under a group carrying the object transform, so the
  * crop helper (a child of the mesh) lives in the raw file frame, exactly like
  * the bake's crop.
  */
-export function SplatObject({ object, url, selected, registry, onSelect, onError }: Props) {
+export function SplatObject({ object, url, selected, registry, gizmoBusy, onSelect, onError }: Props) {
   const groupRef = useRef<THREE.Group>(null);
   const colorMat = useMemo(() => new THREE.Matrix3(), []);
   const onErrorRef = useRef(onError);
@@ -149,7 +167,7 @@ export function SplatObject({ object, url, selected, registry, onSelect, onError
   }, [mesh, object.id, registry]);
 
   // Primitives are never auto-disposed by R3F; free the packed splat buffers.
-  useEffect(() => () => mesh.dispose(), [mesh]);
+  useEffect(() => () => disposeSplatMesh(mesh), [mesh]);
 
   useEffect(() => {
     const m = colorMatrix(object.color ?? DEFAULT_COLOR);
@@ -163,7 +181,8 @@ export function SplatObject({ object, url, selected, registry, onSelect, onError
   }, [selected, crop]);
 
   const handleClick = (e: ThreeEvent<MouseEvent>) => {
-    if (e.delta > CLICK_SLOP || !object.visible) return; // orbit drag / hidden object
+    // Orbit drag, gizmo interaction or hidden object: not a selection click.
+    if (e.delta > CLICK_SLOP || gizmoBusy.current || !object.visible) return;
     e.stopPropagation();
     onSelect(object.id);
   };
