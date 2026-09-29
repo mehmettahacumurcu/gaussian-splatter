@@ -373,8 +373,8 @@ export function ComposePage({ active }: { active: boolean }) {
           dispatch({ type: "select", id: null });
           setCropEditing(false);
           break;
-        case "delete":
-        case "backspace": {
+        // Delete only: Backspace is too easy to hit by accident and there is no undo yet.
+        case "delete": {
           e.preventDefault();
           const id = stateRef.current.selectedId;
           if (!e.repeat && id) dispatch({ type: "remove", id });

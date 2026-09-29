@@ -281,6 +281,18 @@ describe("ComposePage", () => {
     expect(saved.transform.quaternion[3]).toBeCloseTo(Math.SQRT1_2, 6);
   });
 
+  it("Delete removes the selected object but Backspace does not (no undo yet)", async () => {
+    api.getScene.mockResolvedValue({ ...DOC, objects: [...DOC.objects, STATUE] });
+    await openScene();
+    fireEvent.click(screen.getByText("statue"));
+
+    fireEvent.keyDown(window, { key: "Backspace" });
+    expect(screen.getByText("statue")).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "Delete" });
+    expect(screen.queryByText("statue")).not.toBeInTheDocument();
+  });
+
   it("Dikleştir clears its status when the object was deleted meanwhile", async () => {
     let resolve: (o: AssetOrientation) => void = () => {};
     api.getScene.mockResolvedValue({ ...DOC, objects: [...DOC.objects, STATUE] });

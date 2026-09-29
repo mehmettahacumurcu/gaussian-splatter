@@ -169,6 +169,72 @@ def test_export_bakes_merged_ply_meshes_and_zip(tmp_path):
     assert names == {"merged.ply", "meshes/o_chair.glb", "scene.json"}
 
 
+def test_export_reads_each_splat_asset_once(tmp_path, monkeypatch):
+    client, manager = _setup(tmp_path)
+    doc = _scene_with_statue(client, tmp_path)
+    statue = doc["objects"][1]
+    doc["objects"].append({**statue, "id": "o_statue2", "name": "statue 2",
+                           "transform": {"position": [-5, 0, 0], "quaternion": [0, 0, 0, 1], "scale": 1}})
+    assert client.put(f"/compose/scenes/{doc['id']}", json=doc).status_code == 200
+
+    import backend.compose.exporter as exporter
+    reads: list[str] = []
+    real_read_ply = exporter.read_ply
+
+    def counting_read_ply(path, *args, **kwargs):
+        reads.append(Path(path).name)
+        return real_read_ply(path, *args, **kwargs)
+
+    monkeypatch.setattr(exporter, "read_ply", counting_read_ply)
+    r = _export(client, doc["id"])
+
+    assert sorted(reads) == sorted([f"{doc['objects'][0]['asset']}.ply", f"{statue['asset']}.ply"])
+    assert manager.results[r.json()["job_id"]]["gaussians"] == 30 + 2 * 40
+    merged = read_ply(tmp_path / "compose" / "exports" / doc["id"] / "merged.ply")
+    # Both copies baked with their own placement from the one shared read.
+    xs = merged.means[30:, 0]
+    src = read_ply(tmp_path / "compose" / "assets" / f"{statue['asset']}.ply")
+    np.testing.assert_allclose(xs[:40], src.means[:, 0] + 5, atol=1e-5)
+    np.testing.assert_allclose(xs[40:], src.means[:, 0] - 5, atol=1e-5)
+
+
+def test_list_scenes_skips_files_that_vanish_while_listing(tmp_path, monkeypatch):
+    client, _ = _setup(tmp_path)
+    doc = _scene_with_statue(client, tmp_path)
+    gone = _scene_with_statue(client, tmp_path, name="Gone")
+    gone_path = tmp_path / "compose" / "scenes" / f"{gone['id']}.json"
+    real_read_text = Path.read_text
+
+    def flaky_read_text(self, *args, **kwargs):
+        if self == gone_path:
+            raise FileNotFoundError(str(self))
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+    r = client.get("/compose/scenes")
+    assert r.status_code == 200
+    assert [s["id"] for s in r.json()] == [doc["id"]]
+
+
+def test_list_scenes_skips_files_deleted_before_stat(tmp_path, monkeypatch):
+    from backend.compose.store import ComposeStore
+
+    client, _ = _setup(tmp_path)
+    doc = _scene_with_statue(client, tmp_path)
+    gone = _scene_with_statue(client, tmp_path, name="Gone")
+    gone_path = tmp_path / "compose" / "scenes" / f"{gone['id']}.json"
+    real_read_text = Path.read_text
+
+    def read_then_delete(self, *args, **kwargs):
+        text = real_read_text(self, *args, **kwargs)
+        if self == gone_path:
+            self.unlink()
+        return text
+
+    monkeypatch.setattr(Path, "read_text", read_then_delete)
+    assert [s.id for s in ComposeStore(tmp_path).list_scenes()] == [doc["id"]]
+
+
 def test_export_rejects_missing_assets(tmp_path):
     client, manager = _setup(tmp_path)
     base = _upload(client, "room.ply", _ply_bytes(tmp_path)).json()

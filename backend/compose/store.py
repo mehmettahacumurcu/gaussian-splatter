@@ -184,11 +184,13 @@ class ComposeStore:
         if not self.scenes_dir.is_dir():
             return out
         for path in self.scenes_dir.glob("*.json"):
+            # Unreadable, invalid or deleted mid-listing (OSError): skip it.
             try:
                 doc = SceneDoc.model_validate_json(path.read_text(encoding="utf-8"))
-            except ValueError:
+                updated_ts = path.stat().st_mtime
+            except (ValueError, OSError):
                 continue
-            out.append(SceneSummary(id=doc.id, name=doc.name, updated_ts=path.stat().st_mtime,
+            out.append(SceneSummary(id=doc.id, name=doc.name, updated_ts=updated_ts,
                                     object_count=len(doc.objects)))
         out.sort(key=lambda s: s.updated_ts, reverse=True)
         return out

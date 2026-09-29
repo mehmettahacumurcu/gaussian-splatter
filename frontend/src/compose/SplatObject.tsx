@@ -11,6 +11,7 @@ import {
 } from "@sparkjsdev/spark";
 import { colorMatrix } from "./colorMath";
 import type { ObjectRegistry } from "./registry";
+import { COMPOSE_SPLAT_ENCODING, disposeSplatMeshOwn, packedSplatsCache } from "./splatCache";
 import { CROP_BOX_HALF_EXTENT, isInsideCrop } from "./transformMath";
 import { DEFAULT_COLOR, type CropBox, type SceneObject } from "./types";
 
@@ -31,22 +32,6 @@ const noRaycast: THREE.Object3D["raycast"] = () => {};
 
 /** Pixels the pointer may travel between down and up and still count as a click. */
 const CLICK_SLOP = 4;
-
-/**
- * SplatMesh.dispose() only frees the packed splat buffers; also free the SH
- * textures (PackedSplats.extra.sh{1,2,3}Texture, DynoUsampler2DArray wrappers)
- * and the edit SDF texture (private SplatMesh.rgbaDisplaceEdits.sdfTexture).
- */
-function disposeSplatMesh(mesh: SplatMesh) {
-  const extra = mesh.packedSplats?.extra as Record<string, { value?: unknown } | undefined> | undefined;
-  for (const key of ["sh1Texture", "sh2Texture", "sh3Texture"]) {
-    const tex = extra?.[key]?.value;
-    if (tex instanceof THREE.Texture) tex.dispose();
-  }
-  const edits = (mesh as unknown as { rgbaDisplaceEdits?: { sdfTexture?: THREE.Texture } | null }).rgbaDisplaceEdits;
-  edits?.sdfTexture?.dispose();
-  mesh.dispose();
-}
 
 /**
  * Splat with crop (mesh-local SplatEdit) and colour matrix (objectModifier).
@@ -75,7 +60,14 @@ export function SplatObject({ object, url, selected, registry, gizmoBusy, onSele
       const { rgb } = dyno.splitGsplat(gsplat).outputs;
       return { gsplat: dyno.combineGsplat({ gsplat, rgb: dyno.mul(uniform, rgb) }) };
     });
-    const m = new SplatMesh({ url, objectModifier: modifier, editable: true });
+    // Splat data is shared per asset URL (see splatCache.ts); every mesh on a
+    // shared PackedSplats must pass the same splatEncoding (SplatMesh sets it).
+    const m = new SplatMesh({
+      packedSplats: packedSplatsCache.acquire(url),
+      splatEncoding: COMPOSE_SPLAT_ENCODING,
+      objectModifier: modifier,
+      editable: true,
+    });
     // SplatMesh.raycast ignores edits: drop hits on cropped-away splats here so
     // that both clicks (R3F keeps only the nearest hit per object) and
     // snap-to-ground see the first *visible* splat.
@@ -166,8 +158,15 @@ export function SplatObject({ object, url, selected, registry, gizmoBusy, onSele
     };
   }, [mesh, object.id, registry]);
 
-  // Primitives are never auto-disposed by R3F; free the packed splat buffers.
-  useEffect(() => () => disposeSplatMesh(mesh), [mesh]);
+  // Primitives are never auto-disposed by R3F: free the mesh's own resources and
+  // drop its reference to the shared splat data (freed with the last user).
+  useEffect(
+    () => () => {
+      disposeSplatMeshOwn(mesh);
+      packedSplatsCache.release(url);
+    },
+    [mesh, url],
+  );
 
   useEffect(() => {
     const m = colorMatrix(object.color ?? DEFAULT_COLOR);

@@ -220,7 +220,7 @@ Frontend'deki **Sahne Editörü** sekmesi, bir taban splat sahnesine başka obje
 
 - **Taban sahne:** pipeline sonucu (`data/<scene>/output/ply`) ya da Drive'dan indirilip yüklenen bir Spirula `splat.ply`.
 - **Eklenebilen objeler:** başka splat'lar (`.ply`) ve mesh'ler (**yalnızca `.glb`**; Draco/KTX2 sıkıştırmalı GLB desteklenmez).
-- **Düzenleme:** gizmo ile taşı / döndür / tek tip ölçekle, crop box, **Zemine oturt**, **Dikleştir** (objenin kendi "yukarı"sını sahneninkine hizalar) ve renk eşleme (pozlama / ton / doygunluk).
+- **Düzenleme:** gizmo ile taşı / döndür / tek tip ölçekle, crop box, **Zemine oturt**, **Dikleştir** (objenin kendi "yukarı"sını sahneninkine hizalar) ve renk eşleme (pozlama / ton / doygunluk). Renk önizlemesi export ile aynıdır; tek istisna taban rengi [−0.5, 1.5] dışında kalan aşırı parlak/koyu splat'lardır (Spark rengi bu aralıkta 8 bit saklar).
 - **Yukarı seçici:** `Otomatik` (zemin düzlemi tahmini), `+Y`, `−Y`. Yalnızca görünüm/snap içindir, export'a işlenmez.
 
 ### Export
@@ -243,7 +243,7 @@ data/compose/
 
 ### Kısayollar
 
-`W` / `E` / `R` taşı / döndür / ölçekle · `Esc` seçimi bırak · `Del`/`Backspace` sil · `Ctrl+D` çoğalt · `Ctrl+S` kaydet
+`W` / `E` / `R` taşı / döndür / ölçekle · `Esc` seçimi bırak · `Del` sil (geri alma henüz yok; `Backspace` bilerek silmez) · `Ctrl+D` çoğalt · `Ctrl+S` kaydet
 
 ### Sınırlamalar
 

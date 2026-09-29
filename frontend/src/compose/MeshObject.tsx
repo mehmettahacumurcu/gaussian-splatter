@@ -3,6 +3,7 @@ import type { ThreeEvent } from "@react-three/fiber";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
+import { gltfRoot } from "./gltfScene";
 import type { ObjectRegistry } from "./registry";
 import type { SceneObject } from "./types";
 
@@ -60,8 +61,9 @@ export function MeshObject({ object, url, registry, gizmoBusy, onSelect, onError
     new GLTFLoader()
       .setMeshoptDecoder(MeshoptDecoder)
       .loadAsync(url)
-      .then((gltf) => {
-        loaded = gltf.scene;
+      .then(gltfRoot)
+      .then((root) => {
+        loaded = root;
         if (cancelled) {
           disposeTree(loaded);
           return;

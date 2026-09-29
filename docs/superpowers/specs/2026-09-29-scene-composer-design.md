@@ -87,9 +87,12 @@ data/compose/exports/<scene_id>.zip
 ```
 
 Pipeline results are exposed as virtual assets with id `scene__<name>`,
-resolving to the last `.ply` in `data/<name>/output/ply/`. Asset ids are
-generated server-side (`a_<hex12>`) and validated against `^[A-Za-z0-9_.-]+$`;
-user file names never become paths.
+resolving to the last `.ply` in `data/<name>/output/ply/`. Uploaded asset,
+scene and object ids are ASCII: generated (`a_<hex12>`, `s_<hex12>` by the
+server, `o_<hex…>` by the server or the editor) and validated against
+`^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,79}$`. Pipeline asset refs (`scene__<name>`)
+follow the data folder name and may be Unicode: `^[\w-][\w.-]{0,79}$` with
+Python's Unicode `\w`. User file names never become paths.
 
 ## 4. Scene document (v1)
 
@@ -194,7 +197,7 @@ Changes to existing code:
   report their own progress instead of jumping to 100%.
   `_mark_completed` uses `result["download_url"]` when present.
 - `JobsList.tsx`: use `job.download_url` when set; hide "Viewer'da aç" for
-  `compose:` jobs.
+  compose jobs (scene name `compose-<id>`).
 
 Export job writes into `exports/<id>.tmp/`, then atomically replaces
 `exports/<id>/`, then writes the zip (to a temp name, then rename). Export runs
@@ -208,8 +211,8 @@ for v1).
 - **Selection:** click; splats via `SplatMesh.raycast`, meshes via standard
   raycast. `Esc` deselect, `Delete` remove, `Ctrl+D` duplicate. Base cannot be
   deleted, moved or duplicated.
-- **Gizmo:** drei `TransformControls`. Scale mode forces uniform scale (average
-  of axes). Object moves directly during drag; reducer commit on drag end.
+- **Gizmo:** drei `TransformControls`. Scale mode forces uniform scale (follows
+  the axis that changed most). Object moves directly during drag; reducer commit on drag end.
 - **Crop:** "Crop" toggle in inspector creates a default box around the
   object's bounds and shows a wireframe; "edit box" mode points the gizmo at the
   box. Preview: `SplatEdit` child of the `SplatMesh` with a `BOX`
@@ -221,6 +224,15 @@ for v1).
 - **Colour:** sliders exposure, saturation; tint colour picker. Preview applies
   the full matrix `M` in one `objectModifier` (a `DynoMat3` uniform); Spark runs
   it after SH evaluation, so it equals the bake for every view direction.
+  Caveat: Spark stores the base colour `0.5 + C0·dc` in 8 bits clamped to the
+  load encoding's `[rgbMin, rgbMax]` before the modifier, while the bake uses
+  unclamped values. Composer splats are therefore loaded with
+  `rgbMin = −0.5, rgbMax = 1.5` (`splatCache.ts`; 8-bit step 2/255 instead of
+  1/255), so preview and export match for base colours in that range; only
+  more extreme over-bright/negative values can still differ.
+- **Splat data sharing:** objects on the same asset (duplicates) share one
+  `PackedSplats` (ref-counted per URL in `splatCache.ts`, freed with the last
+  user); transform, crop edits and colour modifier stay per `SplatMesh`.
 - **Save:** explicit save button (and Ctrl+S), dirty indicator. The editor stays
   mounted when switching tabs (render loop paused), so nothing is lost; closing
   the scene or the window with unsaved changes asks for confirmation.

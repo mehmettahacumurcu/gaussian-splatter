@@ -5,6 +5,7 @@ import re
 import secrets
 import shutil
 import zipfile
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
@@ -12,7 +13,7 @@ from .bake import ColorAdjust, Crop, Placement, merge_clouds, transform_cloud
 from .fsutil import replace_with_retry
 from .glb import placement_matrix, wrap_with_transform
 from .models import SceneDoc, SceneObject
-from .plyio import read_ply, write_ply
+from .plyio import GaussianCloud, read_ply, write_ply
 from .store import ComposeStore
 
 ProgressFn = Callable[..., None]
@@ -104,10 +105,25 @@ def run_export(
     tmp.mkdir(parents=True)
     try:
         clouds = []
+        # Several objects may share one asset (duplicates): read each PLY once and
+        # keep it only until its last user is baked (transform_cloud never
+        # mutates its input).
+        uses_left = Counter(o.asset for o in splats)
+        sources: dict[str, GaussianCloud] = {}
         for i, obj in enumerate(splats):
             check_cancel()
             on_progress("compose_bake", i / max(len(splats), 1), f"{obj.name} işleniyor", {})
-            clouds.append(transform_cloud(read_ply(store.asset_path(obj.asset)), placement_for(obj)))
+            src = sources.get(obj.asset)
+            if src is None:
+                src = read_ply(store.asset_path(obj.asset))
+            uses_left[obj.asset] -= 1
+            if uses_left[obj.asset] > 0:
+                sources[obj.asset] = src
+            else:
+                sources.pop(obj.asset, None)
+            clouds.append(transform_cloud(src, placement_for(obj)))
+            del src
+        sources.clear()
         merged = merge_clouds(clouds)
         del clouds
         n_gaussians = merged.count
