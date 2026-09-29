@@ -99,7 +99,19 @@ class SceneDoc(_Strict):
     id: str = Field(pattern=ID_PATTERN)
     name: str = Field(min_length=1, max_length=128)
     viewUp: Literal["y", "-y"] = "y"
+    # Measured world "up" of the base capture (unit vector); None = assume +Y.
+    up: Vec3 | None = None
     objects: list[SceneObject] = Field(default_factory=list)
+
+    @field_validator("up")
+    @classmethod
+    def _unit_up(cls, v: Vec3 | None) -> Vec3 | None:
+        if v is None:
+            return None
+        norm = math.sqrt(sum(c * c for c in v))
+        if not math.isfinite(norm) or abs(norm - 1.0) > 1e-3:
+            raise ValueError(f"up must be a unit vector (norm={norm:.4f})")
+        return tuple(c / norm for c in v)  # type: ignore[return-value]
 
     @model_validator(mode="after")
     def _check_objects(self) -> "SceneDoc":

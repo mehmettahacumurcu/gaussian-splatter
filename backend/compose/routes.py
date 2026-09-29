@@ -12,6 +12,8 @@ from pydantic import ValidationError
 
 from .exporter import missing_assets, run_export
 from .models import Asset, CreateSceneRequest, ExportResponse, SceneDoc, SceneSummary
+from .orientation import MeshAssetError, estimate_asset_up
+from .plyio import PlyFormatError
 from .store import AssetError, ComposeStore, SceneFileError
 
 _SCENE_BODY_OPENAPI = {
@@ -62,6 +64,20 @@ def build_compose_router(data_root: str | Path, get_manager: Callable[[], Any]) 
             raise HTTPException(404, f"Asset not found: {asset_id}")
         return FileResponse(path, media_type=_MEDIA_TYPES[asset.kind],
                             filename=f"{asset.name}{path.suffix}")
+
+    # Sync def on purpose: RANSAC + PLY read is CPU/IO heavy, so FastAPI runs it in
+    # its threadpool instead of blocking the event loop.
+    @router.get("/assets/{asset_id}/orientation")
+    def asset_orientation(asset_id: str) -> dict:
+        try:
+            result = estimate_asset_up(store, asset_id)
+        except MeshAssetError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except (PlyFormatError, ValueError) as exc:
+            raise HTTPException(422, f"Cannot estimate orientation: {exc}") from exc
+        if result is None:
+            raise HTTPException(404, f"Asset not found: {asset_id}")
+        return result
 
     @router.get("/scenes", response_model=list[SceneSummary])
     def list_scenes() -> list[SceneSummary]:

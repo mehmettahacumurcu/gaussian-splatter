@@ -181,6 +181,17 @@ class ComposeStore:
             name=name,
             objects=[SceneObject(id=new_id("o"), kind="splat", asset=base.id, name=base.name, role="base")],
         )
+        try:
+            # Imported lazily (orientation imports this module) and looked up as a
+            # module attribute so tests can monkeypatch the estimator.
+            from . import orientation
+
+            est = orientation.estimate_asset_up(self, base.id)
+            if est is not None:
+                # Re-validate so the vector is checked and normalised.
+                doc = SceneDoc.model_validate({**doc.model_dump(), "up": list(est["up"])})
+        except Exception:
+            pass  # best effort: a scene without `up` is still valid (assumes +Y)
         self.save_scene(doc)
         return doc
 
