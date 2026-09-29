@@ -101,6 +101,20 @@ export function straightenQuaternion(current: Quat, objUp: Vec3, sceneUp: Vec3):
   return toQuat(fix.multiply(q).normalize());
 }
 
+/**
+ * Full "Dikleştir" transform: `straightenQuaternion`, turning about the
+ * content centre `localPivot` (object-local frame) so the visible content
+ * stays where it is instead of swinging around the raw file origin. Scale is
+ * unchanged.
+ */
+export function straightenTransform(t: Transform, objUp: Vec3, sceneUp: Vec3, localPivot: Vec3): Transform {
+  const quaternion = straightenQuaternion(t.quaternion, objUp, sceneUp);
+  const pivot = new Vector3(...localPivot).multiplyScalar(t.scale);
+  const worldPivot = pivot.clone().applyQuaternion(new Quaternion(...t.quaternion).normalize()).add(new Vector3(...t.position));
+  const p = worldPivot.sub(pivot.applyQuaternion(new Quaternion(...quaternion)));
+  return { position: [p.x, p.y, p.z], quaternion, scale: t.scale };
+}
+
 const MAX_ELEVATION = (85 * Math.PI) / 180;
 
 /**

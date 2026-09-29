@@ -283,9 +283,18 @@ Changes:
   null on failure).
 - **Editor:** "Yukarı" selector offers `Otomatik (zemin)`, `+Y`, `−Y`; snap and
   the orbit camera use the effective up vector (any direction); inserted meshes
-  are rotated so their +Y matches it. Splat objects get a **"Dikleştir"**
-  (straighten) action: rotate the object so its own estimated up (from its
-  asset's orientation) maps onto the scene up, keeping position and scale.
+  are rotated so their +Y matches it. Snap uses the object's true content
+  extent along up (mesh vertices through their world matrices; splat centres
+  kept by the crop, in world space), not an axis-aligned bounding box, so a
+  rotated object's lowest point lands on the surface. Splat objects get a
+  **"Dikleştir"** (straighten) action: rotate the object so its own estimated
+  up (from its asset's orientation) maps onto the scene up, using the minimal
+  correction from its current rotation (so its heading is preserved; from
+  identity this is `setFromUnitVectors(objUp, up)`). The rotation pivots on
+  the visible content centre (centre of the local splat bounds ∩ crop box),
+  whose world position stays fixed; `position` is adjusted accordingly and
+  scale is unchanged. It is applied by the reducer to the object's current
+  transform, so edits made while the orientation request runs are kept.
 - **Bug fix:** inspector number fields could re-commit a stale value when a
   field was left right after pressing Enter (the field text was reset to the
   old value until the prop update arrived), silently undoing the edit.

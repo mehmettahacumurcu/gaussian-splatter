@@ -8,8 +8,10 @@ import {
   readCrop,
   readTransform,
   straightenQuaternion,
+  straightenTransform,
   uniformScaleFrom,
 } from "../transformMath";
+import type { Transform } from "../types";
 
 describe("uniformScaleFrom guards", () => {
   it("ignores non-finite components", () => {
@@ -166,5 +168,29 @@ describe("orbitPositionForUp", () => {
     const q = orbitPositionForUp([0, 5, 0], [0, 0, 0], [0, 1, 0], [0, 1, 0]);
     expect(q.every(Number.isFinite)).toBe(true);
     expect(Math.hypot(...q)).toBeCloseTo(5, 9);
+  });
+});
+
+describe("straightenTransform", () => {
+  it("keeps the pivot's world position and scale and maps objUp onto sceneUp", () => {
+    const rot = new Quaternion().setFromAxisAngle(new Vector3(0.3, 1, -0.2).normalize(), 0.9);
+    const t: Transform = { position: [1, -2, 0.5], quaternion: [rot.x, rot.y, rot.z, rot.w], scale: 1.7 };
+    const objUp = unit([0.1, 0.2, 0.97]);
+    const sceneUp = unit([-0.94, -0.11, -0.32]);
+    const pivot: [number, number, number] = [0.4, -0.3, 1.2];
+    const worldPivot = (x: Transform) =>
+      new Vector3(...pivot)
+        .multiplyScalar(x.scale)
+        .applyQuaternion(new Quaternion(...x.quaternion))
+        .add(new Vector3(...x.position));
+
+    const out = straightenTransform(t, objUp, sceneUp, pivot);
+    expect(out.scale).toBe(1.7);
+    expect(out.quaternion).toEqual(straightenQuaternion(t.quaternion, objUp, sceneUp));
+    expect(worldPivot(out).distanceTo(worldPivot(t))).toBeLessThan(1e-9);
+    const r = rotate(out.quaternion, objUp);
+    expect(r.x).toBeCloseTo(sceneUp[0], 6);
+    expect(r.y).toBeCloseTo(sceneUp[1], 6);
+    expect(r.z).toBeCloseTo(sceneUp[2], 6);
   });
 });

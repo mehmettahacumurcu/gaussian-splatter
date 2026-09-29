@@ -251,4 +251,48 @@ describe("ComposePage", () => {
     expect(await screen.findByText("Bu objede zemin düzlemi bulunamadı")).toBeInTheDocument();
     expect(screen.queryByText(/Bahçe •/)).not.toBeInTheDocument();
   });
+
+  it("Dikleştir applies to the latest transform when the object moved during the request", async () => {
+    let resolve: (o: AssetOrientation) => void = () => {};
+    api.getScene.mockResolvedValue({ ...DOC, up: [0, 1, 0], objects: [...DOC.objects, STATUE] });
+    api.getAssetOrientation.mockImplementation(() => new Promise((r) => (resolve = r)));
+    api.saveScene.mockImplementation(async (d) => d);
+    await openScene();
+    fireEvent.click(screen.getByText("statue"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Dikleştir" }));
+    // Busy: the button is disabled while the request runs.
+    expect(screen.getByRole("button", { name: "Dikleştir" })).toBeDisabled();
+    // The user moves the object meanwhile.
+    const x = screen.getByLabelText("Konum X");
+    fireEvent.change(x, { target: { value: "5" } });
+    fireEvent.keyDown(x, { key: "Enter" });
+
+    await act(async () => resolve(orientation({ up: [0, 0, 1] })));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Dikleştir" })).not.toBeDisabled());
+    expect(screen.queryByText("Obje yönü hesaplanıyor…")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Kaydet" }));
+    await waitFor(() => expect(api.saveScene).toHaveBeenCalledTimes(1));
+    const saved = api.saveScene.mock.calls[0][0].objects.find((o) => o.id === "o_statue")!;
+    // Both edits kept: the move and the straightening (no registry bounds → pivot = origin).
+    expect(saved.transform.position).toEqual([5, 2, 3]);
+    expect(saved.transform.quaternion[0]).toBeCloseTo(-Math.SQRT1_2, 6);
+    expect(saved.transform.quaternion[3]).toBeCloseTo(Math.SQRT1_2, 6);
+  });
+
+  it("Dikleştir clears its status when the object was deleted meanwhile", async () => {
+    let resolve: (o: AssetOrientation) => void = () => {};
+    api.getScene.mockResolvedValue({ ...DOC, objects: [...DOC.objects, STATUE] });
+    api.getAssetOrientation.mockImplementation(() => new Promise((r) => (resolve = r)));
+    await openScene();
+    fireEvent.click(screen.getByText("statue"));
+    fireEvent.click(screen.getByRole("button", { name: "Dikleştir" }));
+    expect(screen.getByText("Obje yönü hesaplanıyor…")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "statue sil" }));
+    await act(async () => resolve(orientation({ up: [0, 0, 1] })));
+    await waitFor(() => expect(screen.queryByText("Obje yönü hesaplanıyor…")).not.toBeInTheDocument());
+    expect(screen.queryByText("statue")).not.toBeInTheDocument();
+  });
 });

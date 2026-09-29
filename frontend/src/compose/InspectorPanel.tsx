@@ -14,6 +14,8 @@ interface Props {
   onSnap: () => void;
   /** "Dikleştir" (non-base splats): align the object's own floor up with the scene up. */
   onStraighten?: () => void;
+  /** A backend action is running (disables actions that start another one). */
+  busy?: boolean;
 }
 
 const RAD = Math.PI / 180;
@@ -93,6 +95,7 @@ export function InspectorPanel({
   onColor,
   onSnap,
   onStraighten,
+  busy = false,
 }: Props) {
   const [name, setName] = useState(object.name);
   useLayoutEffect(() => setName(object.name), [object.name]);
@@ -174,6 +177,7 @@ export function InspectorPanel({
             <button
               type="button"
               className="btn-secondary"
+              disabled={busy}
               title="Objeyi kendi zemin düzlemine göre sahnenin yukarı yönüne çevir"
               onClick={onStraighten}
             >

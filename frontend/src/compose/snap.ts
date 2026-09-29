@@ -19,65 +19,108 @@ function localBoundsWithCrop(obj: SceneObject, entry: RegistryEntry): THREE.Box3
   return box.isEmpty() ? null : box;
 }
 
-/** Eight corners of `box` (in its own frame), optionally transformed by `m`. */
-function boxCorners(box: THREE.Box3, m?: THREE.Matrix4): THREE.Vector3[] {
-  const out: THREE.Vector3[] = [];
-  for (const x of [box.min.x, box.max.x])
-    for (const y of [box.min.y, box.max.y])
-      for (const z of [box.min.z, box.max.z]) {
-        const v = new THREE.Vector3(x, y, z);
-        out.push(m ? v.applyMatrix4(m) : v);
-      }
-  return out;
+/**
+ * Centre of the visible content in the object's local frame (splat bounds ∩
+ * crop box), or null before the splat has loaded. The pivot for "Dikleştir".
+ */
+export function contentPivot(obj: SceneObject, entry: RegistryEntry): Vec3 | null {
+  const box = localBoundsWithCrop(obj, entry);
+  if (!box) return null;
+  const c = box.getCenter(new THREE.Vector3());
+  return [c.x, c.y, c.z];
 }
+
+/** Calls `visit` with every world-space content point (reused vector: copy to keep). */
+type PointSource = (visit: (p: THREE.Vector3) => void) => void;
 
 /**
- * World-space corners of an object's bounds (cropped for splats). Splats use
- * their local box through the world matrix (a tight oriented box); meshes
- * use their world AABB.
+ * Meshes: every vertex through its mesh's world matrix. Exact (a rotated
+ * mesh's AABB would leave it floating) and O(vertices) once per click, which
+ * is cheap next to a raycast. Skinning / morph targets are ignored.
  */
-export function worldCorners(obj: SceneObject, entry: RegistryEntry): THREE.Vector3[] | null {
-  entry.group.updateWorldMatrix(true, true);
-  if (obj.kind === "mesh") {
-    const box = new THREE.Box3().setFromObject(entry.group);
-    return box.isEmpty() ? null : boxCorners(box);
-  }
-  const local = localBoundsWithCrop(obj, entry);
-  return local ? boxCorners(local, entry.group.matrixWorld) : null;
+function meshPoints(entry: RegistryEntry): PointSource {
+  return (visit) => {
+    const v = new THREE.Vector3();
+    entry.group.traverse((node) => {
+      const mesh = node as THREE.Mesh;
+      const pos = mesh.isMesh ? mesh.geometry?.getAttribute("position") : undefined;
+      if (!pos) return;
+      for (let i = 0; i < pos.count; i++) visit(v.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld));
+    });
+  };
 }
 
-/** World-space bounds of an object (cropped for splats). */
-export function worldBounds(obj: SceneObject, entry: RegistryEntry): THREE.Box3 | null {
-  const corners = worldCorners(obj, entry);
-  return corners ? new THREE.Box3().setFromPoints(corners) : null;
+/** Splats: the centres kept by the crop (tested in the local/raw frame, like the bake), in world space. */
+function splatPoints(obj: SceneObject, entry: RegistryEntry): PointSource | null {
+  const splat = entry.splat;
+  if (!splat) return null;
+  const crop = obj.crop ?? null;
+  // Same test as isInsideCrop, without per-splat allocations (runs per centre).
+  const inv = crop ? new THREE.Quaternion(...crop.quaternion).normalize().invert() : null;
+  const cropCenter = crop ? new THREE.Vector3(...crop.center) : null;
+  return (visit) => {
+    const m = splat.matrixWorld;
+    const v = new THREE.Vector3();
+    const l = new THREE.Vector3();
+    splat.forEachSplat((_i, center) => {
+      if (crop && inv && cropCenter) {
+        l.copy(center).sub(cropCenter).applyQuaternion(inv);
+        const h = crop.halfSize;
+        if (Math.abs(l.x) > h[0] || Math.abs(l.y) > h[1] || Math.abs(l.z) > h[2]) return;
+      }
+      visit(v.copy(center).applyMatrix4(m));
+    });
+  };
+}
+
+interface UpExtent {
+  /** Min / max projection of the content on up. */
+  lo: number;
+  hi: number;
+  /** Centre of the content's world AABB (horizontal position of the drop ray). */
+  center: THREE.Vector3;
+}
+
+/** Extent of the object's actual content along `up`, or null when it has none (yet). */
+export function contentExtentAlongUp(obj: SceneObject, entry: RegistryEntry, up: THREE.Vector3): UpExtent | null {
+  entry.group.updateWorldMatrix(true, true);
+  const source = obj.kind === "mesh" ? meshPoints(entry) : splatPoints(obj, entry);
+  if (!source) return null;
+  let lo = Infinity;
+  let hi = -Infinity;
+  const box = new THREE.Box3();
+  try {
+    source((p) => {
+      const d = p.dot(up);
+      if (d < lo) lo = d;
+      if (d > hi) hi = d;
+      box.expandByPoint(p);
+    });
+  } catch {
+    return null; // splat data not loaded
+  }
+  if (!Number.isFinite(lo) || !Number.isFinite(hi)) return null;
+  return { lo, hi, center: box.getCenter(new THREE.Vector3()) };
 }
 
 /**
  * New position that drops ``id`` onto the first visible surface below it
  * (along −up, `effectiveUp(doc)`, any direction), or null when nothing is
- * hit. Hits on cropped-away splats never reach us: SplatObject's raycast
- * override already drops them.
+ * hit. The object's lowest content point along up lands on the hit. Hits on
+ * cropped-away splats never reach us: SplatObject's raycast override already
+ * drops them.
  */
 export function snapToGround(doc: SceneDoc, registry: ObjectRegistry, id: string): Vec3 | null {
   const obj = doc.objects.find((o) => o.id === id);
   const entry = registry.get(id);
   if (!obj || !entry || obj.role === "base") return null;
-  const corners = worldCorners(obj, entry);
-  if (!corners) return null;
 
   const up = new THREE.Vector3(...effectiveUp(doc));
-  // Centre of the (symmetric) corner set; extent of the corners along up.
-  const center = corners.reduce((acc, c) => acc.add(c), new THREE.Vector3()).divideScalar(corners.length);
-  let lo = Infinity;
-  let hi = -Infinity;
-  for (const c of corners) {
-    const d = c.dot(up);
-    lo = Math.min(lo, d);
-    hi = Math.max(hi, d);
-  }
-  const half = (hi - lo) / 2;
+  const extent = contentExtentAlongUp(obj, entry, up);
+  if (!extent) return null;
+  const { lo, hi, center } = extent;
   const bottom = center.clone().addScaledVector(up, lo - center.dot(up));
-  const origin = bottom.clone().addScaledVector(up, half);
+  const origin = bottom.clone().addScaledVector(up, (hi - lo) / 2);
 
   const targets: THREE.Object3D[] = [];
   for (const [otherId, other] of registry.all()) {

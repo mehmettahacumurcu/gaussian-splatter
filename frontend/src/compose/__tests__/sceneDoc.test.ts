@@ -164,6 +164,36 @@ describe("composeReducer", () => {
     expect(composeReducer(initialComposeState, { type: "setUp", up: [0, 1, 0] })).toBe(initialComposeState);
   });
 
+  it("straighten rotates the current transform about the pivot", () => {
+    const s0 = composeReducer(composeReducer(loaded(), { type: "setUp", up: [0, 1, 0] }), { type: "add", object: statue });
+    const moved = composeReducer(s0, {
+      type: "setTransform", id: "o_statue",
+      transform: { position: [5, 0, 0], quaternion: [0, 0, 0, 1], scale: 2 },
+    });
+    const s1 = composeReducer(moved, { type: "straighten", id: "o_statue", objUp: [0, 0, 1], localPivot: [0, 0, 1] });
+    const t = s1.doc!.objects[1].transform;
+    // +Z → +Y is −90° about X; the pivot (world (5,0,2)) must stay put.
+    expect(t.quaternion[0]).toBeCloseTo(-Math.SQRT1_2, 9);
+    expect(t.quaternion[3]).toBeCloseTo(Math.SQRT1_2, 9);
+    expect(t.scale).toBe(2);
+    expect(t.position[0]).toBeCloseTo(5, 9);
+    expect(t.position[1]).toBeCloseTo(-2, 9);
+    expect(t.position[2]).toBeCloseTo(2, 9);
+    expect(s1.dirty).toBe(true);
+  });
+
+  it("straighten ignores the base, meshes, unknown ids and degenerate ups", () => {
+    const s0 = composeReducer(loaded(), { type: "add", object: statue });
+    const run = (id: string, objUp: [number, number, number]) =>
+      composeReducer(s0, { type: "straighten", id, objUp, localPivot: [0, 0, 0] });
+    expect(run("o_base", [0, 0, 1])).toBe(s0);
+    expect(run("nope", [0, 0, 1])).toBe(s0);
+    expect(run("o_statue", [0, 0, 0])).toBe(s0);
+    expect(run("o_statue", [NaN, 1, 0])).toBe(s0);
+    const s1 = composeReducer(s0, { type: "add", object: { ...statue, id: "o_mesh", kind: "mesh" } });
+    expect(composeReducer(s1, { type: "straighten", id: "o_mesh", objUp: [0, 0, 1], localPivot: [0, 0, 0] })).toBe(s1);
+  });
+
   it("generates safe unique ids", () => {
     const a = newObjectId();
     expect(a).toMatch(/^o_[0-9a-f]{12}$/);

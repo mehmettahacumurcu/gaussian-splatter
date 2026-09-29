@@ -21,8 +21,8 @@ import { InspectorPanel } from "./InspectorPanel";
 import { ObjectListPanel } from "./ObjectListPanel";
 import { ObjectRegistry } from "./registry";
 import { composeReducer, initialComposeState, newObjectId } from "./sceneDoc";
-import { snapToGround } from "./snap";
-import { meshInsertQuaternion, straightenQuaternion } from "./transformMath";
+import { contentPivot, snapToGround } from "./snap";
+import { meshInsertQuaternion } from "./transformMath";
 import type { Asset, CropBox, GizmoMode, SceneDoc, SceneObject, SceneSummary, Transform, ViewUp } from "./types";
 import { effectiveUp } from "./upVector";
 import "./compose.css";
@@ -311,23 +311,29 @@ export function ComposePage({ active }: { active: boolean }) {
     });
   };
 
-  /** "Dikleştir": rotate a splat object so its own floor up matches the scene up. */
+  /**
+   * "Dikleştir": rotate a splat object so its own floor up matches the scene
+   * up, pivoting on its visible content. The reducer applies it to the
+   * object's current transform, so edits made during the request are kept.
+   */
   const straighten = (id: string) => {
     const obj = stateRef.current.doc?.objects.find((o) => o.id === id);
     if (!obj || obj.kind !== "splat" || obj.role === "base") return;
     void run("Obje yönü hesaplanıyor…", async (current) => {
       const o = await getAssetOrientation(obj.asset);
       if (!current()) return;
+      const latest = stateRef.current.doc?.objects.find((x) => x.id === id);
+      if (!latest) {
+        setStatus(null); // deleted meanwhile
+        return;
+      }
       if (!o.measured) {
         setStatus({ kind: "error", text: "Bu objede zemin düzlemi bulunamadı" });
         return;
       }
-      // Latest values: the object may have moved while the request was running.
-      const latestDoc = stateRef.current.doc;
-      const latest = latestDoc?.objects.find((x) => x.id === id);
-      if (!latestDoc || !latest) return;
-      const quaternion = straightenQuaternion(latest.transform.quaternion, o.up, effectiveUp(latestDoc));
-      dispatch({ type: "setTransform", id, transform: { ...latest.transform, quaternion } });
+      const entry = registry.get(id);
+      const localPivot = (entry && contentPivot(latest, entry)) ?? latest.crop?.center ?? [0, 0, 0];
+      dispatch({ type: "straighten", id, objUp: o.up, localPivot });
       setStatus(null);
     });
   };
@@ -538,6 +544,7 @@ export function ComposePage({ active }: { active: boolean }) {
               onColor={(color) => dispatch({ type: "setColor", id: selected.id, color })}
               onSnap={snap}
               onStraighten={() => straighten(selected.id)}
+              busy={busy}
             />
           ) : (
             <p className="muted">Düzenlemek için bir obje seç.</p>

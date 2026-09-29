@@ -1,6 +1,6 @@
-import { isValidTransform } from "./transformMath";
+import { isValidTransform, straightenTransform } from "./transformMath";
 import type { ColorAdjust, CropBox, SceneDoc, SceneObject, Transform, Vec3, ViewUp } from "./types";
-import { normalizeUp } from "./upVector";
+import { effectiveUp, normalizeUp } from "./upVector";
 
 export interface ComposeState {
   doc: SceneDoc | null;
@@ -23,9 +23,13 @@ export type ComposeAction =
   | { type: "setColor"; id: string; color: ColorAdjust | null }
   | { type: "setVisible"; id: string; visible: boolean }
   | { type: "rename"; id: string; name: string }
-  | { type: "setViewUp"; viewUp: ViewUp }
   /** `up` null = use `viewUp` (optionally changed too); a vector is normalised, degenerate ones ignored. */
-  | { type: "setUp"; up: Vec3 | null; viewUp?: ViewUp };
+  | { type: "setUp"; up: Vec3 | null; viewUp?: ViewUp }
+  /**
+   * "Dikleştir" a splat object: rotate its CURRENT transform so `objUp` (its
+   * own floor up, local frame) matches the scene up, pivoting on `localPivot`.
+   */
+  | { type: "straighten"; id: string; objUp: Vec3; localPivot: Vec3 };
 
 const MAX_NAME = 128;
 const COPY_SUFFIX = " kopya";
@@ -116,9 +120,6 @@ export function composeReducer(state: ComposeState, action: ComposeAction): Comp
       if (!name) return state;
       return update(state, action.id, (o) => ({ ...o, name }));
     }
-    case "setViewUp":
-      if (!state.doc || state.doc.viewUp === action.viewUp) return state;
-      return { ...state, doc: { ...state.doc, viewUp: action.viewUp }, dirty: true };
     case "setUp": {
       if (!state.doc) return state;
       const up = action.up === null ? null : normalizeUp(action.up);
@@ -128,6 +129,15 @@ export function composeReducer(state: ComposeState, action: ComposeAction): Comp
       const sameUp = prev === null || up === null ? prev === up : prev.every((c, i) => c === up[i]);
       if (sameUp && viewUp === state.doc.viewUp) return state;
       return { ...state, doc: { ...state.doc, up, viewUp }, dirty: true };
+    }
+    case "straighten": {
+      const target = find(state, action.id);
+      const objUp = normalizeUp(action.objUp);
+      if (!state.doc || !target || target.role === "base" || target.kind !== "splat" || !objUp) return state;
+      if (!action.localPivot.every(Number.isFinite)) return state;
+      const transform = straightenTransform(target.transform, objUp, effectiveUp(state.doc), action.localPivot);
+      if (!isValidTransform(transform)) return state;
+      return update(state, action.id, (o) => ({ ...o, transform }));
     }
   }
 }
