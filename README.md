@@ -23,6 +23,7 @@ Tek bir videodan 4D Gaussian Splatting sahnesi üreten masaüstü uygulamasını
 | 7  | FastAPI backend (`api.py`, `/process` `/status` `/download`) | hazır |
 | 8a | Tauri + React 4D viewer (`frontend/`) | hazır |
 | 8b | Tam UI (job list, upload form, live progress) | sonraki sprint |
+| 9  | Sahne Editörü — splat/mesh yerleştirme + export (bkz. [Sahne Editörü](#sahne-editörü-obje-yerleştirme)) | hazır |
 
 ## Kurulum
 
@@ -120,6 +121,7 @@ Swagger UI interaktif dokümantasyon: [http://127.0.0.1:8000/docs](http://127.0.
 | `GET` | `/status/{job_id}` | Job ilerlemesi (faz, progress 0-1, mesaj) |
 | `GET` | `/jobs` | Tüm job'ların listesi |
 | `GET` | `/download/{job_id}` | Bitmiş job'un .ply'larını zip olarak indir |
+| çeşitli | `/compose/*` | Sahne Editörü: asset yükleme/listeleme, sahne kaydet/aç, export job'ı + zip indirme (bkz. [Sahne Editörü](#sahne-editörü-obje-yerleştirme)) |
 
 ### Hızlı test — curl
 
@@ -211,6 +213,44 @@ npm run tauri build
 ```
 
 `src-tauri/target/release/` altında `.exe` + MSI installer çıkar.
+
+## Sahne Editörü (obje yerleştirme)
+
+Frontend'deki **Sahne Editörü** sekmesi, bir taban splat sahnesine başka obje yerleştirip sonucu dışa aktarmanı sağlar. Düzenleme tarayıcıda canlı yapılır (Spark + three.js); export backend'de numpy ile bake edilir.
+
+- **Taban sahne:** pipeline sonucu (`data/<scene>/output/ply`) ya da Drive'dan indirilip yüklenen bir Spirula `splat.ply`.
+- **Eklenebilen objeler:** başka splat'lar (`.ply`) ve mesh'ler (**yalnızca `.glb`**; Draco/KTX2 sıkıştırmalı GLB desteklenmez).
+- **Düzenleme:** gizmo ile taşı / döndür / tek tip ölçekle, crop box, **Zemine oturt**, **Dikleştir** (objenin kendi "yukarı"sını sahneninkine hizalar) ve renk eşleme (pozlama / ton / doygunluk).
+- **Yukarı seçici:** `Otomatik` (zemin düzlemi tahmini), `+Y`, `−Y`. Yalnızca görünüm/snap içindir, export'a işlenmez.
+
+### Export
+
+Export, Jobs kuyruğunda bir job olarak çalışır (eğitim job'larının arkasında sıra bekler). Sonuç zip'i editörden ya da Jobs sekmesinden indirilir:
+
+- `merged.ply` — görünür tüm splat'lar bake edilmiş (SH doğru döndürülmüş, crop ve renk uygulanmış), standart 3DGS PLY, taban sahneyle aynı koordinat çerçevesinde
+- `meshes/<id>.glb` — yerleşim dönüşümü kök node'a işlenmiş mesh'ler
+- `scene.json` — sahne dokümanı
+
+### Disk yapısı
+
+```
+data/compose/
+├── assets/    # yüklenen .ply/.glb + metadata
+├── scenes/    # kayıtlı sahne dokümanları (JSON)
+├── exports/   # export çıktıları + zip
+└── cache/     # orientation (zemin/yukarı) önbelleği
+```
+
+### Kısayollar
+
+`W` / `E` / `R` taşı / döndür / ölçekle · `Esc` seçimi bırak · `Del`/`Backspace` sil · `Ctrl+D` çoğalt · `Ctrl+S` kaydet
+
+### Sınırlamalar
+
+- Yalnızca tek tip (uniform) ölçek.
+- OBJ/FBX desteklenmez — Blender'da GLB'ye çevir.
+- Mesh aydınlatması sahneye uydurulmaz.
+- Henüz undo/redo yok.
 
 ## Faz faz çalıştır
 
