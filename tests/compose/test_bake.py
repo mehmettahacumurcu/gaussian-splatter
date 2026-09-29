@@ -138,6 +138,26 @@ def test_merge_pads_lower_sh_degree():
     np.testing.assert_array_equal(merged.means[5:], b.means)
 
 
+def test_merge_rejects_all_cropped_away():
+    empty = random_cloud(0, degree=3)
+    with pytest.raises(ValueError, match="All Gaussians were cropped away"):
+        merge_clouds([empty, random_cloud(0, degree=1)])
+
+
+def test_quaternion_composition_order():
+    from backend.compose.bake import quat_to_matrix
+
+    cloud = random_cloud(25, seed=9)
+    q = np.array([0.3, -0.6, 0.2, 0.7])
+    q /= np.linalg.norm(q)
+    out = transform_cloud(cloud, Placement(quaternion_xyzw=tuple(q)))
+    r_o = quat_to_matrix(tuple(q))
+    for qi, qo in zip(cloud.quats.astype(np.float64), out.quats.astype(np.float64)):
+        expected = r_o @ quat_to_matrix((qi[1], qi[2], qi[3], qi[0]))
+        got = quat_to_matrix((qo[1], qo[2], qo[3], qo[0]))
+        np.testing.assert_allclose(got, expected, atol=1e-5)
+
+
 def test_merge_requires_at_least_one_cloud():
     with pytest.raises(ValueError, match="Nothing to merge"):
         merge_clouds([])

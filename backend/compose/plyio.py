@@ -90,9 +90,12 @@ def validate_ply(path: str | Path) -> int:
     missing = [f for f in REQUIRED_FIELDS if f not in props]
     if missing:
         raise PlyFormatError(f"Not a Gaussian-splat PLY, missing fields: {', '.join(missing)}")
-    n_rest = sum(1 for p in props if p.startswith("f_rest_"))
+    rest_suffixes = [p[len("f_rest_"):] for p in props if p.startswith("f_rest_")]
+    n_rest = len(rest_suffixes)
     if n_rest not in _VALID_REST_FIELD_COUNTS:
         raise PlyFormatError(f"Unsupported number of f_rest fields: {n_rest}")
+    if set(rest_suffixes) != {str(i) for i in range(n_rest)}:
+        raise PlyFormatError("f_rest fields must be numbered contiguously from f_rest_0")
     if count <= 0:
         raise PlyFormatError("PLY contains no Gaussians")
     return count
@@ -102,11 +105,12 @@ def read_ply(path: str | Path) -> GaussianCloud:
     from plyfile import PlyData
 
     validate_ply(path)
-    vertex = PlyData.read(str(path))["vertex"].data
+    # mmap=False: a memmap would keep the file locked on Windows while the cloud lives.
+    vertex = PlyData.read(str(path), mmap=False)["vertex"].data
     n = len(vertex)
 
     def col(name: str) -> np.ndarray:
-        return np.asarray(vertex[name], dtype=np.float32)
+        return np.array(vertex[name], dtype=np.float32)
 
     rest_names = sorted(
         (f for f in vertex.dtype.names if f.startswith("f_rest_")),
@@ -150,7 +154,7 @@ def write_ply(cloud: GaussianCloud, path: str | Path) -> Path:
     arr["nx"] = arr["ny"] = arr["nz"] = 0.0
     for i in range(3):
         arr[f"f_dc_{i}"] = cloud.sh_dc[:, i]
-    rest_flat = cloud.sh_rest.transpose(0, 2, 1).reshape(n, -1)
+    rest_flat = cloud.sh_rest.transpose(0, 2, 1).reshape(n, 3 * k)
     for i in range(3 * k):
         arr[f"f_rest_{i}"] = rest_flat[:, i]
     arr["opacity"] = cloud.opacities

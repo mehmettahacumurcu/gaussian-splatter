@@ -92,5 +92,6 @@ def rotate_sh_rest(sh_rest: np.ndarray, rotation: np.ndarray) -> np.ndarray:
     out = np.empty_like(sh_rest)
     for band, d in band_rotation_matrices(rotation, degree).items():
         s = BAND_SLICES[band]
-        out[:, s, :] = np.einsum("ij,njc->nic", d, sh_rest[:, s, :])
+        # (n, n) @ (N, n, 3) broadcasts to D @ block per Gaussian, in the input dtype.
+        np.matmul(d.astype(sh_rest.dtype), sh_rest[:, s, :], out=out[:, s, :])
     return out

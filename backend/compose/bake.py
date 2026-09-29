@@ -84,8 +84,8 @@ def _apply_color(sh_dc: np.ndarray, sh_rest: np.ndarray, m: np.ndarray) -> tuple
     # and to every rest coefficient equals M · colour for every view direction.
     rgb = 0.5 + C0 * sh_dc.astype(np.float64)
     dc = (rgb @ m.T - 0.5) / C0
-    rest = np.einsum("ij,nkj->nki", m, sh_rest)
-    return dc.astype(np.float32), rest.astype(np.float32)
+    rest = sh_rest @ m.T.astype(np.float32)  # float32: sh_rest is the big (N, K, 3) array
+    return dc.astype(np.float32), rest.astype(np.float32, copy=False)
 
 
 def _select(cloud: GaussianCloud, keep: np.ndarray) -> GaussianCloud:
@@ -102,12 +102,15 @@ def transform_cloud(cloud: GaussianCloud, placement: Placement) -> GaussianCloud
     r = quat_to_matrix(tuple(q))
     s = float(placement.scale)
 
-    means = (s * (src.means.astype(np.float64) @ r.T) + np.asarray(placement.position)).astype(np.float32)
+    means = (s * (src.means.astype(np.float64) @ r.T) + np.asarray(placement.position)).astype(np.float32, copy=False)
     # Unit q_o keeps the norm of the stored (possibly unnormalised) quaternion.
     q_wxyz = np.array([q[3], q[0], q[1], q[2]])
-    quats = quat_multiply_wxyz(q_wxyz, src.quats.astype(np.float64)).astype(np.float32)
-    log_scales = (src.log_scales.astype(np.float64) + math.log(s)).astype(np.float32)
-    sh_rest = rotate_sh_rest(src.sh_rest, r).astype(np.float32)
+    quats = quat_multiply_wxyz(q_wxyz, src.quats.astype(np.float64)).astype(np.float32, copy=False)
+    log_scales = (src.log_scales.astype(np.float64) + math.log(s)).astype(np.float32, copy=False)
+    if np.allclose(r, np.eye(3), atol=1e-12):
+        sh_rest = src.sh_rest  # identity rotation: skip the (large) SH rotation
+    else:
+        sh_rest = rotate_sh_rest(src.sh_rest, r).astype(np.float32, copy=False)
     sh_dc = src.sh_dc.copy()
     if placement.color is not None:
         sh_dc, sh_rest = _apply_color(sh_dc, sh_rest, color_matrix(placement.color))
@@ -117,13 +120,20 @@ def transform_cloud(cloud: GaussianCloud, placement: Placement) -> GaussianCloud
 def merge_clouds(clouds: list[GaussianCloud]) -> GaussianCloud:
     if not clouds:
         raise ValueError("Nothing to merge: no visible splat objects")
+    total = sum(c.count for c in clouds)
+    if total == 0:
+        raise ValueError("All Gaussians were cropped away: nothing to export")
     k = max(c.sh_rest.shape[1] for c in clouds)
-    rest = [np.pad(c.sh_rest, ((0, 0), (0, k - c.sh_rest.shape[1]), (0, 0))) for c in clouds]
+    rest = np.zeros((total, k, 3), dtype=np.float32)
+    offset = 0
+    for c in clouds:
+        rest[offset:offset + c.count, :c.sh_rest.shape[1]] = c.sh_rest
+        offset += c.count
     return GaussianCloud(
         means=np.concatenate([c.means for c in clouds]),
         log_scales=np.concatenate([c.log_scales for c in clouds]),
         quats=np.concatenate([c.quats for c in clouds]),
         opacities=np.concatenate([c.opacities for c in clouds]),
         sh_dc=np.concatenate([c.sh_dc for c in clouds]),
-        sh_rest=np.concatenate(rest),
+        sh_rest=rest,
     )
