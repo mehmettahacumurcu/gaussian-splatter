@@ -3815,3 +3815,12 @@ import { getApiBase, withTokenParam } from "../connection";
 - [ ] **Step 5:** Export; watch progress; download zip; open `merged.ply` in the Viewer tab or another viewer and compare with the editor.
 - [ ] **Step 6:** README: add a short "Sahne Editörü" section (what it does, where files live, `.glb` only).
 - [ ] **Step 7:** Run full suites: `E:/anaconda3/envs/gs4d/python.exe -m pytest tests/compose tests/notebooks -q` and `cd frontend && npx vitest run`. Commit + push.
+
+---
+
+### Task 13 (added after browser testing): arbitrary up vector + inspector fix
+
+See spec §10. Split into two groups:
+
+- **13a Backend:** `backend/compose/orientation.py` (`estimate_asset_up(store, asset_id)` with on-disk cache under `data/compose/cache/`), `SceneDoc.up: Vec3 | None` (unit, finite), `store.create_scene` fills `up`, route `GET /compose/assets/{id}/orientation`. Tests: model validation of `up`, endpoint 200/400/404, cache hit (monkeypatch estimator call count), create_scene sets a unit `up` for a synthetic floor-plane cloud (points on the plane z=0 plus content above → up ≈ +z), failure → `up` null.
+- **13b Frontend:** `types.ts` `up?: Vec3 | null`; `effectiveUp(doc)` helper; reducer `setUp`; `composeApi.getAssetOrientation`; toolbar selector (Otomatik/+Y/−Y); OrbitRig uses the up vector; `snap.ts` generalised to any up; mesh insert orientation from up; Inspector "Dikleştir" for non-base splats; NumberField stale-revert fix. Tests: effectiveUp, reducer setUp, snap with a tilted up (plain three meshes), Dikleştir quaternion helper, NumberField regression (Enter then immediate blur keeps the new value; second field edit doesn't revert the first).

@@ -258,3 +258,33 @@ by both suites via relative path), colour matrix, compose API client.
 Task 0 spike: confirm in Spark 0.1.10 that `SplatEdit` under a `SplatMesh`
 only affects that mesh, how `recolor` combines, and that `SplatMesh.raycast`
 returns hits.
+
+## 10. Amendment (2026-09-30): arbitrary up vector, found in browser testing
+
+Manual testing on `myroom_v2` showed the `viewUp ∈ {y, -y}` assumption is wrong
+for real captures: COLMAP frames are arbitrary (this room's floor normal is
+≈ (−0.94, −0.11, −0.32), i.e. the scene lies on its side), so snap-to-ground
+found nothing below objects. The repo already has a tested estimator,
+`backend/image_to_scene/orientation.py::estimate_world_orientation` (RANSAC
+floor plane, content-asymmetry sign; ~2 s on 100k Gaussians).
+
+Changes:
+
+- **SceneDoc:** new optional field `up: [x,y,z] | null` (unit; norm within
+  1e-3, then normalised; finite). When set it overrides `viewUp`; effective up =
+  `up ?? (viewUp == "-y" ? [0,-1,0] : [0,1,0])`. Still view-only (camera up,
+  snap direction, mesh insert orientation); never baked. Backward compatible.
+- **Orientation endpoint:** `GET /compose/assets/{id}/orientation` →
+  `{up, tilt_deg, plane_inlier_frac, above_below_ratio}` for splat assets
+  (400 for meshes, 404 unknown), computed from means + sigmoid(opacity)
+  weights, cached on disk keyed by asset id + file size + mtime.
+- **Scene creation** sets `up` from the base asset's orientation (falls back to
+  null on failure).
+- **Editor:** "Yukarı" selector offers `Otomatik (zemin)`, `+Y`, `−Y`; snap and
+  the orbit camera use the effective up vector (any direction); inserted meshes
+  are rotated so their +Y matches it. Splat objects get a **"Dikleştir"**
+  (straighten) action: rotate the object so its own estimated up (from its
+  asset's orientation) maps onto the scene up, keeping position and scale.
+- **Bug fix:** inspector number fields could re-commit a stale value when a
+  field was left right after pressing Enter (the field text was reset to the
+  old value until the prop update arrived), silently undoing the edit.
