@@ -50,10 +50,28 @@ def sh_degree_for_coeffs(k: int) -> int:
     raise PlyFormatError(f"Unsupported SH coefficient count: {k}")
 
 
-def read_ply_header(path: str | Path) -> tuple[int, list[str]]:
-    """Parse only the header: (vertex count, vertex property names)."""
+_TYPE_SIZES = {
+    "char": 1, "int8": 1, "uchar": 1, "uint8": 1,
+    "short": 2, "int16": 2, "ushort": 2, "uint16": 2,
+    "int": 4, "int32": 4, "uint": 4, "uint32": 4, "float": 4, "float32": 4,
+    "double": 8, "float64": 8,
+}
+
+
+@dataclass
+class _Header:
+    count: int
+    props: list[str]
+    fmt: str
+    row_stride: int | None  # None when a vertex property is a list / unknown type
+    header_len: int
+
+
+def _parse_header(path: str | Path) -> _Header:
     count: int | None = None
     props: list[str] = []
+    fmt = ""
+    stride: int | None = 0
     in_vertex = False
     with open(path, "rb") as fh:
         if fh.readline().strip() != b"ply":
@@ -64,11 +82,14 @@ def read_ply_header(path: str | Path) -> tuple[int, list[str]]:
                 raise PlyFormatError("PLY header has no end_header")
             line = raw.decode("ascii", errors="replace").strip()
             if line == "end_header":
+                header_len = fh.tell()
                 break
             parts = line.split()
             if not parts:
                 continue
-            if parts[0] == "element":
+            if parts[0] == "format" and len(parts) >= 2:
+                fmt = parts[1]
+            elif parts[0] == "element":
                 in_vertex = len(parts) >= 3 and parts[1] == "vertex"
                 if in_vertex:
                     try:
@@ -77,16 +98,25 @@ def read_ply_header(path: str | Path) -> tuple[int, list[str]]:
                         raise PlyFormatError(f"Bad vertex count: {parts[2]}") from exc
             elif parts[0] == "property" and in_vertex:
                 props.append(parts[-1])
+                size = _TYPE_SIZES.get(parts[1]) if len(parts) == 3 else None
+                stride = None if (size is None or stride is None) else stride + size
         else:
             raise PlyFormatError("PLY header too long")
     if count is None:
         raise PlyFormatError("PLY has no vertex element")
-    return count, props
+    return _Header(count, props, fmt, stride, header_len)
+
+
+def read_ply_header(path: str | Path) -> tuple[int, list[str]]:
+    """Parse only the header: (vertex count, vertex property names)."""
+    header = _parse_header(path)
+    return header.count, header.props
 
 
 def validate_ply(path: str | Path) -> int:
     """Check that ``path`` is a Gaussian-splat PLY. Returns the Gaussian count."""
-    count, props = read_ply_header(path)
+    header = _parse_header(path)
+    count, props = header.count, header.props
     missing = [f for f in REQUIRED_FIELDS if f not in props]
     if missing:
         raise PlyFormatError(f"Not a Gaussian-splat PLY, missing fields: {', '.join(missing)}")
@@ -98,6 +128,11 @@ def validate_ply(path: str | Path) -> int:
         raise PlyFormatError("f_rest fields must be numbered contiguously from f_rest_0")
     if count <= 0:
         raise PlyFormatError("PLY contains no Gaussians")
+    # Binary rows are fixed-size, so a short file is detectable without reading it.
+    # Only the vertex element is checked: it comes first in every 3DGS file.
+    if header.fmt.startswith("binary") and header.row_stride is not None:
+        if Path(path).stat().st_size < header.header_len + count * header.row_stride:
+            raise PlyFormatError("PLY file is truncated")
     return count
 
 

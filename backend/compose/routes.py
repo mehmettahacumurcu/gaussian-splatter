@@ -1,16 +1,25 @@
 """/compose API: assets, scene documents and export jobs."""
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
+from pydantic import ValidationError
 
 from .exporter import missing_assets, run_export
 from .models import Asset, CreateSceneRequest, ExportResponse, SceneDoc, SceneSummary
-from .store import AssetError, ComposeStore
+from .store import AssetError, ComposeStore, SceneFileError
 
+_SCENE_BODY_OPENAPI = {
+    "requestBody": {
+        "required": True,
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SceneDoc"}}},
+    }
+}
 _MEDIA_TYPES = {"splat": "application/octet-stream", "mesh": "model/gltf-binary"}
 
 
@@ -21,6 +30,13 @@ def _kind_errors(doc: SceneDoc, store: ComposeStore) -> list[str]:
         if asset is not None and asset.kind != obj.kind:
             errors.append(f"object {obj.id} is a {obj.kind} but asset {obj.asset} is a {asset.kind}")
     return errors
+
+
+def _load_scene(store: ComposeStore, scene_id: str) -> SceneDoc | None:
+    try:
+        return store.load_scene(scene_id)
+    except SceneFileError as exc:
+        raise HTTPException(409, f"Scene file is unreadable: {exc}") from exc
 
 
 def build_compose_router(data_root: str | Path, get_manager: Callable[[], Any]) -> APIRouter:
@@ -62,15 +78,27 @@ def build_compose_router(data_root: str | Path, get_manager: Callable[[], Any]) 
 
     @router.get("/scenes/{scene_id}", response_model=SceneDoc)
     def get_scene(scene_id: str) -> SceneDoc:
-        doc = store.load_scene(scene_id)
+        doc = _load_scene(store, scene_id)
         if doc is None:
             raise HTTPException(404, f"Scene not found: {scene_id}")
         return doc
 
-    @router.put("/scenes/{scene_id}", response_model=SceneDoc)
-    def save_scene(scene_id: str, doc: SceneDoc) -> SceneDoc:
+    # The body is validated by hand: FastAPI's own 422 response cannot be encoded when
+    # the offending input is NaN/Infinity (it would surface as a 500).
+    @router.put("/scenes/{scene_id}", response_model=SceneDoc, openapi_extra=_SCENE_BODY_OPENAPI)
+    async def save_scene(scene_id: str, request: Request) -> SceneDoc:
+        try:
+            doc = SceneDoc.model_validate_json(await request.body())
+        except ValidationError as exc:
+            detail = json.loads(exc.json(include_input=False, include_url=False, include_context=False))
+            raise HTTPException(422, detail) from exc
+        return await run_in_threadpool(_save_scene, scene_id, doc)
+
+    def _save_scene(scene_id: str, doc: SceneDoc) -> SceneDoc:
         if doc.id != scene_id:
             raise HTTPException(400, "Scene id in body does not match the URL")
+        if not store.scene_exists(scene_id):
+            raise HTTPException(404, f"Scene not found: {scene_id}")
         errors = _kind_errors(doc, store)
         if errors:
             raise HTTPException(400, "; ".join(errors))
@@ -79,7 +107,7 @@ def build_compose_router(data_root: str | Path, get_manager: Callable[[], Any]) 
 
     @router.post("/scenes/{scene_id}/export", response_model=ExportResponse, status_code=202)
     def export_scene(scene_id: str) -> ExportResponse:
-        doc = store.load_scene(scene_id)
+        doc = _load_scene(store, scene_id)
         if doc is None:
             raise HTTPException(404, f"Scene not found: {scene_id}")
         missing = missing_assets(doc, store)
@@ -89,12 +117,17 @@ def build_compose_router(data_root: str | Path, get_manager: Callable[[], Any]) 
             raise HTTPException(400, "No visible splat objects to export")
         manager = get_manager()
         job = manager.create(scene=f"compose-{scene_id}")
-        manager.submit(job.id, lambda cb: run_export(doc, store, cb))
+        job_id = job.id
+
+        def cancelled() -> bool:
+            return bool(getattr(manager, "cancel_requested", lambda _id: False)(job_id))
+
+        manager.submit(job_id, lambda cb: run_export(doc, store, cb, cancelled))
         return ExportResponse(job_id=job.id)
 
     @router.get("/exports/{scene_id}/download")
     def download_export(scene_id: str) -> FileResponse:
-        doc = store.load_scene(scene_id)
+        doc = _load_scene(store, scene_id)
         zip_path = store.export_zip(scene_id) if doc else None
         if doc is None or zip_path is None or not zip_path.is_file():
             raise HTTPException(404, f"No export for scene: {scene_id}")

@@ -15,15 +15,19 @@ import os
 import re
 import secrets
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import BinaryIO
 
+from pydantic import ValidationError
+
 from .glb import GlbFormatError, validate_glb
-from .models import ID_PATTERN, Asset, SceneDoc, SceneObject, SceneSummary
+from .models import ASSET_REF_PATTERN, ID_PATTERN, Asset, SceneDoc, SceneObject, SceneSummary
 from .plyio import PlyFormatError, validate_ply
 
 _ID_RE = re.compile(ID_PATTERN)
+_REF_RE = re.compile(ASSET_REF_PATTERN)
 PIPELINE_PREFIX = "scene__"
 _KIND_BY_EXT = {".ply": "splat", ".glb": "mesh"}
 _EXT_BY_KIND = {"splat": ".ply", "mesh": ".glb"}
@@ -33,14 +37,35 @@ class AssetError(ValueError):
     """Upload rejected (wrong type or unreadable content)."""
 
 
+class SceneFileError(ValueError):
+    """A stored scene document exists but cannot be parsed."""
+
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(6)}"
 
 
+def replace_with_retry(src: str | Path, dst: str | Path, tries: int = 5, delay: float = 0.2) -> None:
+    """``os.replace`` that tolerates transient Windows locks (antivirus, open handles)."""
+    for attempt in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(delay)
+
+
 def _atomic_write_text(path: Path, text: str) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        replace_with_retry(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
 
 
 class ComposeStore:
@@ -78,7 +103,7 @@ class ComposeStore:
         except BaseException:
             part.unlink(missing_ok=True)
             raise
-        os.replace(part, final)
+        replace_with_retry(part, final)
         asset = Asset(
             id=asset_id,
             kind=kind,
@@ -99,6 +124,8 @@ class ComposeStore:
         return plys[-1] if plys else None
 
     def _pipeline_asset(self, scene_name: str) -> Asset | None:
+        if not _REF_RE.fullmatch(PIPELINE_PREFIX + scene_name):
+            return None
         ply = self._pipeline_ply(scene_name)
         if ply is None:
             return None
@@ -115,19 +142,21 @@ class ComposeStore:
                     out.append(asset)
         if self.data_root.is_dir():
             for d in sorted(self.data_root.iterdir()):
-                if d.is_dir() and d.name != "compose" and _ID_RE.match(PIPELINE_PREFIX + d.name) \
-                        and _ID_RE.match(d.name):
+                if d.is_dir() and d.name != "compose" and _REF_RE.fullmatch(PIPELINE_PREFIX + d.name) \
+                        and _REF_RE.fullmatch(d.name):
                     asset = self._pipeline_asset(d.name)
                     if asset is not None:
                         out.append(asset)
         return out
 
     def get_asset(self, asset_id: str) -> Asset | None:
-        if not _ID_RE.match(asset_id):
+        if not _REF_RE.fullmatch(asset_id):
             return None
         if asset_id.startswith(PIPELINE_PREFIX):
             name = asset_id[len(PIPELINE_PREFIX):]
-            return self._pipeline_asset(name) if _ID_RE.match(name) else None
+            return self._pipeline_asset(name) if _REF_RE.fullmatch(name) else None
+        if not _ID_RE.fullmatch(asset_id):
+            return None
         meta = self.assets_dir / f"{asset_id}.json"
         if not meta.is_file():
             return None
@@ -159,13 +188,19 @@ class ComposeStore:
         self._ensure_dirs()
         _atomic_write_text(self.scenes_dir / f"{doc.id}.json", doc.model_dump_json(indent=2))
 
+    def scene_exists(self, scene_id: str) -> bool:
+        return bool(_ID_RE.fullmatch(scene_id)) and (self.scenes_dir / f"{scene_id}.json").is_file()
+
     def load_scene(self, scene_id: str) -> SceneDoc | None:
-        if not _ID_RE.match(scene_id):
+        if not _ID_RE.fullmatch(scene_id):
             return None
         path = self.scenes_dir / f"{scene_id}.json"
         if not path.is_file():
             return None
-        return SceneDoc.model_validate_json(path.read_text(encoding="utf-8"))
+        try:
+            return SceneDoc.model_validate_json(path.read_text(encoding="utf-8"))
+        except (ValidationError, ValueError, OSError) as exc:
+            raise SceneFileError(str(exc)) from exc
 
     def list_scenes(self) -> list[SceneSummary]:
         out: list[SceneSummary] = []

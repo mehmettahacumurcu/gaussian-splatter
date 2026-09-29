@@ -106,6 +106,32 @@ def test_rejects_gap_in_f_rest_suffixes(tmp_path):
         validate_ply(path)
 
 
+def test_rejects_truncated_binary_file(tmp_path):
+    path = write_ply(random_cloud(50, degree=3, seed=1), tmp_path / "ok.ply")
+    assert validate_ply(path) == 50
+    data = path.read_bytes()
+    cut = tmp_path / "cut.ply"
+    cut.write_bytes(data[: len(data) - 100])
+    with pytest.raises(PlyFormatError, match="truncated"):
+        validate_ply(cut)
+
+
+def test_accepts_binary_file_with_trailing_bytes(tmp_path):
+    path = write_ply(random_cloud(10, degree=0, seed=1), tmp_path / "ok.ply")
+    path.write_bytes(path.read_bytes() + b"\x00" * 16)
+    assert validate_ply(path) == 10
+
+
+def test_truncation_check_skipped_for_ascii(tmp_path):
+    names = ["x", "y", "z", "f_dc_0", "f_dc_1", "f_dc_2", "opacity",
+             "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"]
+    header = "ply\nformat ascii 1.0\nelement vertex 3\n" + "".join(
+        f"property float {n}\n" for n in names) + "end_header\n"
+    path = tmp_path / "a.ply"
+    path.write_bytes(header.encode() + b"0 " * 14 + b"\n")  # fewer rows than declared
+    assert validate_ply(path) == 3
+
+
 def test_read_ply_speed_guard(tmp_path):
     import time
 

@@ -8,6 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 # Safe for use in file names: no separators, no leading dot.
 ID_PATTERN = r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,79}$"
+# Reference to an asset: uploaded ids plus ``scene__<name>`` pipeline ids, whose
+# names may contain Unicode letters. Still no leading dot and no separators.
+ASSET_REF_PATTERN = r"^[\w-][\w.-]{0,79}$"
 
 Vec3 = tuple[float, float, float]
 Quat = tuple[float, float, float, float]  # three.js order: x, y, z, w
@@ -21,7 +24,7 @@ def _unit_quat(q: Quat) -> Quat:
 
 
 class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
 
 class Transform(_Strict):
@@ -76,7 +79,7 @@ class ColorAdjust(_Strict):
 class SceneObject(_Strict):
     id: str = Field(pattern=ID_PATTERN)
     kind: Literal["splat", "mesh"]
-    asset: str = Field(pattern=ID_PATTERN)
+    asset: str = Field(pattern=ASSET_REF_PATTERN)
     name: str = Field(min_length=1, max_length=128)
     role: Literal["base", "object"] = "object"
     visible: bool = True
@@ -115,7 +118,7 @@ class SceneDoc(_Strict):
 
 
 class Asset(_Strict):
-    id: str
+    id: str = Field(pattern=ASSET_REF_PATTERN)
     kind: Literal["splat", "mesh"]
     name: str
     size_bytes: int
@@ -132,7 +135,7 @@ class SceneSummary(BaseModel):
 
 class CreateSceneRequest(_Strict):
     name: str = Field(min_length=1, max_length=128)
-    base_asset: str = Field(pattern=ID_PATTERN)
+    base_asset: str = Field(pattern=ASSET_REF_PATTERN)
 
 
 class ExportResponse(BaseModel):
