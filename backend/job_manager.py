@@ -35,25 +35,40 @@ def _phase_order() -> list[str]:
     return list(PHASE_WEIGHTS.keys())
 
 
-def _compute_overall(phase_name: str, phase_progress: float,
-                     skip_foundation: bool = True) -> float:
-    """Hangi fazdayız + o faz ne kadar tamamlandı → toplam ilerleme (0-1)."""
-    order = _phase_order()
-    weights = dict(PHASE_WEIGHTS)
-    if skip_foundation:
-        weights["foundation"] = 0.0
+# Scene-composer export jobs have their own short phase sequence.
+COMPOSE_PHASE_WEIGHTS = {
+    "compose_load":  0.05,
+    "compose_bake":  0.70,
+    "compose_write": 0.25,
+}
 
+
+def _progress_in(weights: dict[str, float], phase_name: str, phase_progress: float) -> float:
     total = sum(weights.values()) or 1.0
-    # Normalize
-    weights = {k: v / total for k, v in weights.items()}
-
     done = 0.0
-    for name in order:
+    for name, weight in weights.items():
         if name == phase_name:
-            done += weights[name] * max(0.0, min(1.0, phase_progress))
+            done += weight * max(0.0, min(1.0, phase_progress))
             break
-        done += weights[name]
-    return min(done, 1.0)
+        done += weight
+    return min(done / total, 1.0)
+
+
+def _compute_overall(phase_name: str, phase_progress: float,
+                     skip_foundation: bool = True) -> float | None:
+    """Hangi fazdayız + o faz ne kadar tamamlandı → toplam ilerleme (0-1).
+
+    Bilinmeyen fazlar için None döner; çağıran taraf ilerlemeyi geri almadan
+    kendi başına günceller.
+    """
+    if phase_name in COMPOSE_PHASE_WEIGHTS:
+        return _progress_in(COMPOSE_PHASE_WEIGHTS, phase_name, phase_progress)
+    if phase_name in PHASE_WEIGHTS:
+        weights = dict(PHASE_WEIGHTS)
+        if skip_foundation:
+            weights["foundation"] = 0.0
+        return _progress_in(weights, phase_name, phase_progress)
+    return None
 
 
 class JobManager:
@@ -132,11 +147,14 @@ class JobManager:
             job.phase = PhaseProgress(name="done", progress=1.0, message="Tamamlandı")
             if result is not None:
                 job.result = result
-            # İndirilebilir URL'i set et
-            ply_dir = self.data_dir / job.scene / "output" / "ply"
-            if ply_dir.exists():
-                job.ply_dir = str(ply_dir)
-                job.download_url = f"/download/{job_id}"
+            if result and result.get("download_url"):
+                job.download_url = result["download_url"]
+            else:
+                # İndirilebilir URL'i set et
+                ply_dir = self.data_dir / job.scene / "output" / "ply"
+                if ply_dir.exists():
+                    job.ply_dir = str(ply_dir)
+                    job.download_url = f"/download/{job_id}"
 
     def _mark_failed(self, job_id: str, error: str) -> None:
         with self._lock:
@@ -156,7 +174,12 @@ class JobManager:
             job.phase = PhaseProgress(
                 name=phase, progress=progress, message=message, details=details,
             )
-            job.overall_progress = _compute_overall(phase, progress)
+            overall = _compute_overall(phase, progress)
+            if overall is None:
+                # Bilinmeyen faz (eval, image-to-splat aşamaları, ...): hemen
+                # %100'e atlama ve geri gitme — mevcut değerle maksimumunu al.
+                overall = max(job.overall_progress, max(0.0, min(1.0, progress)))
+            job.overall_progress = overall
 
     # ------------------------------------------------------------------
     # Query

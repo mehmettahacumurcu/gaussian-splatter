@@ -31,7 +31,8 @@ from .api_models import (
     JobStatus,
     ProcessResponse,
 )
-from .config import default_config, cloud_config, local_max_config, safe_4d_8gb_config, scene_paths
+from .compose.routes import build_compose_router
+from .config import DATA_ROOT, default_config, cloud_config, local_max_config, safe_4d_8gb_config, scene_paths
 from .job_manager import JobManager, get_manager
 from .pipeline import run_pipeline
 from .notebooks.routes import static_notebook_router
@@ -61,6 +62,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.include_router(static_notebook_router)
+app.include_router(build_compose_router(DATA_ROOT, get_manager))
 
 
 # CORS — Tauri / localhost client'ları için.
@@ -81,7 +83,7 @@ app.add_middleware(
     ],
     allow_origin_regex=r"^(https?://(localhost|127\.0\.0\.1)(:\d+)?|tauri://localhost|https://tauri\.localhost)$",
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
 )
