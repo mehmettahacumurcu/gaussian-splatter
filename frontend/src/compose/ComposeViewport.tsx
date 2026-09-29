@@ -11,12 +11,14 @@ import {
 import { OrbitControls, TransformControls } from "@react-three/drei";
 import type { OrbitControls as OrbitControlsImpl, TransformControls as TransformControlsImpl } from "three-stdlib";
 import type * as THREE from "three";
+import { Vector3 } from "three";
 import { SparkRenderer } from "@sparkjsdev/spark";
 import { MeshObject } from "./MeshObject";
 import type { ObjectRegistry } from "./registry";
 import { SplatObject } from "./SplatObject";
-import { CROP_BOX_HALF_EXTENT, readCrop, readTransform, uniformScaleFrom } from "./transformMath";
-import type { CropBox, GizmoMode, SceneDoc, SceneObject, Transform, Vec3, ViewUp } from "./types";
+import { CROP_BOX_HALF_EXTENT, orbitPositionForUp, readCrop, readTransform, uniformScaleFrom } from "./transformMath";
+import type { CropBox, GizmoMode, SceneDoc, SceneObject, Transform, Vec3 } from "./types";
+import { effectiveUp, upKey } from "./upVector";
 
 interface ViewportProps {
   doc: SceneDoc;
@@ -76,14 +78,15 @@ function SparkLayer() {
 }
 
 /**
- * Orbit controls that follow `viewUp` without remounting the Canvas (which
- * would reload every asset): camera.up is set first, then the controls are
- * recreated (OrbitControls reads camera.up only at construction), keeping the
- * previous orbit target.
+ * Orbit controls that follow the scene up vector (any direction) without
+ * remounting the Canvas (which would reload every asset): camera.up is set
+ * first and the camera re-placed around the kept orbit target, then the
+ * controls are recreated (OrbitControls reads camera.up only at construction).
  */
-function OrbitRig({ viewUp }: { viewUp: ViewUp }) {
+function OrbitRig({ up }: { up: Vec3 }) {
   const camera = useThree((s) => s.camera);
-  const [applied, setApplied] = useState<{ viewUp: ViewUp; target: Vec3 } | null>(null);
+  const key = upKey(up);
+  const [applied, setApplied] = useState<{ key: string; target: Vec3 } | null>(null);
   // Last mounted controls (kept after unmount so the new ones inherit the target).
   const lastControls = useRef<OrbitControlsImpl | null>(null);
   const keepControls = useCallback((c: OrbitControlsImpl | null) => {
@@ -91,23 +94,26 @@ function OrbitRig({ viewUp }: { viewUp: ViewUp }) {
   }, []);
 
   useLayoutEffect(() => {
-    const sign = viewUp === "-y" ? -1 : 1;
     const prev = lastControls.current;
     const target: Vec3 = prev ? [prev.target.x, prev.target.y, prev.target.z] : [0, 0, 0];
-    if (camera.up.y !== sign) {
-      // Mirror the camera about the target's horizontal plane so the same
-      // elevation is kept relative to the new up.
-      camera.position.y = 2 * target[1] - camera.position.y;
-      camera.up.set(0, sign, 0);
+    const newUp = new Vector3(...up);
+    if (camera.up.angleTo(newUp) > 1e-4) {
+      const pos = orbitPositionForUp(
+        [camera.position.x, camera.position.y, camera.position.z],
+        target,
+        [camera.up.x, camera.up.y, camera.up.z],
+        up,
+      );
+      camera.position.set(...pos);
+      camera.up.copy(newUp);
       camera.lookAt(target[0], target[1], target[2]);
     }
-    setApplied({ viewUp, target });
-  }, [viewUp, camera]);
+    setApplied({ key, target });
+    // `key` stands for `up`'s value: a new array with the same numbers is no change.
+  }, [key, camera]);
 
-  if (!applied || applied.viewUp !== viewUp) return null;
-  return (
-    <OrbitControls key={viewUp} ref={keepControls} makeDefault enableDamping={false} target={applied.target} />
-  );
+  if (!applied || applied.key !== key) return null;
+  return <OrbitControls key={key} ref={keepControls} makeDefault enableDamping={false} target={applied.target} />;
 }
 
 function ControlsBridge({ onControls }: { onControls: ViewportProps["onControls"] }) {
@@ -286,11 +292,25 @@ function Gizmo({
   );
 }
 
+/** Start 4 m back and 1.5 m up from the origin, relative to `up`. */
+function initialCameraFor(up: Vec3): { position: Vec3; up: Vec3 } {
+  return { position: orbitPositionForUp([0, 0, 4], [0, 0, 0], [0, 1, 0], up, Math.atan2(1.5, 4)), up };
+}
+
+/** Key light above the scene along `up`, slightly off-axis ([5, ±10, 5] for ±Y). */
+function lightPositionFor(up: Vec3): Vec3 {
+  return [5 + 10 * up[0], 10 * up[1], 5 + 10 * up[2]];
+}
+
 export function ComposeViewport(props: ViewportProps) {
   const { doc, active, selectedId, registry, assetUrl, onSelect, onError, onControls } = props;
   const gizmoBusy = useRef(false);
-  // Initial camera only (R3F applies `camera` once); OrbitRig handles later viewUp changes.
-  const upSign = doc.viewUp === "-y" ? -1 : 1;
+  const up = effectiveUp(doc);
+  const upStr = upKey(up);
+  // Initial camera only (R3F applies `camera` once per Canvas, i.e. per doc.id);
+  // OrbitRig handles later up changes.
+  const initialCamera = useMemo(() => initialCameraFor(up), [doc.id]);
+  const lightPosition = useMemo(() => lightPositionFor(up), [upStr]);
   return (
     <Canvas
       key={doc.id}
@@ -300,14 +320,14 @@ export function ComposeViewport(props: ViewportProps) {
       gl={{ antialias: false }}
       flat
       frameloop={active ? "always" : "never"}
-      camera={{ position: [0, 1.5 * upSign, 4], up: [0, upSign, 0], fov: 60, near: 0.01, far: 2000 }}
+      camera={{ ...initialCamera, fov: 60, near: 0.01, far: 2000 }}
       onPointerMissed={() => {
         if (!gizmoBusy.current) onSelect(null);
       }}
       style={{ width: "100%", height: "100%", background: "#101015" }}
     >
       <ambientLight intensity={0.7} />
-      <directionalLight position={[5, 10 * upSign, 5]} intensity={1.2} />
+      <directionalLight position={lightPosition} intensity={1.2} />
       <SparkLayer />
       {doc.objects.map((o) =>
         o.kind === "splat" ? (
@@ -333,7 +353,7 @@ export function ComposeViewport(props: ViewportProps) {
           />
         ),
       )}
-      <OrbitRig viewUp={doc.viewUp} />
+      <OrbitRig up={up} />
       <ControlsBridge onControls={onControls} />
       <GizmoBusyReset gizmoBusy={gizmoBusy} />
       <Gizmo {...props} gizmoBusy={gizmoBusy} />

@@ -1,6 +1,6 @@
 import { fetchJson } from "../api";
 import { getApiBase, withTokenParam } from "../connection";
-import type { Asset, SceneDoc, SceneSummary } from "./types";
+import type { Asset, AssetOrientation, SceneDoc, SceneSummary } from "./types";
 
 const JSON_HEADERS = { "Content-Type": "application/json" };
 const enc = encodeURIComponent;
@@ -17,6 +17,11 @@ export function uploadAsset(file: File): Promise<Asset> {
 
 export function assetFileUrl(assetId: string): string {
   return withTokenParam(`${getApiBase()}/compose/assets/${enc(assetId)}/file`);
+}
+
+/** Floor-plane up estimate of a splat asset (400 for meshes, 503 while busy). */
+export function getAssetOrientation(assetId: string): Promise<AssetOrientation> {
+  return fetchJson<AssetOrientation>(`/compose/assets/${enc(assetId)}/orientation`);
 }
 
 export function listScenes(): Promise<SceneSummary[]> {

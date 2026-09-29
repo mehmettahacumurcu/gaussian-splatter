@@ -1,5 +1,5 @@
 import { Matrix4, Object3D, Quaternion, Vector3 } from "three";
-import type { CropBox, Transform, Vec3 } from "./types";
+import type { CropBox, Quat, Transform, Vec3 } from "./types";
 
 /** Same order as backend bake: scale → rotate → translate. */
 export function transformMatrix(t: Transform): Matrix4 {
@@ -77,4 +77,59 @@ export function isValidTransform(t: Transform): boolean {
   if (t.scale <= 0) return false;
   const norm = Math.hypot(...t.quaternion);
   return Math.abs(norm - 1) <= 1e-3;
+}
+
+function toQuat(q: Quaternion): Quat {
+  return [q.x, q.y, q.z, q.w];
+}
+
+/** Rotation for a newly inserted glTF mesh (+Y up) so its up matches the scene up. */
+export function meshInsertQuaternion(sceneUp: Vec3): Quat {
+  return toQuat(new Quaternion().setFromUnitVectors(new Vector3(0, 1, 0), new Vector3(...sceneUp).normalize()));
+}
+
+/**
+ * "Dikleştir": the rotation that maps the object's own up (`objUp`, in its
+ * local/raw frame) onto `sceneUp`, reached by the smallest turn from the
+ * current rotation (so the heading the user chose is kept as far as
+ * possible). From identity this is exactly setFromUnitVectors(objUp, sceneUp).
+ */
+export function straightenQuaternion(current: Quat, objUp: Vec3, sceneUp: Vec3): Quat {
+  const q = new Quaternion(...current).normalize();
+  const worldObjUp = new Vector3(...objUp).normalize().applyQuaternion(q);
+  const fix = new Quaternion().setFromUnitVectors(worldObjUp, new Vector3(...sceneUp).normalize());
+  return toQuat(fix.multiply(q).normalize());
+}
+
+const MAX_ELEVATION = (85 * Math.PI) / 180;
+
+/**
+ * Orbit camera position for a new up vector: same distance to `target`, same
+ * heading (direction projected on the plane ⟂ `newUp`) and the same elevation
+ * above the horizon that it had relative to `oldUp` (or `elevation`, radians),
+ * clamped to ±85° so lookAt stays well defined.
+ */
+export function orbitPositionForUp(position: Vec3, target: Vec3, oldUp: Vec3, newUp: Vec3, elevation?: number): Vec3 {
+  const t = new Vector3(...target);
+  const d = new Vector3(...position).sub(t);
+  let dist = d.length();
+  if (!(dist > 1e-6)) {
+    dist = 4;
+    d.set(0, 0, 1);
+  }
+  d.normalize();
+  const up = new Vector3(...newUp).normalize();
+  const elev = Math.max(
+    -MAX_ELEVATION,
+    Math.min(MAX_ELEVATION, elevation ?? Math.asin(Math.max(-1, Math.min(1, d.dot(new Vector3(...oldUp).normalize()))))),
+  );
+  const h = d.clone().addScaledVector(up, -d.dot(up));
+  if (h.lengthSq() < 1e-12) {
+    // Looking straight along the new up: any horizontal direction will do.
+    const axis = Math.abs(up.x) < 0.9 ? new Vector3(1, 0, 0) : new Vector3(0, 0, 1);
+    h.crossVectors(up, axis);
+  }
+  h.normalize();
+  const p = t.addScaledVector(up, Math.sin(elev) * dist).addScaledVector(h, Math.cos(elev) * dist);
+  return [p.x, p.y, p.z];
 }

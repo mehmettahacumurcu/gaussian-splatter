@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { Euler, Quaternion } from "three";
 import { hexToTint, tintToHex } from "./colorMath";
 import { DEFAULT_COLOR, type ColorAdjust, type SceneObject, type Transform } from "./types";
@@ -12,34 +12,60 @@ interface Props {
   onCropEditing: (editing: boolean) => void;
   onColor: (c: ColorAdjust | null) => void;
   onSnap: () => void;
+  /** "Dikleştir" (non-base splats): align the object's own floor up with the scene up. */
+  onStraighten?: () => void;
 }
 
 const RAD = Math.PI / 180;
 const AXES = ["X", "Y", "Z"];
 
-/** Numeric input that commits on blur / Enter only (never per keystroke). */
+/**
+ * Numeric input that commits on blur / Enter only (never per keystroke).
+ *
+ * After an accepted commit the text is left as typed until the new `value`
+ * prop arrives (synced in a layout effect, before any later event can run);
+ * `committed` remembers the last committed text so a blur right after Enter
+ * is a no-op instead of re-committing a stale value.
+ */
 function NumberField({
   label,
   value,
   step = 0.01,
   disabled,
+  isValid,
   onCommit,
 }: {
   label: string;
   value: number;
   step?: number;
   disabled?: boolean;
+  /** Extra acceptance test; rejected values are reverted in the field. */
+  isValid?: (v: number) => boolean;
   onCommit: (v: number) => void;
 }) {
   const [text, setText] = useState(value.toFixed(3));
-  useEffect(() => setText(value.toFixed(3)), [value]);
+  // Last text/number that the field committed or received as a prop.
+  const committed = useRef({ text: value.toFixed(3), value });
+  // Bumped on each accepted commit so the next render re-syncs from the prop
+  // even when the parent's value came back unchanged (e.g. a rejected edit).
+  const [syncTick, setSyncTick] = useState(0);
+  useLayoutEffect(() => {
+    const shown = value.toFixed(3);
+    committed.current = { text: shown, value };
+    setText(shown);
+  }, [value, syncTick]);
+
   const commit = () => {
-    // Unedited field: the text is only the rounded value, don't write it back.
-    if (text === value.toFixed(3)) return;
+    // Unedited (the text is only the rounded value) or already committed.
+    if (text === committed.current.text) return;
     const v = parseFloat(text);
-    if (Number.isFinite(v) && v !== value) onCommit(v);
-    // Accepted → the new `value` prop replaces this; rejected → show the old value again.
-    setText(value.toFixed(3));
+    if (!Number.isFinite(v) || v === committed.current.value || (isValid && !isValid(v))) {
+      setText(committed.current.text);
+      return;
+    }
+    committed.current = { text, value: v };
+    onCommit(v);
+    setSyncTick((n) => n + 1);
   };
   return (
     <input
@@ -57,9 +83,19 @@ function NumberField({
   );
 }
 
-export function InspectorPanel({ object, cropEditing, onRename, onTransform, onToggleCrop, onCropEditing, onColor, onSnap }: Props) {
+export function InspectorPanel({
+  object,
+  cropEditing,
+  onRename,
+  onTransform,
+  onToggleCrop,
+  onCropEditing,
+  onColor,
+  onSnap,
+  onStraighten,
+}: Props) {
   const [name, setName] = useState(object.name);
-  useEffect(() => setName(object.name), [object.name]);
+  useLayoutEffect(() => setName(object.name), [object.name]);
   const t = object.transform;
   const locked = object.role === "base";
   const euler = new Euler().setFromQuaternion(new Quaternion(...t.quaternion));
@@ -121,12 +157,30 @@ export function InspectorPanel({ object, cropEditing, onRename, onTransform, onT
       </div>
       <div className="compose-vec">
         <span>Ölçek</span>
-        <NumberField label="Ölçek" value={t.scale} disabled={locked} onCommit={(n) => n > 0 && onTransform({ ...t, scale: n })} />
+        <NumberField
+          label="Ölçek"
+          value={t.scale}
+          disabled={locked}
+          isValid={(n) => n > 0}
+          onCommit={(n) => onTransform({ ...t, scale: n })}
+        />
       </div>
       {!locked && (
-        <button type="button" className="btn-secondary" onClick={onSnap}>
-          Zemine oturt
-        </button>
+        <div className="compose-row">
+          <button type="button" className="btn-secondary" onClick={onSnap}>
+            Zemine oturt
+          </button>
+          {object.kind === "splat" && onStraighten && (
+            <button
+              type="button"
+              className="btn-secondary"
+              title="Objeyi kendi zemin düzlemine göre sahnenin yukarı yönüne çevir"
+              onClick={onStraighten}
+            >
+              Dikleştir
+            </button>
+          )}
+        </div>
       )}
 
       {object.kind === "splat" && (

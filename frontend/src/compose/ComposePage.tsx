@@ -9,6 +9,7 @@ import {
   backendUrl,
   createScene,
   exportScene,
+  getAssetOrientation,
   getScene,
   listAssets,
   listScenes,
@@ -21,7 +22,9 @@ import { ObjectListPanel } from "./ObjectListPanel";
 import { ObjectRegistry } from "./registry";
 import { composeReducer, initialComposeState, newObjectId } from "./sceneDoc";
 import { snapToGround } from "./snap";
-import type { Asset, CropBox, GizmoMode, SceneDoc, SceneObject, SceneSummary, Transform } from "./types";
+import { meshInsertQuaternion, straightenQuaternion } from "./transformMath";
+import type { Asset, CropBox, GizmoMode, SceneDoc, SceneObject, SceneSummary, Transform, ViewUp } from "./types";
+import { effectiveUp } from "./upVector";
 import "./compose.css";
 
 type Status = { kind: "info" | "error"; text: string } | null;
@@ -168,8 +171,8 @@ export function ComposePage({ active }: { active: boolean }) {
       visible: true,
       transform: {
         position: target ? [target.x, target.y, target.z] : [0, 0, 0],
-        // glTF is +Y up; flip meshes into COLMAP-style (−Y up) scenes.
-        quaternion: asset.kind === "mesh" && current.viewUp === "-y" ? [1, 0, 0, 0] : [0, 0, 0, 1],
+        // glTF is +Y up; turn meshes so their up matches the scene's (any direction).
+        quaternion: asset.kind === "mesh" ? meshInsertQuaternion(effectiveUp(current)) : [0, 0, 0, 1],
         scale: 1,
       },
     };
@@ -285,6 +288,48 @@ export function ComposePage({ active }: { active: boolean }) {
     }
     dispatch({ type: "setTransform", id: selected.id, transform: { ...selected.transform, position } });
     setStatus(null);
+  };
+
+  /** Toolbar "Yukarı": "auto" = floor-plane up of the base asset, else a fixed ±Y. */
+  const chooseUp = (choice: string) => {
+    if (choice === "y" || choice === "-y") {
+      dispatch({ type: "setUp", up: null, viewUp: choice as ViewUp });
+      return;
+    }
+    if (choice !== "auto") return;
+    const base = stateRef.current.doc?.objects.find((o) => o.role === "base");
+    if (!base) return;
+    void run("Zemin yönü hesaplanıyor…", async (current) => {
+      const o = await getAssetOrientation(base.asset);
+      if (!current()) return;
+      if (!o.measured) {
+        setStatus({ kind: "error", text: "Zemin düzlemi bulunamadı; +Y/−Y seçin" });
+        return;
+      }
+      dispatch({ type: "setUp", up: o.up });
+      setStatus(null);
+    });
+  };
+
+  /** "Dikleştir": rotate a splat object so its own floor up matches the scene up. */
+  const straighten = (id: string) => {
+    const obj = stateRef.current.doc?.objects.find((o) => o.id === id);
+    if (!obj || obj.kind !== "splat" || obj.role === "base") return;
+    void run("Obje yönü hesaplanıyor…", async (current) => {
+      const o = await getAssetOrientation(obj.asset);
+      if (!current()) return;
+      if (!o.measured) {
+        setStatus({ kind: "error", text: "Bu objede zemin düzlemi bulunamadı" });
+        return;
+      }
+      // Latest values: the object may have moved while the request was running.
+      const latestDoc = stateRef.current.doc;
+      const latest = latestDoc?.objects.find((x) => x.id === id);
+      if (!latestDoc || !latest) return;
+      const quaternion = straightenQuaternion(latest.transform.quaternion, o.up, effectiveUp(latestDoc));
+      dispatch({ type: "setTransform", id, transform: { ...latest.transform, quaternion } });
+      setStatus(null);
+    });
   };
 
   const hasDoc = !!doc;
@@ -417,7 +462,8 @@ export function ComposePage({ active }: { active: boolean }) {
         </div>
         <label className="compose-inline">
           Yukarı
-          <select value={doc.viewUp} onChange={(e) => dispatch({ type: "setViewUp", viewUp: e.target.value as "y" | "-y" })}>
+          <select value={doc.up ? "auto" : doc.viewUp} disabled={busy} onChange={(e) => chooseUp(e.target.value)}>
+            <option value="auto">Otomatik (zemin)</option>
             <option value="y">+Y</option>
             <option value="-y">−Y (COLMAP)</option>
           </select>
@@ -491,6 +537,7 @@ export function ComposePage({ active }: { active: boolean }) {
               onCropEditing={setCropEditing}
               onColor={(color) => dispatch({ type: "setColor", id: selected.id, color })}
               onSnap={snap}
+              onStraighten={() => straighten(selected.id)}
             />
           ) : (
             <p className="muted">Düzenlemek için bir obje seç.</p>

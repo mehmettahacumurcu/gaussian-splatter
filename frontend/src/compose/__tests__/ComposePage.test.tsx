@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Job } from "../../api";
-import type { SceneDoc } from "../types";
+import type { AssetOrientation, SceneDoc } from "../types";
 
 vi.mock("../../api", () => ({ getJobStatus: vi.fn() }));
 vi.mock("../composeApi", () => ({
@@ -9,6 +9,7 @@ vi.mock("../composeApi", () => ({
   backendUrl: (path: string) => `http://backend${path}`,
   createScene: vi.fn(),
   exportScene: vi.fn(),
+  getAssetOrientation: vi.fn(),
   getScene: vi.fn(),
   listAssets: vi.fn(),
   listScenes: vi.fn(),
@@ -41,6 +42,20 @@ const DOC: SceneDoc = {
     },
   ],
 };
+
+const STATUE = {
+  id: "o_statue",
+  kind: "splat" as const,
+  asset: "a_statue",
+  name: "statue",
+  role: "object" as const,
+  visible: true,
+  transform: { position: [1, 2, 3] as [number, number, number], quaternion: [0, 0, 0, 1] as [number, number, number, number], scale: 2 },
+};
+
+function orientation(patch: Partial<AssetOrientation>): AssetOrientation {
+  return { up: [0, 0, 1], tilt_deg: 90, plane_inlier_frac: 0.5, above_below_ratio: 4, measured: true, ...patch };
+}
 
 function job(patch: Partial<Job>): Job {
   return {
@@ -172,5 +187,68 @@ describe("ComposePage", () => {
     fireEvent.click(screen.getByRole("button", { name: "← Sahneler" }));
     expect(confirm).toHaveBeenCalledTimes(2);
     expect(await screen.findByRole("heading", { name: "Sahneler" })).toBeInTheDocument();
+  });
+
+  it("'Otomatik (zemin)' uses the base asset's measured floor up", async () => {
+    api.getAssetOrientation.mockResolvedValue(orientation({ up: [0, 0, 2] }));
+    api.saveScene.mockImplementation(async (d) => d);
+    await openScene();
+
+    fireEvent.change(screen.getByDisplayValue("+Y"), { target: { value: "auto" } });
+    expect(await screen.findByDisplayValue("Otomatik (zemin)")).toBeInTheDocument();
+    expect(api.getAssetOrientation).toHaveBeenCalledWith("a1");
+    expect(screen.getByText(/Bahçe •/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Kaydet" }));
+    await waitFor(() => expect(api.saveScene).toHaveBeenCalledTimes(1));
+    expect(api.saveScene.mock.calls[0][0].up).toEqual([0, 0, 1]);
+
+    // Back to a fixed axis clears the vector.
+    fireEvent.change(screen.getByDisplayValue("Otomatik (zemin)"), { target: { value: "-y" } });
+    expect(screen.getByDisplayValue("−Y (COLMAP)")).toBeInTheDocument();
+  });
+
+  it("'Otomatik (zemin)' reports an unmeasured floor and keeps ±Y", async () => {
+    api.getAssetOrientation.mockResolvedValue(orientation({ up: [0, 1, 0], measured: false }));
+    await openScene();
+
+    fireEvent.change(screen.getByDisplayValue("+Y"), { target: { value: "auto" } });
+    expect(await screen.findByText("Zemin düzlemi bulunamadı; +Y/−Y seçin")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("+Y")).toBeInTheDocument();
+    expect(screen.queryByText(/Bahçe •/)).not.toBeInTheDocument();
+  });
+
+  it("Dikleştir rotates a splat object so its measured up matches the scene up", async () => {
+    api.getScene.mockResolvedValue({ ...DOC, up: [0, 1, 0], objects: [...DOC.objects, STATUE] });
+    api.getAssetOrientation.mockResolvedValue(orientation({ up: [0, 0, 1] }));
+    api.saveScene.mockImplementation(async (d) => d);
+    await openScene();
+    fireEvent.click(screen.getByText("statue"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Dikleştir" }));
+    await waitFor(() => expect(screen.getByText(/Bahçe •/)).toBeInTheDocument());
+    expect(api.getAssetOrientation).toHaveBeenCalledWith("a_statue");
+
+    fireEvent.click(screen.getByRole("button", { name: "Kaydet" }));
+    await waitFor(() => expect(api.saveScene).toHaveBeenCalledTimes(1));
+    const saved = api.saveScene.mock.calls[0][0].objects.find((o) => o.id === "o_statue")!;
+    expect(saved.transform.position).toEqual([1, 2, 3]);
+    expect(saved.transform.scale).toBe(2);
+    // +Z (object up) → +Y (scene up): −90° about X.
+    const [x, y, z, w] = saved.transform.quaternion;
+    expect(x).toBeCloseTo(-Math.SQRT1_2, 6);
+    expect(y).toBeCloseTo(0, 6);
+    expect(z).toBeCloseTo(0, 6);
+    expect(w).toBeCloseTo(Math.SQRT1_2, 6);
+  });
+
+  it("Dikleştir reports an object without a floor plane", async () => {
+    api.getScene.mockResolvedValue({ ...DOC, objects: [...DOC.objects, STATUE] });
+    api.getAssetOrientation.mockResolvedValue(orientation({ measured: false }));
+    await openScene();
+    fireEvent.click(screen.getByText("statue"));
+    fireEvent.click(screen.getByRole("button", { name: "Dikleştir" }));
+    expect(await screen.findByText("Bu objede zemin düzlemi bulunamadı")).toBeInTheDocument();
+    expect(screen.queryByText(/Bahçe •/)).not.toBeInTheDocument();
   });
 });

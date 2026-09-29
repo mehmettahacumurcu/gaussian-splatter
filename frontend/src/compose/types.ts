@@ -41,7 +41,21 @@ export interface SceneDoc {
   id: string;
   name: string;
   viewUp: ViewUp;
+  /**
+   * Unit "up" vector (view-only: camera, snap, mesh insert; never baked).
+   * Overrides `viewUp` when set; see `effectiveUp`.
+   */
+  up?: Vec3 | null;
   objects: SceneObject[];
+}
+
+/** GET /compose/assets/{id}/orientation. `up` is only meaningful when `measured`. */
+export interface AssetOrientation {
+  up: Vec3;
+  tilt_deg: number;
+  plane_inlier_frac: number;
+  above_below_ratio: number;
+  measured: boolean;
 }
 
 export interface Asset {

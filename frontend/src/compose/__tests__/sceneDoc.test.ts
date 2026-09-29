@@ -140,6 +140,30 @@ describe("composeReducer", () => {
     expect(bad({ position: [2, 0, 0] })).not.toBe(s0);
   });
 
+  it("setUp normalises, clears on null and dirties", () => {
+    const s0 = loaded();
+    const s1 = composeReducer(s0, { type: "setUp", up: [0, 0, 2] });
+    expect(s1.doc!.up).toEqual([0, 0, 1]);
+    expect(s1.dirty).toBe(true);
+    // Same up again: unchanged state object.
+    expect(composeReducer(s1, { type: "setUp", up: [0, 0, 1] })).toBe(s1);
+    const s2 = composeReducer(s1, { type: "setUp", up: null, viewUp: "-y" });
+    expect(s2.doc!.up).toBeNull();
+    expect(s2.doc!.viewUp).toBe("-y");
+    expect(s2.dirty).toBe(true);
+    // No up, same viewUp: nothing changes.
+    expect(composeReducer(s0, { type: "setUp", up: null, viewUp: "y" })).toBe(s0);
+    expect(composeReducer(s0, { type: "setUp", up: null })).toBe(s0);
+  });
+
+  it("setUp ignores degenerate vectors", () => {
+    const s0 = loaded();
+    expect(composeReducer(s0, { type: "setUp", up: [0, 0, 0] })).toBe(s0);
+    expect(composeReducer(s0, { type: "setUp", up: [NaN, 1, 0] })).toBe(s0);
+    expect(composeReducer(s0, { type: "setUp", up: [Infinity, 0, 0] })).toBe(s0);
+    expect(composeReducer(initialComposeState, { type: "setUp", up: [0, 1, 0] })).toBe(initialComposeState);
+  });
+
   it("generates safe unique ids", () => {
     const a = newObjectId();
     expect(a).toMatch(/^o_[0-9a-f]{12}$/);

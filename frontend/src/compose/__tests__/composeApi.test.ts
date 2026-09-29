@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { assetFileUrl, createScene, exportScene, saveScene, uploadAsset } from "../composeApi";
+import { assetFileUrl, createScene, exportScene, getAssetOrientation, saveScene, uploadAsset } from "../composeApi";
 import type { SceneDoc } from "../types";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -53,5 +53,15 @@ describe("compose API", () => {
 
   it("builds asset file urls", () => {
     expect(assetFileUrl("scene__garden")).toMatch(/\/compose\/assets\/scene__garden\/file$/);
+  });
+
+  it("fetches an asset's orientation with an encoded id", async () => {
+    const body = { up: [0, 0, 1], tilt_deg: 90, plane_inlier_frac: 0.4, above_below_ratio: 3, measured: true };
+    const fetchMock = vi.fn().mockResolvedValue(okJson(body));
+    vi.stubGlobal("fetch", fetchMock);
+    await expect(getAssetOrientation("scène/ü 1")).resolves.toEqual(body);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toMatch(/\/compose\/assets\/sc%C3%A8ne%2F%C3%BC%201\/orientation$/);
+    expect(init?.method ?? "GET").toBe("GET");
   });
 });
