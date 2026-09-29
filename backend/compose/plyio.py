@@ -105,12 +105,13 @@ def read_ply(path: str | Path) -> GaussianCloud:
     from plyfile import PlyData
 
     validate_ply(path)
-    # mmap=False: a memmap would keep the file locked on Windows while the cloud lives.
-    vertex = PlyData.read(str(path), mmap=False)["vertex"].data
+    # Default memmap read (mmap=False is pure-Python and ~300x slower). Everything
+    # stored on the cloud must be a copy, or it would keep the file locked on Windows.
+    vertex = PlyData.read(str(path))["vertex"].data
     n = len(vertex)
 
     def col(name: str) -> np.ndarray:
-        return np.array(vertex[name], dtype=np.float32)
+        return np.asarray(vertex[name], dtype=np.float32)
 
     rest_names = sorted(
         (f for f in vertex.dtype.names if f.startswith("f_rest_")),
@@ -128,7 +129,7 @@ def read_ply(path: str | Path) -> GaussianCloud:
         means=np.stack([col("x"), col("y"), col("z")], axis=1),
         log_scales=np.stack([col(f"scale_{i}") for i in range(3)], axis=1),
         quats=np.stack([col(f"rot_{i}") for i in range(4)], axis=1),
-        opacities=col("opacity"),
+        opacities=col("opacity").copy(),  # single column: would otherwise alias the memmap
         sh_dc=np.stack([col(f"f_dc_{i}") for i in range(3)], axis=1),
         sh_rest=sh_rest,
     )

@@ -104,3 +104,15 @@ def test_rejects_gap_in_f_rest_suffixes(tmp_path):
     path = _rest_ply(tmp_path, [f"f_rest_{i}" for i in range(8)] + ["f_rest_10"])
     with pytest.raises(PlyFormatError, match="f_rest"):
         validate_ply(path)
+
+
+def test_read_ply_speed_guard(tmp_path):
+    import time
+
+    path = write_ply(random_cloud(200_000, degree=3, seed=5), tmp_path / "big.ply")
+    start = time.perf_counter()
+    cloud = read_ply(path)
+    elapsed = time.perf_counter() - start
+    print(f"read_ply 200k gaussians: {elapsed:.2f}s")
+    assert cloud.count == 200_000
+    assert elapsed < 5.0

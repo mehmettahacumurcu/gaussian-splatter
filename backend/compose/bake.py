@@ -96,6 +96,7 @@ def _select(cloud: GaussianCloud, keep: np.ndarray) -> GaussianCloud:
 
 
 def transform_cloud(cloud: GaussianCloud, placement: Placement) -> GaussianCloud:
+    # NOTE: on the identity-rotation path the output may share sh_rest with the input; do not mutate it in place.
     src = cloud if placement.crop is None else _select(cloud, crop_mask(cloud.means, placement.crop))
     q = np.asarray(placement.quaternion_xyzw, dtype=np.float64)
     q = q / np.linalg.norm(q)
