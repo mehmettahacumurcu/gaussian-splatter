@@ -65,8 +65,79 @@ describe("composeReducer", () => {
   });
 
   it("markSaved clears dirty", () => {
-    const s = composeReducer(composeReducer(loaded(), { type: "add", object: statue }), { type: "markSaved" });
+    const dirty = composeReducer(loaded(), { type: "add", object: statue });
+    const s = composeReducer(dirty, { type: "markSaved", doc: dirty.doc! });
     expect(s.dirty).toBe(false);
+  });
+
+  it("markSaved keeps dirty when the doc changed after the saved snapshot", () => {
+    const snapshot = composeReducer(loaded(), { type: "add", object: statue });
+    const edited = composeReducer(snapshot, { type: "rename", id: "o_statue", name: "renamed" });
+    const s = composeReducer(edited, { type: "markSaved", doc: snapshot.doc! });
+    expect(s).toBe(edited);
+    expect(s.dirty).toBe(true);
+  });
+
+  it("markSaved on a clean state returns the same state", () => {
+    const s0 = loaded();
+    expect(composeReducer(s0, { type: "markSaved", doc: s0.doc! })).toBe(s0);
+  });
+
+  it("select returns the same state when unchanged", () => {
+    const s0 = composeReducer(loaded(), { type: "select", id: "o_base" });
+    expect(composeReducer(s0, { type: "select", id: "o_base" })).toBe(s0);
+  });
+
+  it("truncates duplicate names to 128 characters", () => {
+    const long: SceneObject = { ...statue, name: "x".repeat(128) };
+    let s = composeReducer(loaded(), { type: "add", object: long });
+    s = composeReducer(s, { type: "duplicate", id: "o_statue", newId: "o_copy" });
+    const name = s.doc!.objects[2].name;
+    expect(name.length).toBeLessThanOrEqual(128);
+    expect(name.endsWith(" kopya")).toBe(true);
+  });
+
+  it("duplicate does not share nested objects with the original", () => {
+    const withExtras: SceneObject = {
+      ...statue,
+      crop: { center: [0, 0, 0], halfSize: [1, 1, 1], quaternion: [0, 0, 0, 1] },
+      color: { exposure: 0, tint: [1, 1, 1], saturation: 1 },
+    };
+    let s = composeReducer(loaded(), { type: "add", object: withExtras });
+    s = composeReducer(s, { type: "duplicate", id: "o_statue", newId: "o_copy" });
+    const [orig, copy] = [s.doc!.objects[1], s.doc!.objects[2]];
+    expect(copy.transform).toEqual(orig.transform);
+    expect(copy.transform).not.toBe(orig.transform);
+    expect(copy.transform.position).not.toBe(orig.transform.position);
+    expect(copy.crop).not.toBe(orig.crop);
+    expect(copy.color).not.toBe(orig.color);
+  });
+
+  it("ignores adding a duplicate id or a second base", () => {
+    const s0 = composeReducer(loaded(), { type: "add", object: statue });
+    expect(composeReducer(s0, { type: "add", object: statue })).toBe(s0);
+    expect(composeReducer(s0, { type: "add", object: { ...statue, id: "o_b2", role: "base" } })).toBe(s0);
+  });
+
+  it("rename trims, caps at 128 and ignores blank names", () => {
+    const s0 = composeReducer(loaded(), { type: "add", object: statue });
+    expect(composeReducer(s0, { type: "rename", id: "o_statue", name: "   " })).toBe(s0);
+    expect(composeReducer(s0, { type: "rename", id: "o_statue", name: "" })).toBe(s0);
+    const s1 = composeReducer(s0, { type: "rename", id: "o_statue", name: "  new  " });
+    expect(s1.doc!.objects[1].name).toBe("new");
+    const s2 = composeReducer(s0, { type: "rename", id: "o_statue", name: "y".repeat(200) });
+    expect(s2.doc!.objects[1].name).toHaveLength(128);
+  });
+
+  it("ignores invalid transforms", () => {
+    const s0 = composeReducer(loaded(), { type: "add", object: statue });
+    const bad = (t: Partial<SceneObject["transform"]>) =>
+      composeReducer(s0, { type: "setTransform", id: "o_statue", transform: { ...statue.transform, ...t } });
+    expect(bad({ position: [NaN, 0, 0] })).toBe(s0);
+    expect(bad({ scale: 0 })).toBe(s0);
+    expect(bad({ scale: Infinity })).toBe(s0);
+    expect(bad({ quaternion: [0, 0, 0, 0] })).toBe(s0);
+    expect(bad({ position: [2, 0, 0] })).not.toBe(s0);
   });
 
   it("generates safe unique ids", () => {

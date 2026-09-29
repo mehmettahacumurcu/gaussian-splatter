@@ -21,8 +21,16 @@ export function applyColor(c: ColorAdjust, rgb: Vec3): Vec3 {
   return [0, 1, 2].map((i) => m[3 * i] * rgb[0] + m[3 * i + 1] * rgb[1] + m[3 * i + 2] * rgb[2]) as Vec3;
 }
 
+/**
+ * The hex form is lossy: 8 bits per channel, and values are clamped to [0, 1]
+ * (non-finite components are treated as 1).
+ */
 export function tintToHex(t: Vec3): string {
-  return `#${t.map((v) => Math.round(Math.min(Math.max(v, 0), 1) * 255).toString(16).padStart(2, "0")).join("")}`;
+  const ch = (v: number) => {
+    const x = Number.isFinite(v) ? v : 1;
+    return Math.round(Math.min(Math.max(x, 0), 1) * 255).toString(16).padStart(2, "0");
+  };
+  return `#${t.map(ch).join("")}`;
 }
 
 export function hexToTint(hex: string): Vec3 {

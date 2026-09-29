@@ -5,6 +5,7 @@ import { applyTransform, isInsideCrop, uniformScaleFrom } from "../transformMath
 import type { ColorAdjust, CropBox, Transform, Vec3 } from "../types";
 
 function close(a: number[], b: number[], eps = 1e-5) {
+  expect(a.length).toBe(b.length);
   a.forEach((v, i) => expect(Math.abs(v - b[i])).toBeLessThan(eps));
 }
 

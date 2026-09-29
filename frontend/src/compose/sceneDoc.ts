@@ -1,3 +1,4 @@
+import { isValidTransform } from "./transformMath";
 import type { ColorAdjust, CropBox, SceneDoc, SceneObject, Transform, ViewUp } from "./types";
 
 export interface ComposeState {
@@ -11,7 +12,7 @@ export const initialComposeState: ComposeState = { doc: null, selectedId: null, 
 export type ComposeAction =
   | { type: "load"; doc: SceneDoc }
   | { type: "close" }
-  | { type: "markSaved" }
+  | { type: "markSaved"; doc: SceneDoc }
   | { type: "select"; id: string | null }
   | { type: "add"; object: SceneObject }
   | { type: "remove"; id: string }
@@ -22,6 +23,18 @@ export type ComposeAction =
   | { type: "setVisible"; id: string; visible: boolean }
   | { type: "rename"; id: string; name: string }
   | { type: "setViewUp"; viewUp: ViewUp };
+
+const MAX_NAME = 128;
+const COPY_SUFFIX = " kopya";
+
+function cloneObject(o: SceneObject): SceneObject {
+  return {
+    ...o,
+    transform: { ...o.transform, position: [...o.transform.position], quaternion: [...o.transform.quaternion] },
+    ...(o.crop ? { crop: { center: [...o.crop.center], halfSize: [...o.crop.halfSize], quaternion: [...o.crop.quaternion] } } : {}),
+    ...(o.color ? { color: { ...o.color, tint: [...o.color.tint] } } : {}),
+  } as SceneObject;
+}
 
 export function newObjectId(): string {
   const bytes = new Uint8Array(6);
@@ -49,11 +62,14 @@ export function composeReducer(state: ComposeState, action: ComposeAction): Comp
     case "close":
       return initialComposeState;
     case "markSaved":
+      // Only clear dirty if nothing changed since the snapshot that was saved.
+      if (!state.dirty || state.doc !== action.doc) return state;
       return { ...state, dirty: false };
     case "select":
+      if (state.selectedId === action.id) return state;
       return { ...state, selectedId: action.id };
     case "add":
-      if (!state.doc) return state;
+      if (!state.doc || action.object.role === "base" || find(state, action.object.id)) return state;
       return {
         doc: { ...state.doc, objects: [...state.doc.objects, action.object] },
         selectedId: action.object.id,
@@ -71,12 +87,13 @@ export function composeReducer(state: ComposeState, action: ComposeAction): Comp
     case "duplicate": {
       const target = find(state, action.id);
       if (!state.doc || !target || target.role === "base") return state;
-      const copy: SceneObject = { ...structuredClone(target), id: action.newId, name: `${target.name} kopya` };
+      const name = target.name.slice(0, MAX_NAME - COPY_SUFFIX.length) + COPY_SUFFIX;
+      const copy: SceneObject = { ...cloneObject(target), id: action.newId, name };
       return { doc: { ...state.doc, objects: [...state.doc.objects, copy] }, selectedId: copy.id, dirty: true };
     }
     case "setTransform": {
       const target = find(state, action.id);
-      if (!target || target.role === "base") return state;
+      if (!target || target.role === "base" || !isValidTransform(action.transform)) return state;
       return update(state, action.id, (o) => ({ ...o, transform: action.transform }));
     }
     case "setCrop": {
@@ -91,8 +108,11 @@ export function composeReducer(state: ComposeState, action: ComposeAction): Comp
     }
     case "setVisible":
       return update(state, action.id, (o) => ({ ...o, visible: action.visible }));
-    case "rename":
-      return update(state, action.id, (o) => ({ ...o, name: action.name }));
+    case "rename": {
+      const name = action.name.trim().slice(0, MAX_NAME);
+      if (!name) return state;
+      return update(state, action.id, (o) => ({ ...o, name }));
+    }
     case "setViewUp":
       if (!state.doc || state.doc.viewUp === action.viewUp) return state;
       return { ...state, doc: { ...state.doc, viewUp: action.viewUp }, dirty: true };

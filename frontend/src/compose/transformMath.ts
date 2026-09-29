@@ -24,28 +24,57 @@ export function isInsideCrop(crop: CropBox, localPoint: Vec3): boolean {
   );
 }
 
+/**
+ * Half-extent of the crop helper box. The helper is a box of half-extent 1
+ * (e.g. BoxGeometry(2,2,2) / a SplatEditSdf BOX whose scale is the half size),
+ * parented under the splat mesh so its position/quaternion are object-local;
+ * hence `scale × CROP_BOX_HALF_EXTENT = halfSize`.
+ */
+export const CROP_BOX_HALF_EXTENT = 1;
+
 /** TransformControls scales one axis at a time; follow the axis that changed most. */
 export function uniformScaleFrom(prev: number, s: { x: number; y: number; z: number }): number {
-  let best = s.x;
-  for (const c of [s.y, s.z]) if (Math.abs(c - prev) > Math.abs(best - prev)) best = c;
-  return Math.max(Math.abs(best), 1e-4);
+  let best: number | null = null;
+  for (const c of [s.x, s.y, s.z]) {
+    if (!Number.isFinite(c)) continue;
+    const a = Math.abs(c);
+    if (best === null || Math.abs(a - prev) > Math.abs(best - prev)) best = a;
+  }
+  return Math.max(best ?? prev, 1e-4);
 }
 
-export function readTransform(obj: Object3D): Transform {
-  const q = obj.quaternion;
+function allFinite(values: number[]): boolean {
+  return values.every(Number.isFinite);
+}
+
+export function readTransform(obj: Object3D, prevScale: number): Transform {
+  const p = obj.position;
+  const q = obj.quaternion.clone().normalize();
+  if (!allFinite([p.x, p.y, p.z, q.x, q.y, q.z, q.w])) throw new Error("Non-finite transform");
   return {
-    position: [obj.position.x, obj.position.y, obj.position.z],
+    position: [p.x, p.y, p.z],
     quaternion: [q.x, q.y, q.z, q.w],
-    scale: obj.scale.x,
+    scale: uniformScaleFrom(prevScale, obj.scale),
   };
 }
 
 export function readCrop(obj: Object3D): CropBox {
-  const q = obj.quaternion;
-  const h = (v: number) => Math.max(Math.abs(v), 1e-3);
+  const p = obj.position;
+  const s = obj.scale;
+  const q = obj.quaternion.clone().normalize();
+  if (!allFinite([p.x, p.y, p.z, s.x, s.y, s.z, q.x, q.y, q.z, q.w])) throw new Error("Non-finite crop");
+  const h = (v: number) => Math.max(Math.abs(v) * CROP_BOX_HALF_EXTENT, 1e-3);
   return {
-    center: [obj.position.x, obj.position.y, obj.position.z],
-    halfSize: [h(obj.scale.x), h(obj.scale.y), h(obj.scale.z)],
+    center: [p.x, p.y, p.z],
+    halfSize: [h(s.x), h(s.y), h(s.z)],
     quaternion: [q.x, q.y, q.z, q.w],
   };
+}
+
+/** True when every component is finite, scale > 0 and the quaternion is (nearly) unit length. */
+export function isValidTransform(t: Transform): boolean {
+  if (!allFinite([...t.position, ...t.quaternion, t.scale])) return false;
+  if (t.scale <= 0) return false;
+  const norm = Math.hypot(...t.quaternion);
+  return Math.abs(norm - 1) <= 1e-3;
 }
