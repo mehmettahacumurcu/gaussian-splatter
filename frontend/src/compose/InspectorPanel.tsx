@@ -15,14 +15,17 @@ interface Props {
 }
 
 const RAD = Math.PI / 180;
+const AXES = ["X", "Y", "Z"];
 
 /** Numeric input that commits on blur / Enter only (never per keystroke). */
 function NumberField({
+  label,
   value,
   step = 0.01,
   disabled,
   onCommit,
 }: {
+  label: string;
   value: number;
   step?: number;
   disabled?: boolean;
@@ -41,6 +44,7 @@ function NumberField({
   return (
     <input
       type="number"
+      aria-label={label}
       step={step}
       value={text}
       disabled={disabled}
@@ -99,18 +103,25 @@ export function InspectorPanel({ object, cropEditing, onRename, onTransform, onT
       <div className="compose-vec">
         <span>Konum</span>
         {t.position.map((v, i) => (
-          <NumberField key={i} value={v} disabled={locked} onCommit={(n) => setPos(i, n)} />
+          <NumberField key={i} label={`Konum ${AXES[i]}`} value={v} disabled={locked} onCommit={(n) => setPos(i, n)} />
         ))}
       </div>
       <div className="compose-vec">
         <span>Dönüş °</span>
         {deg.map((v, i) => (
-          <NumberField key={i} value={v} step={1} disabled={locked} onCommit={(n) => setRot(i, n)} />
+          <NumberField
+            key={i}
+            label={`Dönüş ${AXES[i]}`}
+            value={v}
+            step={1}
+            disabled={locked}
+            onCommit={(n) => setRot(i, n)}
+          />
         ))}
       </div>
       <div className="compose-vec">
         <span>Ölçek</span>
-        <NumberField value={t.scale} disabled={locked} onCommit={(n) => n > 0 && onTransform({ ...t, scale: n })} />
+        <NumberField label="Ölçek" value={t.scale} disabled={locked} onCommit={(n) => n > 0 && onTransform({ ...t, scale: n })} />
       </div>
       {!locked && (
         <button type="button" className="btn-secondary" onClick={onSnap}>

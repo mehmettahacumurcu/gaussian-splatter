@@ -15,13 +15,13 @@ import {
   saveScene,
   uploadAsset,
 } from "./composeApi";
-import { errorMessage } from "./errorMessage";
+import { errorMessage, firstLine } from "./errorMessage";
 import { InspectorPanel } from "./InspectorPanel";
 import { ObjectListPanel } from "./ObjectListPanel";
 import { ObjectRegistry } from "./registry";
 import { composeReducer, initialComposeState, newObjectId } from "./sceneDoc";
 import { snapToGround } from "./snap";
-import type { Asset, CropBox, GizmoMode, SceneObject, SceneSummary, Transform } from "./types";
+import type { Asset, CropBox, GizmoMode, SceneDoc, SceneObject, SceneSummary, Transform } from "./types";
 import "./compose.css";
 
 type Status = { kind: "info" | "error"; text: string } | null;
@@ -32,18 +32,38 @@ const GIZMO_MODES: { mode: GizmoMode; label: string }[] = [
   { mode: "scale", label: "Ölçekle (R)" },
 ];
 
+const BACKEND_ERROR = "Backend'e ulaşılamadı";
+const POLL_MS = 1000;
+/** Consecutive failed status polls before the export is given up locally. */
+const MAX_POLL_FAILURES = 5;
+
+function isEditable(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  const tag = el?.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || !!el?.isContentEditable;
+}
+
 export function ComposePage({ active }: { active: boolean }) {
   const [state, dispatch] = useReducer(composeReducer, initialComposeState);
   const { doc, selectedId, dirty } = state;
+  // Latest state for async actions and window listeners (never a stale closure).
+  const stateRef = useRef(state);
+  stateRef.current = state;
   const [scenes, setScenes] = useState<SceneSummary[]>([]);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [status, setStatus] = useState<Status>(null);
+  // busyRef guards re-entry synchronously; `busy` mirrors it for rendering.
+  const busyRef = useRef(false);
   const [busy, setBusy] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [gizmoMode, setGizmoMode] = useState<GizmoMode>("translate");
   const [cropEditing, setCropEditing] = useState(false);
   const [newName, setNewName] = useState("");
   const [exportJob, setExportJob] = useState<Job | null>(null);
+  const pollFailures = useRef(0);
+  const [pollTick, setPollTick] = useState(0);
+  // Last doc object the server has (dirty may lag one render behind a save).
+  const lastSavedRef = useRef<SceneDoc | null>(null);
   const registry = useMemo(() => new ObjectRegistry(), []);
   const controlsRef = useRef<OrbitControlsImpl | null>(null);
   const selected = doc?.objects.find((o) => o.id === selectedId) ?? null;
@@ -53,8 +73,9 @@ export function ComposePage({ active }: { active: boolean }) {
       const [s, a] = await Promise.all([listScenes(), listAssets()]);
       setScenes(s);
       setAssets(a);
+      setStatus((prev) => (prev?.kind === "error" && prev.text.startsWith(BACKEND_ERROR) ? null : prev));
     } catch (e) {
-      setStatus({ kind: "error", text: `Backend'e ulaşılamadı: ${errorMessage(e)}` });
+      setStatus({ kind: "error", text: `${BACKEND_ERROR}: ${errorMessage(e)}` });
     }
   }, []);
 
@@ -76,14 +97,23 @@ export function ComposePage({ active }: { active: boolean }) {
     if (!selected || !selected.crop) setCropEditing(false);
   }, [selected]);
 
-  const run = async (label: string, fn: () => Promise<void>) => {
+  /**
+   * Runs one backend action at a time. `current()` is false once the open
+   * scene changed (closed / another one opened) — skip updates then.
+   */
+  const run = async (label: string, fn: (current: () => boolean) => Promise<void>) => {
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setStatus({ kind: "info", text: label });
+    const docId = stateRef.current.doc?.id ?? null;
+    const current = () => (stateRef.current.doc?.id ?? null) === docId;
     try {
-      await fn();
+      await fn(current);
     } catch (e) {
-      setStatus({ kind: "error", text: errorMessage(e) });
+      if (current()) setStatus({ kind: "error", text: errorMessage(e) });
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   };
@@ -92,19 +122,23 @@ export function ComposePage({ active }: { active: boolean }) {
     setErrors({});
     setExportJob(null);
     setCropEditing(false);
+    pollFailures.current = 0;
+    lastSavedRef.current = null;
   };
 
   const openScene = (id: string) =>
-    run("Sahne açılıyor…", async () => {
+    run("Sahne açılıyor…", async (current) => {
       const loaded = await getScene(id);
+      if (!current()) return;
       resetSceneUi();
       dispatch({ type: "load", doc: loaded });
       setStatus(null);
     });
 
   const createNew = (base: Asset) =>
-    run("Sahne oluşturuluyor…", async () => {
+    run("Sahne oluşturuluyor…", async (current) => {
       const created = await createScene(newName.trim() || base.name, base.id);
+      if (!current()) return;
       resetSceneUi();
       dispatch({ type: "load", doc: created });
       setNewName("");
@@ -113,7 +147,8 @@ export function ComposePage({ active }: { active: boolean }) {
     });
 
   const closeScene = () => {
-    if (dirty && !window.confirm("Kaydedilmemiş değişiklikler kaybolacak. Devam edilsin mi?")) return;
+    if (busyRef.current) return;
+    if (stateRef.current.dirty && !window.confirm("Kaydedilmemiş değişiklikler kaybolacak. Devam edilsin mi?")) return;
     resetSceneUi();
     setStatus(null);
     dispatch({ type: "close" });
@@ -121,7 +156,8 @@ export function ComposePage({ active }: { active: boolean }) {
   };
 
   const addAsset = (asset: Asset) => {
-    if (!doc) return;
+    const current = stateRef.current.doc;
+    if (!current) return;
     const target = controlsRef.current?.target;
     const object: SceneObject = {
       id: newObjectId(),
@@ -133,7 +169,7 @@ export function ComposePage({ active }: { active: boolean }) {
       transform: {
         position: target ? [target.x, target.y, target.z] : [0, 0, 0],
         // glTF is +Y up; flip meshes into COLMAP-style (−Y up) scenes.
-        quaternion: asset.kind === "mesh" && doc.viewUp === "-y" ? [1, 0, 0, 0] : [0, 0, 0, 1],
+        quaternion: asset.kind === "mesh" && current.viewUp === "-y" ? [1, 0, 0, 0] : [0, 0, 0, 1],
         scale: 1,
       },
     };
@@ -141,55 +177,82 @@ export function ComposePage({ active }: { active: boolean }) {
   };
 
   const upload = (file: File, thenAdd: boolean) =>
-    run(`${file.name} yükleniyor…`, async () => {
+    run(`${file.name} yükleniyor…`, async (current) => {
       const asset = await uploadAsset(file);
-      setAssets(await listAssets());
+      const list = await listAssets();
+      if (!current()) return;
+      setAssets(list);
       if (thenAdd) addAsset(asset);
       setStatus({ kind: "info", text: `${asset.name} yüklendi` });
     });
 
+  const needsSave = () => {
+    const { doc: snap, dirty: isDirty } = stateRef.current;
+    return !!snap && isDirty && snap !== lastSavedRef.current;
+  };
+
   const save = () => {
     // Snapshot: dirty is cleared only if nothing changed while the request was in flight.
-    const snap = doc;
-    if (!snap) return;
-    return run("Kaydediliyor…", async () => {
+    const snap = stateRef.current.doc;
+    if (!snap || !needsSave()) return;
+    return run("Kaydediliyor…", async (current) => {
       await saveScene(snap);
+      lastSavedRef.current = snap;
+      if (!current()) return;
       dispatch({ type: "markSaved", doc: snap });
       setStatus({ kind: "info", text: "Kaydedildi" });
     });
   };
+  const saveRef = useRef(save);
+  saveRef.current = save;
 
   const startExport = () => {
-    const snap = doc;
+    const snap = stateRef.current.doc;
     if (!snap) return;
-    const saveFirst = dirty;
-    return run("Export başlatılıyor…", async () => {
+    const saveFirst = needsSave();
+    return run("Export başlatılıyor…", async (current) => {
       if (saveFirst) {
         await saveScene(snap);
-        dispatch({ type: "markSaved", doc: snap });
+        lastSavedRef.current = snap;
+        if (current()) dispatch({ type: "markSaved", doc: snap });
       }
       const { job_id } = await exportScene(snap.id);
-      setExportJob(await getJobStatus(job_id));
+      const started = await getJobStatus(job_id);
+      if (!current()) return;
+      pollFailures.current = 0;
+      setExportJob(started);
       setStatus(null);
     });
   };
 
+  // Poll the export job; a failed poll retries with backoff, and after
+  // MAX_POLL_FAILURES in a row the export is marked failed locally.
   useEffect(() => {
     if (!exportJob || exportJob.status === "completed" || exportJob.status === "failed") return;
     let cancelled = false;
+    const delay = POLL_MS * 2 ** pollFailures.current;
     const timer = window.setTimeout(async () => {
       try {
         const next = await getJobStatus(exportJob.id);
-        if (!cancelled) setExportJob(next);
+        if (cancelled) return;
+        pollFailures.current = 0;
+        setExportJob(next);
       } catch (e) {
-        if (!cancelled) setStatus({ kind: "error", text: errorMessage(e) });
+        if (cancelled) return;
+        pollFailures.current += 1;
+        if (pollFailures.current >= MAX_POLL_FAILURES) {
+          pollFailures.current = 0;
+          setExportJob({ ...exportJob, status: "failed", error: `Export durumu alınamadı: ${errorMessage(e)}` });
+        } else {
+          setPollTick((t) => t + 1);
+        }
       }
-    }, 1000);
+    }, delay);
     return () => {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [exportJob]);
+  }, [exportJob, pollTick]);
 
   const toggleCrop = (enabled: boolean) => {
     if (!selected) return;
@@ -224,25 +287,28 @@ export function ComposePage({ active }: { active: boolean }) {
     setStatus(null);
   };
 
+  const hasDoc = !!doc;
   useEffect(() => {
-    if (!active || !doc) return;
+    if (!active || !hasDoc) return;
     const onKey = (e: KeyboardEvent) => {
-      const el = e.target as HTMLElement | null;
-      const tag = el?.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || el?.isContentEditable) return;
       const mod = e.ctrlKey || e.metaKey;
-      if (mod && e.key.toLowerCase() === "d") {
+      const key = e.key.toLowerCase();
+      if (mod && key === "s") {
         e.preventDefault();
-        if (selectedId) dispatch({ type: "duplicate", id: selectedId, newId: newObjectId() });
+        // Blur first so a pending field value commits (onBlur), then save the result.
+        const focused = document.activeElement;
+        if (focused instanceof HTMLElement) focused.blur();
+        window.setTimeout(() => void saveRef.current(), 0);
         return;
       }
-      if (mod && e.key.toLowerCase() === "s") {
+      if (mod && key === "d") {
         e.preventDefault();
-        void save();
+        const id = stateRef.current.selectedId;
+        if (!e.repeat && id) dispatch({ type: "duplicate", id, newId: newObjectId() });
         return;
       }
-      if (mod || e.altKey) return;
-      switch (e.key.toLowerCase()) {
+      if (mod || e.altKey || isEditable(e.target)) return;
+      switch (key) {
         case "w":
           setGizmoMode("translate");
           break;
@@ -257,14 +323,17 @@ export function ComposePage({ active }: { active: boolean }) {
           setCropEditing(false);
           break;
         case "delete":
-          if (selectedId) dispatch({ type: "remove", id: selectedId });
+        case "backspace": {
+          e.preventDefault();
+          const id = stateRef.current.selectedId;
+          if (!e.repeat && id) dispatch({ type: "remove", id });
           break;
+        }
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, doc, selectedId]);
+  }, [active, hasDoc]);
 
   const onError = useCallback((id: string, msg: string) => setErrors((prev) => ({ ...prev, [id]: msg })), []);
   const onSelect = useCallback((id: string | null) => dispatch({ type: "select", id }), []);
@@ -326,16 +395,22 @@ export function ComposePage({ active }: { active: boolean }) {
   return (
     <div className="compose-editor">
       <div className="compose-toolbar">
-        <button type="button" className="btn-secondary" onClick={closeScene}>
+        <button type="button" className="btn-secondary" disabled={busy} onClick={closeScene}>
           ← Sahneler
         </button>
         <strong className="compose-title">
           {doc.name}
           {dirty ? " •" : ""}
         </strong>
-        <div className="compose-segment">
+        <div className="compose-segment" role="group" aria-label="Gizmo modu">
           {GIZMO_MODES.map(({ mode, label }) => (
-            <button key={mode} type="button" className={gizmoMode === mode ? "active" : ""} onClick={() => setGizmoMode(mode)}>
+            <button
+              key={mode}
+              type="button"
+              className={gizmoMode === mode ? "active" : ""}
+              aria-pressed={gizmoMode === mode}
+              onClick={() => setGizmoMode(mode)}
+            >
               {label}
             </button>
           ))}
@@ -348,10 +423,10 @@ export function ComposePage({ active }: { active: boolean }) {
           </select>
         </label>
         <span className="compose-spacer" />
-        <button type="button" className="btn-secondary" disabled={busy || !dirty} onClick={save}>
+        <button type="button" className="btn-secondary" disabled={busy || !dirty} onClick={() => void save()}>
           Kaydet
         </button>
-        <button type="button" className="btn-primary" disabled={busy || exporting} onClick={startExport}>
+        <button type="button" className="btn-primary" disabled={busy || exporting} onClick={() => void startExport()}>
           Export
         </button>
         {exportJob && (
@@ -361,9 +436,10 @@ export function ComposePage({ active }: { active: boolean }) {
                 .zip indir
               </a>
             ) : exportJob.status === "failed" ? (
-              <span className="err" title={exportJob.error ?? ""}>
-                Export başarısız
-              </span>
+              <details className="compose-export-error">
+                <summary>Export başarısız{exportJob.error ? `: ${firstLine(exportJob.error)}` : ""}</summary>
+                {exportJob.error && <pre>{exportJob.error}</pre>}
+              </details>
             ) : (
               <span>
                 {Math.round(exportJob.overall_progress * 100)}% · {exportJob.phase?.message ?? ""}
@@ -387,7 +463,7 @@ export function ComposePage({ active }: { active: boolean }) {
           <h3>Obje ekle</h3>
           <AssetPicker assets={assets} busy={busy} actionLabel="Sahneye ekle" onPick={addAsset} onUpload={(f) => upload(f, true)} />
         </aside>
-        <main className="compose-viewport">
+        <section className="compose-viewport" aria-label="Sahne görünümü">
           <ComposeViewport
             doc={doc}
             active={active}
@@ -402,7 +478,7 @@ export function ComposePage({ active }: { active: boolean }) {
             onError={onError}
             onControls={onControls}
           />
-        </main>
+        </section>
         <aside className="compose-right">
           {selected ? (
             <InspectorPanel

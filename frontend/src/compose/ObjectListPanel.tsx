@@ -14,11 +14,24 @@ export function ObjectListPanel({ objects, selectedId, errors, onSelect, onToggl
   return (
     <ul className="compose-object-list">
       {objects.map((o) => (
-        <li key={o.id} className={o.id === selectedId ? "selected" : ""} onClick={() => onSelect(o.id)}>
+        <li
+          key={o.id}
+          className={o.id === selectedId ? "selected" : ""}
+          tabIndex={0}
+          aria-current={o.id === selectedId ? "true" : undefined}
+          onClick={() => onSelect(o.id)}
+          onKeyDown={(e) => {
+            if (e.target !== e.currentTarget || (e.key !== "Enter" && e.key !== " ")) return;
+            e.preventDefault();
+            onSelect(o.id);
+          }}
+        >
           <button
             type="button"
             className="compose-icon-btn"
             title={o.visible ? "Gizle" : "Göster"}
+            aria-label={`${o.name} ${o.visible ? "gizle" : "göster"}`}
+            aria-pressed={!o.visible}
             onClick={(e) => {
               e.stopPropagation();
               onToggleVisible(o.id, !o.visible);
@@ -42,6 +55,7 @@ export function ObjectListPanel({ objects, selectedId, errors, onSelect, onToggl
                 type="button"
                 className="compose-icon-btn"
                 title="Kopyala (Ctrl+D)"
+                aria-label={`${o.name} kopyala`}
                 onClick={(e) => {
                   e.stopPropagation();
                   onDuplicate(o.id);
@@ -53,6 +67,7 @@ export function ObjectListPanel({ objects, selectedId, errors, onSelect, onToggl
                 type="button"
                 className="compose-icon-btn"
                 title="Sil (Del)"
+                aria-label={`${o.name} sil`}
                 onClick={(e) => {
                   e.stopPropagation();
                   onRemove(o.id);

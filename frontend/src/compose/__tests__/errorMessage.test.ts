@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { errorMessage } from "../errorMessage";
+import { errorMessage, firstLine } from "../errorMessage";
 
 describe("errorMessage", () => {
   it("returns the string detail of a FastAPI error", () => {
@@ -26,5 +26,13 @@ describe("errorMessage", () => {
 
   it("handles non-Error values", () => {
     expect(errorMessage("Failed to fetch")).toBe("Failed to fetch");
+  });
+});
+
+describe("firstLine", () => {
+  it("returns the first non-empty line, shortened", () => {
+    expect(firstLine("\nTraceback (most recent call last):\n  File x")).toBe("Traceback (most recent call last):");
+    expect(firstLine("a".repeat(100), 10)).toBe("a".repeat(9) + "…");
+    expect(firstLine("")).toBe("");
   });
 });

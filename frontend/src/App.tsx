@@ -19,6 +19,7 @@ import { NvsEvalPanel } from "./components/NvsEvalPanel";
 import { ConnectionSettings } from "./components/ConnectionSettings";
 import { InteractivePage } from "./interactive/InteractivePage";
 import { ComposePage } from "./compose/ComposePage";
+import { isComposeJob } from "./compose/isComposeJob";
 import { NotebookGeneratorPanel } from "./notebook/NotebookGeneratorPanel";
 import {
   getHealth,
@@ -83,10 +84,9 @@ function App() {
   const [connection, setConnectionState] = useState(() => getConnection());
   useEffect(() => onConnectionChange(setConnectionState), []);
   // Sahne Editörü: ilk açılışta mount edilir, sonra sekme değişse de state kaybolmasın diye açık kalır.
+  // Render sırasında set edilir (effect değil) → ilk açılışta boş bir frame olmaz.
   const [composeMounted, setComposeMounted] = useState(false);
-  useEffect(() => {
-    if (tab === "compose") setComposeMounted(true);
-  }, [tab]);
+  if (tab === "compose" && !composeMounted) setComposeMounted(true);
 
   // Health poll (her 5 sn)
   useEffect(() => {
@@ -144,7 +144,7 @@ function App() {
     try {
       const { jobs } = await listJobs();
       // Compose export job'larının viewer'da açılacak bir splat çıktısı yok.
-      const done = jobs.find((j) => j.status === "completed" && !j.scene.startsWith("compose-"));
+      const done = jobs.find((j) => j.status === "completed" && !isComposeJob(j));
       if (done) {
         setJobIdInput(done.id);
         loadInViewer(done.id);
@@ -344,7 +344,7 @@ function App() {
                 onClick={async () => {
                   try {
                     const { jobs } = await listJobs();
-                    const done = jobs.find((j) => j.status === "completed");
+                    const done = jobs.find((j) => j.status === "completed" && !isComposeJob(j));
                     if (done) setAnalyticsScene(done.scene);
                   } catch { /* ignore */ }
                 }}

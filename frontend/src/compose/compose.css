@@ -13,7 +13,10 @@
 .compose-segment button.active { background: var(--accent-bg); }
 .compose-inline { display: inline-flex; gap: 6px; align-items: center; font-size: 12px; color: var(--text-muted); }
 .compose-export { font-size: 12px; }
-.compose-export .err { color: var(--err); }
+.compose-toolbar { position: relative; }
+.compose-export-error summary { color: var(--err); cursor: pointer; max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.compose-export-error pre { position: absolute; right: 12px; top: 100%; z-index: 10; margin: 4px 0 0; max-width: min(720px, 90vw); max-height: 40vh; overflow: auto; padding: 8px 10px; font-size: 11px; white-space: pre-wrap; background: var(--bg-2); border: 1px solid var(--border-1); border-radius: 6px; color: var(--text); }
+.compose-object-list li:focus-visible { outline: 2px solid var(--accent); }
 .compose-body { display: grid; grid-template-columns: 260px 1fr 280px; min-height: 0; }
 .compose-left, .compose-right { background: var(--bg-1); padding: 10px 12px; overflow: auto; min-height: 0; }
 .compose-left { border-right: 1px solid var(--border); }

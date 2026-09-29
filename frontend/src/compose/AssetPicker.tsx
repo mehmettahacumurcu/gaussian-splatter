@@ -23,7 +23,7 @@ export function AssetPicker({ assets, kinds = ["splat", "mesh"], busy, actionLab
 
   return (
     <div className="compose-asset-picker">
-      <select value={assetId} onChange={(e) => setAssetId(e.target.value)} disabled={busy}>
+      <select aria-label="Asset" value={assetId} onChange={(e) => setAssetId(e.target.value)} disabled={busy}>
         <option value="">Asset seç…</option>
         {options.map((a) => (
           <option key={a.id} value={a.id}>

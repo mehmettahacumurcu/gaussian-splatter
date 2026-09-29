@@ -27,3 +27,10 @@ export function errorMessage(e: unknown): string {
   }
   return text;
 }
+
+/** First non-empty line of `text`, cut to `max` characters (e.g. a job's traceback). */
+export function firstLine(text: string, max = 80): string {
+  const line = text.split("\n").find((l) => l.trim()) ?? "";
+  const trimmed = line.trim();
+  return trimmed.length > max ? `${trimmed.slice(0, max - 1)}…` : trimmed;
+}

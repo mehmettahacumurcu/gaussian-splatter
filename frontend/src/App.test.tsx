@@ -56,4 +56,15 @@ describe("App notebook and legacy tabs", () => {
     fireEvent.click(screen.getByRole("button", { name: "Sahne Editörü" }));
     expect(screen.getByTestId("compose-page")).toBeInTheDocument();
   });
+
+  it("keeps the scene composer mounted when switching tabs", () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Sahne Editörü" }));
+    const page = screen.getByTestId("compose-page");
+    fireEvent.click(screen.getByRole("button", { name: "Jobs" }));
+    expect(screen.getByText("Jobs content")).toBeInTheDocument();
+    expect(page).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Sahne Editörü" }));
+    expect(screen.getByTestId("compose-page")).toBe(page);
+  });
 });

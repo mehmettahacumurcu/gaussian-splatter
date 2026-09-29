@@ -10,6 +10,7 @@
 import { useEffect, useState } from "react";
 import type { Job } from "../api";
 import { cancelJob, downloadUrl, listJobs } from "../api";
+import { isComposeJob } from "../compose/isComposeJob";
 import { getApiBase, withTokenParam } from "../connection";
 
 interface Props {
@@ -170,7 +171,7 @@ function JobRow({ job, expanded, onToggleExpand, onView }: RowProps) {
           {job.status === "completed" && (
             <div className="job-actions">
               {/* Compose export job'ları (scene "compose-…") viewer'da açılamaz. */}
-              {!job.scene.startsWith("compose-") && (
+              {!isComposeJob(job) && (
                 <button className="btn-primary" onClick={onView}>
                   Viewer'da aç
                 </button>
