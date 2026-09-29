@@ -144,7 +144,8 @@ For each visible splat object with transform `(t, q_o → R, s)`:
 
 1. **Crop** in local frame (before transform).
 2. **Position:** `p' = s·R·p + t`.
-3. **Rotation:** `q' = normalize(q_o ⊗ q)` (Hamilton product, `wxyz`).
+3. **Rotation:** `q' = q_o ⊗ q` (Hamilton product, `wxyz`). `q_o` is unit, so the
+   stored norm of `q` is preserved (renderers normalise).
 4. **Scale:** `log_scale' = log_scale + ln(s)`. Opacity unchanged.
 5. **SH rotation:** DC unchanged. For each band `l = 1..deg`, a matrix `D_l`
    (size `(2l+1)²`) is solved numerically: sample `M ≥ 200` unit directions
@@ -217,10 +218,12 @@ for v1).
 - **Snap to ground:** cast from the bottom-centre of the object's (cropped)
   world bounding box along −up against other visible objects; place the bottom
   on the hit point.
-- **Colour:** sliders exposure, saturation; tint colour picker. Preview via
-  `recolor` (gain) and an `objectModifier` for saturation.
-- **Save:** explicit save button, dirty indicator; warning when leaving the tab
-  with unsaved changes.
+- **Colour:** sliders exposure, saturation; tint colour picker. Preview applies
+  the full matrix `M` in one `objectModifier` (a `DynoMat3` uniform); Spark runs
+  it after SH evaluation, so it equals the bake for every view direction.
+- **Save:** explicit save button (and Ctrl+S), dirty indicator. The editor stays
+  mounted when switching tabs (render loop paused), so nothing is lost; closing
+  the scene or the window with unsaved changes asks for confirmation.
 
 ## 8. Error handling
 
