@@ -200,7 +200,7 @@ export interface ProcessResponse {
  * base + auth header. Always read getApiBase()/getAuthToken() *per call*
  * so a settings change takes effect immediately.
  */
-function authHeaders(extra?: HeadersInit): Headers {
+export function authHeaders(extra?: HeadersInit): Headers {
   const headers = new Headers(extra);
   const tok = getAuthToken();
   if (tok && !headers.has("Authorization")) {
@@ -209,7 +209,7 @@ function authHeaders(extra?: HeadersInit): Headers {
   return headers;
 }
 
-async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
+export async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const url = path.startsWith("http") ? path : `${getApiBase()}${path}`;
   const res = await fetch(url, { ...init, headers: authHeaders(init?.headers) });
   if (!res.ok) {
