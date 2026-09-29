@@ -38,3 +38,22 @@ def test_completed_job_uses_result_download_url(tmp_path):
     manager._mark_completed(job.id, result={"download_url": "/compose/exports/s_1/download"})
     assert manager.get(job.id).download_url == "/compose/exports/s_1/download"
     manager.shutdown(wait=False)
+
+
+def test_pipeline_job_keeps_legacy_download_url_and_ply_dir(tmp_path):
+    (tmp_path / "vid" / "output" / "ply").mkdir(parents=True)
+    manager = JobManager(data_dir=tmp_path)
+    job = manager.create(scene="vid")
+    manager._mark_completed(job.id, result={"scene_name": "vid"})
+    done = manager.get(job.id)
+    assert done.download_url == f"/download/{job.id}"
+    assert done.ply_dir == str(tmp_path / "vid" / "output" / "ply")
+    manager.shutdown(wait=False)
+
+
+def test_job_without_ply_dir_or_download_url_has_no_download(tmp_path):
+    manager = JobManager(data_dir=tmp_path)
+    job = manager.create(scene="vid")
+    manager._mark_completed(job.id, result=None)
+    assert manager.get(job.id).download_url is None
+    manager.shutdown(wait=False)

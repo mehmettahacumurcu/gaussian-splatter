@@ -20,7 +20,7 @@ from typing import Any
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -977,7 +977,7 @@ def list_jobs() -> JobListResponse:
 # Download — .ply'ları zip olarak stream et
 # ---------------------------------------------------------------------------
 @app.get("/download/{job_id}", tags=["jobs"])
-def download_result(job_id: str) -> StreamingResponse:
+def download_result(job_id: str, request: Request) -> Response:
     """Bitmiş bir job'un .ply çıktılarını ZIP olarak indir."""
     manager: JobManager = app.state.manager
     job = manager.get(job_id)
@@ -985,6 +985,12 @@ def download_result(job_id: str) -> StreamingResponse:
         raise HTTPException(404, f"Job bulunamadı: {job_id}")
     if job.status != JobStatus.COMPLETED:
         raise HTTPException(409, f"Job henüz hazır değil (status: {job.status.value})")
+
+    # Scene-composer export jobs publish their own download route; keep the query
+    # (e.g. ?token=) so auth survives the redirect.
+    if job.download_url and job.download_url != f"/download/{job_id}":
+        query = request.url.query
+        return RedirectResponse(job.download_url + (f"?{query}" if query else ""), status_code=307)
 
     ply_dir = Path(job.ply_dir) if job.ply_dir else scene_paths(job.scene)["output"] / "ply"
     if not ply_dir.exists():

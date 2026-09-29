@@ -48,6 +48,10 @@ def _clean_stale_exports(store: ComposeStore, scene_id: str) -> None:
     Deletes ``<id>.<token>.tmp`` dirs and ``<id>.<token>.zip.tmp`` files. If the
     export dir is missing but ``<id>.<token>.old`` backups exist (killed between the
     two swap steps), the newest backup is restored; any other backup is deleted.
+
+    Assumes a single backend process with the single-worker JobManager: it cannot
+    tell leftovers from a live export, so it is not safe with multiple uvicorn
+    workers sharing DATA_ROOT.
     """
     pattern = re.compile(rf"^{re.escape(scene_id)}\.[0-9a-f]{{8}}\.(tmp|zip\.tmp|old)$")
     stale = [p for p in store.exports_dir.iterdir() if pattern.match(p.name)]

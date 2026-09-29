@@ -31,10 +31,6 @@ PHASE_WEIGHTS = {
 }
 
 
-def _phase_order() -> list[str]:
-    return list(PHASE_WEIGHTS.keys())
-
-
 # Scene-composer export jobs have their own short phase sequence.
 COMPOSE_PHASE_WEIGHTS = {
     "compose_load":  0.05,
@@ -177,7 +173,8 @@ class JobManager:
             overall = _compute_overall(phase, progress)
             if overall is None:
                 # Bilinmeyen faz (eval, image-to-splat aşamaları, ...): hemen
-                # %100'e atlama ve geri gitme — mevcut değerle maksimumunu al.
+                # %100'e atlama; bilinmeyen fazlar arasında ilerleme geri gitmez
+                # (mevcut değerle maksimumu). Bilinen fazlar mutlak değer atar.
                 overall = max(job.overall_progress, max(0.0, min(1.0, progress)))
             job.overall_progress = overall
 
