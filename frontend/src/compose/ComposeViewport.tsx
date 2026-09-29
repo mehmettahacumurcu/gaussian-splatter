@@ -9,7 +9,7 @@ import {
   type RootStore,
 } from "@react-three/fiber";
 import { OrbitControls, TransformControls } from "@react-three/drei";
-import type { OrbitControls as OrbitControlsImpl } from "three-stdlib";
+import type { OrbitControls as OrbitControlsImpl, TransformControls as TransformControlsImpl } from "three-stdlib";
 import type * as THREE from "three";
 import { SparkRenderer } from "@sparkjsdev/spark";
 import { MeshObject } from "./MeshObject";
@@ -153,6 +153,103 @@ type GizmoProps = Pick<
   "doc" | "selectedId" | "gizmoMode" | "cropEditing" | "registry" | "onTransformCommit" | "onCropCommit"
 > & { gizmoBusy: RefObject<boolean> };
 
+/**
+ * `gizmoBusy` is set when a gizmo drag starts (so the click ending it doesn't
+ * change selection) and cleared at the start of the next gesture: a
+ * capture-phase document pointerdown runs before the canvas listeners
+ * (TransformControls sets the flag again if that gesture grabs the gizmo).
+ */
+function GizmoBusyReset({ gizmoBusy }: { gizmoBusy: RefObject<boolean> }) {
+  const doc = useThree((s) => s.gl.domElement.ownerDocument);
+  useEffect(() => {
+    const reset = () => {
+      gizmoBusy.current = false;
+    };
+    doc.addEventListener("pointerdown", reset, true);
+    return () => doc.removeEventListener("pointerdown", reset, true);
+  }, [doc, gizmoBusy]);
+  return null;
+}
+
+interface ActiveDrag {
+  target: THREE.Object3D;
+  obj: SceneObject;
+  isCrop: boolean;
+}
+
+type GizmoControlsProps = Pick<GizmoProps, "gizmoMode" | "onTransformCommit" | "onCropCommit" | "gizmoBusy"> & {
+  target: THREE.Object3D;
+  obj: SceneObject;
+  isCrop: boolean;
+};
+
+/** TransformControls for one target; mounted per target (keyed by the caller). */
+function GizmoControls({
+  target,
+  obj,
+  isCrop,
+  gizmoMode,
+  onTransformCommit,
+  onCropCommit,
+  gizmoBusy,
+}: GizmoControlsProps) {
+  const controlsRef = useRef<TransformControlsImpl>(null);
+  const dragRef = useRef<ActiveDrag | null>(null);
+  const getState = useThree((s) => s.get);
+
+  useEffect(() => {
+    // drei creates the three-stdlib controls in useMemo and never disposes
+    // them; dispose() removes their canvas/document pointer listeners.
+    const controls = controlsRef.current;
+    return () => {
+      // Detached mid-drag (selection/target change, delete…): three-stdlib
+      // only emits mouseUp while attached, so no commit happened. Put the
+      // object back to the doc values and re-enable the orbit controls that
+      // drei disabled on 'dragging-changed' (its listener is already gone).
+      const drag = dragRef.current;
+      dragRef.current = null;
+      if (drag) {
+        delete drag.target.userData.scaleAtStart;
+        restoreTarget(drag.target, drag.obj, drag.isCrop);
+        const orbit = getState().controls as { enabled?: boolean } | null;
+        if (orbit) orbit.enabled = true;
+      }
+      controls?.dispose();
+    };
+  }, [getState]);
+
+  return (
+    <TransformControls
+      ref={controlsRef}
+      object={target}
+      mode={gizmoMode}
+      space={isCrop ? "local" : "world"}
+      onMouseDown={() => {
+        gizmoBusy.current = true;
+        dragRef.current = { target, obj, isCrop };
+        target.userData.scaleAtStart = obj.transform.scale;
+      }}
+      onObjectChange={() => {
+        if (!isCrop && gizmoMode === "scale") {
+          const prev = (target.userData.scaleAtStart as number | undefined) ?? obj.transform.scale;
+          target.scale.setScalar(uniformScaleFrom(prev, target.scale));
+        }
+      }}
+      onMouseUp={() => {
+        dragRef.current = null;
+        delete target.userData.scaleAtStart;
+        try {
+          if (isCrop) onCropCommit(obj.id, readCrop(target));
+          else onTransformCommit(obj.id, readTransform(target, obj.transform.scale));
+        } catch {
+          // Non-finite values from the gizmo: keep the doc as is.
+          restoreTarget(target, obj, isCrop);
+        }
+      }}
+    />
+  );
+}
+
 function Gizmo({
   doc,
   selectedId,
@@ -173,44 +270,18 @@ function Gizmo({
     if (next !== target) setTarget(next);
   });
 
-  useEffect(
-    () => () => {
-      gizmoBusy.current = false;
-    },
-    [gizmoBusy],
-  );
-
   // The state lags one frame behind selection / mode changes: never attach to a stale target.
   if (!obj || !target || target !== gizmoTarget(obj, isCrop, registry)) return null;
   return (
-    <TransformControls
-      object={target}
-      mode={gizmoMode}
-      space={isCrop ? "local" : "world"}
-      onMouseDown={() => {
-        gizmoBusy.current = true;
-        target.userData.scaleAtStart = obj.transform.scale;
-      }}
-      onObjectChange={() => {
-        if (!isCrop && gizmoMode === "scale") {
-          const prev = (target.userData.scaleAtStart as number | undefined) ?? obj.transform.scale;
-          target.scale.setScalar(uniformScaleFrom(prev, target.scale));
-        }
-      }}
-      onMouseUp={() => {
-        // The DOM click that follows this pointerup is dispatched before the timeout.
-        setTimeout(() => {
-          gizmoBusy.current = false;
-        }, 0);
-        delete target.userData.scaleAtStart;
-        try {
-          if (isCrop) onCropCommit(obj.id, readCrop(target));
-          else onTransformCommit(obj.id, readTransform(target, obj.transform.scale));
-        } catch {
-          // Non-finite values from the gizmo: keep the doc as is.
-          restoreTarget(target, obj, isCrop);
-        }
-      }}
+    <GizmoControls
+      key={target.uuid}
+      target={target}
+      obj={obj}
+      isCrop={isCrop}
+      gizmoMode={gizmoMode}
+      onTransformCommit={onTransformCommit}
+      onCropCommit={onCropCommit}
+      gizmoBusy={gizmoBusy}
     />
   );
 }
@@ -264,6 +335,7 @@ export function ComposeViewport(props: ViewportProps) {
       )}
       <OrbitRig viewUp={doc.viewUp} />
       <ControlsBridge onControls={onControls} />
+      <GizmoBusyReset gizmoBusy={gizmoBusy} />
       <Gizmo {...props} gizmoBusy={gizmoBusy} />
     </Canvas>
   );
