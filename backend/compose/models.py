@@ -16,11 +16,16 @@ Vec3 = tuple[float, float, float]
 Quat = tuple[float, float, float, float]  # three.js order: x, y, z, w
 
 
+def _unit(v: tuple[float, ...], what: str) -> tuple[float, ...]:
+    """Require a finite, (nearly) unit-length vector and return it normalised."""
+    norm = math.sqrt(sum(c * c for c in v))
+    if not math.isfinite(norm) or abs(norm - 1.0) > 1e-3:
+        raise ValueError(f"{what} must be unit length (norm={norm:.4f})")
+    return tuple(c / norm for c in v)
+
+
 def _unit_quat(q: Quat) -> Quat:
-    norm = math.sqrt(sum(c * c for c in q))
-    if abs(norm - 1.0) > 1e-3:
-        raise ValueError(f"quaternion must be unit length (norm={norm:.4f})")
-    return tuple(c / norm for c in q)  # type: ignore[return-value]
+    return _unit(q, "quaternion")  # type: ignore[return-value]
 
 
 class _Strict(BaseModel):
@@ -106,12 +111,7 @@ class SceneDoc(_Strict):
     @field_validator("up")
     @classmethod
     def _unit_up(cls, v: Vec3 | None) -> Vec3 | None:
-        if v is None:
-            return None
-        norm = math.sqrt(sum(c * c for c in v))
-        if not math.isfinite(norm) or abs(norm - 1.0) > 1e-3:
-            raise ValueError(f"up must be a unit vector (norm={norm:.4f})")
-        return tuple(c / norm for c in v)  # type: ignore[return-value]
+        return None if v is None else _unit(v, "up")  # type: ignore[return-value]
 
     @model_validator(mode="after")
     def _check_objects(self) -> "SceneDoc":

@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from plyfile import PlyData, PlyElement
 
-from backend.compose.plyio import PlyFormatError, read_ply, read_ply_header, validate_ply, write_ply
+from backend.compose.plyio import PlyFormatError, read_means_opacity, read_ply, read_ply_header, validate_ply, write_ply
 from tests.compose.helpers import random_cloud
 
 
@@ -142,3 +142,24 @@ def test_read_ply_speed_guard(tmp_path):
     print(f"read_ply 200k gaussians: {elapsed:.2f}s")
     assert cloud.count == 200_000
     assert elapsed < 5.0
+
+
+def test_read_means_opacity_matches_read_ply_and_releases_the_file(tmp_path):
+    cloud = random_cloud(50, seed=3)
+    path = write_ply(cloud, tmp_path / "a.ply")
+    means, opac = read_means_opacity(path)
+    full = read_ply(path)
+    assert means.shape == (50, 3) and means.dtype == np.float32
+    assert opac.shape == (50,) and opac.dtype == np.float32
+    np.testing.assert_array_equal(means, full.means)
+    np.testing.assert_array_equal(opac, full.opacities)
+    path.unlink()  # would raise PermissionError on Windows if a memmap were still held
+    assert not path.exists()
+    assert means.sum() == means.sum()  # arrays remain usable
+
+
+def test_read_means_opacity_validates(tmp_path):
+    path = tmp_path / "bad.ply"
+    path.write_bytes(b"ply\nformat ascii 1.0\nend_header\n")
+    with pytest.raises(PlyFormatError):
+        read_means_opacity(path)

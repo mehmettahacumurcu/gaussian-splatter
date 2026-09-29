@@ -20,8 +20,8 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from ..image_to_scene.orientation import estimate_world_orientation
-from .plyio import read_ply
-from .store import _atomic_write_text
+from .fsutil import atomic_write_text
+from .plyio import read_means_opacity
 
 if TYPE_CHECKING:
     from .store import ComposeStore
@@ -36,46 +36,61 @@ def _cache_path(store: "ComposeStore", asset_id: str):
     return store.root / "cache" / f"{digest}.orientation.json"
 
 
+CACHE_VERSION = 1
+
+
+def _validated(result: dict) -> dict:
+    """Normalise and check an orientation result; raises ValueError if invalid."""
+    try:
+        up = [float(c) for c in result["up"]]
+        tilt = float(result["tilt_deg"])
+        frac = float(result["plane_inlier_frac"])
+        ratio = float(result["above_below_ratio"])
+        measured = result["measured"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"malformed orientation result: {exc}") from exc
+    if len(up) != 3 or not all(math.isfinite(c) for c in up):
+        raise ValueError("up must be 3 finite numbers")
+    norm = math.sqrt(sum(c * c for c in up))
+    if abs(norm - 1.0) > 1e-3:
+        raise ValueError(f"up must be unit length (norm={norm:.4f})")
+    if not all(math.isfinite(v) for v in (tilt, frac, ratio)):
+        raise ValueError("orientation metrics must be finite")
+    if not isinstance(measured, bool):
+        raise ValueError("measured must be a bool")
+    return {
+        "up": [c / norm for c in up],
+        "tilt_deg": tilt,
+        "plane_inlier_frac": frac,
+        "above_below_ratio": ratio,
+        "measured": measured,
+    }
+
+
 def _read_cache(path, size: int, mtime_ns: int) -> dict | None:
     try:
         entry = json.loads(path.read_text(encoding="utf-8"))
-        if entry["size"] != size or entry["mtime_ns"] != mtime_ns:
+        if entry["v"] != CACHE_VERSION or entry["size"] != size or entry["mtime_ns"] != mtime_ns:
             return None
-        res = entry["result"]
-        up = [float(c) for c in res["up"]]
-        if len(up) != 3:
-            return None
-        return {
-            "up": up,
-            "tilt_deg": float(res["tilt_deg"]),
-            "plane_inlier_frac": float(res["plane_inlier_frac"]),
-            "above_below_ratio": float(res["above_below_ratio"]),
-        }
+        return _validated(entry["result"])
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
 def _compute(ply_path) -> dict:
-    cloud = read_ply(ply_path)
-    opac = np.clip(cloud.opacities.astype(np.float64), -30.0, 30.0)
-    weights = 1.0 / (1.0 + np.exp(-opac))
-    wo = estimate_world_orientation(cloud.means, weights)
-    up = np.asarray(wo.up_raw, dtype=np.float64)
-    norm = float(np.linalg.norm(up))
-    if not math.isfinite(norm) or norm < 1e-9:
-        raise ValueError("orientation estimate is degenerate")
-    up = up / norm
-    result = {
-        "up": [float(c) for c in up],
+    means, opacities = read_means_opacity(ply_path)
+    weights = 1.0 / (1.0 + np.exp(-np.clip(opacities.astype(np.float64), -30.0, 30.0)))
+    wo = estimate_world_orientation(means, weights)
+    frac = float(wo.plane_inlier_frac)
+    return _validated({
+        "up": [float(c) for c in wo.up_raw],
         "tilt_deg": float(wo.tilt_deg),
-        "plane_inlier_frac": float(wo.plane_inlier_frac),
+        "plane_inlier_frac": frac,
         "above_below_ratio": float(wo.above_below_ratio),
-    }
-    if not all(math.isfinite(v) for v in (*result["up"], result["tilt_deg"],
-                                          result["plane_inlier_frac"],
-                                          result["above_below_ratio"])):
-        raise ValueError("orientation estimate is not finite")
-    return result
+        # The estimator returns a placeholder +Y with zero inliers when it has
+        # too few points or finds no plane; that is "unmeasured", not a floor.
+        "measured": frac > 0.0,
+    })
 
 
 def estimate_asset_up(store: "ComposeStore", asset_id: str) -> dict | None:
@@ -104,8 +119,9 @@ def estimate_asset_up(store: "ComposeStore", asset_id: str) -> dict | None:
     result = _compute(path)
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write_text(cache, json.dumps(
-            {"size": st.st_size, "mtime_ns": st.st_mtime_ns, "result": result}))
+        atomic_write_text(cache, json.dumps(
+            {"v": CACHE_VERSION, "size": st.st_size, "mtime_ns": st.st_mtime_ns,
+             "result": result}))
     except OSError:
         pass  # the cache is an optimisation; never fail the request over it
     return result

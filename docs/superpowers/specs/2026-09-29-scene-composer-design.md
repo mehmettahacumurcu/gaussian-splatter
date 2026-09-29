@@ -275,7 +275,8 @@ Changes:
   `up ?? (viewUp == "-y" ? [0,-1,0] : [0,1,0])`. Still view-only (camera up,
   snap direction, mesh insert orientation); never baked. Backward compatible.
 - **Orientation endpoint:** `GET /compose/assets/{id}/orientation` →
-  `{up, tilt_deg, plane_inlier_frac, above_below_ratio}` for splat assets
+  `{up, tilt_deg, plane_inlier_frac, above_below_ratio, measured}` (`measured` =
+  a floor plane was found; false means `up` is a +Y placeholder) for splat assets
   (400 for meshes, 404 unknown), computed from means + sigmoid(opacity)
   weights, cached on disk keyed by asset id + file size + mtime.
 - **Scene creation** sets `up` from the base asset's orientation (falls back to

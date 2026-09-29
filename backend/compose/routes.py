@@ -2,18 +2,19 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any, Callable
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
+from plyfile import PlyParseError
 from pydantic import ValidationError
 
 from .exporter import missing_assets, run_export
 from .models import Asset, CreateSceneRequest, ExportResponse, SceneDoc, SceneSummary
 from .orientation import MeshAssetError, estimate_asset_up
-from .plyio import PlyFormatError
 from .store import AssetError, ComposeStore, SceneFileError
 
 _SCENE_BODY_OPENAPI = {
@@ -22,6 +23,9 @@ _SCENE_BODY_OPENAPI = {
         "content": {"application/json": {"schema": {"$ref": "#/components/schemas/SceneDoc"}}},
     }
 }
+logger = logging.getLogger(__name__)
+# Failures of the up estimate that must not block scene creation (PlyFormatError is a ValueError).
+_ESTIMATE_ERRORS = (ValueError, OSError, MemoryError, PlyParseError)
 _MEDIA_TYPES = {"splat": "application/octet-stream", "mesh": "model/gltf-binary"}
 
 
@@ -73,7 +77,9 @@ def build_compose_router(data_root: str | Path, get_manager: Callable[[], Any]) 
             result = estimate_asset_up(store, asset_id)
         except MeshAssetError as exc:
             raise HTTPException(400, str(exc)) from exc
-        except (PlyFormatError, ValueError) as exc:
+        except OSError as exc:
+            raise HTTPException(503, f"Asset file busy or unreadable: {exc}") from exc
+        except (ValueError, PlyParseError) as exc:
             raise HTTPException(422, f"Cannot estimate orientation: {exc}") from exc
         if result is None:
             raise HTTPException(404, f"Asset not found: {asset_id}")
@@ -90,7 +96,15 @@ def build_compose_router(data_root: str | Path, get_manager: Callable[[], Any]) 
             raise HTTPException(400, f"Base asset not found: {req.base_asset}")
         if base.kind != "splat":
             raise HTTPException(400, "Base asset must be a splat (.ply)")
-        return store.create_scene(req.name, base)
+        up = None
+        try:
+            est = estimate_asset_up(store, base.id)
+            if est is not None and est["measured"]:
+                up = tuple(est["up"])
+        except _ESTIMATE_ERRORS:
+            logger.warning("up estimation failed for %s; creating scene without `up`",
+                           base.id, exc_info=True)
+        return store.create_scene(req.name, base, up=up)
 
     @router.get("/scenes/{scene_id}", response_model=SceneDoc)
     def get_scene(scene_id: str) -> SceneDoc:

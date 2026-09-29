@@ -9,10 +9,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .bake import ColorAdjust, Crop, Placement, merge_clouds, transform_cloud
+from .fsutil import replace_with_retry
 from .glb import placement_matrix, wrap_with_transform
 from .models import SceneDoc, SceneObject
 from .plyio import read_ply, write_ply
-from .store import ComposeStore, replace_with_retry
+from .store import ComposeStore
 
 ProgressFn = Callable[..., None]
 

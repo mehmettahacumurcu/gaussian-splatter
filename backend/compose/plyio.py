@@ -136,6 +136,20 @@ def validate_ply(path: str | Path) -> int:
     return count
 
 
+def read_means_opacity(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
+    """Read only the positions and (logit) opacities: ((N, 3), (N,)) float32 copies.
+
+    Much cheaper than ``read_ply`` for callers that need nothing else (up estimation).
+    """
+    from plyfile import PlyData
+
+    validate_ply(path)
+    vertex = PlyData.read(str(path))["vertex"].data
+    means = np.stack([np.asarray(vertex[c], dtype=np.float32) for c in ("x", "y", "z")], axis=1)
+    opacities = np.array(vertex["opacity"], dtype=np.float32)  # copy: don't alias the memmap
+    return means, opacities
+
+
 def read_ply(path: str | Path) -> GaussianCloud:
     from plyfile import PlyData
 

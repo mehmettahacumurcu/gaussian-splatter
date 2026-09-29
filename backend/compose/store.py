@@ -11,19 +11,18 @@ assets with id ``scene__<scene>``. Ids are generated here and checked against
 """
 from __future__ import annotations
 
-import os
 import re
 import secrets
 import shutil
-import tempfile
 import time
 from pathlib import Path
 from typing import BinaryIO
 
 from pydantic import ValidationError
 
+from .fsutil import atomic_write_text, replace_with_retry
 from .glb import GlbFormatError, validate_glb
-from .models import ASSET_REF_PATTERN, ID_PATTERN, Asset, SceneDoc, SceneObject, SceneSummary
+from .models import ASSET_REF_PATTERN, ID_PATTERN, Asset, SceneDoc, SceneObject, SceneSummary, Vec3
 from .plyio import PlyFormatError, validate_ply
 
 _ID_RE = re.compile(ID_PATTERN)
@@ -43,29 +42,6 @@ class SceneFileError(ValueError):
 
 def new_id(prefix: str) -> str:
     return f"{prefix}_{secrets.token_hex(6)}"
-
-
-def replace_with_retry(src: str | Path, dst: str | Path, tries: int = 5, delay: float = 0.2) -> None:
-    """``os.replace`` that tolerates transient Windows locks (antivirus, open handles)."""
-    for attempt in range(tries):
-        try:
-            os.replace(src, dst)
-            return
-        except PermissionError:
-            if attempt == tries - 1:
-                raise
-            time.sleep(delay)
-
-
-def _atomic_write_text(path: Path, text: str) -> None:
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-        replace_with_retry(tmp_name, path)
-    except BaseException:
-        Path(tmp_name).unlink(missing_ok=True)
-        raise
 
 
 class ComposeStore:
@@ -112,7 +88,7 @@ class ComposeStore:
             source="upload",
             created_ts=time.time(),
         )
-        _atomic_write_text(self.assets_dir / f"{asset_id}.json", asset.model_dump_json())
+        atomic_write_text(self.assets_dir / f"{asset_id}.json", asset.model_dump_json())
         return asset
 
     def _upload_path(self, asset: Asset) -> Path:
@@ -175,29 +151,19 @@ class ComposeStore:
         return self._upload_path(asset)
 
     # -- scenes ---------------------------------------------------------
-    def create_scene(self, name: str, base: Asset) -> SceneDoc:
+    def create_scene(self, name: str, base: Asset, up: Vec3 | None = None) -> SceneDoc:
         doc = SceneDoc(
             id=new_id("s"),
             name=name,
+            up=up,
             objects=[SceneObject(id=new_id("o"), kind="splat", asset=base.id, name=base.name, role="base")],
         )
-        try:
-            # Imported lazily (orientation imports this module) and looked up as a
-            # module attribute so tests can monkeypatch the estimator.
-            from . import orientation
-
-            est = orientation.estimate_asset_up(self, base.id)
-            if est is not None:
-                # Re-validate so the vector is checked and normalised.
-                doc = SceneDoc.model_validate({**doc.model_dump(), "up": list(est["up"])})
-        except Exception:
-            pass  # best effort: a scene without `up` is still valid (assumes +Y)
         self.save_scene(doc)
         return doc
 
     def save_scene(self, doc: SceneDoc) -> None:
         self._ensure_dirs()
-        _atomic_write_text(self.scenes_dir / f"{doc.id}.json", doc.model_dump_json(indent=2))
+        atomic_write_text(self.scenes_dir / f"{doc.id}.json", doc.model_dump_json(indent=2))
 
     def scene_exists(self, scene_id: str) -> bool:
         return bool(_ID_RE.fullmatch(scene_id)) and (self.scenes_dir / f"{scene_id}.json").is_file()

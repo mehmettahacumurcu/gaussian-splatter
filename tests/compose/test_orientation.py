@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 
 import numpy as np
@@ -10,7 +11,7 @@ import pytest
 import backend.compose.orientation as orientation_mod
 from backend.compose.models import SceneDoc
 from backend.compose.plyio import GaussianCloud, write_ply
-from tests.compose.helpers import minimal_glb
+from tests.compose.helpers import minimal_glb, random_cloud
 from tests.compose.test_routes import _setup, _upload
 
 
@@ -101,7 +102,8 @@ def test_orientation_endpoint_finds_floor_normal(tmp_path):
     r = client.get(f"/compose/assets/{base['id']}/orientation")
     assert r.status_code == 200
     body = r.json()
-    assert set(body) == {"up", "tilt_deg", "plane_inlier_frac", "above_below_ratio"}
+    assert set(body) == {"up", "tilt_deg", "plane_inlier_frac", "above_below_ratio", "measured"}
+    assert body["measured"] is True
     up = np.array(body["up"])
     assert np.linalg.norm(up) == pytest.approx(1.0, abs=1e-6)
     assert up @ np.array([0, 0, 1]) > 0.9
@@ -154,6 +156,76 @@ def test_orientation_cache_hit_and_invalidation(tmp_path, monkeypatch):
     assert len(calls) == 3
 
 
+def test_cache_entries_are_versioned_and_validated(tmp_path, monkeypatch):
+    client, _ = _setup(tmp_path)
+    base = _floor_asset(tmp_path, client)
+    calls = []
+    real = orientation_mod.estimate_world_orientation
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(orientation_mod, "estimate_world_orientation", counting)
+    url = f"/compose/assets/{base['id']}/orientation"
+    client.get(url)
+    (cache_file,) = (tmp_path / "compose" / "cache").glob("*.orientation.json")
+    entry = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert entry["v"] == 1 and entry["result"]["measured"] is True
+
+    def poisoned(**changes):
+        e = json.loads(json.dumps(entry))
+        for k, val in changes.items():
+            if k == "v":
+                e["v"] = val
+            else:
+                e["result"][k] = val
+        cache_file.write_text(json.dumps(e), encoding="utf-8")
+
+    expected = 1
+    for changes in ({"v": 0}, {"up": [0, 0, 5]}, {"up": [0, 0]}, {"measured": "yes"},
+                    {"tilt_deg": None}, {"up": [0, 0, 1e999]}):
+        poisoned(**changes)
+        r = client.get(url)
+        expected += 1
+        assert r.status_code == 200 and len(calls) == expected, changes
+        assert r.json()["up"][2] > 0.9
+
+
+def test_orientation_unmeasured_for_sparse_cloud(tmp_path):
+    client, _ = _setup(tmp_path)
+    data = write_ply(random_cloud(300), tmp_path / "src" / "tiny.ply").read_bytes()
+    asset = _upload(client, "tiny.ply", data).json()
+    body = client.get(f"/compose/assets/{asset['id']}/orientation").json()
+    assert body["measured"] is False and body["plane_inlier_frac"] == 0
+
+
+def test_orientation_error_mapping(tmp_path, monkeypatch):
+    client, _ = _setup(tmp_path)
+    base = _floor_asset(tmp_path, client)
+    url = f"/compose/assets/{base['id']}/orientation"
+
+    def bad_value(*a, **k):
+        raise ValueError("degenerate")
+
+    monkeypatch.setattr(orientation_mod, "estimate_world_orientation", bad_value)
+    assert client.get(url).status_code == 422
+
+    def busy(*a, **k):
+        raise PermissionError("locked")
+
+    monkeypatch.setattr(orientation_mod, "estimate_world_orientation", busy)
+    assert client.get(url).status_code == 503
+
+
+def test_orientation_truncated_ply_is_422(tmp_path):
+    client, _ = _setup(tmp_path)
+    base = _floor_asset(tmp_path, client)
+    ply = tmp_path / "compose" / "assets" / f"{base['id']}.ply"
+    ply.write_bytes(ply.read_bytes()[:-5000])
+    assert client.get(f"/compose/assets/{base['id']}/orientation").status_code == 422
+
+
 # -- create_scene ---------------------------------------------------------------
 def test_create_scene_sets_up_from_floor(tmp_path):
     client, _ = _setup(tmp_path)
@@ -165,14 +237,43 @@ def test_create_scene_sets_up_from_floor(tmp_path):
     assert client.get(f"/compose/scenes/{r.json()['id']}").json()["up"] == r.json()["up"]
 
 
-def test_create_scene_survives_estimator_failure(tmp_path, monkeypatch):
+def test_create_scene_survives_estimator_failure_and_logs(tmp_path, monkeypatch, caplog):
     client, _ = _setup(tmp_path)
     base = _floor_asset(tmp_path, client)
 
     def boom(*args, **kwargs):
-        raise RuntimeError("estimator exploded")
+        raise ValueError("estimator exploded")
 
     monkeypatch.setattr(orientation_mod, "estimate_world_orientation", boom)
-    r = client.post("/compose/scenes", json={"name": "Oda", "base_asset": base["id"]})
+    with caplog.at_level(logging.WARNING, logger="backend.compose.routes"):
+        r = client.post("/compose/scenes", json={"name": "Oda", "base_asset": base["id"]})
     assert r.status_code == 201
     assert r.json()["up"] is None
+    rec = [x for x in caplog.records if x.levelno == logging.WARNING]
+    assert rec and rec[0].exc_info is not None
+
+
+def test_create_scene_leaves_up_null_when_unmeasured(tmp_path):
+    client, _ = _setup(tmp_path)
+    data = write_ply(random_cloud(300), tmp_path / "src" / "tiny.ply").read_bytes()
+    asset = _upload(client, "tiny.ply", data).json()
+    r = client.post("/compose/scenes", json={"name": "Oda", "base_asset": asset["id"]})
+    assert r.status_code == 201 and r.json()["up"] is None
+
+
+def test_store_create_scene_takes_up_and_never_estimates(tmp_path, monkeypatch):
+    from backend.compose.store import ComposeStore
+
+    client, _ = _setup(tmp_path)
+    base_meta = _floor_asset(tmp_path, client)
+    store = ComposeStore(tmp_path)
+    base = store.get_asset(base_meta["id"])
+
+    def boom(*a, **k):
+        raise AssertionError("store must not estimate")
+
+    monkeypatch.setattr(orientation_mod, "estimate_world_orientation", boom)
+    assert store.create_scene("a", base).up is None
+    doc = store.create_scene("b", base, up=(0.0, 0.0, 1.0))
+    assert doc.up == (0.0, 0.0, 1.0)
+    assert store.load_scene(doc.id).up == (0.0, 0.0, 1.0)
