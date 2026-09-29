@@ -7,6 +7,7 @@
  *   - Viewer: seçilen job'ın splat render'ı
  *   - Analiz / Eval: training metrikleri + held-out NVS
  *   - Interactive: gezilebilir splat dünyası (D+E)
+ *   - Sahne Editörü: splat/mesh objeleri bir base sahneye yerleştir + export
  */
 import { useCallback, useEffect, useState } from "react";
 import "./App.css";
@@ -17,6 +18,7 @@ import { TrainingAnalytics } from "./components/TrainingAnalytics";
 import { NvsEvalPanel } from "./components/NvsEvalPanel";
 import { ConnectionSettings } from "./components/ConnectionSettings";
 import { InteractivePage } from "./interactive/InteractivePage";
+import { ComposePage } from "./compose/ComposePage";
 import { NotebookGeneratorPanel } from "./notebook/NotebookGeneratorPanel";
 import {
   getHealth,
@@ -30,7 +32,7 @@ import {
 } from "./api";
 import { getConnection, isLocal, onConnectionChange } from "./connection";
 
-type Tab = "notebook" | "submit" | "jobs" | "viewer" | "analytics" | "eval" | "interactive";
+type Tab = "notebook" | "submit" | "jobs" | "viewer" | "analytics" | "eval" | "interactive" | "compose";
 
 type ViewerState =
   | { kind: "idle" }
@@ -80,6 +82,11 @@ function App() {
   const [connSettingsOpen, setConnSettingsOpen] = useState(false);
   const [connection, setConnectionState] = useState(() => getConnection());
   useEffect(() => onConnectionChange(setConnectionState), []);
+  // Sahne Editörü: ilk açılışta mount edilir, sonra sekme değişse de state kaybolmasın diye açık kalır.
+  const [composeMounted, setComposeMounted] = useState(false);
+  useEffect(() => {
+    if (tab === "compose") setComposeMounted(true);
+  }, [tab]);
 
   // Health poll (her 5 sn)
   useEffect(() => {
@@ -136,7 +143,8 @@ function App() {
   const loadLatestCompleted = useCallback(async () => {
     try {
       const { jobs } = await listJobs();
-      const done = jobs.find((j) => j.status === "completed");
+      // Compose export job'larının viewer'da açılacak bir splat çıktısı yok.
+      const done = jobs.find((j) => j.status === "completed" && !j.scene.startsWith("compose-"));
       if (done) {
         setJobIdInput(done.id);
         loadInViewer(done.id);
@@ -237,6 +245,12 @@ function App() {
             onClick={() => setTab("interactive")}
           >
             Interactive
+          </button>
+          <button
+            className={`tab-btn ${tab === "compose" ? "active" : ""}`}
+            onClick={() => setTab("compose")}
+          >
+            Sahne Editörü
           </button>
         </nav>
         <div className="app-status">
@@ -466,6 +480,12 @@ function App() {
 
         {tab === "interactive" && (
           <InteractivePage />
+        )}
+
+        {composeMounted && (
+          <div className="compose-host" style={{ display: tab === "compose" ? "block" : "none" }}>
+            <ComposePage active={tab === "compose"} />
+          </div>
         )}
       </main>
 

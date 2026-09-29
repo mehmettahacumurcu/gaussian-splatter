@@ -10,6 +10,7 @@
 import { useEffect, useState } from "react";
 import type { Job } from "../api";
 import { cancelJob, downloadUrl, listJobs } from "../api";
+import { getApiBase, withTokenParam } from "../connection";
 
 interface Props {
   onViewJob: (job: Job) => void;
@@ -168,12 +169,15 @@ function JobRow({ job, expanded, onToggleExpand, onView }: RowProps) {
 
           {job.status === "completed" && (
             <div className="job-actions">
-              <button className="btn-primary" onClick={onView}>
-                Viewer'da aç
-              </button>
+              {/* Compose export job'ları (scene "compose-…") viewer'da açılamaz. */}
+              {!job.scene.startsWith("compose-") && (
+                <button className="btn-primary" onClick={onView}>
+                  Viewer'da aç
+                </button>
+              )}
               <a
                 className="btn-secondary"
-                href={downloadUrl(job.id)}
+                href={job.download_url ? withTokenParam(`${getApiBase()}${job.download_url}`) : downloadUrl(job.id)}
                 target="_blank"
                 rel="noreferrer"
               >

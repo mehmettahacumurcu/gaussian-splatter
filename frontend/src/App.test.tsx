@@ -27,6 +27,7 @@ vi.mock("./components/TrainingAnalytics", () => ({ TrainingAnalytics: () => <div
 vi.mock("./components/NvsEvalPanel", () => ({ NvsEvalPanel: () => <div /> }));
 vi.mock("./components/ConnectionSettings", () => ({ ConnectionSettings: () => null }));
 vi.mock("./interactive/InteractivePage", () => ({ InteractivePage: () => <div /> }));
+vi.mock("./compose/ComposePage", () => ({ ComposePage: () => <div data-testid="compose-page" /> }));
 
 import App from "./App";
 
@@ -48,5 +49,11 @@ describe("App notebook and legacy tabs", () => {
     expect(screen.getByTestId("legacy-panel")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Submit legacy job" }));
     expect(screen.getByText("Jobs content")).toBeInTheDocument();
+  });
+
+  it("opens the scene composer tab", () => {
+    render(<App />);
+    fireEvent.click(screen.getByRole("button", { name: "Sahne Editörü" }));
+    expect(screen.getByTestId("compose-page")).toBeInTheDocument();
   });
 });
