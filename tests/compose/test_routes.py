@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -118,7 +119,9 @@ def test_scene_validation_errors(tmp_path):
     url = f"/compose/scenes/{doc['id']}"
 
     moved = {**doc, "objects": [{**doc["objects"][0], "transform": {"position": [1, 0, 0]}}]}
-    assert client.put(url, json=moved).status_code == 422
+    r = client.put(url, json=moved)
+    assert r.status_code == 422
+    assert r.json()["detail"][0]["loc"][0] == "body"
     two_bases = {**doc, "objects": doc["objects"] + [{**doc["objects"][0], "id": "o_b2"}]}
     assert client.put(url, json=two_bases).status_code == 422
     mesh_crop = {**doc, "objects": doc["objects"] + [{
@@ -294,6 +297,44 @@ def test_export_can_be_repeated_and_replaces_previous(tmp_path):
     z = zipfile.ZipFile(exports / f"{doc['id']}.zip")
     assert z.read("merged.ply") == (exports / doc["id"] / "merged.ply").read_bytes()
     z.close()
+
+
+def test_export_cleans_stale_leftovers_from_killed_runs(tmp_path):
+    client, _ = _setup(tmp_path)
+    doc = _scene_with_statue(client, tmp_path)
+    sid = doc["id"]
+    exports = tmp_path / "compose" / "exports"
+    exports.mkdir(parents=True, exist_ok=True)
+    (exports / f"{sid}.aaaaaaaa.tmp").mkdir()
+    (exports / f"{sid}.aaaaaaaa.tmp" / "merged.ply").write_bytes(b"x")
+    (exports / f"{sid}.bbbbbbbb.zip.tmp").write_bytes(b"x")
+    (exports / f"{sid}.cccccccc.old").mkdir()
+    other = exports / "s_other.dddddddd.tmp"  # another scene's leftovers are not ours to touch
+    other.mkdir()
+    _export(client, sid)
+    assert sorted(p.name for p in exports.iterdir()) == sorted([sid, f"{sid}.zip", other.name])
+
+
+def test_export_restores_newest_backup_when_export_dir_is_missing(tmp_path):
+    client, _ = _setup(tmp_path)
+    doc = _scene_with_statue(client, tmp_path)
+    sid = doc["id"]
+    exports = tmp_path / "compose" / "exports"
+    exports.mkdir(parents=True, exist_ok=True)
+    old, older = exports / f"{sid}.11111111.old", exports / f"{sid}.22222222.old"
+    for d, content in ((older, b"older"), (old, b"newer")):
+        d.mkdir()
+        (d / "marker.txt").write_bytes(content)
+    os.utime(older, (1_000_000, 1_000_000))
+    os.utime(old, (2_000_000, 2_000_000))
+    from backend.compose.exporter import _clean_stale_exports
+    from backend.compose.store import ComposeStore
+    _clean_stale_exports(ComposeStore(tmp_path), sid)
+    assert (exports / sid / "marker.txt").read_bytes() == b"newer"
+    assert sorted(p.name for p in exports.iterdir()) == [sid]
+    _export(client, sid)
+    assert (exports / sid / "merged.ply").is_file()
+    assert not (exports / sid / "marker.txt").exists()
 
 
 def test_export_honours_cancellation(tmp_path):

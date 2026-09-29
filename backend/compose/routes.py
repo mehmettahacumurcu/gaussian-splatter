@@ -91,6 +91,8 @@ def build_compose_router(data_root: str | Path, get_manager: Callable[[], Any]) 
             doc = SceneDoc.model_validate_json(await request.body())
         except ValidationError as exc:
             detail = json.loads(exc.json(include_input=False, include_url=False, include_context=False))
+            for err in detail:
+                err["loc"] = ["body", *err["loc"]]
             raise HTTPException(422, detail) from exc
         return await run_in_threadpool(_save_scene, scene_id, doc)
 

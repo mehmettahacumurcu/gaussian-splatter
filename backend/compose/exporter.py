@@ -1,6 +1,7 @@
 """Export job body: bake a saved SceneDoc into merged.ply + meshes + zip."""
 from __future__ import annotations
 
+import re
 import secrets
 import shutil
 import zipfile
@@ -41,6 +42,26 @@ def _build_zip(src_dir: Path, zip_path: Path) -> None:
                 zf.write(p, arcname=p.relative_to(src_dir).as_posix())
 
 
+def _clean_stale_exports(store: ComposeStore, scene_id: str) -> None:
+    """Remove leftovers of killed export runs for ``scene_id``.
+
+    Deletes ``<id>.<token>.tmp`` dirs and ``<id>.<token>.zip.tmp`` files. If the
+    export dir is missing but ``<id>.<token>.old`` backups exist (killed between the
+    two swap steps), the newest backup is restored; any other backup is deleted.
+    """
+    pattern = re.compile(rf"^{re.escape(scene_id)}\.[0-9a-f]{{8}}\.(tmp|zip\.tmp|old)$")
+    stale = [p for p in store.exports_dir.iterdir() if pattern.match(p.name)]
+    backups = sorted((p for p in stale if p.name.endswith(".old") and p.is_dir()),
+                     key=lambda p: p.stat().st_mtime, reverse=True)
+    if backups and not store.export_dir(scene_id).exists():
+        replace_with_retry(backups[0], store.export_dir(scene_id))
+    for p in stale:
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            p.unlink(missing_ok=True)
+
+
 def run_export(
     doc: SceneDoc,
     store: ComposeStore,
@@ -68,6 +89,7 @@ def run_export(
                 {"splats": len(splats), "meshes": len(meshes)})
 
     store.exports_dir.mkdir(parents=True, exist_ok=True)
+    _clean_stale_exports(store, doc.id)
     token = secrets.token_hex(4)
     tmp = store.exports_dir / f"{doc.id}.{token}.tmp"
     zip_tmp = store.exports_dir / f"{doc.id}.{token}.zip.tmp"
