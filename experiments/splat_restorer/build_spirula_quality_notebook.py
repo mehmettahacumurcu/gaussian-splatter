@@ -199,12 +199,18 @@ for name in VARIANTS:
     for key in ("metrics", "config"):
         if found[key] is not None:
             shutil.copy2(found[key], vdir / f"spirula_{key}.json")
+    slot_frames = None
     if found["eval_gt"]:
-        split_psnr = sq.check_split(found["eval_gt"], data, holdout)
-        print(f"Saklanan kare eşleşmesi (Spirula GT ↔ bizim foto, yüksek olmalı): {[round(p, 1) for p in split_psnr]}")
-        assert min(split_psnr) > 25, "Spirula'nın sakladığı kareler bizimkilerle aynı değil!"
+        # Spirula yazdığı eval-gt sırası bizim sıramız değil: kareleri içeriğe göre eşle.
+        slot_frames, match_psnr = sq.match_eval_slots(found["eval_gt"], data, holdout)
+        # Spirula GT lens düzeltmesiz orijinal; bizim foto düzeltilmiş → aynı kare ~27-31 dB, farklı kare ~10.
+        print(f"Saklanan kare eşleşmesi: en kötü {min(match_psnr):.1f} dB, "
+              f"{len(set(slot_frames))}/{len(holdout)} farklı kare", flush=True)
+        ok = min(match_psnr) > 20 and sorted(slot_frames) == sorted(holdout)
+        assert ok, "Spirula'nın sakladığı kareler bizimkilerle aynı değil!"
     r = evaluate(name, vdir / "spirula.ply", v.note, minutes)
     r["native"] = sq.native_metrics(found["metrics"])
+    r["spirula_eval_slot_frames"] = slot_frames
     r["variant"] = sq.variant_dict(v)
     sq.save_json(res_path, r)
     results[name] = r

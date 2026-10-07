@@ -102,17 +102,30 @@ def find_outputs(out_prefix: Path) -> dict:
     }
 
 
-def check_split(eval_gt: list[Path], data: SplatData, holdout: list[int], n_check: int = 5) -> list[float]:
-    """PSNR between Spirula's held-out GT slots and our held-out photos (should be high if the sets match)."""
+def _thumb(path: Path) -> np.ndarray:
+    im = Image.open(path)
+    im.draft("RGB", (240, 135))  # fast JPEG decode; no-op for PNG
+    return np.asarray(im.convert("L").resize((96, 54), Image.BILINEAR), np.float32) / 255
+
+
+def match_eval_slots(eval_gt: list[Path], data: SplatData, holdout: list[int]) -> tuple[list[int], list[float]]:
+    """Frame id of each Spirula eval slot, found by image content.
+
+    Spirula holds out the requested frames but writes eval-gt-NNNNN in its own
+    order (not sorted by name), so slot k is not holdout[k]. Returns the frame
+    per slot and the thumbnail PSNR of each match. Spirula saves the uncorrected
+    original while our photos are undistorted, so a true match scores ~27-31 dB and a
+    wrong frame ~10 dB."""
     if len(eval_gt) != len(holdout):
         raise AssertionError(f"Spirula held out {len(eval_gt)} images, we hold out {len(holdout)}")
-    out = []
-    for k in np.linspace(0, len(holdout) - 1, n_check).round().astype(int):
-        ours = np.asarray(Image.open(data.frames_dir / data.frames[holdout[k]]).convert("L"), np.float32) / 255
-        theirs = Image.open(eval_gt[k]).convert("L").resize((data.width, data.height), Image.BILINEAR)
-        theirs = np.asarray(theirs, np.float32) / 255
-        out.append(float(10 * np.log10(1 / max(np.mean((ours - theirs) ** 2), 1e-12))))
-    return out
+    ours = np.stack([_thumb(data.frames_dir / data.frames[i]) for i in holdout])
+    frames, psnrs = [], []
+    for path in eval_gt:
+        err = ((ours - _thumb(path)) ** 2).mean(axis=(1, 2))
+        j = int(err.argmin())
+        frames.append(holdout[j])
+        psnrs.append(float(10 * np.log10(1 / max(float(err[j]), 1e-12))))
+    return frames, psnrs
 
 
 def native_metrics(path: Path | None) -> dict:
