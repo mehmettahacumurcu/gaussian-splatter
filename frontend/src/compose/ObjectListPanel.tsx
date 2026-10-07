@@ -8,9 +8,12 @@ interface Props {
   onToggleVisible: (id: string, visible: boolean) => void;
   onDuplicate: (id: string) => void;
   onRemove: (id: string) => void;
+  morphSourceId?: string | null;
+  morphTargetId?: string | null;
+  onMorphSelect?: (slot: "sourceId" | "targetId", id: string) => void;
 }
 
-export function ObjectListPanel({ objects, selectedId, errors, onSelect, onToggleVisible, onDuplicate, onRemove }: Props) {
+export function ObjectListPanel({ objects, selectedId, errors, onSelect, onToggleVisible, onDuplicate, onRemove, morphSourceId, morphTargetId, onMorphSelect }: Props) {
   return (
     <ul className="compose-object-list">
       {objects.map((o) => (
@@ -47,6 +50,30 @@ export function ObjectListPanel({ objects, selectedId, errors, onSelect, onToggl
           {errors[o.id] && (
             <span className="compose-badge error" title={errors[o.id]}>
               hata
+            </span>
+          )}
+          {o.kind === "splat" && onMorphSelect && (
+            <span className="compose-morph-slots" role="group" aria-label={`${o.name} morph seçimi`}>
+              {(["sourceId", "targetId"] as const).map((slot) => {
+                const label = slot === "sourceId" ? "A" : "B";
+                const chosen = (slot === "sourceId" ? morphSourceId : morphTargetId) === o.id;
+                return (
+                  <button
+                    key={slot}
+                    type="button"
+                    className="compose-icon-btn"
+                    title={`Morph ${label}: ${o.name}`}
+                    aria-label={`${o.name} Morph ${label}`}
+                    aria-pressed={chosen}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onMorphSelect(slot, o.id);
+                    }}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
             </span>
           )}
           {o.role !== "base" && o.id === selectedId && (

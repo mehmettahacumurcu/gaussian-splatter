@@ -14,6 +14,8 @@ import type * as THREE from "three";
 import { Vector3 } from "three";
 import { SparkRenderer } from "@sparkjsdev/spark";
 import { MeshObject } from "./MeshObject";
+import { MorphLayer, type MorphDisplay } from "./MorphLayer";
+import type { MorphPlayback, MorphState, MorphStatus } from "./morphTypes";
 import type { ObjectRegistry } from "./registry";
 import { SplatObject } from "./SplatObject";
 import { CROP_BOX_HALF_EXTENT, orbitPositionForUp, readCrop, readTransform, uniformScaleFrom } from "./transformMath";
@@ -32,6 +34,10 @@ interface ViewportProps {
   onTransformCommit: (id: string, t: Transform) => void;
   onCropCommit: (id: string, crop: CropBox) => void;
   onError: (id: string, message: string) => void;
+  morph: MorphState;
+  morphPlayback: MorphPlayback;
+  onMorphChange: (patch: Partial<MorphState>) => void;
+  onMorphStatus: (status: MorphStatus) => void;
   /**
    * `(controls)` when new orbit controls are ready; `(null, released)` when
    * `released` goes away — ignore that unless `released` is still your current one.
@@ -304,6 +310,15 @@ function lightPositionFor(up: Vec3): Vec3 {
 
 export function ComposeViewport(props: ViewportProps) {
   const { doc, active, selectedId, registry, assetUrl, onSelect, onError, onControls } = props;
+  const { morph, morphPlayback, onMorphChange, onMorphStatus } = props;
+  const [display, setDisplay] = useState<MorphDisplay | null>(null);
+  const source = doc.objects.find((o) => o.id === morph.sourceId && o.kind === "splat");
+  const target = doc.objects.find((o) => o.id === morph.targetId && o.kind === "splat");
+  const preview = morph.enabled && source && target && source.id !== target.id;
+  const suppressed = (id: string) => !!preview && !!display && (
+    (id === display.sourceId && display.endpoint !== "source") ||
+    (id === display.targetId && display.endpoint !== "target")
+  );
   const gizmoBusy = useRef(false);
   const up = effectiveUp(doc);
   const upStr = upKey(up);
@@ -329,6 +344,19 @@ export function ComposeViewport(props: ViewportProps) {
       <ambientLight intensity={0.7} />
       <directionalLight position={lightPosition} intensity={1.2} />
       <SparkLayer />
+      {preview && (
+        <MorphLayer
+          source={source}
+          target={target}
+          sourceUrl={assetUrl(source.asset)}
+          targetUrl={assetUrl(target.asset)}
+          morph={morph}
+          playback={morphPlayback}
+          onChange={onMorphChange}
+          onStatus={onMorphStatus}
+          onDisplay={setDisplay}
+        />
+      )}
       {doc.objects.map((o) =>
         o.kind === "splat" ? (
           <SplatObject
@@ -336,6 +364,7 @@ export function ComposeViewport(props: ViewportProps) {
             object={o}
             url={assetUrl(o.asset)}
             selected={o.id === selectedId}
+            suppressed={suppressed(o.id)}
             registry={registry}
             gizmoBusy={gizmoBusy}
             onSelect={onSelect}
@@ -356,7 +385,7 @@ export function ComposeViewport(props: ViewportProps) {
       <OrbitRig up={up} />
       <ControlsBridge onControls={onControls} />
       <GizmoBusyReset gizmoBusy={gizmoBusy} />
-      <Gizmo {...props} gizmoBusy={gizmoBusy} />
+      {!preview && <Gizmo {...props} gizmoBusy={gizmoBusy} />}
     </Canvas>
   );
 }

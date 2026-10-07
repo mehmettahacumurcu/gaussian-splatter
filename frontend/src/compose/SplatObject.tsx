@@ -19,6 +19,8 @@ interface Props {
   object: SceneObject;
   url: string;
   selected: boolean;
+  /** A morph replaces this object without changing its saved visibility. */
+  suppressed?: boolean;
   registry: ObjectRegistry;
   /** True while a gizmo drag/click is in progress: clicks must not change selection. */
   gizmoBusy: RefObject<boolean>;
@@ -40,7 +42,7 @@ const CLICK_SLOP = 4;
  * crop helper (a child of the mesh) lives in the raw file frame, exactly like
  * the bake's crop.
  */
-export function SplatObject({ object, url, selected, registry, gizmoBusy, onSelect, onError }: Props) {
+export function SplatObject({ object, url, selected, suppressed = false, registry, gizmoBusy, onSelect, onError }: Props) {
   const groupRef = useRef<THREE.Group>(null);
   const colorMat = useMemo(() => new THREE.Matrix3(), []);
   const onErrorRef = useRef(onError);
@@ -49,7 +51,7 @@ export function SplatObject({ object, url, selected, registry, gizmoBusy, onSele
   const cropRef = useRef<CropBox | null>(object.crop ?? null);
   cropRef.current = object.crop ?? null;
   const visibleRef = useRef(object.visible);
-  visibleRef.current = object.visible;
+  visibleRef.current = object.visible && !suppressed;
 
   const mesh = useMemo(() => {
     // The DynoMat3 keeps a reference to `colorMat`; mutating it in place and
@@ -181,7 +183,7 @@ export function SplatObject({ object, url, selected, registry, gizmoBusy, onSele
 
   const handleClick = (e: ThreeEvent<MouseEvent>) => {
     // Orbit drag, gizmo interaction or hidden object: not a selection click.
-    if (e.delta > CLICK_SLOP || gizmoBusy.current || !object.visible) return;
+    if (e.delta > CLICK_SLOP || gizmoBusy.current || !visibleRef.current) return;
     e.stopPropagation();
     onSelect(object.id);
   };
@@ -193,7 +195,7 @@ export function SplatObject({ object, url, selected, registry, gizmoBusy, onSele
       position={t.position}
       quaternion={t.quaternion}
       scale={t.scale}
-      visible={object.visible}
+      visible={object.visible && !suppressed}
       onClick={handleClick}
     >
       <primitive object={mesh} />

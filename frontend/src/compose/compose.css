@@ -33,6 +33,23 @@
 .compose-badge { font-size: 10px; padding: 1px 5px; border-radius: 3px; background: var(--bg-3); color: var(--text-muted); }
 .compose-badge.base { color: var(--accent); }
 .compose-badge.error { color: var(--err); }
+.compose-morph-slots { display: inline-flex; gap: 2px; flex-shrink: 0; }
+.compose-morph-slots button { border: 1px solid var(--border); border-radius: 3px; font-size: 10px; padding: 2px 4px; }
+.compose-morph-slots button[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-bg); }
+.compose-object-list li { flex-wrap: wrap; }
+.compose-object-name { min-width: 32px; }
+.compose-morph { margin-bottom: 16px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+.compose-morph h3 { margin: 0; font-size: 14px; }
+.compose-morph h3 small { margin-left: 6px; font-size: 10px; font-weight: normal; color: var(--text-muted); }
+.compose-morph-hint, .compose-morph-status { margin: 0; font-size: 11px; line-height: 1.5; }
+.compose-morph-status { color: var(--text-muted); }
+.compose-morph-status.error { color: var(--err); }
+.compose-morph-pair { display: grid; gap: 4px; padding: 6px 8px; border-radius: 4px; background: var(--bg-2); font-size: 12px; }
+.compose-morph-pair > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.compose-morph-pair b { color: var(--accent); margin-right: 6px; }
+.compose-morph-time { align-self: center; margin-left: auto; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.compose-morph input { min-width: 0; width: 100%; box-sizing: border-box; }
+.compose-morph small { font-size: 10px; }
 .compose-asset-picker { display: grid; gap: 6px; }
 .compose-asset-picker select { width: 100%; }
 .compose-row { display: flex; gap: 6px; flex-wrap: wrap; }

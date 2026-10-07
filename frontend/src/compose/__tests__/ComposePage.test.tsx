@@ -2,6 +2,15 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Job } from "../../api";
 import type { AssetOrientation, SceneDoc } from "../types";
+import type { MorphPlayback, MorphState, MorphStatus } from "../morphTypes";
+
+interface ViewportProps {
+  morph: MorphState;
+  morphPlayback: MorphPlayback;
+  onMorphChange: (patch: Partial<MorphState>) => void;
+  onMorphStatus: (status: MorphStatus) => void;
+}
+const viewport = vi.hoisted(() => ({ props: null as ViewportProps | null }));
 
 vi.mock("../../api", () => ({ getJobStatus: vi.fn() }));
 vi.mock("../composeApi", () => ({
@@ -16,7 +25,10 @@ vi.mock("../composeApi", () => ({
   saveScene: vi.fn(),
   uploadAsset: vi.fn(),
 }));
-vi.mock("../ComposeViewport", () => ({ ComposeViewport: () => <div data-testid="viewport" /> }));
+vi.mock("../ComposeViewport", () => ({ ComposeViewport: (props: ViewportProps) => {
+  viewport.props = props;
+  return <div data-testid="viewport" />;
+} }));
 
 import { getJobStatus } from "../../api";
 import * as composeApi from "../composeApi";
@@ -106,6 +118,44 @@ afterEach(() => {
 });
 
 describe("ComposePage", () => {
+  it("keeps morph selection transient and ends the preview when an endpoint is deleted", async () => {
+    api.getScene.mockResolvedValue({ ...DOC, objects: [...DOC.objects, STATUE] });
+    await openScene();
+    fireEvent.click(screen.getByRole("button", { name: "garden Morph A" }));
+    fireEvent.click(screen.getByRole("button", { name: "statue Morph B" }));
+    fireEvent.click(screen.getByRole("button", { name: "Morph hazırla" }));
+    expect(viewport.props?.morph).toMatchObject({ sourceId: "base", targetId: "o_statue", enabled: true });
+    expect(screen.getByRole("button", { name: "Kaydet" })).toBeDisabled();
+    act(() => viewport.props?.onMorphStatus({ phase: "ready", count: 200000 }));
+    fireEvent.click(screen.getByRole("button", { name: "Oynat" }));
+    expect(viewport.props?.morph.playing).toBe(true);
+    fireEvent.click(screen.getByText("statue", { selector: ".compose-object-name" }));
+    fireEvent.keyDown(window, { key: "Delete" });
+    expect(viewport.props?.morph).toMatchObject({ sourceId: "base", targetId: null, enabled: false, playing: false, t: 0 });
+    expect(viewport.props?.morphPlayback).toEqual({ t: 0, playing: false });
+  });
+
+  it("pauses morph at the live time when the editor becomes inactive and clears it on scene close", async () => {
+    api.getScene.mockResolvedValue({ ...DOC, objects: [...DOC.objects, STATUE] });
+    const { rerender } = render(<ComposePage active />);
+    fireEvent.click(await screen.findByRole("button", { name: "Aç" }));
+    await screen.findByTestId("viewport");
+    fireEvent.click(screen.getByRole("button", { name: "garden Morph A" }));
+    fireEvent.click(screen.getByRole("button", { name: "statue Morph B" }));
+    fireEvent.click(screen.getByRole("button", { name: "Morph hazırla" }));
+    act(() => viewport.props?.onMorphStatus({ phase: "ready" }));
+    fireEvent.click(screen.getByRole("button", { name: "Oynat" }));
+    viewport.props!.morphPlayback.t = 0.625;
+    rerender(<ComposePage active={false} />);
+    expect(viewport.props?.morph).toMatchObject({ playing: false, t: 0.625 });
+    expect(viewport.props?.morphPlayback.playing).toBe(false);
+    rerender(<ComposePage active />);
+    fireEvent.click(screen.getByRole("button", { name: "← Sahneler" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Aç" }));
+    await screen.findByTestId("viewport");
+    expect(viewport.props?.morph).toMatchObject({ sourceId: null, targetId: null, enabled: false, playing: false, t: 0 });
+  });
+
   it("saves once on Ctrl+S even when pressed twice quickly", async () => {
     let resolveSave: (doc: SceneDoc) => void = () => {};
     api.saveScene.mockImplementation(() => new Promise((r) => (resolveSave = r)));

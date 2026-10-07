@@ -18,6 +18,8 @@ import {
 } from "./composeApi";
 import { errorMessage, firstLine } from "./errorMessage";
 import { InspectorPanel } from "./InspectorPanel";
+import { MorphPanel } from "./MorphPanel";
+import { INITIAL_MORPH_STATE, selectMorphSlot, type MorphPlayback, type MorphState, type MorphStatus } from "./morphTypes";
 import { ObjectListPanel } from "./ObjectListPanel";
 import { ObjectRegistry } from "./registry";
 import { composeReducer, initialComposeState, newObjectId } from "./sceneDoc";
@@ -61,6 +63,9 @@ export function ComposePage({ active }: { active: boolean }) {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [gizmoMode, setGizmoMode] = useState<GizmoMode>("translate");
   const [cropEditing, setCropEditing] = useState(false);
+  const [morph, setMorph] = useState<MorphState>(INITIAL_MORPH_STATE);
+  const morphPlayback = useRef<MorphPlayback>({ t: 0, playing: false }).current;
+  const [morphStatus, setMorphStatus] = useState<MorphStatus>({ phase: "idle" });
   const [newName, setNewName] = useState("");
   const [exportJob, setExportJob] = useState<Job | null>(null);
   const pollFailures = useRef(0);
@@ -100,6 +105,38 @@ export function ComposePage({ active }: { active: boolean }) {
     if (!selected || !selected.crop) setCropEditing(false);
   }, [selected]);
 
+  useEffect(() => {
+    if (!active) {
+      setMorph((previous) => previous.playing ? { ...previous, playing: false, t: morphPlayback.t } : previous);
+      morphPlayback.playing = false;
+    }
+  }, [active, morphPlayback]);
+
+  // Deleting a selected endpoint ends the transient preview immediately.
+  useEffect(() => {
+    setMorph((previous) => {
+      const sourceId = doc?.objects.some((object) => object.id === previous.sourceId && object.kind === "splat") ? previous.sourceId : null;
+      const targetId = doc?.objects.some((object) => object.id === previous.targetId && object.kind === "splat") ? previous.targetId : null;
+      if (sourceId === previous.sourceId && targetId === previous.targetId) return previous;
+      morphPlayback.t = 0;
+      morphPlayback.playing = false;
+      return { ...previous, sourceId, targetId, enabled: false, playing: false, t: 0 };
+    });
+  }, [doc?.objects, morphPlayback]);
+
+  const onMorphChange = useCallback((patch: Partial<MorphState>) => {
+    if (patch.t !== undefined) morphPlayback.t = patch.t;
+    if (patch.playing !== undefined) morphPlayback.playing = patch.playing;
+    setMorph((previous) => ({ ...previous, ...patch }));
+  }, [morphPlayback]);
+
+  const onMorphSelect = useCallback((slot: "sourceId" | "targetId", id: string) => {
+    morphPlayback.t = 0;
+    morphPlayback.playing = false;
+    setMorph((previous) => selectMorphSlot(previous, slot, id));
+    setMorphStatus({ phase: "idle" });
+  }, [morphPlayback]);
+
   /**
    * Runs one backend action at a time. `current()` is false once the open
    * scene changed (closed / another one opened) — skip updates then.
@@ -125,6 +162,10 @@ export function ComposePage({ active }: { active: boolean }) {
     setErrors({});
     setExportJob(null);
     setCropEditing(false);
+    setMorph(INITIAL_MORPH_STATE);
+    morphPlayback.t = 0;
+    morphPlayback.playing = false;
+    setMorphStatus({ phase: "idle" });
     pollFailures.current = 0;
     lastSavedRef.current = null;
   };
@@ -511,6 +552,9 @@ export function ComposePage({ active }: { active: boolean }) {
             onToggleVisible={(id, visible) => dispatch({ type: "setVisible", id, visible })}
             onDuplicate={(id) => dispatch({ type: "duplicate", id, newId: newObjectId() })}
             onRemove={(id) => dispatch({ type: "remove", id })}
+            morphSourceId={morph.sourceId}
+            morphTargetId={morph.targetId}
+            onMorphSelect={onMorphSelect}
           />
           <h3>Obje ekle</h3>
           <AssetPicker assets={assets} busy={busy} actionLabel="Sahneye ekle" onPick={addAsset} onUpload={(f) => upload(f, true)} />
@@ -529,9 +573,14 @@ export function ComposePage({ active }: { active: boolean }) {
             onCropCommit={onCropCommit}
             onError={onError}
             onControls={onControls}
+            morph={morph}
+            morphPlayback={morphPlayback}
+            onMorphChange={onMorphChange}
+            onMorphStatus={setMorphStatus}
           />
         </section>
         <aside className="compose-right">
+          <MorphPanel morph={morph} playback={morphPlayback} status={morphStatus} objects={doc.objects} onChange={onMorphChange} />
           {selected ? (
             <InspectorPanel
               key={selected.id}
