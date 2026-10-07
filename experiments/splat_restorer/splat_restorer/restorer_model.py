@@ -109,10 +109,12 @@ class Restorer(torch.nn.Module):
         pretrained: bool = True,
         unet_overrides: dict | None = None,
         base_model: str = BASE_MODEL,
+        pretrained_text_encoder: bool | None = None,
     ):
         """``pretrained=False`` builds random weights from the configs only, and
         ``unet_overrides`` can shrink that random UNet (tests on small GPUs).
-        ``base_model`` is the Hugging Face repo the parts are loaded from."""
+        ``base_model`` is the Hugging Face repo the parts are loaded from.
+        ``pretrained_text_encoder`` defaults to ``pretrained``."""
         super().__init__()
         from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
         from diffusers.models.attention_processor import AttnProcessor2_0
@@ -127,7 +129,7 @@ class Restorer(torch.nn.Module):
             return cls.from_config(config)
 
         tokenizer = AutoTokenizer.from_pretrained(base_model, subfolder="tokenizer")
-        if pretrained:
+        if pretrained if pretrained_text_encoder is None else pretrained_text_encoder:
             text_encoder = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder")
         else:
             text_encoder = CLIPTextModel(CLIPTextConfig.from_pretrained(base_model, subfolder="text_encoder"))
@@ -180,7 +182,9 @@ class Restorer(torch.nn.Module):
         from huggingface_hub import hf_hub_download
         from safetensors.torch import load_file
 
-        model = cls(device=device, base_model=repo)
+        # Build VAE/UNet from the configs only: Difix's VAE file stores LoRA-wrapped
+        # layers (".base_layer."), which a plain AutoencoderKL.from_pretrained rejects.
+        model = cls(device=device, base_model=repo, pretrained=False, pretrained_text_encoder=True)
         for part, module in (("vae", model.vae), ("unet", model.unet)):
             path = hf_hub_download(repo, f"{part}/diffusion_pytorch_model.safetensors")
             module.load_state_dict(load_file(path), strict=True)
