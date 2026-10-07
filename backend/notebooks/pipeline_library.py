@@ -21,6 +21,7 @@ from .models import StrictModel, StaticNotebookRunSpec
 from .source import (
     GENERATOR_ID, GENERATOR_VERSION, REPOSITORY_URL, NotebookSource, NotebookSourceError,
 )
+from .templates.text_to_splat_settings import IMAGE_MODELS, SETTING_FIELDS, model_provenance, validate_settings
 
 ASSETS = Path(__file__).parent / 'templates'
 ROOT = Path(__file__).resolve().parents[2]
@@ -82,6 +83,21 @@ class PipelineNotebookSpec(StrictModel):
     seed: int = Field(default=42, ge=0, le=2147483647, strict=True)
     output_dir: str | None = None
     target_splat_count: int | None = Field(default=None, ge=1000, le=2000000, strict=True)
+    gpu_preset: Literal['l4', 'a100', 'h100', 'rtx_pro_6000'] = 'l4'
+    image_model: Literal['sdxl', 'flux1_dev', 'flux1_schnell', 'flux2_klein_4b', 'qwen_image'] | None = None
+    background_model: Literal['u2net', 'birefnet'] | None = None
+    reconstruction_model: Literal['trellis', 'trellis2', 'hunyuan3d'] | None = None
+    image_steps: int | None = Field(default=None, ge=1, le=100, strict=True)
+    image_guidance: float | None = Field(default=None, ge=0, le=20, allow_inf_nan=False, strict=True)
+    image_resolution: Literal[512, 768, 1024] | None = None
+    trellis_seed: int | None = Field(default=None, ge=0, le=2147483647, strict=True)
+    sparse_steps: int | None = Field(default=None, ge=1, le=100, strict=True)
+    sparse_cfg: float | None = Field(default=None, ge=0, le=20, allow_inf_nan=False, strict=True)
+    slat_steps: int | None = Field(default=None, ge=1, le=100, strict=True)
+    slat_cfg: float | None = Field(default=None, ge=0, le=20, allow_inf_nan=False, strict=True)
+    mesh_views: int | None = Field(default=None, ge=12, le=120, strict=True)
+    mesh_fit_iterations: int | None = Field(default=None, ge=100, le=10000, strict=True)
+    mesh_splat_cap: int | None = Field(default=None, ge=1000, le=300000, strict=True)
 
     @field_validator('prompt', 'negative_prompt', 'style')
     @classmethod
@@ -111,7 +127,13 @@ class PipelineNotebookSpec(StrictModel):
             if self.iterations is not None or self.max_gaussians is not None:
                 raise ValueError('Metin → splat için eğitim ayarları yerine preset ve target_splat_count kullanın')
             self.output_dir = self.output_dir or f'GaussianTests/text_to_splat/{text_prompt_slug(self.prompt)}'
+            resolved = validate_settings(self.model_dump())
+            for field in SETTING_FIELDS:
+                setattr(self, field, resolved[field])
         else:
+            if any(getattr(self, field) != type(self).model_fields[field].default
+                   for field in self.model_fields_set & SETTING_FIELDS):
+                raise ValueError('Model ayarları yalnızca text_to_splat tarifi için kullanılabilir')
             self.input_path = normalize_input_folder(self.input_path)
             if self.prompt or self.negative_prompt or self.style or self.output_dir or self.target_splat_count is not None:
                 raise ValueError('Metin alanları yalnızca text_to_splat tarifi için kullanılabilir')
@@ -128,7 +150,11 @@ def replace_assignments(source: str, values: dict) -> str:
         if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             name = node.targets[0].id
             if name in values:
-                edits.append((node.lineno - 1, node.end_lineno, f'{name} = {values[name]!r}\n'))
+                # Preserve trusted Colab form annotations, never user-supplied code.
+                tail = lines[node.end_lineno - 1].encode('utf-8')[node.end_col_offset:].decode('utf-8')
+                annotation = tail[tail.index('#@param'):].rstrip() if '#@param' in tail else ''
+                edits.append((node.lineno - 1, node.end_lineno, f'{name} = {values[name]!r}' +
+                              (f' {annotation}' if annotation else '') + '\n'))
     found = {ast.parse(text).body[0].targets[0].id for _, _, text in edits}
     if found != set(values):
         raise ValueError(f'Template configuration drift: {set(values) - found}')
@@ -169,11 +195,17 @@ def build_pipeline_notebook(spec: PipelineNotebookSpec, *, source: NotebookSourc
             'SEED': spec.seed, 'QUALITY_PRESET': spec.preset,
             'OUTPUT_DIR': '/content/drive/MyDrive/' + spec.output_dir,
             'TARGET_SPLAT_COUNT': spec.target_splat_count,
+            **{field.upper(): getattr(spec, field) for field in SETTING_FIELDS},
         })
+        if not IMAGE_MODELS[spec.image_model]['negative_prompt']:
+            config.source = '\n'.join(
+                "NEGATIVE_PROMPT = '' # Bu modelde negatif istem devre dışı." if line.startswith('NEGATIVE_PROMPT =') else line
+                for line in config.source.splitlines()) + '\n'
         runtime_files = {
             name: (ASSETS / name).read_text(encoding='utf-8')
             for name in ('text_to_splat_bootstrap.py', 'text_to_splat_runtime.py', 'text_to_splat_helpers.py',
-                         'text_to_splat_requirements.txt')
+                         'text_to_splat_requirements.txt', 'text_to_splat_settings.py',
+                         'text_to_splat_image.py', 'text_to_splat_mesh.py')
         }
         bundle = next(c for c in notebook.cells if c.cell_type == 'code' and 'RUNTIME_FILES =' in c.source)
         bundle.source = replace_assignments(bundle.source, {
@@ -221,6 +253,9 @@ def build_pipeline_notebook(spec: PipelineNotebookSpec, *, source: NotebookSourc
             cell.source += f'\nTRAIN_QUALITY = {cfg["recipe"]!r}\nSFM_QUALITY = {spec.sfm_quality!r}\n'
     notebook.metadata['pipeline'] = {'id': spec.pipeline, 'template_version': 1, 'spec': spec.model_dump(),
                                     'generator_commit': source.commit_sha}
+    if spec.pipeline == 'text_to_splat':
+        notebook.metadata['pipeline']['template_version'] = 2
+        notebook.metadata['pipeline']['models'] = model_provenance(spec.model_dump())
     for cell in notebook.cells:
         if cell.cell_type == 'code':
             cell.outputs = []

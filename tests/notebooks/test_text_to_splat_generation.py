@@ -77,6 +77,7 @@ def test_text_generation_embeds_portable_runtime_and_compiles_every_cell(preset)
     assert set(literals['RUNTIME_FILES']) == {
         'text_to_splat_bootstrap.py', 'text_to_splat_runtime.py', 'text_to_splat_helpers.py',
         'text_to_splat_requirements.txt',
+        'text_to_splat_settings.py', 'text_to_splat_image.py', 'text_to_splat_mesh.py',
     }
     for name, source in literals['RUNTIME_FILES'].items():
         assert source == (ASSETS / name).read_text(encoding='utf-8')

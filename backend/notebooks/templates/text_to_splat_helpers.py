@@ -219,7 +219,7 @@ class StageCache:
             print(f'✓ {name}: doğrulanmış çıktı bulundu; tekrar kullanılacak.', flush=True)
             return
         # Any downstream stages are invalid after a stage rerun, even if files remain.
-        order = ['image', 'gaussian', 'export']
+        order = ['image', 'mesh', 'views', 'gaussian', 'export']
         if name in order:
             for downstream in order[order.index(name) + 1:]:
                 self.data['stages'].pop(downstream, None)

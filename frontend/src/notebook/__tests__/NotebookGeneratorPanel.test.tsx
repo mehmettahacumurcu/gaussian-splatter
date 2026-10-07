@@ -77,6 +77,10 @@ describe("NotebookGeneratorPanel", () => {
     await waitFor(() => expect(generatePipelineNotebook).toHaveBeenCalledWith({
       pipeline: "text_to_splat", input_mode: "text", input_path: "", prompt: "a red sports car",
       negative_prompt: "", style: "", seed: 42, preset: "baseline", output_dir: null, target_splat_count: null,
+      image_model: "sdxl", background_model: "u2net", reconstruction_model: "trellis", gpu_preset: "l4",
+      image_steps: 25, image_guidance: 7, image_resolution: 1024, trellis_seed: 42,
+      sparse_steps: 12, sparse_cfg: 7.5, slat_steps: 12, slat_cfg: 3,
+      mesh_views: 24, mesh_fit_iterations: 1500, mesh_splat_cap: 50000,
     }));
     expect(generateStaticNotebook).not.toHaveBeenCalled();
   });

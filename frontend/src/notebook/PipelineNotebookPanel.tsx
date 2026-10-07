@@ -3,6 +3,7 @@ import { generatePipelineNotebook, getPipelineNotebookPresets } from "../api";
 import { NotebookDownload } from "./NotebookDownload";
 import { resolveDriveFolder } from "./drivePath";
 import type { GeneratedNotebook } from "./types";
+import type { TextToSplatModelSettings } from "./textToSplatSettings";
 
 export type TrainingPipeline = "hybrid" | "spirula";
 export type ExternalPipeline = TrainingPipeline | "text_to_splat";
@@ -21,7 +22,7 @@ export interface TrainingPipelineNotebookSpec {
   geometry_model: "moge2-vits" | "moge2-vitb" | "moge2-vitl";
   sfm_quality: "high" | "extreme";
 }
-export interface TextToSplatNotebookSpec {
+export interface TextToSplatNotebookSpec extends TextToSplatModelSettings {
   pipeline: "text_to_splat";
   input_mode: "text";
   input_path: "";

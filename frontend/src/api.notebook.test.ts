@@ -27,6 +27,10 @@ describe("notebook API", () => {
       pipeline: "text_to_splat", input_mode: "text", input_path: "", preset: "baseline",
       prompt: 'a "red" car\nİstanbul 🚗; print("literal")', negative_prompt: "", style: "", seed: 42,
       output_dir: null, target_splat_count: null,
+      image_model: "sdxl", background_model: "u2net", reconstruction_model: "trellis", gpu_preset: "l4",
+      image_steps: 25, image_guidance: 7, image_resolution: 1024, trellis_seed: 42,
+      sparse_steps: 12, sparse_cfg: 7.5, slat_steps: 12, slat_cfg: 3,
+      mesh_views: 24, mesh_fit_iterations: 1500, mesh_splat_cap: 50000,
     };
     const fetchMock = vi.fn().mockResolvedValue(new Response("{}", { status: 200, headers: {
       "Content-Disposition": 'attachment; filename="car_text_to_splat.ipynb"',

@@ -9,18 +9,25 @@ import platform
 import sys
 from pathlib import Path
 
-from text_to_splat_helpers import StageCache, atomic_json, file_sha256, normalize_gaussians, render_turntable, write_ply
+if __package__:
+    from .text_to_splat_helpers import StageCache, atomic_json, file_sha256, normalize_gaussians, render_turntable, write_ply
+    from .text_to_splat_settings import estimate_requirements, model_provenance, validate_settings
+else:
+    from text_to_splat_helpers import StageCache, atomic_json, file_sha256, normalize_gaussians, render_turntable, write_ply
+    from text_to_splat_settings import estimate_requirements, model_provenance, validate_settings
 
 PINS = {
     'trellis_repo': 'microsoft/TRELLIS', 'trellis_commit': '442aa1e1afb9014e80681d3bf604e8d728a86ee7',
     'trellis_model': 'microsoft/TRELLIS-image-large', 'trellis_revision': '25e0d31ffbebe4b5a97464dd851910efc3002d96',
-    'image_model': 'stabilityai/stable-diffusion-xl-base-1.0', 'image_revision': '462165984030d82259a11f4367a4eed129e94a7b',
     'dino_repo': 'facebookresearch/dinov2', 'dino_commit': '7764ea0f912e53c92e82eb78a2a1631e92725fc8',
     'dino_model': 'dinov2_vitl14_reg',
     'dino_weights': 'https://dl.fbaipublicfiles.com/dinov2/dinov2_vitl14/dinov2_vitl14_reg4_pretrain.pth',
-    'rembg_model': 'u2net', 'rembg_weights': 'https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx',
-    'rembg_md5': '60024c5c889badc19c04ad937298a77b',
 }
+
+
+def provenance_for(config):
+    """Identical cache identity across the image, Gaussian and mesh environments."""
+    return {'models': model_provenance(config), 'recipe_sha256': config['recipe_sha256']}
 
 
 def gpu_preflight(min_vram):
@@ -36,48 +43,6 @@ def gpu_preflight(min_vram):
     if memory < min_vram or free < min_vram - 2:
         raise RuntimeError(f'Yetersiz VRAM: toplam {memory:.1f}, boş {free:.1f} GiB; bu ön ayar en az {min_vram} GiB ister. L4/A100 veya daha düşük ön ayar seçin.')
     return {'name': torch.cuda.get_device_name(0), 'total_gib': memory, 'free_gib_at_start': free}
-
-
-def generate_image(output, config):
-    import torch
-    from diffusers import StableDiffusionXLPipeline
-    from PIL import Image
-    import numpy as np
-    import rembg
-
-    pipe = StableDiffusionXLPipeline.from_pretrained(PINS['image_model'], revision=PINS['image_revision'],
-        variant='fp16', use_safetensors=True, torch_dtype=torch.float16)
-    pipe.enable_model_cpu_offload()
-    pipe.enable_vae_slicing()
-    prompt = config['prompt'] + '. ' + config['style']
-    prompt += '. Single isolated object, full object visible, three-quarter view, plain white background, studio lighting, no text.'
-    negative = config['negative_prompt']
-    framing_negative = 'cropped, out of frame, multiple objects, text, watermark, blurry, flat illustration'
-    negative = ', '.join(filter(None, (negative, framing_negative)))
-    print('Görüntü üretiliyor. Kısa, tek nesneli İngilizce istemler önerilir; CLIP uzun metni kırpabilir.', flush=True)
-    image = pipe(prompt=prompt, negative_prompt=negative, num_inference_steps=config['quality']['image_steps'],
-        guidance_scale=7.0, height=1024, width=1024,
-        generator=torch.Generator(device='cpu').manual_seed(config['seed'])).images[0]
-    image.save(output / 'input.png')
-    del pipe
-    import gc
-    gc.collect()
-    torch.cuda.empty_cache()
-    session = rembg.new_session('u2net', providers=['CPUExecutionProvider'])
-    cutout = rembg.remove(image, session=session).convert('RGBA')
-    alpha = np.asarray(cutout)[:, :, 3]
-    coords = np.argwhere(alpha > 204)
-    if len(coords) < 64 or np.any(np.ptp(coords, axis=0) < 8):
-        raise RuntimeError('Arka plan temizlemede nesne bulunamadı. İstemi sadeleştirin ve yeni OUTPUT_DIR seçin.')
-    # Ensure an alpha channel is used by TRELLIS, including unusually full masks.
-    if np.all(alpha == 255):
-        raise RuntimeError('Arka plan maskesi tüm görüntüyü kaplıyor. Tek nesne/beyaz arka plan ile yeniden deneyin.')
-    cutout.save(output / 'cutout.png')
-    with Image.open(output / 'input.png') as check:
-        check.verify()
-    weights = Path(os.environ['U2NET_HOME']) / 'u2net.onnx'
-    return {'effective_prompt': prompt, 'effective_negative_prompt': negative,
-            'rembg_weights_sha256': file_sha256(weights)}
 
 
 def gaussian_model_directory(work):
@@ -115,12 +80,11 @@ def generate_gaussians(output, config, work):
     print('TRELLIS Gaussian modeli yükleniyor; mesh ve radyans alanı yüklenmez.', flush=True)
     pipeline = TrellisImageTo3DPipeline.from_pretrained(str(model_dir))
     pipeline.cuda()
-    quality = config['quality']
     with Image.open(output / 'cutout.png') as image:
         with torch.inference_mode():
-            result = pipeline.run(image, seed=config['seed'], formats=['gaussian'],
-                sparse_structure_sampler_params={'steps': quality['sparse_steps'], 'cfg_strength': 7.5},
-                slat_sampler_params={'steps': quality['slat_steps'], 'cfg_strength': 3.0})
+            result = pipeline.run(image, seed=config['trellis_seed'], formats=['gaussian'],
+                sparse_structure_sampler_params={'steps': config['sparse_steps'], 'cfg_strength': config['sparse_cfg']},
+                slat_sampler_params={'steps': config['slat_steps'], 'cfg_strength': config['slat_cfg']})
     gs = result['gaussian'][0]
     if gs.sh_degree != 0:
         raise RuntimeError('Beklenmeyen SH derecesi; koordinat dönüşümü için reçete güncellenmeli.')
@@ -154,8 +118,10 @@ def main():
     parser.add_argument('stage', choices=['image', 'gaussian', 'export', 'check'])
     parser.add_argument('--config', required=True)
     args = parser.parse_args()
-    config = json.loads(Path(args.config).read_text(encoding='utf8'))
-    gpu = gpu_preflight(config['quality']['min_vram'])
+    config = validate_settings(json.loads(Path(args.config).read_text(encoding='utf8')))
+    if args.stage == 'image':
+        raise RuntimeError('Görüntü adımı için ayrı image-env ortamını kullanın; kurulum hücresini yeniden çalıştırın.')
+    gpu = gpu_preflight(estimate_requirements(config)['geometry_vram'])
     import torch
     # Avoid TF32 differences between GPU generations; full bitwise reproducibility is not promised.
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -179,17 +145,14 @@ def main():
         print('✓ Python, Torch, xformers, spconv CUDA çekirdekleri ve Gaussian import kontrolü başarılı.', flush=True)
         return
     work = Path(config['work_dir'])
-    provenance = {'models': PINS, 'recipe_sha256': config['recipe_sha256'],
-        'licenses': {'TRELLIS': 'MIT', 'SDXL': 'CreativeML Open RAIL++-M', 'DINOv2': 'Apache-2.0', 'U2Net': 'Apache-2.0'}}
-    cache = StageCache(config['output_dir'], config, provenance)
+    cache = StageCache(config['output_dir'], config, provenance_for(config))
     cache.data['environment'] = {'python': platform.python_version(), 'torch_cuda': torch.version.cuda,
         'gpu': gpu, 'packages': {p: importlib.metadata.version(p) for p in (
             'torch', 'torchvision', 'xformers', 'spconv-cu120', 'cumm-cu120', 'numpy', 'diffusers',
             'transformers', 'huggingface-hub', 'rembg', 'onnxruntime', 'Pillow')}}
+    cache.data.setdefault('environments', {})['trellis'] = cache.data['environment']
     atomic_json(cache.path, cache.data)
-    if args.stage == 'image':
-        cache.run('image', ['input.png', 'cutout.png'], lambda: generate_image(cache.output, config))
-    elif args.stage == 'gaussian':
+    if args.stage == 'gaussian':
         cache.run('gaussian', ['gaussians_raw.npz'], lambda: generate_gaussians(cache.output, config, work), ['image'])
     else:
         cache.run('export', ['target.ply', 'turntable.gif'], lambda: export_gaussians(cache.output, config), ['image', 'gaussian'])
