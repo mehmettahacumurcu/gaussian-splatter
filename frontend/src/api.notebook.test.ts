@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { generateStaticNotebook, getStaticNotebookPresets } from "./api";
+import { generatePipelineNotebook, generateStaticNotebook, getStaticNotebookPresets } from "./api";
+import type { TextToSplatNotebookSpec } from "./notebook/PipelineNotebookPanel";
 import type { StaticNotebookRunSpec } from "./notebook/types";
 
 const SPEC: StaticNotebookRunSpec = {
@@ -21,6 +22,24 @@ afterEach(() => {
 });
 
 describe("notebook API", () => {
+  it("posts text-to-splat through the shared pipeline endpoint as literal JSON", async () => {
+    const spec: TextToSplatNotebookSpec = {
+      pipeline: "text_to_splat", input_mode: "text", input_path: "", preset: "baseline",
+      prompt: 'a "red" car\nİstanbul 🚗; print("literal")', negative_prompt: "", style: "", seed: 42,
+      output_dir: null, target_splat_count: null,
+    };
+    const fetchMock = vi.fn().mockResolvedValue(new Response("{}", { status: 200, headers: {
+      "Content-Disposition": 'attachment; filename="car_text_to_splat.ipynb"',
+    } }));
+    vi.stubGlobal("fetch", fetchMock);
+    const artifact = await generatePipelineNotebook(spec);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toMatch(/\/notebooks\/static\/pipeline$/);
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body)).toEqual(spec);
+    expect(artifact.filename).toBe("car_text_to_splat.ipynb");
+  });
+
   it("posts only JSON and parses filename star", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(new Blob(["{}"]), {

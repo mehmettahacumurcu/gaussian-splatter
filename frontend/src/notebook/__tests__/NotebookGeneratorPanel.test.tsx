@@ -43,9 +43,11 @@ const PRESETS: StaticNotebookPresetsResponse = {
 
 beforeEach(() => {
   const recipe = { iterations: 30000, max_gaussians: 1000000, min_vram: 14, recipe: "medium" };
+  const textRecipe = { min_vram: 20, recipe: "sdxl_trellis", image_steps: 25, sparse_steps: 12, slat_steps: 12, resolution: 1024 };
   vi.mocked(getPipelineNotebookPresets).mockResolvedValue({ template_version: 1, presets: {
     hybrid: { baseline: recipe, quality: recipe, ultra: recipe },
     spirula: { baseline: recipe, quality: { ...recipe, iterations: 60000, max_gaussians: 6000000 }, ultra: recipe },
+    text_to_splat: { baseline: textRecipe, quality: textRecipe, ultra: { ...textRecipe, min_vram: 38 } },
   }});
   vi.mocked(generatePipelineNotebook).mockResolvedValue({ blob: new Blob(["notebook"]), filename: "room_spirula.ipynb" });
   vi.mocked(getStaticNotebookPresets).mockResolvedValue(PRESETS);
@@ -65,6 +67,20 @@ beforeEach(() => {
 });
 
 describe("NotebookGeneratorPanel", () => {
+  it("opens text-to-splat from the pipeline selector and submits text defaults", async () => {
+    render(<NotebookGeneratorPanel />);
+    fireEvent.change(screen.getByLabelText("Pipeline"), { target: { value: "text_to_splat" } });
+    await screen.findByText(/En az 20 GiB/);
+    fireEvent.change(screen.getByLabelText("Nesne tarifi (PROMPT)"), { target: { value: "a red sports car" } });
+    expect(screen.queryByLabelText("MyDrive path")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Metinden splat notebook’unu indir" }));
+    await waitFor(() => expect(generatePipelineNotebook).toHaveBeenCalledWith({
+      pipeline: "text_to_splat", input_mode: "text", input_path: "", prompt: "a red sports car",
+      negative_prompt: "", style: "", seed: 42, preset: "baseline", output_dir: null, target_splat_count: null,
+    }));
+    expect(generateStaticNotebook).not.toHaveBeenCalled();
+  });
+
   it("generates Spirula with selected input and training overrides", async () => {
     render(<NotebookGeneratorPanel />);
     fireEvent.change(screen.getByLabelText("Pipeline"), { target: { value: "spirula" } });

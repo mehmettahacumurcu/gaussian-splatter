@@ -17,11 +17,13 @@
 
 .notebook-generator button,
 .notebook-generator input,
-.notebook-generator select { font: inherit; }
+.notebook-generator select,
+.notebook-generator textarea { font: inherit; }
 
 .notebook-generator button:focus-visible,
 .notebook-generator input:focus-visible,
 .notebook-generator select:focus-visible,
+.notebook-generator textarea:focus-visible,
 .notebook-generator summary:focus-visible {
   outline: 2px solid var(--nb-signal);
   outline-offset: 3px;
@@ -152,3 +154,5 @@
 .nb-pipeline-picker label, .nb-pipeline-fields label { display: flex; flex-direction: column; gap: 6px; }
 .nb-pipeline-picker select, .nb-pipeline-fields select, .nb-pipeline-fields input:not([type="checkbox"]) { padding: 9px; background: #171b24; color: #eef2fa; border: 1px solid #444c60; border-radius: 6px; }
 .nb-pipeline-fields { display: grid; gap: 18px; padding: 24px; border: 1px solid #444c60; border-radius: 10px; }
+.nb-pipeline-fields textarea { width: 100%; box-sizing: border-box; min-height: 100px; resize: vertical; padding: 9px; background: #171b24; color: #eef2fa; border: 1px solid #444c60; border-radius: 6px; line-height: 1.5; }
+.nb-pipeline-fields .nb-advanced-grid { padding-top: 14px; }

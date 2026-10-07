@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
 import { PipelineNotebookPanel } from "./PipelineNotebookPanel";
 import { SpirulaPreprocessPanel } from "./SpirulaPreprocessPanel";
+import { TextToSplatPanel } from "./TextToSplatPanel";
 import { generateStaticNotebook, getStaticNotebookPresets } from "../api";
 import { resolveDriveFolder } from "./drivePath";
 import { DriveFolderSection } from "./DriveFolderSection";
@@ -19,7 +20,7 @@ import type { NotebookAdvancedDraft, StaticNotebookRunSpec } from "./types";
 import "./notebook.css";
 
 export function NotebookGeneratorPanel() {
-  const [pipeline, setPipeline] = useState<"native" | "hybrid" | "spirula" | "preprocess">("native");
+  const [pipeline, setPipeline] = useState<"native" | "hybrid" | "spirula" | "preprocess" | "text_to_splat">("native");
   return <>
     <div className="nb-pipeline-picker">
       <label>Pipeline<select value={pipeline} onChange={(e) => setPipeline(e.target.value as typeof pipeline)}>
@@ -27,9 +28,10 @@ export function NotebookGeneratorPanel() {
         <option value="hybrid">Spirula dataset + our trainer</option>
         <option value="spirula">Spirula preprocessing + Spirula trainer</option>
         <option value="preprocess">Spirula dataset hazırlama (yalnız preprocessing)</option>
+        <option value="text_to_splat">Metinden hedef splat (Colab)</option>
       </select></label>
     </div>
-    {pipeline === "native" ? <NativeNotebookGeneratorPanel /> : pipeline === "preprocess" ? <SpirulaPreprocessPanel /> : <PipelineNotebookPanel key={pipeline} pipeline={pipeline} />}
+    {pipeline === "native" ? <NativeNotebookGeneratorPanel /> : pipeline === "preprocess" ? <SpirulaPreprocessPanel /> : pipeline === "text_to_splat" ? <TextToSplatPanel /> : <PipelineNotebookPanel key={pipeline} pipeline={pipeline} />}
   </>;
 }
 

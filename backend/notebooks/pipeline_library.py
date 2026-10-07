@@ -6,6 +6,8 @@ import base64
 import hashlib
 import io
 import re
+import subprocess
+import unicodedata
 import zipfile
 from pathlib import Path
 from typing import Literal
@@ -16,7 +18,9 @@ from pydantic import Field, field_validator, model_validator
 from .builder import build_static_notebook
 from .drive_paths import normalize_input_folder
 from .models import StrictModel, StaticNotebookRunSpec
-from .source import NotebookSource
+from .source import (
+    GENERATOR_ID, GENERATOR_VERSION, REPOSITORY_URL, NotebookSource, NotebookSourceError,
+)
 
 ASSETS = Path(__file__).parent / 'templates'
 ROOT = Path(__file__).resolve().parents[2]
@@ -31,13 +35,38 @@ PRESETS = {
         'quality': dict(iterations=60000, max_gaussians=6000000, min_vram=22, recipe='high'),
         'ultra': dict(iterations=80000, max_gaussians=10000000, min_vram=38, recipe='ultra'),
     },
+    'text_to_splat': {
+        'baseline': dict(min_vram=20, recipe='sdxl_trellis', image_steps=25, sparse_steps=12, slat_steps=12, resolution=1024),
+        'quality': dict(min_vram=20, recipe='sdxl_trellis', image_steps=40, sparse_steps=20, slat_steps=20, resolution=1024),
+        'ultra': dict(min_vram=38, recipe='sdxl_trellis', image_steps=50, sparse_steps=25, slat_steps=25, resolution=1024),
+    },
 }
 
 
+def text_prompt_slug(prompt: str) -> str:
+    """A stable ASCII basename, including a digest for non-ASCII/colliding prompts."""
+    ascii_prompt = unicodedata.normalize('NFKD', prompt).encode('ascii', 'ignore').decode()
+    slug = re.sub(r'[^a-z0-9]+', '-', ascii_prompt.lower()).strip('-')[:48].rstrip('-') or 'object'
+    return f'{slug}-{hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:8]}'
+
+
+def resolve_embedded_notebook_source() -> NotebookSource:
+    """Record local provenance; this recipe embeds its runtime and never clones HEAD."""
+    try:
+        result = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=ROOT, check=True,
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise NotebookSourceError('Gömülü notebook için yerel Git HEAD okunamadı') from exc
+    sha = result.stdout.strip()
+    if not re.fullmatch(r'[0-9a-f]{40}', sha):
+        raise NotebookSourceError('Gömülü notebook kaynağı 40 karakterli Git SHA gerektirir')
+    return NotebookSource(REPOSITORY_URL, sha, GENERATOR_ID, GENERATOR_VERSION)
+
+
 class PipelineNotebookSpec(StrictModel):
-    pipeline: Literal['native', 'hybrid', 'spirula']
-    input_mode: Literal['folder', 'video', 'dataset_zip', 'dataset_folder']
-    input_path: str
+    pipeline: Literal['native', 'hybrid', 'spirula', 'text_to_splat']
+    input_mode: Literal['folder', 'video', 'dataset_zip', 'dataset_folder', 'text'] | None = None
+    input_path: str = ''
     preset: Literal['baseline', 'quality', 'ultra'] = 'baseline'
     iterations: int | None = Field(default=None, ge=1000, le=120000)
     max_gaussians: int | None = Field(default=None, ge=50000, le=20000000)
@@ -47,18 +76,45 @@ class PipelineNotebookSpec(StrictModel):
     generate_depth: bool = True
     geometry_model: Literal['moge2-vits', 'moge2-vitb', 'moge2-vitl'] = 'moge2-vitb'
     sfm_quality: Literal['high', 'extreme'] = 'high'
+    prompt: str = Field(default='', max_length=2000)
+    negative_prompt: str = Field(default='', max_length=2000)
+    style: str = Field(default='', max_length=500)
+    seed: int = Field(default=42, ge=0, le=2147483647, strict=True)
+    output_dir: str | None = None
+    target_splat_count: int | None = Field(default=None, ge=1000, le=2000000, strict=True)
 
-    @field_validator('input_path')
+    @field_validator('prompt', 'negative_prompt', 'style')
     @classmethod
-    def input_is_drive_relative(cls, value: str) -> str:
-        return normalize_input_folder(value)
+    def text_is_literal(cls, value: str) -> str:
+        if '\x00' in value:
+            raise ValueError('Metin alanları NUL karakteri içeremez')
+        return value.strip()
+
+    @field_validator('output_dir')
+    @classmethod
+    def output_is_drive_relative(cls, value: str | None) -> str | None:
+        return normalize_input_folder(value, allow_result_folder=True) if value and value.strip() else None
 
     @model_validator(mode='after')
     def check_mode(self):
         allowed = {'native': {'folder'}, 'hybrid': {'dataset_zip', 'dataset_folder'},
-                   'spirula': {'video', 'dataset_zip', 'dataset_folder'}}
+                   'spirula': {'video', 'dataset_zip', 'dataset_folder'}, 'text_to_splat': {'text'}}
+        if self.pipeline == 'text_to_splat' and self.input_mode is None:
+            self.input_mode = 'text'
         if self.input_mode not in allowed[self.pipeline]:
             raise ValueError(f'{self.pipeline} supports: {sorted(allowed[self.pipeline])}')
+        if self.pipeline == 'text_to_splat':
+            if not self.prompt:
+                raise ValueError('Nesne açıklaması 1–2000 karakter olmalı')
+            if self.input_path:
+                raise ValueError('Metin → splat tarifi dosya girişi kullanmaz; input_path boş olmalı')
+            if self.iterations is not None or self.max_gaussians is not None:
+                raise ValueError('Metin → splat için eğitim ayarları yerine preset ve target_splat_count kullanın')
+            self.output_dir = self.output_dir or f'GaussianTests/text_to_splat/{text_prompt_slug(self.prompt)}'
+        else:
+            self.input_path = normalize_input_folder(self.input_path)
+            if self.prompt or self.negative_prompt or self.style or self.output_dir or self.target_splat_count is not None:
+                raise ValueError('Metin alanları yalnızca text_to_splat tarifi için kullanılabilir')
         if self.pipeline == 'native' and self.max_gaussians and self.max_gaussians > 6000000:
             raise ValueError('Native generator supports at most 6,000,000 Gaussians')
         return self
@@ -105,6 +161,24 @@ def build_pipeline_notebook(spec: PipelineNotebookSpec, *, source: NotebookSourc
             quality={'profile': {'baseline': 'balanced_l4', 'quality': 'high', 'ultra': 'ultra'}[spec.preset],
                      'n_iters': spec.iterations, 'max_gaussians': spec.max_gaussians})
         notebook = build_static_notebook(native, source=source)
+    elif spec.pipeline == 'text_to_splat':
+        notebook = nbformat.read(ASSETS / 'text_to_splat.ipynb', as_version=4)
+        config = next(c for c in notebook.cells if c.cell_type == 'code' and 'PROMPT =' in c.source)
+        config.source = replace_assignments(config.source, {
+            'PROMPT': spec.prompt, 'NEGATIVE_PROMPT': spec.negative_prompt, 'STYLE': spec.style,
+            'SEED': spec.seed, 'QUALITY_PRESET': spec.preset,
+            'OUTPUT_DIR': '/content/drive/MyDrive/' + spec.output_dir,
+            'TARGET_SPLAT_COUNT': spec.target_splat_count,
+        })
+        runtime_files = {
+            name: (ASSETS / name).read_text(encoding='utf-8')
+            for name in ('text_to_splat_bootstrap.py', 'text_to_splat_runtime.py', 'text_to_splat_helpers.py',
+                         'text_to_splat_requirements.txt')
+        }
+        bundle = next(c for c in notebook.cells if c.cell_type == 'code' and 'RUNTIME_FILES =' in c.source)
+        bundle.source = replace_assignments(bundle.source, {
+            'RUNTIME_FILES': runtime_files, 'QUALITY_PRESETS': PRESETS['text_to_splat'],
+        })
     else:
         notebook = nbformat.read(ASSETS / f'{spec.pipeline}.ipynb', as_version=4)
         cfg = PRESETS[spec.pipeline][spec.preset]
@@ -157,6 +231,6 @@ def build_pipeline_notebook(spec: PipelineNotebookSpec, *, source: NotebookSourc
 
 
 def pipeline_filename(spec: PipelineNotebookSpec) -> str:
-    leaf = Path(spec.input_path).stem
+    leaf = text_prompt_slug(spec.prompt) if spec.pipeline == 'text_to_splat' else Path(spec.input_path).stem
     leaf = re.sub(r'[^A-Za-z0-9_-]', '_', leaf)[:60] or 'scene'
     return f'{leaf}_{spec.pipeline}_{spec.preset}.ipynb'

@@ -10,7 +10,7 @@ export type DriveFolderResolution =
 const CONTROL = /[\u0000-\u001f\u007f]/;
 const DRIVE_LETTER = /^[A-Za-z]:/;
 
-export function resolveDriveFolder(raw: string): DriveFolderResolution {
+export function resolveDriveFolder(raw: string, options: { allowResultFolder?: boolean } = {}): DriveFolderResolution {
   let value = raw.trim();
   if (value === "MyDrive") {
     return { ok: false, error: "Choose a folder below MyDrive." };
@@ -29,7 +29,7 @@ export function resolveDriveFolder(raw: string): DriveFolderResolution {
       error: "Enter a relative folder without empty, dot, or traversal segments.",
     };
   }
-  if (parts.at(-1)?.endsWith("_result")) {
+  if (!options.allowResultFolder && parts.at(-1)?.endsWith("_result")) {
     return { ok: false, error: "Choose the input folder, not a result folder." };
   }
   const canonicalInput = parts.join("/");

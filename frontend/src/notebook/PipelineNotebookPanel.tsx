@@ -4,10 +4,11 @@ import { NotebookDownload } from "./NotebookDownload";
 import { resolveDriveFolder } from "./drivePath";
 import type { GeneratedNotebook } from "./types";
 
-export type ExternalPipeline = "hybrid" | "spirula";
+export type TrainingPipeline = "hybrid" | "spirula";
+export type ExternalPipeline = TrainingPipeline | "text_to_splat";
 export type PipelinePreset = "baseline" | "quality" | "ultra";
-export interface PipelineNotebookSpec {
-  pipeline: ExternalPipeline;
+export interface TrainingPipelineNotebookSpec {
+  pipeline: TrainingPipeline;
   input_mode: "video" | "dataset_zip" | "dataset_folder";
   input_path: string;
   preset: PipelinePreset;
@@ -20,21 +21,36 @@ export interface PipelineNotebookSpec {
   geometry_model: "moge2-vits" | "moge2-vitb" | "moge2-vitl";
   sfm_quality: "high" | "extreme";
 }
+export interface TextToSplatNotebookSpec {
+  pipeline: "text_to_splat";
+  input_mode: "text";
+  input_path: "";
+  prompt: string;
+  negative_prompt: string;
+  style: string;
+  seed: number;
+  preset: PipelinePreset;
+  output_dir: string | null;
+  target_splat_count: number | null;
+}
+export type PipelineNotebookSpec = TrainingPipelineNotebookSpec | TextToSplatNotebookSpec;
 export interface PipelinePresets {
   template_version: number;
-  presets: Record<ExternalPipeline, Record<PipelinePreset, {
+  presets: Record<TrainingPipeline, Record<PipelinePreset, {
     iterations: number; max_gaussians: number; min_vram: number; recipe: string;
-  }>>;
+  }>> & { text_to_splat: Record<PipelinePreset, {
+    min_vram: number; recipe: string; image_steps: number; sparse_steps: number; slat_steps: number; resolution: number;
+  }> };
 }
 
-export function PipelineNotebookPanel({ pipeline }: { pipeline: ExternalPipeline }) {
+export function PipelineNotebookPanel({ pipeline }: { pipeline: TrainingPipeline }) {
   const [catalog, setCatalog] = useState<PipelinePresets | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [artifact, setArtifact] = useState<GeneratedNotebook | null>(null);
   const alive = useRef(true);
   const [inputPath, setInputPath] = useState("");
-  const [mode, setMode] = useState<PipelineNotebookSpec["input_mode"]>(pipeline === "spirula" ? "video" : "dataset_zip");
+  const [mode, setMode] = useState<TrainingPipelineNotebookSpec["input_mode"]>(pipeline === "spirula" ? "video" : "dataset_zip");
   const [preset, setPreset] = useState<PipelinePreset>("baseline");
   const [iterations, setIterations] = useState("");
   const [cap, setCap] = useState("");
@@ -42,8 +58,8 @@ export function PipelineNotebookPanel({ pipeline }: { pipeline: ExternalPipeline
   const [model, setModel] = useState("0");
   const [partial, setPartial] = useState(false);
   const [depth, setDepth] = useState(true);
-  const [geometry, setGeometry] = useState<PipelineNotebookSpec["geometry_model"]>("moge2-vitb");
-  const [sfm, setSfm] = useState<PipelineNotebookSpec["sfm_quality"]>("high");
+  const [geometry, setGeometry] = useState<TrainingPipelineNotebookSpec["geometry_model"]>("moge2-vitb");
+  const [sfm, setSfm] = useState<TrainingPipelineNotebookSpec["sfm_quality"]>("high");
   useEffect(() => {
     alive.current = true;
     getPipelineNotebookPresets().then(

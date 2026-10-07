@@ -8,7 +8,7 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 _DRIVE_LETTER = re.compile(r"^[A-Za-z]:")
 
 
-def normalize_input_folder(raw: str) -> str:
+def normalize_input_folder(raw: str, *, allow_result_folder: bool = False) -> str:
     value = raw.strip()
     if value == "MyDrive":
         raise ValueError("Choose a folder below MyDrive, not the Drive root")
@@ -21,7 +21,7 @@ def normalize_input_folder(raw: str) -> str:
     parts = value.split("/")
     if any(part in {"", ".", ".."} for part in parts):
         raise ValueError("Path contains an empty or traversal segment")
-    if parts[-1].endswith("_result"):
+    if not allow_result_folder and parts[-1].endswith("_result"):
         raise ValueError("Choose the input folder, not a result folder")
     canonical = PurePosixPath(*parts).as_posix()
     if canonical in {"", "."}:
