@@ -19,6 +19,46 @@ const prepared: MorphState = { ...INITIAL_MORPH_STATE, sourceId: "a", targetId: 
 afterEach(() => vi.useRealTimers());
 
 describe("Morph controls", () => {
+  it("defaults new morphs to shape preserving and offers mode selection before preparation", () => {
+    render(<MorphPanel morph={INITIAL_MORPH_STATE} playback={{ t: 0, playing: false }} status={{ phase: "idle" }} objects={objects} onChange={vi.fn()} />);
+    const mode = screen.getByRole("combobox", { name: "Mod" });
+    expect(mode).toHaveValue("shape");
+    expect(mode).not.toBeDisabled();
+    expect(screen.getByRole("option", { name: "Şekil koruyan" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Parçacık bulutu" })).toBeInTheDocument();
+    expect(screen.getByRole("slider", { name: /Dalga/ })).toHaveValue("0");
+    expect(screen.getByRole("slider", { name: /Yay/ })).toHaveValue("0");
+    expect(screen.queryByRole("slider", { name: /Dissolve/ })).not.toBeInTheDocument();
+  });
+
+  it("switches modes from a running preview, resets playback, and keeps preview enabled for rebuilding", () => {
+    const onChange = vi.fn();
+    const running = { ...prepared, playing: true, t: 0.6 };
+    const props = { playback: { t: 0.6, playing: true }, objects, onChange };
+    const { rerender } = render(<MorphPanel {...props} morph={running} status={{ phase: "ready" }} />);
+    fireEvent.change(screen.getByRole("combobox", { name: "Mod" }), { target: { value: "cloud" } });
+    expect(onChange).toHaveBeenLastCalledWith({ mode: "cloud", playing: false, t: 0 });
+    const cloud = { ...running, ...onChange.mock.lastCall![0] };
+    expect(cloud.enabled).toBe(true);
+    rerender(<MorphPanel {...props} morph={cloud} status={{ phase: "loading" }} />);
+    expect(screen.getByRole("slider", { name: /Dissolve/ })).toHaveValue(String(cloud.dissolve));
+    expect(screen.queryByRole("slider", { name: /Dalga/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("slider", { name: /Yay/ })).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox", { name: "Mod" }), { target: { value: "shape" } });
+    expect(onChange).toHaveBeenLastCalledWith({ mode: "shape", playing: false, t: 0 });
+  });
+
+  it("changes wave and arc independently and preserves the common blend control", () => {
+    const onChange = vi.fn();
+    render(<MorphPanel morph={prepared} playback={{ t: 0, playing: false }} status={{ phase: "ready" }} objects={objects} onChange={onChange} />);
+    fireEvent.change(screen.getByRole("slider", { name: /Dalga/ }), { target: { value: "0.65" } });
+    expect(onChange).toHaveBeenLastCalledWith({ wave: 0.65 });
+    fireEvent.change(screen.getByRole("slider", { name: /Yay/ }), { target: { value: "0.4" } });
+    expect(onChange).toHaveBeenLastCalledWith({ arc: 0.4 });
+    fireEvent.change(screen.getByRole("slider", { name: /Target blend/ }), { target: { value: "0.75" } });
+    expect(onChange).toHaveBeenLastCalledWith({ targetBlend: 0.75 });
+  });
+
   it("requires two distinct splats and offers cancellation while loading", () => {
     const onChange = vi.fn();
     const { rerender } = render(
@@ -80,16 +120,17 @@ describe("Morph controls", () => {
     expect(screen.getByRole("button", { name: "Önizlemeyi kapat" })).not.toBeDisabled();
   });
 
-  it("offers recording only for a ready pair with a recording handler", () => {
+  it.each(["cloud", "shape"] as const)("offers recording in %s mode only for a ready pair with a recording handler", (mode) => {
     const onRecord = vi.fn();
-    const props = { morph: prepared, playback: { t: 0, playing: false }, objects, onChange: vi.fn(), onRecord };
+    const selected = { ...prepared, mode };
+    const props = { morph: selected, playback: { t: 0, playing: false }, objects, onChange: vi.fn(), onRecord };
     const { rerender } = render(<MorphPanel {...props} status={{ phase: "loading" }} />);
     expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
     rerender(<MorphPanel {...props} status={{ phase: "error" }} />);
     expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
-    rerender(<MorphPanel {...props} status={{ phase: "ready" }} morph={{ ...prepared, enabled: false }} />);
+    rerender(<MorphPanel {...props} status={{ phase: "ready" }} morph={{ ...selected, enabled: false }} />);
     expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
-    rerender(<MorphPanel {...props} status={{ phase: "ready" }} morph={{ ...prepared, targetId: "a" }} />);
+    rerender(<MorphPanel {...props} status={{ phase: "ready" }} morph={{ ...selected, targetId: "a" }} />);
     expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
     rerender(<MorphPanel {...props} status={{ phase: "ready" }} onRecord={undefined} />);
     expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
@@ -98,17 +139,17 @@ describe("Morph controls", () => {
     expect(onRecord).toHaveBeenCalledOnce();
   });
 
-  it("locks all morph controls, discards pending numeric edits, and keeps cancel available", () => {
+  it.each(["cloud", "shape"] as const)("locks all %s morph controls, discards pending numeric edits, and keeps cancel available", (mode) => {
     const onChange = vi.fn();
     const onRecord = vi.fn();
     const onCancelRecording = vi.fn();
-    const props = { morph: prepared, playback: { t: 0, playing: false }, objects, onChange, onRecord, onCancelRecording };
+    const props = { morph: { ...prepared, mode }, playback: { t: 0, playing: false }, objects, onChange, onRecord, onCancelRecording };
     const { rerender } = render(<MorphPanel {...props} status={{ phase: "ready" }} />);
     const duration = screen.getByLabelText("Süre (sn)");
     fireEvent.change(duration, { target: { value: "12" } });
 
     rerender(<MorphPanel {...props} status={{ phase: "ready" }} recording={{ progress: 0.375 }} />);
-    for (const input of [...screen.getAllByRole("slider"), ...screen.getAllByRole("spinbutton")]) {
+    for (const input of [...screen.getAllByRole("slider"), ...screen.getAllByRole("spinbutton"), ...screen.getAllByRole("combobox")]) {
       expect(input).toBeDisabled();
     }
     for (const button of screen.getAllByRole("button")) {
@@ -118,6 +159,10 @@ describe("Morph controls", () => {
     fireEvent.blur(duration);
     expect(duration).toHaveValue(prepared.duration);
     fireEvent.change(screen.getByLabelText("Zaman çizelgesi"), { target: { value: "0.9" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Mod" }), { target: { value: mode === "shape" ? "cloud" : "shape" } });
+    for (const slider of screen.getAllByRole("slider")) {
+      fireEvent.change(slider, { target: { value: "0.5" } });
+    }
     fireEvent.click(screen.getByRole("button", { name: "Önizlemeyi kapat" }));
     expect(onChange).not.toHaveBeenCalled();
     expect(onRecord).not.toHaveBeenCalled();
@@ -134,7 +179,7 @@ describe("Morph controls", () => {
     expect(screen.getByRole("button", { name: "Videoyu kaydet" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "Duraklat" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "Önizlemeyi kapat" })).not.toBeDisabled();
-    for (const input of [...screen.getAllByRole("slider"), ...screen.getAllByRole("spinbutton")]) {
+    for (const input of [...screen.getAllByRole("slider"), ...screen.getAllByRole("spinbutton"), ...screen.getAllByRole("combobox")]) {
       expect(input).not.toBeDisabled();
     }
     expect(screen.getByLabelText("Morph ilerleme")).toHaveTextContent("43%");

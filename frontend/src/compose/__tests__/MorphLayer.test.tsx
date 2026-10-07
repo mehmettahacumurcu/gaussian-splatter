@@ -110,7 +110,7 @@ describe("MorphLayer recording integration", () => {
     return { ...p, onRecorder };
   }
 
-  it("updates the morph before endpoint handoff, waits two paints, and captures only after rendering", async () => {
+  it.each(["cloud", "shape"] as const)("records %s with current controls before handoff and captures only after rendering", async (mode) => {
     const events: string[] = [];
     const sort = deferred<void>();
     const capture = {
@@ -133,6 +133,7 @@ describe("MorphLayer recording integration", () => {
       return blob;
     });
     const p = recordingProps();
+    p.morph = { ...p.morph, mode, wave: 0.6, arc: 0.4 };
     vi.mocked(p.onDisplay).mockImplementation(() => { events.push("display"); });
     const { unmount } = render(<MorphLayer {...p} />);
     const resource = await ready();
@@ -144,7 +145,7 @@ describe("MorphLayer recording integration", () => {
     expect(events).toEqual(["update", "display", "paint", "paint", "prepare"]);
     expect(p.playback).toEqual({ t: 0.5, playing: false });
     expect(resource.object.visible).toBe(true);
-    expect(resource.update).toHaveBeenLastCalledWith(0.5, 1, 1);
+    expect(resource.update).toHaveBeenLastCalledWith(0.5, 1, 1, mode, 0.6, 0.4);
     act(() => mocks.frame?.({}, 1));
     expect(resource.update).toHaveBeenCalledTimes(1);
     expect(request).not.toHaveBeenCalled();
@@ -248,6 +249,7 @@ describe("MorphLayer lifecycle", () => {
     expect(p.onStatus).toHaveBeenLastCalledWith({ phase: "loading" });
     expect(mocks.release).not.toHaveBeenCalled();
     expect(instances[0].postMessage.mock.calls[0][0].seed).toBe(42);
+    expect(instances[0].postMessage.mock.calls[0][0].mode).toBe("shape");
     const resource = await ready();
     expect(mocks.release.mock.calls).toEqual([["/a.ply"], ["/b.ply"]]);
     expect(p.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ phase: "ready", count: 2 }));
@@ -282,7 +284,7 @@ describe("MorphLayer lifecycle", () => {
     rerender(<MorphLayer {...p} />);
     act(() => mocks.frame?.({}, 0));
     expect(resource.object.visible).toBe(true);
-    expect(resource.update).toHaveBeenLastCalledWith(1, 1, 0.7);
+    expect(resource.update).toHaveBeenLastCalledWith(1, 1, 0.7, "shape", 0, 0);
     expect(p.onDisplay).toHaveBeenLastCalledWith({ sourceId: "source", targetId: "target", endpoint: "particles" });
     expect(mocks.createGpu).toHaveBeenCalledTimes(1);
   });
@@ -307,19 +309,22 @@ describe("MorphLayer lifecycle", () => {
     expect(vi.mocked(p.onChange).mock.calls.filter(([patch]) => patch.t === 1)).toHaveLength(1);
   });
 
-  it.each(["seed", "target"])("terminates an old worker and ignores its late result when the %s changes", async (change) => {
+  it.each(["seed", "target", "mode"])("terminates an old worker and ignores its late result when the %s changes", async (change) => {
     let p = props();
     const { rerender } = render(<MorphLayer {...p} />);
     await settle();
     const previousWorker = instances[0];
     p = change === "seed"
       ? { ...p, morph: { ...p.morph, seed: 123 } }
+      : change === "mode"
+      ? { ...p, morph: { ...p.morph, mode: "cloud", t: 0, playing: false } }
       : { ...p, target: { ...p.target, id: "replacement", asset: "c" }, targetUrl: "/c.ply", morph: { ...p.morph, targetId: "replacement" } };
     rerender(<MorphLayer {...p} />);
     await settle();
     expect(previousWorker.terminate).toHaveBeenCalled();
     expect(instances).toHaveLength(2);
     expect(instances[1].postMessage.mock.calls[0][0].seed).toBe(change === "seed" ? 123 : 42);
+    expect(instances[1].postMessage.mock.calls[0][0].mode).toBe(change === "mode" ? "cloud" : "shape");
     previousWorker.reply({ id: 1, ok: true, result: data });
     await settle();
     expect(mocks.createGpu).not.toHaveBeenCalled();
@@ -327,6 +332,21 @@ describe("MorphLayer lifecycle", () => {
     await ready();
     expect(mocks.createGpu).toHaveBeenCalledTimes(1);
     expect(mocks.release).toHaveBeenCalledTimes(4);
+  });
+
+  it("updates wave and arc during playback without rebuilding correspondence", async () => {
+    let p = props();
+    const { rerender } = render(<MorphLayer {...p} />);
+    const resource = await ready();
+    p.playback.t = 0.4;
+    p.playback.playing = true;
+    p = { ...p, morph: { ...p.morph, wave: 0.8, arc: 0.3 } };
+    rerender(<MorphLayer {...p} />);
+    act(() => mocks.frame?.({}, 0));
+    expect(instances).toHaveLength(1);
+    expect(mocks.createGpu).toHaveBeenCalledTimes(1);
+    expect(p.playback).toEqual({ t: 0.4, playing: true });
+    expect(resource.update).toHaveBeenLastCalledWith(0.4, 1, 1, "shape", 0.8, 0.3);
   });
 
   it("ignores a rename, rebuilds a moved endpoint, and discards the previous display", async () => {

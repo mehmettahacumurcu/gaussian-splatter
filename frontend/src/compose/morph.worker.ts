@@ -1,11 +1,13 @@
 import { prepareMorph } from "./morphData";
 import type { PreparedMorph } from "./morphData";
+import type { MorphMode } from "./morphTypes";
 
 export interface MorphWorkerRequest {
   id: number;
   a: Float32Array;
   b: Float32Array;
   seed: number;
+  mode: MorphMode;
 }
 
 export type MorphWorkerResponse =
@@ -20,7 +22,7 @@ const workerScope = self as unknown as {
 
 workerScope.onmessage = ({ data }) => {
   try {
-    const result = prepareMorph(data.a, data.b, data.seed);
+    const result = prepareMorph(data.a, data.b, data.seed, data.mode);
     workerScope.postMessage({ id: data.id, ok: true, result }, [result.a.buffer, result.b.buffer]);
   } catch (error) {
     workerScope.postMessage({

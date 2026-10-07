@@ -7,7 +7,7 @@ import { recordMorphVideo } from "./morphRecording";
 import { createMorphGpu, type MorphGpu } from "./morphGpu";
 import { extractMorphSource } from "./morphSource";
 import type { MorphWorkerRequest, MorphWorkerResponse } from "./morph.worker";
-import type { MorphPlayback, MorphState, MorphStatus } from "./morphTypes";
+import type { MorphMode, MorphPlayback, MorphState, MorphStatus } from "./morphTypes";
 import { packedSplatsCache } from "./splatCache";
 import type { SceneObject } from "./types";
 
@@ -30,7 +30,7 @@ interface Props {
   onRecorder?: OnMorphRecorder;
 }
 
-function prepareInWorker(a: Float32Array, b: Float32Array, seed: number, signal: AbortSignal) {
+function prepareInWorker(a: Float32Array, b: Float32Array, seed: number, mode: MorphMode, signal: AbortSignal) {
   return new Promise<PreparedMorph>((resolve, reject) => {
     signal.throwIfAborted();
     const worker = new Worker(new URL("./morph.worker.ts", import.meta.url), { type: "module" });
@@ -56,7 +56,7 @@ function prepareInWorker(a: Float32Array, b: Float32Array, seed: number, signal:
       finish();
       reject(new Error("Morph worker result could not be read"));
     };
-    const request: MorphWorkerRequest = { id: 1, a, b, seed };
+    const request: MorphWorkerRequest = { id: 1, a, b, seed, mode };
     try {
       worker.postMessage(request, [a.buffer, b.buffer]);
     } catch (error) {
@@ -102,7 +102,7 @@ export function MorphLayer(props: Props) {
         for (const result of initialized) if (result.status === "rejected") throw result.reason;
         abort.signal.throwIfAborted();
         if (Math.max(packedA.numSplats, packedB.numSplats) > 1_000_000) {
-          throw new Error("Morph v1 supports up to 1,000,000 splats per asset. Start with about 200,000.");
+          throw new Error("Morph supports up to 1,000,000 splats per asset. Start with about 200,000.");
         }
         const extracted = await Promise.allSettled([
           extractMorphSource(packedA, source, abort.signal),
@@ -112,7 +112,7 @@ export function MorphLayer(props: Props) {
           if (result.status === "rejected") throw result.reason;
           return result.value;
         });
-        const data = await prepareInWorker(a, b, morph.seed, abort.signal);
+        const data = await prepareInWorker(a, b, morph.seed, morph.mode, abort.signal);
         abort.signal.throwIfAborted();
         resource = createMorphGpu(data, gl.capabilities.maxTextureSize);
         resource.object.visible = false;
@@ -142,7 +142,7 @@ export function MorphLayer(props: Props) {
       display.current = null;
       onDisplay(null);
     };
-  }, [sourceKey, targetKey, sourceUrl, targetUrl, morph.seed, scene, gl, playback, onDisplay]);
+  }, [sourceKey, targetKey, sourceUrl, targetUrl, morph.seed, morph.mode, scene, gl, playback, onDisplay]);
 
   useEffect(() => {
     if (!props.onRecorder) return;
@@ -170,7 +170,7 @@ export function MorphLayer(props: Props) {
             const progress = t * current.morph.targetBlend;
             const endpoint = progress <= 0 ? "source" : progress >= 1 ? "target" : "particles";
             resource.object.visible = endpoint === "particles";
-            resource.update(t, current.morph.dissolve, current.morph.targetBlend);
+            resource.update(t, current.morph.dissolve, current.morph.targetBlend, current.morph.mode, current.morph.wave, current.morph.arc);
             if (display.current !== endpoint || t === 0) {
               display.current = endpoint;
               current.onDisplay({ sourceId: current.source.id, targetId: current.target.id, endpoint });
@@ -226,7 +226,7 @@ export function MorphLayer(props: Props) {
     const progress = playback.t * current.morph.targetBlend;
     const endpoint = progress <= 0 ? "source" : progress >= 1 ? "target" : "particles";
     resource.object.visible = endpoint === "particles";
-    resource.update(playback.t, current.morph.dissolve, current.morph.targetBlend);
+    resource.update(playback.t, current.morph.dissolve, current.morph.targetBlend, current.morph.mode, current.morph.wave, current.morph.arc);
     if (display.current !== endpoint) {
       display.current = endpoint;
       onDisplay({ sourceId: source.id, targetId: target.id, endpoint });

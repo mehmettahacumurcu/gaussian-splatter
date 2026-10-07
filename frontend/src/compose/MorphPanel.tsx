@@ -89,6 +89,17 @@ export function MorphPanel({ morph, playback, status, objects, onChange, recordi
         <span title={source?.name}><b>A</b> {source?.name ?? "Başlangıç seçilmedi"}</span>
         <span title={target?.name}><b>B</b> {target?.name ?? "Hedef seçilmedi"}</span>
       </div>
+      <label className="compose-field">
+        <span>Mod</span>
+        <select
+          value={morph.mode}
+          disabled={locked}
+          onChange={(event) => change({ mode: event.target.value === "cloud" ? "cloud" : "shape", playing: false, t: 0 })}
+        >
+          <option value="shape">Şekil koruyan</option>
+          <option value="cloud">Parçacık bulutu</option>
+        </select>
+      </label>
       <div className="compose-row">
         <button
           type="button"
@@ -153,7 +164,7 @@ export function MorphPanel({ morph, playback, status, objects, onChange, recordi
         />
       </label>
       <NumericControl label="Süre (sn)" value={morph.duration} min={0.5} max={120} step={0.5} disabled={locked} onCommit={(duration) => change({ duration })} />
-      <label className="compose-field">
+      {morph.mode === "cloud" ? <label className="compose-field">
         <span>Dissolve · {Math.round(morph.dissolve * 100)}%</span>
         <input
           type="range"
@@ -165,7 +176,34 @@ export function MorphPanel({ morph, playback, status, objects, onChange, recordi
           onChange={(event) => change({ dissolve: Number(event.target.value) })}
         />
         <small className="muted">Parçacık bulutunun yayılması</small>
-      </label>
+      </label> : <>
+        <label className="compose-field">
+          <span>Dalga · {Math.round(morph.wave * 100)}%</span>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.01}
+            value={morph.wave}
+            disabled={locked}
+            onChange={(event) => change({ wave: Number(event.target.value) })}
+          />
+          <small className="muted">Geçiş sahnenin +X yönünde yayılır; toplam süre değişmez.</small>
+        </label>
+        <label className="compose-field">
+          <span>Yay · {Math.round(morph.arc * 100)}%</span>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.01}
+            value={morph.arc}
+            disabled={locked}
+            onChange={(event) => change({ arc: Number(event.target.value) })}
+          />
+          <small className="muted">Hafif kıvrım; eşleşen çiftin uzaklığının en fazla %5’i.</small>
+        </label>
+      </>}
       <label className="compose-field">
         <span>Target blend · {Math.round(morph.targetBlend * 100)}%</span>
         <input

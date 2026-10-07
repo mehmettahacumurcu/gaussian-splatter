@@ -1,3 +1,5 @@
+export type MorphMode = "cloud" | "shape";
+
 /** Transient preview controls; these are deliberately not part of SceneDoc. */
 export interface MorphState {
   sourceId: string | null;
@@ -7,7 +9,10 @@ export interface MorphState {
   /** Last requested timeline position. Live playback lives in MorphPlayback. */
   t: number;
   duration: number;
+  mode: MorphMode;
   dissolve: number;
+  wave: number;
+  arc: number;
   targetBlend: number;
   seed: number;
 }
@@ -32,7 +37,10 @@ export const INITIAL_MORPH_STATE: MorphState = {
   playing: false,
   t: 0,
   duration: 6,
+  mode: "shape",
   dissolve: 1,
+  wave: 0,
+  arc: 0,
   targetBlend: 1,
   seed: 42,
 };

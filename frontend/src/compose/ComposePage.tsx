@@ -64,7 +64,11 @@ export function ComposePage({ active }: { active: boolean }) {
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [gizmoMode, setGizmoMode] = useState<GizmoMode>("translate");
   const [cropEditing, setCropEditing] = useState(false);
-  const [morph, setMorph] = useState<MorphState>(INITIAL_MORPH_STATE);
+  let [morph, setMorph] = useState<MorphState>(INITIAL_MORPH_STATE);
+  // Fast Refresh can retain a v1 state in an already-open, unsaved scene.
+  // Keep the hook binding names (part of its refresh signature), and replace
+  // only this render's local reference so the visible mode and worker agree.
+  morph = { ...INITIAL_MORPH_STATE, ...morph };
   const morphPlayback = useRef<MorphPlayback>({ t: 0, playing: false }).current;
   const [morphStatus, setMorphStatus] = useState<MorphStatus>({ phase: "idle" });
   const recorderRef = useRef<MorphVideoRecorder | null>(null);

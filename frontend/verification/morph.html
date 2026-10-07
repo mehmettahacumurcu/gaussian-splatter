@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Morph GPU verification</title>
+    <style>
+      body { background: #171b23; color: #edf1f7; font: 15px system-ui; margin: 24px; }
+      canvas, video { display: inline-block; max-width: 48%; border: 1px solid #586273; }
+      pre { white-space: pre-wrap; }
+      button { padding: 10px 18px; }
+    </style>
+  </head>
+  <body>
+    <h1>Morph GPU verification</h1>
+    <p>Compiles the production GLSL, checks CPU parity, then renders and records both modes on synthetic spheres. No downloads or scene changes.</p>
+    <button id="run">Run verification</button>
+    <pre id="result">Ready</pre>
+    <div id="renders"></div>
+    <script type="module" src="./morph.ts"></script>
+  </body>
+</html>
