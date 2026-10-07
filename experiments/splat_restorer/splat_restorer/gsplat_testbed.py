@@ -34,6 +34,12 @@ class GsVariant:
     factor: int = 2  # data_factor: 2 -> 1920x1080 from 4K, 1 -> native 4K
     args: list[str] = field(default_factory=list)
     rasterize_mode: str = "classic"
+    # Extra gsplat rasterization options needed to render this splat as it was trained (3DGUT).
+    render: dict = field(default_factory=dict)
+    # Also score with the plain rasterizer, i.e. how a standard 3DGS viewer would show the PLY.
+    portable_eval: bool = False
+    # Leave training frames in pose-failure segments out of training (held-out set unchanged).
+    exclude_bad_frames: bool = False
     note: str = ""
 
 
@@ -46,7 +52,43 @@ VARIANTS = {
                              note="Mip-Splatting'in 2D filtresi"),
     "pose_opt": GsVariant("pose_opt", args=["--pose-opt"], note="eğitim kamera pozlarını iyileştirir"),
     "default_4k": GsVariant("default_4k", factor=1, note="4K tam çözünürlükte eğitim"),
+    # Appended later; earlier variants keep their names so a resumed run skips them.
+    # 3DGUT has no 2D mean gradients for the default densifier, so gsplat runs it with MCMC:
+    # compare it against the `mcmc` row.
+    "with_ut": GsVariant("with_ut", preset="mcmc", args=["--strategy.cap-max", "1000000", "--with-ut", "--with-eval3d"],
+                         render={"with_ut": True, "with_eval3d": True}, portable_eval=True,
+                         note="3DGUT + MCMC (unscented transform, 3D değerlendirme); `mcmc` ile karşılaştır"),
+    "bilateral_grid": GsVariant("bilateral_grid", args=["--use-bilateral-grid"],
+                                note="kare başına renk/pozlama grid'i (ölçüm grid'siz PLY ile)"),
+    "depth_loss": GsVariant("depth_loss", args=["--depth-loss"], note="SfM noktalarından derinlik kaybı"),
+    "mcmc_pose_opt": GsVariant("mcmc_pose_opt", preset="mcmc", args=["--strategy.cap-max", "1000000", "--pose-opt"],
+                               note="MCMC + poz iyileştirme"),
+    "absgrad_aa": GsVariant("absgrad_aa", args=["--strategy.absgrad", "--strategy.grow-grad2d", "0.0006", "--antialiased"],
+                            rasterize_mode="antialiased",
+                            note="AbsGS + anti-aliasing (gsplat'in en iyi varsayılan kombinasyonu)"),
+    "exclude_bad_frames": GsVariant("exclude_bad_frames", exclude_bad_frames=True,
+                                    note="poz hatalı bölümlerdeki eğitim kareleri çıkarılmış"),
 }
+
+# Wrapper around simple_trainer: optionally drops training images listed in GS_EXCLUDE_NAMES
+# (a JSON list of image names) at the dataset level, so the train/val split (index % test_every)
+# and therefore the held-out frames stay exactly the same.
+WRAPPER = """import json, os, runpy, sys
+import numpy as np
+import datasets.colmap as dc
+_exclude = set(json.load(open(os.environ["GS_EXCLUDE_NAMES"]))) if os.environ.get("GS_EXCLUDE_NAMES") else set()
+_init = dc.Dataset.__init__
+def _filtered_init(self, parser, split="train", *args, **kwargs):
+    _init(self, parser, split, *args, **kwargs)
+    if split == "train" and _exclude:
+        before = len(self.indices)
+        self.indices = np.array([i for i in self.indices if parser.image_names[i] not in _exclude],
+                                dtype=self.indices.dtype)
+        print(f"[tb_train] excluded {before - len(self.indices)} training images", flush=True)
+dc.Dataset.__init__ = _filtered_init
+sys.argv = ["simple_trainer.py", *sys.argv[1:]]
+runpy.run_path("simple_trainer.py", run_name="__main__")
+"""
 
 
 # ----------------------------------------------------------------------------- data
@@ -89,7 +131,7 @@ def prepare_factor_images(data_dir: Path, factor: int, workers: int = 8, log=pri
 
 def trainer_command(v: GsVariant, data_dir: Path, result_dir: Path, steps: int, test_every: int) -> list[str]:
     return [
-        sys.executable, "simple_trainer.py", v.preset,
+        sys.executable, "tb_train.py", v.preset,
         "--data-dir", str(data_dir), "--data-factor", str(v.factor), "--test-every", str(test_every),
         "--no-normalize-world-space", "--result-dir", str(result_dir),
         "--max-steps", str(steps), "--eval-steps", str(steps), "--save-steps", str(steps),
@@ -98,14 +140,24 @@ def trainer_command(v: GsVariant, data_dir: Path, result_dir: Path, steps: int, 
 
 
 def run_variant(v: GsVariant, data_dir: Path, examples_dir: Path, result_dir: Path, steps: int,
-                test_every: int, log_every_s: float = 60.0, log=print) -> float:
-    """Run simple_trainer in a subprocess; full output goes to result_dir/train.log. Returns seconds."""
+                test_every: int, exclude_names: list[str] | None = None, log_every_s: float = 60.0,
+                log=print) -> float:
+    """Run simple_trainer (through WRAPPER) in a subprocess; full output goes to
+    result_dir/train.log. Returns seconds."""
+    import os
+
     result_dir.mkdir(parents=True, exist_ok=True)
+    (Path(examples_dir) / "tb_train.py").write_text(WRAPPER, encoding="utf-8")
+    env = dict(os.environ)
+    env.pop("GS_EXCLUDE_NAMES", None)
+    if exclude_names:
+        (result_dir / "exclude_names.json").write_text(json.dumps(exclude_names), encoding="utf-8")
+        env["GS_EXCLUDE_NAMES"] = str(result_dir / "exclude_names.json")
     cmd = trainer_command(v, data_dir, result_dir, steps, test_every)
     log("[train] " + " ".join(cmd[1:]))
     t0, last = time.time(), 0.0
     with open(result_dir / "train.log", "w", encoding="utf-8") as f, subprocess.Popen(
-        cmd, cwd=examples_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        cmd, cwd=examples_dir, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         encoding="utf-8", errors="replace", bufsize=1,
     ) as proc:
         for line in proc.stdout:
@@ -158,11 +210,12 @@ def save_ply(params, path: Path) -> None:
 
 
 @torch.no_grad()
-def frame_psnr(params, deg: int, data: SplatData, ids: list[int], rasterize_mode="classic", device="cuda") -> dict[int, float]:
+def frame_psnr(params, deg: int, data: SplatData, ids: list[int], rasterize_mode="classic", device="cuda",
+               **raster_kwargs) -> dict[int, float]:
     w2c, K = _w2c_t(data, device)
     out = {}
     for i in ids:
-        img, _ = render(params, w2c[i], K, data.width, data.height, deg, rasterize_mode)
+        img, _ = render(params, w2c[i], K, data.width, data.height, deg, rasterize_mode, **raster_kwargs)
         out[i] = _psnr(img, data.photo(i, device))
     return out
 
@@ -196,7 +249,8 @@ def summarise(results: dict, keep: list[int]) -> dict:
         m = {f"{k}": float(np.mean([x[k] for x in allv])) for k in ("psnr", "ssim", "lpips")}
         m.update({f"{k}_ok": float(np.mean([x[k] for x in kept])) for k in ("psnr", "ssim", "lpips")})
         info = r.get("info", {})
-        m.update(splats=info.get("splats"), minutes=info.get("train_seconds", 0) / 60, source=r.get("source", "gsplat"))
+        m.update(splats=info.get("splats"), minutes=info.get("train_seconds", 0) / 60, source=r.get("source", "gsplat"),
+                 gsplat_val_psnr=(r.get("gsplat_val") or {}).get("psnr"))
         out[name] = m
     return out
 
@@ -209,18 +263,23 @@ def markdown(summary: dict, n_frames: int, flagged: list[int], thr: float) -> st
         f"'Poz hatasız' sütunları, yakınındaki eğitim kareleri bile {thr:.1f} dB altında kalan "
         f"{len(flagged)} kareyi hariç tutar (yanlış SfM pozu / yakın plan çökmesi): {flagged}",
         "",
-        "| varyant | PSNR ↑ | Δ | PSNR (poz hatasız) | Δ | SSIM ↑ | LPIPS ↓ | LPIPS (poz hatasız) | splat | dk |",
-        "|---|---|---|---|---|---|---|---|---|---|",
+        "| varyant | PSNR ↑ | Δ | PSNR (poz hatasız) | Δ | SSIM ↑ | LPIPS ↓ | LPIPS (poz hatasız) | gsplat val PSNR "
+        "| splat | dk |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for name, m in summary.items():
         splats = f"{m['splats']:,}" if m.get("splats") else "-"
+        gv = f"{m['gsplat_val_psnr']:.2f}" if m.get("gsplat_val_psnr") else "-"
         lines.append(
             f"| {name} | {m['psnr']:.2f} | {m['psnr'] - base['psnr']:+.2f} | {m['psnr_ok']:.2f} | "
             f"{m['psnr_ok'] - base['psnr_ok']:+.2f} | {m['ssim']:.4f} | {m['lpips']:.4f} | {m['lpips_ok']:.4f} | "
-            f"{splats} | {m['minutes']:.0f} |"
+            f"{gv} | {splats} | {m['minutes']:.0f} |"
         )
     lines += ["", "Δ: `default` satırına göre. 'app:' ile başlayan satırlar app'in kendi eğiticisiyle yapılan "
-              "A/B testinden (aynı kareler, aynı ölçüm). +0,3 dB altındaki farklar koşudan koşuya oynayabilir."]
+              "A/B testinden (aynı kareler, aynı ölçüm). +0,3 dB altındaki farklar koşudan koşuya oynayabilir.",
+              "'gsplat val PSNR': gsplat'in kendi değerlendirmesi (kendi lens düzeltmesi/kırpması ve, varsa, "
+              "bilateral grid ile); kendi içinde karşılaştırılır, bizim sütunlarla birebir aynı ölçek değildir.",
+              "'(klasik)' satırları, splat'in standart bir 3DGS görüntüleyicide (3DGUT olmadan) nasıl göründüğüdür."]
     return "\n".join(lines)
 
 
@@ -228,3 +287,39 @@ def save_json(path: Path, obj) -> None:
     tmp = Path(path).with_suffix(".tmp")
     tmp.write_text(json.dumps(obj, indent=1), encoding="utf-8")
     tmp.replace(path)
+
+
+def gsplat_val(stats_dir: Path) -> dict | None:
+    """gsplat's own validation metrics (last val_step*.json) from a run or Drive folder."""
+    files = sorted(Path(stats_dir).glob("*val_step*.json"), key=lambda p: int("".join(c for c in p.stem.split("step")[-1] if c.isdigit()) or 0))
+    return json.loads(files[-1].read_text(encoding="utf-8")) if files else None
+
+
+def fix_gsplat_install(examples_dir: Path, python: str = sys.executable) -> None:
+    """Make gsplat v1.5.3's example trainer importable on Colab. Idempotent.
+
+    1. ``examples/datasets`` has no ``__init__.py``, so it is a namespace package and loses to
+       the regular Hugging Face ``datasets`` package that Colab preinstalls.
+    2. The pinned pycolmap fork defines ``np.uint64(-1)``, an OverflowError under numpy 2.
+    Then imports both exactly as the trainer does, in a subprocess from ``examples_dir``.
+    """
+    import importlib.util
+    import re
+
+    init = Path(examples_dir) / "datasets" / "__init__.py"
+    if not init.exists():
+        init.write_text("", encoding="utf-8")
+    spec = importlib.util.find_spec("pycolmap")  # locate without importing (import would fail)
+    if spec and spec.submodule_search_locations:
+        sm = Path(next(iter(spec.submodule_search_locations))) / "scene_manager.py"
+        if sm.exists():
+            text = sm.read_text(encoding="utf-8")
+            fixed = re.sub(r"np\.uint64\(\s*-1\s*\)", "np.uint64(np.iinfo(np.uint64).max)", text)
+            if fixed != text:
+                sm.write_text(fixed, encoding="utf-8")
+    check = ("import numpy, pycolmap; from datasets.colmap import Parser; import datasets.colmap as d; "
+             "print('ok numpy', numpy.__version__, d.__file__)")
+    out = subprocess.run([python, "-c", check], cwd=examples_dir, capture_output=True, text=True)
+    if out.returncode != 0:
+        raise RuntimeError("gsplat trainer imports still fail:\n" + out.stderr[-2000:])
+    print(out.stdout.strip())

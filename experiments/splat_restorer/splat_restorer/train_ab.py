@@ -169,13 +169,13 @@ def train_variant(
 
 @torch.no_grad()
 def evaluate_params(params, deg: int, data: SplatData, holdout: list[int], clean_dir: Path | None, net_lpips,
-                    render_dir: Path, rasterize_mode: str = "classic", device="cuda") -> dict:
+                    render_dir: Path, rasterize_mode: str = "classic", device="cuda", **raster_kwargs) -> dict:
     """Score held-out frames against the captured photo and (if given) its cleaned version."""
     w2c, K = _w2c_t(data, device)
     render_dir.mkdir(parents=True, exist_ok=True)
     rows = {}
     for i in holdout:
-        img, _ = render(params, w2c[i], K, data.width, data.height, deg, rasterize_mode)
+        img, _ = render(params, w2c[i], K, data.width, data.height, deg, rasterize_mode, **raster_kwargs)
         row = _scores(img, data.photo(i, device), net_lpips)
         if clean_dir is not None:
             clean = torch.from_numpy(np.asarray(Image.open(clean_dir / data.frames[i]).convert("RGB")).copy())

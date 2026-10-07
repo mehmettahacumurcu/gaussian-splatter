@@ -90,10 +90,11 @@ def make_optimizers(params, cfg: TrainConfig, scene_scale: float) -> dict[str, t
 
 
 def render(params, w2c: torch.Tensor, K: torch.Tensor, width: int, height: int, sh_degree: int,
-           rasterize_mode: str = "classic"):
+           rasterize_mode: str = "classic", **raster_kwargs):
     """Render one view. Returns (image HxWx3 clamped to [0,1] in the graph, info).
 
-    ``rasterize_mode="antialiased"`` for splats trained with gsplat's antialiased mode."""
+    ``rasterize_mode="antialiased"`` for splats trained with gsplat's antialiased mode;
+    ``raster_kwargs`` pass through to gsplat (e.g. ``with_ut=True, with_eval3d=True`` for 3DGUT)."""
     from gsplat import rasterization
 
     colors = torch.cat([params["sh0"], params["shN"]], dim=1)
@@ -110,6 +111,7 @@ def render(params, w2c: torch.Tensor, K: torch.Tensor, width: int, height: int, 
         sh_degree=sh_degree,
         packed=False,
         rasterize_mode=rasterize_mode,
+        **raster_kwargs,
     )
     return img[0].clamp(0.0, 1.0), info
 

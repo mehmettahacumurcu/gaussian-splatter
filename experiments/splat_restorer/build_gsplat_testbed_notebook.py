@@ -35,19 +35,25 @@ değiştirilerek eğitilir; hepsi önceki testlerle **aynı 93 saklanan fotoğra
 | `absgrad` | AbsGS: mutlak gradyanla bölme (ince detay) |
 | `antialiased` | Mip-Splatting'in 2D anti-aliasing filtresi |
 | `pose_opt` | eğitim sırasında kamera pozlarını iyileştirme |
-| `default_4k` | 4K tam çözünürlükte eğitim (en yavaşı, en sona konuldu) |
+| `default_4k` | 4K tam çözünürlükte eğitim (en yavaşı) |
+| `with_ut` | 3DGUT + MCMC (`mcmc` satırıyla karşılaştır); standart görüntüleyicideki hâli `with_ut (klasik)` satırında |
+| `bilateral_grid` | kare başına renk/pozlama düzeltmesi eğitimde; ölçüm grid'siz PLY ile (PLY'ye taşınıyor mu?) |
+| `depth_loss` | SfM noktalarından derinlik kaybı |
+| `mcmc_pose_opt` | MCMC + poz iyileştirme |
+| `absgrad_aa` | AbsGS + anti-aliasing |
+| `exclude_bad_frames` | varsayılan ayarlar, ama poz hatalı bölümlerdeki **eğitim** kareleri eğitimden çıkarılmış |
 
 Ayrıca: yakınındaki **eğitim** kareleri bile çöken (yanlış SfM pozu) saklanan kareler otomatik bulunur ve
 "poz hatasız" ikinci bir ortalama raporlanır; app eğiticisiyle yapılan A/B sonuçları da aynı tabloya eklenir.
 
-**Kullanım:** GPU (A100 önerilir) → **Run all**. 1080p varyant başına ~15-25 dk, 4K ~45-90 dk.
+**Kullanım:** GPU (A100 önerilir) → **Run all**. 1080p varyant başına ~15-25 dk, 4K ~45-90 dk; 12 varyant toplam ~5-6 saat.
 Her varyant bitince Drive'a yazılır; kopma olursa Run all biten varyantları atlar.
 """),
     code('''
 DATASET_ZIP = "/content/drive/MyDrive/GaussianTests/inputs/IMG_5966_dataset.zip"  # @param {type:"string"}
 OUT_DIR = "/content/drive/MyDrive/GaussianTests/gsplat_testbed/IMG_5966"  # @param {type:"string"}
 APP_AB_DIR = "/content/drive/MyDrive/GaussianTests/training_ab/IMG_5966"  # @param {type:"string"}
-VARIANTS = "default,mcmc,absgrad,antialiased,pose_opt,default_4k"  # @param {type:"string"}
+VARIANTS = "default,mcmc,absgrad,antialiased,pose_opt,default_4k,with_ut,bilateral_grid,depth_loss,mcmc_pose_opt,absgrad_aa,exclude_bad_frames"  # @param {type:"string"}
 STEPS = 30000          # @param {type:"integer"}
 TEST_EVERY = 10        # @param {type:"integer"}
 SAVE_PLY = True        # @param {type:"boolean"}
@@ -81,6 +87,8 @@ for name, text in SOURCES.items():
 if str(root / "lib") not in sys.path:
     sys.path.insert(0, str(root / "lib"))
 from splat_restorer import own_splat, train_ab, gsplat_testbed as tb
+# Colab uyumluluğu: HF datasets paketiyle isim çakışması + pycolmap fork'unun numpy-2 hatası.
+tb.fix_gsplat_install(Path("/content/gsplat_src/examples"))
 print(f"{{len(SOURCES)}} dosya yazıldı")
 ''', title="Kodu yaz (gömülü kaynaklar)"),
     code('''
@@ -115,27 +123,42 @@ from IPython.display import Markdown, display
 assert torch.cuda.is_available(), "GPU yok: Runtime → Change runtime type → GPU"
 net_lpips = lpips.LPIPS(net="alex", verbose=False).cuda().eval()
 flags_path = out_dir / "pose_flags.json"
-results = {}
+results, failed = {}, []
 for name in VARIANTS:
+    v = tb.VARIANTS[name]
     res_path = out_dir / name / "result.json"
     if res_path.exists():
         results[name] = json.loads(res_path.read_text())
+        portable = out_dir / name / "result_klasik.json"
+        if portable.exists():
+            results[name + " (klasik)"] = json.loads(portable.read_text())
         print(f"{name}: daha önce bitmiş, atlandı")
         continue
-    v = tb.VARIANTS[name]
     if FACTOR_OVERRIDE:
         v = dataclasses.replace(v, factor=FACTOR_OVERRIDE)
+    exclude = None
+    if v.exclude_bad_frames:
+        assert flags_path.exists(), "exclude_bad_frames için önce poz taraması gerekli: VARIANTS'ta başa 'default' koy."
+        exclude = [data.names[i] for i in json.loads(flags_path.read_text())["bad_train"]]
+        print(f"Eğitimden çıkarılan {len(exclude)} kare (saklanan 93 kare aynı kalır)")
     print(f"\\n===== {name}: {v.note}")
     run_dir = Path("/content/gs_runs") / name
     shutil.rmtree(run_dir, ignore_errors=True)
-    seconds = tb.run_variant(v, src, Path("/content/gsplat_src/examples"), run_dir, STEPS, TEST_EVERY)
+    try:
+        seconds = tb.run_variant(v, src, Path("/content/gsplat_src/examples"), run_dir, STEPS, TEST_EVERY, exclude)
+    except RuntimeError as e:   # bir varyant çökerse diğerleri yine koşsun
+        print(f"!!! {name} BAŞARISIZ, atlanıyor:\\n{e}")
+        (out_dir / name).mkdir(parents=True, exist_ok=True)
+        (out_dir / name / "failed.txt").write_text(str(e), encoding="utf-8")
+        failed.append(name)
+        continue
     params, deg = tb.load_checkpoint(run_dir)
     (out_dir / name).mkdir(parents=True, exist_ok=True)
     frames = train_ab.evaluate_params(params, deg, data, holdout, None, net_lpips, out_dir / name / "renders",
-                                      rasterize_mode=v.rasterize_mode)
+                                      rasterize_mode=v.rasterize_mode, **v.render)
     if not flags_path.exists():
         print("Eğitim karelerinde poz hatası taranıyor...")
-        tp = tb.frame_psnr(params, deg, data, train_ids, v.rasterize_mode)
+        tp = tb.frame_psnr(params, deg, data, train_ids, v.rasterize_mode, **v.render)
         flagged, bad_train, thr = tb.pose_failure_holdouts(tp, holdout)
         tb.save_json(flags_path, {"reference_variant": name, "threshold_db": thr, "flagged_holdout": flagged,
                                   "bad_train": bad_train, "train_psnr": {str(k): x for k, x in tp.items()}})
@@ -145,8 +168,14 @@ for name in VARIANTS:
         tb.save_ply(params, out_dir / name / "final.ply")
     for stats in (run_dir / "stats").glob("val_step*.json"):
         shutil.copy2(stats, out_dir / name / ("gsplat_" + stats.name))
-    results[name] = {"source": "gsplat", "info": {"variant": dataclasses.asdict(v), "train_seconds": seconds,
-                     "splats": int(params["means"].shape[0])}, "frames": frames}
+    info = {"variant": dataclasses.asdict(v), "train_seconds": seconds, "splats": int(params["means"].shape[0]),
+            "excluded_train_images": len(exclude or [])}
+    results[name] = {"source": "gsplat", "info": info, "frames": frames, "gsplat_val": tb.gsplat_val(run_dir / "stats")}
+    if v.portable_eval:   # standart 3DGS görüntüleyicide (ek render ayarı olmadan) nasıl göründüğü
+        klasik = train_ab.evaluate_params(params, deg, data, holdout, None, net_lpips,
+                                          out_dir / name / "renders_klasik", rasterize_mode="classic")
+        results[name + " (klasik)"] = {"source": "gsplat", "info": info, "frames": klasik}
+        tb.save_json(out_dir / name / "result_klasik.json", results[name + " (klasik)"])
     tb.save_json(res_path, results[name])
     del params
     torch.cuda.empty_cache()
@@ -157,17 +186,23 @@ for name in VARIANTS:
 from IPython.display import Image as IPImage
 flags = json.loads(flags_path.read_text())
 keep = [h for h in holdout if h not in set(flags["flagged_holdout"])]
+for name, r in results.items():   # önceki koşulardan kalan sonuçlara gsplat'in kendi metriğini ekle
+    if r.get("source") == "gsplat" and "gsplat_val" not in r and "(" not in name:
+        r["gsplat_val"] = tb.gsplat_val(out_dir / name)
 table = dict(results)
 if APP_AB_DIR and Path(APP_AB_DIR).exists():   # app eğiticisinin A/B sonuçları, aynı kareler
     for p in sorted(Path(APP_AB_DIR).glob("*/result.json")):
         table["app:" + p.parent.name] = json.loads(p.read_text())
+if failed:
+    print("Başarısız varyantlar (ayrıntı Drive'da <varyant>/failed.txt):", failed)
 summary = tb.summarise(table, keep)
 md_text = tb.markdown(summary, len(holdout), flags["flagged_holdout"], flags["threshold_db"])
 (out_dir / "summary.md").write_text(md_text, encoding="utf-8")
 tb.save_json(out_dir / "summary.json", summary)
 display(Markdown(md_text))
-sheets = train_ab.comparison_sheets(results, data, out_dir, out_dir)
-print("Sütunlar: foto | " + " | ".join(results) + "; alt sıra: kırmızı kutunun zoom'u")
+shown = {n: r for n, r in results.items() if "(" not in n}
+sheets = train_ab.comparison_sheets(shown, data, out_dir, out_dir)
+print("Sütunlar: foto | " + " | ".join(shown) + "; alt sıra: kırmızı kutunun zoom'u")
 for p in sheets[:6]:
     display(IPImage(filename=str(p), width=1600))
 ''', title="Sonuçlar"),
