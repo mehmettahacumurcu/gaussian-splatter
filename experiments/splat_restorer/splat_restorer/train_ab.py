@@ -168,21 +168,27 @@ def train_variant(
 
 
 @torch.no_grad()
-def evaluate_ply(ply: Path, data: SplatData, holdout: list[int], clean_dir: Path | None, net_lpips,
-                 render_dir: Path, device="cuda") -> dict:
+def evaluate_params(params, deg: int, data: SplatData, holdout: list[int], clean_dir: Path | None, net_lpips,
+                    render_dir: Path, rasterize_mode: str = "classic", device="cuda") -> dict:
     """Score held-out frames against the captured photo and (if given) its cleaned version."""
-    params, deg = load_ply(ply, device)
     w2c, K = _w2c_t(data, device)
     render_dir.mkdir(parents=True, exist_ok=True)
     rows = {}
     for i in holdout:
-        img, _ = render(params, w2c[i], K, data.width, data.height, deg)
+        img, _ = render(params, w2c[i], K, data.width, data.height, deg, rasterize_mode)
         row = _scores(img, data.photo(i, device), net_lpips)
         if clean_dir is not None:
             clean = torch.from_numpy(np.asarray(Image.open(clean_dir / data.frames[i]).convert("RGB")).copy())
             row["clean"] = _scores(img, clean.to(device).float() / 255, net_lpips)
         rows[str(i)] = row
         Image.fromarray(_to_u8(img)).save(render_dir / f"{i:06d}.jpg", quality=92)
+    return rows
+
+
+def evaluate_ply(ply: Path, data: SplatData, holdout: list[int], clean_dir: Path | None, net_lpips,
+                 render_dir: Path, device="cuda") -> dict:
+    params, deg = load_ply(ply, device)
+    rows = evaluate_params(params, deg, data, holdout, clean_dir, net_lpips, render_dir, device=device)
     del params
     torch.cuda.empty_cache()
     return rows

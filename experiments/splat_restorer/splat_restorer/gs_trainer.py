@@ -89,8 +89,11 @@ def make_optimizers(params, cfg: TrainConfig, scene_scale: float) -> dict[str, t
     return {k: torch.optim.Adam([{"params": params[k], "lr": lr, "name": k}], eps=1e-15) for k, lr in lrs.items()}
 
 
-def render(params, w2c: torch.Tensor, K: torch.Tensor, width: int, height: int, sh_degree: int):
-    """Render one view. Returns (image HxWx3 clamped to [0,1] in the graph, info)."""
+def render(params, w2c: torch.Tensor, K: torch.Tensor, width: int, height: int, sh_degree: int,
+           rasterize_mode: str = "classic"):
+    """Render one view. Returns (image HxWx3 clamped to [0,1] in the graph, info).
+
+    ``rasterize_mode="antialiased"`` for splats trained with gsplat's antialiased mode."""
     from gsplat import rasterization
 
     colors = torch.cat([params["sh0"], params["shN"]], dim=1)
@@ -106,6 +109,7 @@ def render(params, w2c: torch.Tensor, K: torch.Tensor, width: int, height: int, 
         height=height,
         sh_degree=sh_degree,
         packed=False,
+        rasterize_mode=rasterize_mode,
     )
     return img[0].clamp(0.0, 1.0), info
 
