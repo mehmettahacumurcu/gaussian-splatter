@@ -50,6 +50,7 @@
 .compose-morph-pair b { color: var(--accent); margin-right: 6px; }
 .compose-morph-time { align-self: center; margin-left: auto; color: var(--text-muted); font-variant-numeric: tabular-nums; }
 .compose-morph input { min-width: 0; width: 100%; box-sizing: border-box; }
+.compose-morph input[type="checkbox"] { width: auto; }
 .compose-morph small { font-size: 10px; }
 .compose-asset-picker { display: grid; gap: 6px; }
 .compose-asset-picker select { width: 100%; }

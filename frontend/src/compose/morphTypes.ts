@@ -1,20 +1,13 @@
-export type MorphMode = "cloud" | "shape";
+import type { MorphSettings } from "./types";
 
-/** Transient preview controls; these are deliberately not part of SceneDoc. */
-export interface MorphState {
-  sourceId: string | null;
-  targetId: string | null;
+export type MorphMode = MorphSettings["mode"];
+
+/** Persisted morph settings plus transient preview and playback controls. */
+export interface MorphState extends MorphSettings {
   enabled: boolean;
   playing: boolean;
   /** Last requested timeline position. Live playback lives in MorphPlayback. */
   t: number;
-  duration: number;
-  mode: MorphMode;
-  dissolve: number;
-  wave: number;
-  arc: number;
-  targetBlend: number;
-  seed: number;
 }
 
 /** Renderer-owned live time, sampled by the panel without rerendering the scene. */
@@ -27,6 +20,9 @@ export interface MorphStatus {
   phase: "idle" | "loading" | "ready" | "error";
   count?: number;
   precomputeMs?: number;
+  /** Mean world endpoint distance divided by the larger robust object diagonal. */
+  meanTravel?: number;
+  alignmentMs?: number;
   message?: string;
 }
 
@@ -43,6 +39,7 @@ export const INITIAL_MORPH_STATE: MorphState = {
   arc: 0,
   targetBlend: 1,
   seed: 42,
+  autoAlign: false,
 };
 
 /** Picking the opposite slot moves an object, so a pair can never repeat an ID. */

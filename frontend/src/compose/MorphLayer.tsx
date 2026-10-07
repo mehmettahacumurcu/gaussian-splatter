@@ -30,7 +30,7 @@ interface Props {
   onRecorder?: OnMorphRecorder;
 }
 
-function prepareInWorker(a: Float32Array, b: Float32Array, seed: number, mode: MorphMode, signal: AbortSignal) {
+function prepareInWorker(a: Float32Array, b: Float32Array, seed: number, mode: MorphMode, autoAlign: boolean, signal: AbortSignal) {
   return new Promise<PreparedMorph>((resolve, reject) => {
     signal.throwIfAborted();
     const worker = new Worker(new URL("./morph.worker.ts", import.meta.url), { type: "module" });
@@ -56,7 +56,7 @@ function prepareInWorker(a: Float32Array, b: Float32Array, seed: number, mode: M
       finish();
       reject(new Error("Morph worker result could not be read"));
     };
-    const request: MorphWorkerRequest = { id: 1, a, b, seed, mode };
+    const request: MorphWorkerRequest = { id: 1, a, b, seed, mode, autoAlign };
     try {
       worker.postMessage(request, [a.buffer, b.buffer]);
     } catch (error) {
@@ -90,10 +90,13 @@ export function MorphLayer(props: Props) {
 
   useEffect(() => {
     const abort = new AbortController();
+    // Status belongs to this preparation, even if another React root supplies
+    // a newer callback before this job's completion or effect cleanup.
+    const reportStatus = props.onStatus;
     let resource: MorphGpu | null = null;
     const start = performance.now();
     latest.current.onChange({ t: playback.t, playing: false });
-    latest.current.onStatus({ phase: "loading" });
+    reportStatus({ phase: "loading" });
     const packedA = packedSplatsCache.acquire(sourceUrl);
     const packedB = packedSplatsCache.acquire(targetUrl);
     void (async () => {
@@ -112,16 +115,19 @@ export function MorphLayer(props: Props) {
           if (result.status === "rejected") throw result.reason;
           return result.value;
         });
-        const data = await prepareInWorker(a, b, morph.seed, morph.mode, abort.signal);
+        const data = await prepareInWorker(a, b, morph.seed, morph.mode, morph.autoAlign, abort.signal);
         abort.signal.throwIfAborted();
         resource = createMorphGpu(data, gl.capabilities.maxTextureSize);
         resource.object.visible = false;
         scene.add(resource.object);
         gpu.current = resource;
-        latest.current.onStatus({ phase: "ready", count: data.count, precomputeMs: performance.now() - start });
+        reportStatus({
+          phase: "ready", count: data.count, precomputeMs: performance.now() - start,
+          meanTravel: data.meanTravel, alignmentMs: data.alignmentMs,
+        });
       } catch (error) {
         if (!abort.signal.aborted) {
-          latest.current.onStatus({ phase: "error", message: error instanceof Error ? error.message : String(error) });
+          reportStatus({ phase: "error", message: error instanceof Error ? error.message : String(error) });
           latest.current.onChange({ playing: false });
         }
       } finally {
@@ -142,7 +148,7 @@ export function MorphLayer(props: Props) {
       display.current = null;
       onDisplay(null);
     };
-  }, [sourceKey, targetKey, sourceUrl, targetUrl, morph.seed, morph.mode, scene, gl, playback, onDisplay]);
+  }, [sourceKey, targetKey, sourceUrl, targetUrl, morph.seed, morph.mode, morph.autoAlign, scene, gl, playback, onDisplay]);
 
   useEffect(() => {
     if (!props.onRecorder) return;

@@ -47,7 +47,10 @@ class FakeWorker {
   reply(data: MorphWorkerResponse) { this.onmessage?.({ data } as MessageEvent<MorphWorkerResponse>); }
 }
 
-const data: PreparedMorph = { a: new Float32Array(32), b: new Float32Array(32), count: 2, sceneRadius: 1 };
+const data: PreparedMorph = {
+  a: new Float32Array(32), b: new Float32Array(32), count: 2, sceneRadius: 1,
+  meanTravel: 0.24, matchingTravel: 0.001, alignmentMs: 27,
+};
 const source: SceneObject = {
   id: "source", kind: "splat", asset: "a", name: "A", role: "object", visible: true,
   transform: { position: [0, 0, 0], quaternion: [0, 0, 0, 1], scale: 1 },
@@ -109,6 +112,24 @@ describe("MorphLayer recording integration", () => {
     mocks.scene.children = [new SparkRenderer({ renderer: mocks.gl as never })];
     return { ...p, onRecorder };
   }
+
+  it("rejects recording before preparation and while alignment is rebuilding", async () => {
+    let p = recordingProps();
+    const { rerender } = render(<MorphLayer {...p} />);
+    await settle();
+    const recorder = p.onRecorder.mock.calls[0][0] as MorphVideoRecorder;
+    const options = { duration: 6, signal: new AbortController().signal, onProgress: vi.fn() };
+    await expect(recorder(options)).rejects.toThrow("Morph kayda hazır değil.");
+    const resource = await ready();
+    p = { ...p, morph: { ...p.morph, autoAlign: true } };
+    rerender(<MorphLayer {...p} />);
+    await settle();
+    expect(resource.dispose).toHaveBeenCalledOnce();
+    expect(p.onStatus).toHaveBeenLastCalledWith({ phase: "loading" });
+    await expect(recorder(options)).rejects.toThrow("Morph kayda hazır değil.");
+    expect(mocks.recordVideo).not.toHaveBeenCalled();
+    expect(mocks.createCapture).not.toHaveBeenCalled();
+  });
 
   it.each(["cloud", "shape"] as const)("records %s with current controls before handoff and captures only after rendering", async (mode) => {
     const events: string[] = [];
@@ -242,6 +263,25 @@ describe("MorphLayer recording integration", () => {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("MorphLayer lifecycle", () => {
+  it.each(["ready", "error"] as const)("reports a pending preparation's %s status through its original callback", async (phase) => {
+    let p = props();
+    const initialStatus = p.onStatus;
+    const { rerender } = render(<MorphLayer {...p} />);
+    await settle();
+    const nextStatus = vi.fn();
+    // A root can replace its status closure while the same worker is running.
+    // That must not assign this worker's result to the newer closure's key.
+    p = { ...p, onStatus: nextStatus };
+    rerender(<MorphLayer {...p} />);
+    expect(instances).toHaveLength(1);
+    instances[0].reply(phase === "ready"
+      ? { id: 1, ok: true, result: data }
+      : { id: 1, ok: false, error: "Preparation failed" });
+    await settle();
+    expect(initialStatus).toHaveBeenLastCalledWith(expect.objectContaining({ phase }));
+    expect(nextStatus).not.toHaveBeenCalled();
+  });
+
   it("holds source references through worker completion and disposes the temporary GPU object on close", async () => {
     const p = props();
     const { unmount } = render(<MorphLayer {...p} />);
@@ -250,9 +290,10 @@ describe("MorphLayer lifecycle", () => {
     expect(mocks.release).not.toHaveBeenCalled();
     expect(instances[0].postMessage.mock.calls[0][0].seed).toBe(42);
     expect(instances[0].postMessage.mock.calls[0][0].mode).toBe("shape");
+    expect(instances[0].postMessage.mock.calls[0][0].autoAlign).toBe(false);
     const resource = await ready();
     expect(mocks.release.mock.calls).toEqual([["/a.ply"], ["/b.ply"]]);
-    expect(p.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ phase: "ready", count: 2 }));
+    expect(p.onStatus).toHaveBeenLastCalledWith(expect.objectContaining({ phase: "ready", count: 2, meanTravel: 0.24, alignmentMs: 27 }));
     expect(mocks.scene.add).toHaveBeenCalledWith(resource.object);
     expect(instances[0].terminate).toHaveBeenCalledTimes(1);
     unmount();
@@ -309,7 +350,7 @@ describe("MorphLayer lifecycle", () => {
     expect(vi.mocked(p.onChange).mock.calls.filter(([patch]) => patch.t === 1)).toHaveLength(1);
   });
 
-  it.each(["seed", "target", "mode"])("terminates an old worker and ignores its late result when the %s changes", async (change) => {
+  it.each(["seed", "target", "mode", "autoAlign"])("terminates an old worker and ignores its late result when the %s changes", async (change) => {
     let p = props();
     const { rerender } = render(<MorphLayer {...p} />);
     await settle();
@@ -318,6 +359,8 @@ describe("MorphLayer lifecycle", () => {
       ? { ...p, morph: { ...p.morph, seed: 123 } }
       : change === "mode"
       ? { ...p, morph: { ...p.morph, mode: "cloud", t: 0, playing: false } }
+      : change === "autoAlign"
+      ? { ...p, morph: { ...p.morph, autoAlign: true, t: 0, playing: false } }
       : { ...p, target: { ...p.target, id: "replacement", asset: "c" }, targetUrl: "/c.ply", morph: { ...p.morph, targetId: "replacement" } };
     rerender(<MorphLayer {...p} />);
     await settle();
@@ -325,6 +368,7 @@ describe("MorphLayer lifecycle", () => {
     expect(instances).toHaveLength(2);
     expect(instances[1].postMessage.mock.calls[0][0].seed).toBe(change === "seed" ? 123 : 42);
     expect(instances[1].postMessage.mock.calls[0][0].mode).toBe(change === "mode" ? "cloud" : "shape");
+    expect(instances[1].postMessage.mock.calls[0][0].autoAlign).toBe(change === "autoAlign");
     previousWorker.reply({ id: 1, ok: true, result: data });
     await settle();
     expect(mocks.createGpu).not.toHaveBeenCalled();

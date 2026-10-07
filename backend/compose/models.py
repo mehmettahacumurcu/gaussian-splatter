@@ -99,7 +99,30 @@ class SceneObject(_Strict):
         return self
 
 
+class MorphSettings(_Strict):
+    """Saved preview recipe; playback state and prepared buffers are transient."""
+
+    sourceId: str | None = Field(None, pattern=ID_PATTERN)
+    targetId: str | None = Field(None, pattern=ID_PATTERN)
+    mode: Literal["cloud", "shape"] = "shape"
+    duration: float = Field(6.0, ge=0.5, le=120.0)
+    dissolve: float = Field(1.0, ge=0.0, le=1.0)
+    wave: float = Field(0.0, ge=0.0, le=1.0)
+    arc: float = Field(0.0, ge=0.0, le=1.0)
+    targetBlend: float = Field(1.0, ge=0.0, le=1.0)
+    seed: int = Field(42, ge=0, le=4294967295, strict=True)
+    autoAlign: bool = Field(False, strict=True)
+
+    @model_validator(mode="after")
+    def _distinct_pair(self) -> "MorphSettings":
+        if self.sourceId is not None and self.sourceId == self.targetId:
+            raise ValueError("morph sourceId and targetId must be distinct")
+        return self
+
+
 class SceneDoc(_Strict):
+    # Morph is an optional, additive v1 field. Existing v1 files remain valid;
+    # unknown major versions are deliberately rejected rather than misread.
     version: Literal[1] = 1
     id: str = Field(pattern=ID_PATTERN)
     name: str = Field(min_length=1, max_length=128)
@@ -107,6 +130,7 @@ class SceneDoc(_Strict):
     # Measured world "up" of the base capture (unit vector); None = assume +Y.
     up: Vec3 | None = None
     objects: list[SceneObject] = Field(default_factory=list)
+    morph: MorphSettings | None = None
 
     @field_validator("up")
     @classmethod
@@ -126,6 +150,11 @@ class SceneDoc(_Strict):
             raise ValueError("base object must be a splat")
         if not base.transform.is_identity():
             raise ValueError("base object transform must be identity")
+        if self.morph is not None:
+            splat_ids = {o.id for o in self.objects if o.kind == "splat"}
+            for object_id in (self.morph.sourceId, self.morph.targetId):
+                if object_id is not None and object_id not in splat_ids:
+                    raise ValueError(f"morph reference {object_id} must identify an existing splat")
         return self
 
 

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { composeReducer, initialComposeState, newObjectId } from "../sceneDoc";
-import type { SceneDoc, SceneObject } from "../types";
+import { pickMorphSettings, validateMorphSettings } from "../morphSettings";
+import type { MorphSettings, SceneDoc, SceneObject } from "../types";
 
 const base: SceneObject = {
   id: "o_base", kind: "splat", asset: "scene__garden", name: "garden", role: "base", visible: true,
@@ -15,6 +16,11 @@ const doc: SceneDoc = { version: 1, id: "s_1", name: "x", viewUp: "y", objects: 
 function loaded() {
   return composeReducer(initialComposeState, { type: "load", doc });
 }
+
+const recipe: MorphSettings = {
+  sourceId: "o_base", targetId: "o_statue", mode: "shape", duration: 9.5,
+  dissolve: 0.35, wave: 0.4, arc: 0.2, targetBlend: 0.85, seed: 4294967295, autoAlign: true,
+};
 
 describe("composeReducer", () => {
   it("loads clean and adding selects + dirties", () => {
@@ -198,5 +204,68 @@ describe("composeReducer", () => {
     const a = newObjectId();
     expect(a).toMatch(/^o_[0-9a-f]{12}$/);
     expect(newObjectId()).not.toBe(a);
+  });
+
+  it("stores only morph settings, dirties and retains them across save/load", () => {
+    const start = composeReducer(loaded(), { type: "add", object: statue });
+    const clean = composeReducer(start, { type: "markSaved", doc: start.doc! });
+    const runtime = { ...recipe, enabled: true, playing: true, t: 0.9 };
+    const edited = composeReducer(clean, { type: "setMorph", morph: runtime });
+    expect(edited.dirty).toBe(true);
+    expect(edited.doc!.morph).toEqual(recipe);
+    expect(edited.doc!.morph).not.toBe(runtime);
+    expect(pickMorphSettings(runtime)).toEqual(recipe);
+    expect(composeReducer(edited, { type: "setMorph", morph: { ...recipe } })).toBe(edited);
+    const saved = composeReducer(edited, { type: "markSaved", doc: edited.doc! });
+    const reopened = composeReducer(initialComposeState, { type: "load", doc: JSON.parse(JSON.stringify(saved.doc)) });
+    expect(reopened.dirty).toBe(false);
+    expect(reopened.doc!.morph).toEqual(recipe);
+    expect(composeReducer(reopened, { type: "setMorph", morph: { ...recipe, duration: 10 } }).dirty).toBe(true);
+  });
+
+  it("supports absent recipes, partial pairs and clearing", () => {
+    const clean = loaded();
+    expect(clean.doc!.morph).toBeUndefined();
+    expect(composeReducer(clean, { type: "setMorph", morph: null })).toBe(clean);
+    const partial = composeReducer(clean, { type: "setMorph", morph: { ...recipe, targetId: null } });
+    expect(partial.doc!.morph!.sourceId).toBe("o_base");
+    expect(partial.doc!.morph!.targetId).toBeNull();
+    const cleared = composeReducer(partial, { type: "setMorph", morph: null });
+    expect(cleared.doc!.morph).toBeNull();
+    expect(cleared.dirty).toBe(true);
+    expect(composeReducer(initialComposeState, { type: "setMorph", morph: recipe })).toBe(initialComposeState);
+  });
+
+  it("clears the entire morph when a referenced splat is removed, preserving unrelated recipes", () => {
+    const pair = composeReducer(loaded(), { type: "add", object: statue });
+    const configured = composeReducer(pair, { type: "setMorph", morph: recipe });
+    const extra = composeReducer(configured, { type: "add", object: { ...statue, id: "o_extra" } });
+    expect(composeReducer(extra, { type: "remove", id: "o_extra" }).doc!.morph).toEqual(recipe);
+    const removed = composeReducer(configured, { type: "remove", id: "o_statue" });
+    expect(removed.doc!.morph).toBeNull();
+    expect(removed.dirty).toBe(true);
+    expect(removed.doc!.objects).toEqual([base]);
+    const sourceRemoved = composeReducer(pair, { type: "setMorph", morph: { ...recipe, sourceId: "o_statue", targetId: "o_base" } });
+    expect(composeReducer(sourceRemoved, { type: "remove", id: "o_statue" }).doc!.morph).toBeNull();
+  });
+
+  it("clears stale morph references when loading a document", () => {
+    const stale = composeReducer(initialComposeState, { type: "load", doc: { ...doc, morph: recipe } });
+    expect(stale.doc!.morph).toBeNull();
+    expect(stale.dirty).toBe(false);
+  });
+
+  it.each([
+    { duration: NaN }, { duration: Infinity }, { duration: 0.49 }, { duration: 120.1 },
+    { dissolve: -0.1 }, { wave: 1.01 }, { arc: Infinity }, { targetBlend: -1 },
+    { seed: 1.5 }, { seed: -1 }, { seed: 4294967296 }, { seed: NaN },
+    { sourceId: "missing" }, { targetId: "o_base" }, { targetId: "o_mesh" },
+    { mode: "unknown" }, { autoAlign: "true" },
+  ])("rejects invalid morph settings %j", (patch) => {
+    const objects: SceneObject[] = [base, statue, { ...statue, kind: "mesh", id: "o_mesh" }];
+    const start = composeReducer(initialComposeState, { type: "load", doc: { ...doc, objects } });
+    const bad = { ...recipe, ...patch } as MorphSettings;
+    expect(validateMorphSettings(bad, objects)).toBe(false);
+    expect(composeReducer(start, { type: "setMorph", morph: bad })).toBe(start);
   });
 });

@@ -21,6 +21,7 @@ import { InspectorPanel } from "./InspectorPanel";
 import { MorphPanel } from "./MorphPanel";
 import type { MorphVideoRecorder, OnMorphRecorder } from "./morphCapture";
 import { INITIAL_MORPH_STATE, selectMorphSlot, type MorphPlayback, type MorphState, type MorphStatus } from "./morphTypes";
+import { pickMorphSettings, sameMorphSettings, validateMorphSettings } from "./morphSettings";
 import { ObjectListPanel } from "./ObjectListPanel";
 import { ObjectRegistry } from "./registry";
 import { composeReducer, initialComposeState, newObjectId } from "./sceneDoc";
@@ -69,8 +70,24 @@ export function ComposePage({ active }: { active: boolean }) {
   // Keep the hook binding names (part of its refresh signature), and replace
   // only this render's local reference so the visible mode and worker agree.
   morph = { ...INITIAL_MORPH_STATE, ...morph };
+  const morphRef = useRef(morph);
+  morphRef.current = morph;
   const morphPlayback = useRef<MorphPlayback>({ t: 0, playing: false }).current;
-  const [morphStatus, setMorphStatus] = useState<MorphStatus>({ phase: "idle" });
+  const [morphStatus, setMorphStatus] = useState<MorphStatus & { preparationKey?: string }>({ phase: "idle" });
+  const endpointKey = (id: string | null) => {
+    const object = doc?.objects.find((item) => item.id === id);
+    return object && [object.id, object.asset, object.visible, object.transform, object.crop, object.color];
+  };
+  const preparationKey = JSON.stringify([
+    endpointKey(morph.sourceId), endpointKey(morph.targetId), morph.enabled, morph.seed, morph.mode, morph.autoAlign,
+  ]);
+  // React DOM and the R3F root commit independently. A ready worker result is
+  // usable only for the geometry/settings that launched it, including that gap.
+  const currentMorphStatus: MorphStatus = morphStatus.phase === "ready" && morphStatus.preparationKey !== preparationKey
+    ? { phase: "loading" } : morphStatus;
+  const onMorphStatus = useCallback((next: MorphStatus) => {
+    setMorphStatus({ ...next, preparationKey });
+  }, [preparationKey]);
   const recorderRef = useRef<MorphVideoRecorder | null>(null);
   const [hasRecorder, setHasRecorder] = useState(false);
   const recordingRef = useRef<AbortController | null>(null);
@@ -133,7 +150,7 @@ export function ComposePage({ active }: { active: boolean }) {
     }
   }, [active, morphPlayback]);
 
-  // Deleting a selected endpoint ends the transient preview immediately.
+  // The reducer clears saved settings too when either selected endpoint is deleted.
   useEffect(() => {
     setMorph((previous) => {
       const sourceId = doc?.objects.some((object) => object.id === previous.sourceId && object.kind === "splat") ? previous.sourceId : null;
@@ -141,23 +158,33 @@ export function ComposePage({ active }: { active: boolean }) {
       if (sourceId === previous.sourceId && targetId === previous.targetId) return previous;
       morphPlayback.t = 0;
       morphPlayback.playing = false;
-      return { ...previous, sourceId, targetId, enabled: false, playing: false, t: 0 };
+      return { ...previous, sourceId: null, targetId: null, enabled: false, playing: false, t: 0 };
     });
   }, [doc?.objects, morphPlayback]);
 
   const onMorphChange = useCallback((patch: Partial<MorphState>) => {
+    const previous = morphRef.current;
+    const next = { ...previous, ...patch };
+    morphRef.current = next;
     if (patch.t !== undefined) morphPlayback.t = patch.t;
     if (patch.playing !== undefined) morphPlayback.playing = patch.playing;
-    setMorph((previous) => ({ ...previous, ...patch }));
+    setMorph(next);
+    const settings = pickMorphSettings(next);
+    if (!sameMorphSettings(previous, settings)) {
+      dispatch({ type: "setMorph", morph: settings });
+    }
+    // Invalidate readiness in the same event as a rebuild, before the worker effect.
+    if (next.enabled !== previous.enabled || next.sourceId !== previous.sourceId
+      || next.targetId !== previous.targetId || next.seed !== previous.seed
+      || next.mode !== previous.mode || next.autoAlign !== previous.autoAlign) {
+      setMorphStatus({ phase: next.enabled ? "loading" : "idle" });
+    }
   }, [morphPlayback]);
 
   const onMorphSelect = useCallback((slot: "sourceId" | "targetId", id: string) => {
     if (recordingRef.current) return;
-    morphPlayback.t = 0;
-    morphPlayback.playing = false;
-    setMorph((previous) => selectMorphSlot(previous, slot, id));
-    setMorphStatus({ phase: "idle" });
-  }, [morphPlayback]);
+    onMorphChange(selectMorphSlot(morphRef.current, slot, id));
+  }, [onMorphChange]);
 
   const onMorphRecorder = useCallback<OnMorphRecorder>((next, released) => {
     if (next) recorderRef.current = next;
@@ -167,7 +194,7 @@ export function ComposePage({ active }: { active: boolean }) {
 
   const startRecording = async () => {
     const record = recorderRef.current;
-    if (!record || recordingRef.current || busyRef.current || !active || !morph.enabled || morphStatus.phase !== "ready") return;
+    if (!record || recordingRef.current || busyRef.current || !active || !morph.enabled || currentMorphStatus.phase !== "ready") return;
     const abort = new AbortController();
     const previous = { t: morphPlayback.t, playing: morphPlayback.playing };
     recordingRef.current = abort;
@@ -244,6 +271,9 @@ export function ComposePage({ active }: { active: boolean }) {
       const loaded = await getScene(id);
       if (!current()) return;
       resetSceneUi();
+      setMorph({ ...INITIAL_MORPH_STATE,
+        ...(loaded.morph && validateMorphSettings(loaded.morph, loaded.objects) ? loaded.morph : {}),
+      });
       dispatch({ type: "load", doc: loaded });
       setStatus(null);
     });
@@ -636,7 +666,21 @@ export function ComposePage({ active }: { active: boolean }) {
           <h3>Obje ekle</h3>
           <AssetPicker assets={assets} busy={busy || !!recording} actionLabel="Sahneye ekle" onPick={addAsset} onUpload={(f) => upload(f, true)} />
         </aside>
-        <section className="compose-viewport" aria-label="Sahne görünümü">
+        <section
+          className="compose-viewport"
+          aria-label="Sahne görünümü"
+          aria-keyshortcuts="Space"
+          tabIndex={0}
+          onPointerDownCapture={(event) => event.currentTarget.focus({ preventScroll: true })}
+          onKeyDown={(event) => {
+            if (event.key !== " " || event.repeat || event.ctrlKey || event.metaKey || event.altKey
+              || !event.currentTarget.contains(document.activeElement) || isEditable(event.target)
+              || !active || recordingRef.current || !morph.enabled || currentMorphStatus.phase !== "ready") return;
+            event.preventDefault();
+            event.stopPropagation();
+            onMorphChange({ playing: !morph.playing, t: morph.playing ? morphPlayback.t : morph.t >= 1 ? 0 : morph.t });
+          }}
+        >
           <ComposeViewport
             doc={doc}
             active={active}
@@ -653,14 +697,14 @@ export function ComposePage({ active }: { active: boolean }) {
             morph={morph}
             morphPlayback={morphPlayback}
             onMorphChange={onMorphChange}
-            onMorphStatus={setMorphStatus}
+            onMorphStatus={onMorphStatus}
             onMorphRecorder={onMorphRecorder}
             recording={!!recording}
           />
         </section>
         <aside className="compose-right">
           <MorphPanel
-            morph={morph} playback={morphPlayback} status={morphStatus} objects={doc.objects} onChange={onMorphChange}
+            morph={morph} playback={morphPlayback} status={currentMorphStatus} objects={doc.objects} onChange={onMorphChange}
             recording={recording} recordingError={recordingError}
             onRecord={hasRecorder && !busy ? () => void startRecording() : undefined}
             onCancelRecording={() => recordingRef.current?.abort()}

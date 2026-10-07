@@ -1,5 +1,6 @@
 import { isValidTransform, straightenTransform } from "./transformMath";
-import type { ColorAdjust, CropBox, SceneDoc, SceneObject, Transform, Vec3, ViewUp } from "./types";
+import { pickMorphSettings, sameMorphSettings, validateMorphSettings } from "./morphSettings";
+import type { ColorAdjust, CropBox, MorphSettings, SceneDoc, SceneObject, Transform, Vec3, ViewUp } from "./types";
 import { effectiveUp, normalizeUp } from "./upVector";
 
 export interface ComposeState {
@@ -22,6 +23,7 @@ export type ComposeAction =
   | { type: "setCrop"; id: string; crop: CropBox | null }
   | { type: "setColor"; id: string; color: ColorAdjust | null }
   | { type: "setVisible"; id: string; visible: boolean }
+  | { type: "setMorph"; morph: MorphSettings | null }
   | { type: "rename"; id: string; name: string }
   /** `up` null = use `viewUp` (optionally changed too); a vector is normalised, degenerate ones ignored. */
   | { type: "setUp"; up: Vec3 | null; viewUp?: ViewUp }
@@ -64,8 +66,12 @@ function update(state: ComposeState, id: string, fn: (o: SceneObject) => SceneOb
 
 export function composeReducer(state: ComposeState, action: ComposeAction): ComposeState {
   switch (action.type) {
-    case "load":
-      return { doc: action.doc, selectedId: null, dirty: false };
+    case "load": {
+      // Defend against stale in-memory/imported recipes after an object removal.
+      const doc = action.doc.morph && !validateMorphSettings(action.doc.morph, action.doc.objects)
+        ? { ...action.doc, morph: null } : action.doc;
+      return { doc, selectedId: null, dirty: false };
+    }
     case "close":
       return initialComposeState;
     case "markSaved":
@@ -86,7 +92,11 @@ export function composeReducer(state: ComposeState, action: ComposeAction): Comp
       const target = find(state, action.id);
       if (!state.doc || !target || target.role === "base") return state;
       return {
-        doc: { ...state.doc, objects: state.doc.objects.filter((o) => o.id !== action.id) },
+        doc: {
+          ...state.doc,
+          objects: state.doc.objects.filter((o) => o.id !== action.id),
+          ...(state.doc.morph?.sourceId === action.id || state.doc.morph?.targetId === action.id ? { morph: null } : {}),
+        },
         selectedId: state.selectedId === action.id ? null : state.selectedId,
         dirty: true,
       };
@@ -115,6 +125,12 @@ export function composeReducer(state: ComposeState, action: ComposeAction): Comp
     }
     case "setVisible":
       return update(state, action.id, (o) => ({ ...o, visible: action.visible }));
+    case "setMorph": {
+      if (!state.doc || (action.morph && !validateMorphSettings(action.morph, state.doc.objects))) return state;
+      if (sameMorphSettings(state.doc.morph, action.morph)) return state;
+      const morph = action.morph ? pickMorphSettings(action.morph) : null;
+      return { ...state, doc: { ...state.doc, morph }, dirty: true };
+    }
     case "rename": {
       const name = action.name.trim().slice(0, MAX_NAME);
       if (!name) return state;

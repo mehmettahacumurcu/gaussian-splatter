@@ -135,6 +135,8 @@ def run_export(
             t = obj.transform
             wrap_with_transform(store.asset_path(obj.asset), tmp / "meshes" / f"{obj.id}.glb",
                                 placement_matrix(t.position, t.quaternion, t.scale))
+        # Carry the editable recipe (including morph metadata). Baked PLY/GLBs
+        # remain the static composition; a preview timeline is never applied.
         (tmp / "scene.json").write_text(doc.model_dump_json(indent=2), encoding="utf-8")
         on_progress("compose_write", 0.6, "zip hazırlanıyor", {})
         _build_zip(tmp, zip_tmp)
