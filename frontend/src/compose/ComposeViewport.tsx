@@ -15,6 +15,7 @@ import { Vector3 } from "three";
 import { SparkRenderer } from "@sparkjsdev/spark";
 import { MeshObject } from "./MeshObject";
 import { MorphLayer, type MorphDisplay } from "./MorphLayer";
+import type { OnMorphRecorder } from "./morphCapture";
 import type { MorphPlayback, MorphState, MorphStatus } from "./morphTypes";
 import type { ObjectRegistry } from "./registry";
 import { SplatObject } from "./SplatObject";
@@ -38,6 +39,8 @@ interface ViewportProps {
   morphPlayback: MorphPlayback;
   onMorphChange: (patch: Partial<MorphState>) => void;
   onMorphStatus: (status: MorphStatus) => void;
+  onMorphRecorder?: OnMorphRecorder;
+  recording?: boolean;
   /**
    * `(controls)` when new orbit controls are ready; `(null, released)` when
    * `released` goes away — ignore that unless `released` is still your current one.
@@ -89,7 +92,7 @@ function SparkLayer() {
  * first and the camera re-placed around the kept orbit target, then the
  * controls are recreated (OrbitControls reads camera.up only at construction).
  */
-function OrbitRig({ up }: { up: Vec3 }) {
+function OrbitRig({ up, locked = false }: { up: Vec3; locked?: boolean }) {
   const camera = useThree((s) => s.camera);
   const key = upKey(up);
   const [applied, setApplied] = useState<{ key: string; target: Vec3 } | null>(null);
@@ -119,7 +122,7 @@ function OrbitRig({ up }: { up: Vec3 }) {
   }, [key, camera]);
 
   if (!applied || applied.key !== key) return null;
-  return <OrbitControls key={key} ref={keepControls} makeDefault enableDamping={false} target={applied.target} />;
+  return <OrbitControls key={key} ref={keepControls} makeDefault enabled={!locked} enableDamping={false} target={applied.target} />;
 }
 
 function ControlsBridge({ onControls }: { onControls: ViewportProps["onControls"] }) {
@@ -310,7 +313,7 @@ function lightPositionFor(up: Vec3): Vec3 {
 
 export function ComposeViewport(props: ViewportProps) {
   const { doc, active, selectedId, registry, assetUrl, onSelect, onError, onControls } = props;
-  const { morph, morphPlayback, onMorphChange, onMorphStatus } = props;
+  const { morph, morphPlayback, onMorphChange, onMorphStatus, onMorphRecorder, recording = false } = props;
   const [display, setDisplay] = useState<MorphDisplay | null>(null);
   const source = doc.objects.find((o) => o.id === morph.sourceId && o.kind === "splat");
   const target = doc.objects.find((o) => o.id === morph.targetId && o.kind === "splat");
@@ -334,10 +337,11 @@ export function ComposeViewport(props: ViewportProps) {
       // mapping, so meshes match the (un-tone-mapped) splats.
       gl={{ antialias: false }}
       flat
-      frameloop={active ? "always" : "never"}
+      // The recorder owns every draw while active, including asynchronous sorting.
+      frameloop={active && !recording ? "always" : "never"}
       camera={{ ...initialCamera, fov: 60, near: 0.01, far: 2000 }}
       onPointerMissed={() => {
-        if (!gizmoBusy.current) onSelect(null);
+        if (!recording && !gizmoBusy.current) onSelect(null);
       }}
       style={{ width: "100%", height: "100%", background: "#101015" }}
     >
@@ -355,6 +359,7 @@ export function ComposeViewport(props: ViewportProps) {
           onChange={onMorphChange}
           onStatus={onMorphStatus}
           onDisplay={setDisplay}
+          onRecorder={onMorphRecorder}
         />
       )}
       {doc.objects.map((o) =>
@@ -363,7 +368,7 @@ export function ComposeViewport(props: ViewportProps) {
             key={o.id}
             object={o}
             url={assetUrl(o.asset)}
-            selected={o.id === selectedId}
+            selected={!recording && o.id === selectedId}
             suppressed={suppressed(o.id)}
             registry={registry}
             gizmoBusy={gizmoBusy}
@@ -382,7 +387,7 @@ export function ComposeViewport(props: ViewportProps) {
           />
         ),
       )}
-      <OrbitRig up={up} />
+      <OrbitRig up={up} locked={recording} />
       <ControlsBridge onControls={onControls} />
       <GizmoBusyReset gizmoBusy={gizmoBusy} />
       {!preview && <Gizmo {...props} gizmoBusy={gizmoBusy} />}

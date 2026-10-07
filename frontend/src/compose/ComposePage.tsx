@@ -19,6 +19,7 @@ import {
 import { errorMessage, firstLine } from "./errorMessage";
 import { InspectorPanel } from "./InspectorPanel";
 import { MorphPanel } from "./MorphPanel";
+import type { MorphVideoRecorder, OnMorphRecorder } from "./morphCapture";
 import { INITIAL_MORPH_STATE, selectMorphSlot, type MorphPlayback, type MorphState, type MorphStatus } from "./morphTypes";
 import { ObjectListPanel } from "./ObjectListPanel";
 import { ObjectRegistry } from "./registry";
@@ -66,6 +67,21 @@ export function ComposePage({ active }: { active: boolean }) {
   const [morph, setMorph] = useState<MorphState>(INITIAL_MORPH_STATE);
   const morphPlayback = useRef<MorphPlayback>({ t: 0, playing: false }).current;
   const [morphStatus, setMorphStatus] = useState<MorphStatus>({ phase: "idle" });
+  const recorderRef = useRef<MorphVideoRecorder | null>(null);
+  const [hasRecorder, setHasRecorder] = useState(false);
+  const recordingRef = useRef<AbortController | null>(null);
+  const [recording, setRecording] = useState<{ progress: number } | null>(null);
+  const [recordingError, setRecordingError] = useState<string | null>(null);
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      recordingRef.current?.abort();
+    };
+  }, []);
   const [newName, setNewName] = useState("");
   const [exportJob, setExportJob] = useState<Job | null>(null);
   const pollFailures = useRef(0);
@@ -107,6 +123,7 @@ export function ComposePage({ active }: { active: boolean }) {
 
   useEffect(() => {
     if (!active) {
+      recordingRef.current?.abort();
       setMorph((previous) => previous.playing ? { ...previous, playing: false, t: morphPlayback.t } : previous);
       morphPlayback.playing = false;
     }
@@ -131,18 +148,65 @@ export function ComposePage({ active }: { active: boolean }) {
   }, [morphPlayback]);
 
   const onMorphSelect = useCallback((slot: "sourceId" | "targetId", id: string) => {
+    if (recordingRef.current) return;
     morphPlayback.t = 0;
     morphPlayback.playing = false;
     setMorph((previous) => selectMorphSlot(previous, slot, id));
     setMorphStatus({ phase: "idle" });
   }, [morphPlayback]);
 
+  const onMorphRecorder = useCallback<OnMorphRecorder>((next, released) => {
+    if (next) recorderRef.current = next;
+    else if (recorderRef.current === released) recorderRef.current = null;
+    if (mounted.current) setHasRecorder(!!recorderRef.current);
+  }, []);
+
+  const startRecording = async () => {
+    const record = recorderRef.current;
+    if (!record || recordingRef.current || busyRef.current || !active || !morph.enabled || morphStatus.phase !== "ready") return;
+    const abort = new AbortController();
+    const previous = { t: morphPlayback.t, playing: morphPlayback.playing };
+    recordingRef.current = abort;
+    setRecording({ progress: 0 });
+    setRecordingError(null);
+    onMorphChange({ t: previous.t, playing: false });
+    const cancelHidden = () => { if (document.hidden) abort.abort(); };
+    document.addEventListener("visibilitychange", cancelHidden);
+    try {
+      const blob = await record({
+        duration: morph.duration, signal: abort.signal,
+        onProgress: (progress) => { if (mounted.current) setRecording({ progress }); },
+      });
+      if (blob && !abort.signal.aborted && mounted.current) {
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = `splat-morph-${morph.seed}.webm`;
+        document.body.appendChild(link);
+        try { link.click(); } finally {
+          link.remove();
+          // Give the browser time to start consuming the download URL.
+          window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+        }
+      }
+    } catch (error) {
+      if (!abort.signal.aborted && mounted.current) setRecordingError(errorMessage(error));
+    } finally {
+      document.removeEventListener("visibilitychange", cancelHidden);
+      recordingRef.current = null;
+      if (mounted.current) {
+        setRecording(null);
+        onMorphChange({ ...previous, playing: previous.playing && activeRef.current });
+      }
+    }
+  };
+
   /**
    * Runs one backend action at a time. `current()` is false once the open
    * scene changed (closed / another one opened) — skip updates then.
    */
   const run = async (label: string, fn: (current: () => boolean) => Promise<void>) => {
-    if (busyRef.current) return;
+    if (busyRef.current || recordingRef.current) return;
     busyRef.current = true;
     setBusy(true);
     setStatus({ kind: "info", text: label });
@@ -166,6 +230,7 @@ export function ComposePage({ active }: { active: boolean }) {
     morphPlayback.t = 0;
     morphPlayback.playing = false;
     setMorphStatus({ phase: "idle" });
+    setRecordingError(null);
     pollFailures.current = 0;
     lastSavedRef.current = null;
   };
@@ -191,7 +256,7 @@ export function ComposePage({ active }: { active: boolean }) {
     });
 
   const closeScene = () => {
-    if (busyRef.current) return;
+    if (busyRef.current || recordingRef.current) return;
     if (stateRef.current.dirty && !window.confirm("Kaydedilmemiş değişiklikler kaybolacak. Devam edilsin mi?")) return;
     resetSceneUi();
     setStatus(null);
@@ -385,6 +450,10 @@ export function ComposePage({ active }: { active: boolean }) {
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
       const key = e.key.toLowerCase();
+      if (recordingRef.current) {
+        if ((mod && (key === "s" || key === "d")) || key === "delete") e.preventDefault();
+        return;
+      }
       if (mod && key === "s") {
         e.preventDefault();
         // Blur first so a pending field value commits (onBlur), then save the result.
@@ -428,7 +497,9 @@ export function ComposePage({ active }: { active: boolean }) {
   }, [active, hasDoc]);
 
   const onError = useCallback((id: string, msg: string) => setErrors((prev) => ({ ...prev, [id]: msg })), []);
-  const onSelect = useCallback((id: string | null) => dispatch({ type: "select", id }), []);
+  const onSelect = useCallback((id: string | null) => {
+    if (!recordingRef.current) dispatch({ type: "select", id });
+  }, []);
   const onTransformCommit = useCallback(
     (id: string, transform: Transform) => dispatch({ type: "setTransform", id, transform }),
     [],
@@ -487,7 +558,7 @@ export function ComposePage({ active }: { active: boolean }) {
   return (
     <div className="compose-editor">
       <div className="compose-toolbar">
-        <button type="button" className="btn-secondary" disabled={busy} onClick={closeScene}>
+        <button type="button" className="btn-secondary" disabled={busy || !!recording} onClick={closeScene}>
           ← Sahneler
         </button>
         <strong className="compose-title">
@@ -501,6 +572,7 @@ export function ComposePage({ active }: { active: boolean }) {
               type="button"
               className={gizmoMode === mode ? "active" : ""}
               aria-pressed={gizmoMode === mode}
+              disabled={!!recording}
               onClick={() => setGizmoMode(mode)}
             >
               {label}
@@ -509,17 +581,17 @@ export function ComposePage({ active }: { active: boolean }) {
         </div>
         <label className="compose-inline">
           Yukarı
-          <select value={doc.up ? "auto" : doc.viewUp} disabled={busy} onChange={(e) => chooseUp(e.target.value)}>
+          <select value={doc.up ? "auto" : doc.viewUp} disabled={busy || !!recording} onChange={(e) => chooseUp(e.target.value)}>
             <option value="auto">Otomatik (zemin)</option>
             <option value="y">+Y</option>
             <option value="-y">−Y (COLMAP)</option>
           </select>
         </label>
         <span className="compose-spacer" />
-        <button type="button" className="btn-secondary" disabled={busy || !dirty} onClick={() => void save()}>
+        <button type="button" className="btn-secondary" disabled={busy || !!recording || !dirty} onClick={() => void save()}>
           Kaydet
         </button>
-        <button type="button" className="btn-primary" disabled={busy || exporting} onClick={() => void startExport()}>
+        <button type="button" className="btn-primary" disabled={busy || !!recording || exporting} onClick={() => void startExport()}>
           Export
         </button>
         {exportJob && (
@@ -555,9 +627,10 @@ export function ComposePage({ active }: { active: boolean }) {
             morphSourceId={morph.sourceId}
             morphTargetId={morph.targetId}
             onMorphSelect={onMorphSelect}
+            locked={!!recording}
           />
           <h3>Obje ekle</h3>
-          <AssetPicker assets={assets} busy={busy} actionLabel="Sahneye ekle" onPick={addAsset} onUpload={(f) => upload(f, true)} />
+          <AssetPicker assets={assets} busy={busy || !!recording} actionLabel="Sahneye ekle" onPick={addAsset} onUpload={(f) => upload(f, true)} />
         </aside>
         <section className="compose-viewport" aria-label="Sahne görünümü">
           <ComposeViewport
@@ -577,24 +650,33 @@ export function ComposePage({ active }: { active: boolean }) {
             morphPlayback={morphPlayback}
             onMorphChange={onMorphChange}
             onMorphStatus={setMorphStatus}
+            onMorphRecorder={onMorphRecorder}
+            recording={!!recording}
           />
         </section>
         <aside className="compose-right">
-          <MorphPanel morph={morph} playback={morphPlayback} status={morphStatus} objects={doc.objects} onChange={onMorphChange} />
+          <MorphPanel
+            morph={morph} playback={morphPlayback} status={morphStatus} objects={doc.objects} onChange={onMorphChange}
+            recording={recording} recordingError={recordingError}
+            onRecord={hasRecorder && !busy ? () => void startRecording() : undefined}
+            onCancelRecording={() => recordingRef.current?.abort()}
+          />
           {selected ? (
-            <InspectorPanel
-              key={selected.id}
-              object={selected}
-              cropEditing={cropEditing}
-              onRename={(name) => dispatch({ type: "rename", id: selected.id, name })}
-              onTransform={(transform) => dispatch({ type: "setTransform", id: selected.id, transform })}
-              onToggleCrop={toggleCrop}
-              onCropEditing={setCropEditing}
-              onColor={(color) => dispatch({ type: "setColor", id: selected.id, color })}
-              onSnap={snap}
-              onStraighten={() => straighten(selected.id)}
-              busy={busy}
-            />
+            <fieldset className="compose-inspector-lock" disabled={!!recording}>
+              <InspectorPanel
+                key={selected.id}
+                object={selected}
+                cropEditing={cropEditing}
+                onRename={(name) => dispatch({ type: "rename", id: selected.id, name })}
+                onTransform={(transform) => dispatch({ type: "setTransform", id: selected.id, transform })}
+                onToggleCrop={toggleCrop}
+                onCropEditing={setCropEditing}
+                onColor={(color) => dispatch({ type: "setColor", id: selected.id, color })}
+                onSnap={snap}
+                onStraighten={() => straighten(selected.id)}
+                busy={busy || !!recording}
+              />
+            </fieldset>
           ) : (
             <p className="muted">Düzenlemek için bir obje seç.</p>
           )}

@@ -11,20 +11,22 @@ interface Props {
   morphSourceId?: string | null;
   morphTargetId?: string | null;
   onMorphSelect?: (slot: "sourceId" | "targetId", id: string) => void;
+  locked?: boolean;
 }
 
-export function ObjectListPanel({ objects, selectedId, errors, onSelect, onToggleVisible, onDuplicate, onRemove, morphSourceId, morphTargetId, onMorphSelect }: Props) {
+export function ObjectListPanel({ objects, selectedId, errors, onSelect, onToggleVisible, onDuplicate, onRemove, morphSourceId, morphTargetId, onMorphSelect, locked = false }: Props) {
   return (
     <ul className="compose-object-list">
       {objects.map((o) => (
         <li
           key={o.id}
           className={o.id === selectedId ? "selected" : ""}
-          tabIndex={0}
+          tabIndex={locked ? -1 : 0}
+          aria-disabled={locked || undefined}
           aria-current={o.id === selectedId ? "true" : undefined}
-          onClick={() => onSelect(o.id)}
+          onClick={() => { if (!locked) onSelect(o.id); }}
           onKeyDown={(e) => {
-            if (e.target !== e.currentTarget || (e.key !== "Enter" && e.key !== " ")) return;
+            if (locked || e.target !== e.currentTarget || (e.key !== "Enter" && e.key !== " ")) return;
             e.preventDefault();
             onSelect(o.id);
           }}
@@ -35,6 +37,7 @@ export function ObjectListPanel({ objects, selectedId, errors, onSelect, onToggl
             title={o.visible ? "Gizle" : "Göster"}
             aria-label={`${o.name} ${o.visible ? "gizle" : "göster"}`}
             aria-pressed={!o.visible}
+            disabled={locked}
             onClick={(e) => {
               e.stopPropagation();
               onToggleVisible(o.id, !o.visible);
@@ -65,6 +68,7 @@ export function ObjectListPanel({ objects, selectedId, errors, onSelect, onToggl
                     title={`Morph ${label}: ${o.name}`}
                     aria-label={`${o.name} Morph ${label}`}
                     aria-pressed={chosen}
+                    disabled={locked}
                     onClick={(event) => {
                       event.stopPropagation();
                       onMorphSelect(slot, o.id);
@@ -83,6 +87,7 @@ export function ObjectListPanel({ objects, selectedId, errors, onSelect, onToggl
                 className="compose-icon-btn"
                 title="Kopyala (Ctrl+D)"
                 aria-label={`${o.name} kopyala`}
+                disabled={locked}
                 onClick={(e) => {
                   e.stopPropagation();
                   onDuplicate(o.id);
@@ -95,6 +100,7 @@ export function ObjectListPanel({ objects, selectedId, errors, onSelect, onToggl
                 className="compose-icon-btn"
                 title="Sil (Del)"
                 aria-label={`${o.name} sil`}
+                disabled={locked}
                 onClick={(e) => {
                   e.stopPropagation();
                   onRemove(o.id);

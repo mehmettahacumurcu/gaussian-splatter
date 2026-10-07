@@ -2,30 +2,39 @@ import { act, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ComponentProps } from "react";
 import type { PreparedMorph } from "../morphData";
+import type { MorphRecordingOptions } from "../morphRecording";
+import type { MorphVideoRecorder } from "../morphCapture";
 import type { MorphWorkerRequest, MorphWorkerResponse } from "../morph.worker";
 import { INITIAL_MORPH_STATE } from "../morphTypes";
 import type { SceneObject } from "../types";
 
 const mocks = vi.hoisted(() => ({
   frame: null as ((state: unknown, delta: number) => void) | null,
-  scene: { children: [], add: vi.fn() },
-  gl: { capabilities: { maxTextureSize: 4096 } },
+  scene: { children: [] as unknown[], add: vi.fn() },
+  gl: { capabilities: { maxTextureSize: 4096 }, domElement: {} },
+  camera: {},
   acquire: vi.fn(),
   release: vi.fn(),
   extract: vi.fn(),
   createGpu: vi.fn(),
+  createCapture: vi.fn(),
+  nextPaint: vi.fn(),
+  recordVideo: vi.fn(),
 }));
 
 vi.mock("@react-three/fiber", () => ({
   useFrame: (callback: (state: unknown, delta: number) => void) => { mocks.frame = callback; },
-  useThree: (selector: (state: unknown) => unknown) => selector({ scene: mocks.scene, gl: mocks.gl }),
+  useThree: (selector: (state: unknown) => unknown) => selector({ scene: mocks.scene, gl: mocks.gl, camera: mocks.camera }),
 }));
 vi.mock("@sparkjsdev/spark", () => ({ SparkRenderer: class SparkRenderer {} }));
 vi.mock("../splatCache", () => ({ packedSplatsCache: { acquire: mocks.acquire, release: mocks.release } }));
 vi.mock("../morphSource", () => ({ extractMorphSource: mocks.extract }));
 vi.mock("../morphGpu", () => ({ createMorphGpu: mocks.createGpu }));
+vi.mock("../morphCapture", () => ({ createMorphCapture: mocks.createCapture, nextMorphPaint: mocks.nextPaint }));
+vi.mock("../morphRecording", () => ({ recordMorphVideo: mocks.recordVideo }));
 
 import { MorphLayer } from "../MorphLayer";
+import { SparkRenderer } from "@sparkjsdev/spark";
 
 const instances: FakeWorker[] = [];
 class FakeWorker {
@@ -85,10 +94,148 @@ beforeEach(() => {
   vi.clearAllMocks();
   instances.length = 0;
   mocks.frame = null;
+  mocks.scene.children = [];
   mocks.acquire.mockImplementation(() => ({ initialized: Promise.resolve(), numSplats: 2 }));
   mocks.extract.mockImplementation(async () => new Float32Array(32));
   mocks.createGpu.mockImplementation(() => ({ object: { visible: false }, update: vi.fn(), dispose: vi.fn() }));
+  mocks.nextPaint.mockResolvedValue(undefined);
   vi.stubGlobal("Worker", FakeWorker);
+});
+
+describe("MorphLayer recording integration", () => {
+  function recordingProps() {
+    const p = props();
+    const onRecorder = vi.fn();
+    mocks.scene.children = [new SparkRenderer({ renderer: mocks.gl as never })];
+    return { ...p, onRecorder };
+  }
+
+  it("updates the morph before endpoint handoff, waits two paints, and captures only after rendering", async () => {
+    const events: string[] = [];
+    const sort = deferred<void>();
+    const capture = {
+      render: vi.fn(async (signal: AbortSignal, request: () => void, waitForCapture: () => Promise<void> = async () => {}) => {
+        events.push("prepare");
+        await sort.promise;
+        await waitForCapture();
+        signal.throwIfAborted();
+        events.push("render");
+        request();
+      }),
+      dispose: vi.fn(async () => {}),
+    };
+    mocks.createCapture.mockReturnValue(capture);
+    mocks.nextPaint.mockImplementation(async () => { events.push("paint"); });
+    const request = vi.fn(() => { events.push("capture"); });
+    const blob = new Blob(["video"]);
+    mocks.recordVideo.mockImplementation(async (options: MorphRecordingOptions) => {
+      await options.renderFrame(0.5, options.signal, request, async () => { events.push("cadence"); });
+      return blob;
+    });
+    const p = recordingProps();
+    vi.mocked(p.onDisplay).mockImplementation(() => { events.push("display"); });
+    const { unmount } = render(<MorphLayer {...p} />);
+    const resource = await ready();
+    resource.update.mockImplementation(() => { events.push("update"); });
+    p.playback.playing = true;
+    const recorder = p.onRecorder.mock.calls[0][0] as MorphVideoRecorder;
+    const result = recorder({ duration: 6, signal: new AbortController().signal, onProgress: vi.fn() });
+    await settle();
+    expect(events).toEqual(["update", "display", "paint", "paint", "prepare"]);
+    expect(p.playback).toEqual({ t: 0.5, playing: false });
+    expect(resource.object.visible).toBe(true);
+    expect(resource.update).toHaveBeenLastCalledWith(0.5, 1, 1);
+    act(() => mocks.frame?.({}, 1));
+    expect(resource.update).toHaveBeenCalledTimes(1);
+    expect(request).not.toHaveBeenCalled();
+    expect(mocks.createCapture).toHaveBeenCalledWith(mocks.scene.children[0], mocks.gl, mocks.scene, mocks.camera);
+    sort.resolve();
+    await expect(result).resolves.toBe(blob);
+    expect(events).toEqual(["update", "display", "paint", "paint", "prepare", "cadence", "render", "capture"]);
+    expect(capture.dispose).toHaveBeenCalledTimes(1);
+    unmount();
+    expect(p.onRecorder).toHaveBeenLastCalledWith(null, recorder);
+  });
+
+  it("keeps GPU inputs alive on unmount until the in-flight sort and capture cleanup settle", async () => {
+    const sort = deferred<void>();
+    const request = vi.fn();
+    const capture = {
+      render: vi.fn(async (signal: AbortSignal, captureFrame: () => void, waitForCapture: () => Promise<void> = async () => {}) => {
+        await sort.promise;
+        await waitForCapture();
+        signal.throwIfAborted();
+        captureFrame();
+      }),
+      dispose: vi.fn(async () => { await sort.promise; }),
+    };
+    mocks.createCapture.mockReturnValue(capture);
+    mocks.recordVideo.mockImplementation((options: MorphRecordingOptions) => new Promise<Blob | null>((resolve, reject) => {
+      options.signal.addEventListener("abort", () => resolve(null), { once: true });
+      void options.renderFrame(0.5, options.signal, request, async () => {}).catch((error: unknown) => {
+        if (options.signal.aborted) resolve(null);
+        else reject(error);
+      });
+    }));
+    const p = recordingProps();
+    const { unmount } = render(<MorphLayer {...p} />);
+    const resource = await ready();
+    const recorder = p.onRecorder.mock.calls[0][0] as MorphVideoRecorder;
+    const result = recorder({ duration: 6, signal: new AbortController().signal, onProgress: vi.fn() });
+    await settle();
+    unmount();
+    await settle();
+    expect(capture.dispose).toHaveBeenCalledTimes(1);
+    expect(resource.dispose).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+    sort.resolve();
+    await expect(result).resolves.toBeNull();
+    await settle();
+    expect(resource.dispose).toHaveBeenCalledTimes(1);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("reports GPU generation failure before requesting a capture and releases recording ownership", async () => {
+    const capture = {
+      render: vi.fn(async (_signal: AbortSignal, request: () => void, waitForCapture: () => Promise<void> = async () => {}) => { await waitForCapture(); request(); }),
+      dispose: vi.fn(async () => {}),
+    };
+    mocks.createCapture.mockReturnValue(capture);
+    const request = vi.fn();
+    mocks.recordVideo.mockImplementation(async (options: MorphRecordingOptions) => {
+      await options.renderFrame(0.5, options.signal, request, async () => {});
+      return new Blob();
+    });
+    const p = recordingProps();
+    const { unmount } = render(<MorphLayer {...p} />);
+    const resource = await ready();
+    resource.object.generatorError = new Error("Shader failed");
+    const recorder = p.onRecorder.mock.calls[0][0] as MorphVideoRecorder;
+    await expect(recorder({ duration: 6, signal: new AbortController().signal, onProgress: vi.fn() })).rejects.toThrow("Shader failed");
+    expect(request).not.toHaveBeenCalled();
+    expect(capture.dispose).toHaveBeenCalledTimes(1);
+    unmount();
+    expect(resource.dispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases recording ownership even if restoring Spark after the recording fails", async () => {
+    const capture = {
+      render: vi.fn(async (_signal: AbortSignal, request: () => void, waitForCapture: () => Promise<void> = async () => {}) => { await waitForCapture(); request(); }),
+      dispose: vi.fn(async () => { throw new Error("Context lost"); }),
+    };
+    mocks.createCapture.mockReturnValue(capture);
+    mocks.recordVideo.mockImplementation(async (options: MorphRecordingOptions) => {
+      await options.renderFrame(0.5, options.signal, vi.fn(), async () => {});
+      return new Blob();
+    });
+    const p = recordingProps();
+    const { unmount } = render(<MorphLayer {...p} />);
+    const resource = await ready();
+    const recorder = p.onRecorder.mock.calls[0][0] as MorphVideoRecorder;
+    await expect(recorder({ duration: 6, signal: new AbortController().signal, onProgress: vi.fn() })).rejects.toThrow("Context lost");
+    unmount();
+    expect(resource.dispose).toHaveBeenCalledTimes(1);
+  });
 });
 
 afterEach(() => vi.unstubAllGlobals());

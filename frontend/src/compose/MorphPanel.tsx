@@ -8,6 +8,10 @@ interface Props {
   status: MorphStatus;
   objects: SceneObject[];
   onChange: (patch: Partial<MorphState>) => void;
+  recording?: { progress: number } | null;
+  onRecord?: () => void;
+  onCancelRecording?: () => void;
+  recordingError?: string | null;
 }
 
 function NumericControl({
@@ -16,6 +20,7 @@ function NumericControl({
   min,
   max,
   step,
+  disabled = false,
   onCommit,
 }: {
   label: string;
@@ -23,11 +28,16 @@ function NumericControl({
   min: number;
   max: number;
   step: number;
+  disabled?: boolean;
   onCommit: (value: number) => void;
 }) {
   const [text, setText] = useState(String(value));
-  useEffect(() => setText(String(value)), [value]);
+  useEffect(() => setText(String(value)), [value, disabled]);
   const commit = () => {
+    if (disabled) {
+      setText(String(value));
+      return;
+    }
     const parsed = Number(text);
     const next = text.trim() && Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : value;
     const rounded = step === 1 ? Math.round(next) : next;
@@ -43,7 +53,8 @@ function NumericControl({
         min={min}
         max={max}
         step={step}
-        onChange={(event) => setText(event.target.value)}
+        disabled={disabled}
+        onChange={(event) => { if (!disabled) setText(event.target.value); }}
         onBlur={commit}
         onKeyDown={(event) => {
           if (event.key === "Enter") event.currentTarget.blur();
@@ -53,7 +64,9 @@ function NumericControl({
   );
 }
 
-export function MorphPanel({ morph, playback, status, objects, onChange }: Props) {
+export function MorphPanel({ morph, playback, status, objects, onChange, recording, onRecord, onCancelRecording, recordingError }: Props) {
+  const locked = !!recording;
+  const change = (patch: Partial<MorphState>) => { if (!locked) onChange(patch); };
   const [liveTime, setLiveTime] = useState(morph.t);
   useEffect(() => {
     setLiveTime(morph.t);
@@ -65,7 +78,7 @@ export function MorphPanel({ morph, playback, status, objects, onChange }: Props
   const source = objects.find((object) => object.id === morph.sourceId && object.kind === "splat");
   const target = objects.find((object) => object.id === morph.targetId && object.kind === "splat");
   const hasPair = !!source && !!target && source.id !== target.id;
-  const ready = morph.enabled && status.phase === "ready";
+  const ready = hasPair && morph.enabled && status.phase === "ready";
   const time = morph.playing ? liveTime : morph.t;
 
   return (
@@ -80,17 +93,17 @@ export function MorphPanel({ morph, playback, status, objects, onChange }: Props
         <button
           type="button"
           className={morph.enabled ? "btn-secondary" : "btn-primary"}
-          disabled={!hasPair}
-          onClick={() => onChange({ enabled: !morph.enabled, playing: false, t: 0 })}
+          disabled={locked || !hasPair}
+          onClick={() => change({ enabled: !morph.enabled, playing: false, t: 0 })}
         >
           {morph.enabled ? "Önizlemeyi kapat" : "Morph hazırla"}
         </button>
         <button
           type="button"
           className="btn-secondary"
-          disabled={!hasPair}
+          disabled={locked || !hasPair}
           aria-label="Morph A ve B yer değiştir"
-          onClick={() => onChange({
+          onClick={() => change({
             sourceId: morph.targetId,
             targetId: morph.sourceId,
             enabled: false,
@@ -112,16 +125,16 @@ export function MorphPanel({ morph, playback, status, objects, onChange }: Props
         <button
           type="button"
           className="btn-primary"
-          disabled={!ready}
-          onClick={() => onChange({ playing: !morph.playing, t: morph.playing ? playback.t : morph.t >= 1 ? 0 : morph.t })}
+          disabled={locked || !ready}
+          onClick={() => change({ playing: !morph.playing, t: morph.playing ? playback.t : morph.t >= 1 ? 0 : morph.t })}
         >
           {morph.playing ? "Duraklat" : "Oynat"}
         </button>
         <button
           type="button"
           className="btn-secondary"
-          disabled={!ready}
-          onClick={() => onChange({ t: 0, playing: false })}
+          disabled={locked || !ready}
+          onClick={() => change({ t: 0, playing: false })}
         >
           Başa dön
         </button>
@@ -135,11 +148,11 @@ export function MorphPanel({ morph, playback, status, objects, onChange }: Props
           max={1}
           step={0.001}
           value={time}
-          disabled={!ready}
-          onChange={(event) => onChange({ t: Number(event.target.value), playing: false })}
+          disabled={locked || !ready}
+          onChange={(event) => change({ t: Number(event.target.value), playing: false })}
         />
       </label>
-      <NumericControl label="Süre (sn)" value={morph.duration} min={0.5} max={120} step={0.5} onCommit={(duration) => onChange({ duration })} />
+      <NumericControl label="Süre (sn)" value={morph.duration} min={0.5} max={120} step={0.5} disabled={locked} onCommit={(duration) => change({ duration })} />
       <label className="compose-field">
         <span>Dissolve · {Math.round(morph.dissolve * 100)}%</span>
         <input
@@ -148,7 +161,8 @@ export function MorphPanel({ morph, playback, status, objects, onChange }: Props
           max={1}
           step={0.01}
           value={morph.dissolve}
-          onChange={(event) => onChange({ dissolve: Number(event.target.value) })}
+          disabled={locked}
+          onChange={(event) => change({ dissolve: Number(event.target.value) })}
         />
         <small className="muted">Parçacık bulutunun yayılması</small>
       </label>
@@ -160,11 +174,28 @@ export function MorphPanel({ morph, playback, status, objects, onChange }: Props
           max={1}
           step={0.01}
           value={morph.targetBlend}
-          onChange={(event) => onChange({ targetBlend: Number(event.target.value) })}
+          disabled={locked}
+          onChange={(event) => change({ targetBlend: Number(event.target.value) })}
         />
         <small className="muted">B hedefine yaklaşma miktarı</small>
       </label>
-      <NumericControl label="Seed" value={morph.seed} min={0} max={4294967295} step={1} onCommit={(seed) => onChange({ seed, playing: false, t: 0 })} />
+      <NumericControl label="Seed" value={morph.seed} min={0} max={4294967295} step={1} disabled={locked} onCommit={(seed) => change({ seed, playing: false, t: 0 })} />
+      <div className="compose-row">
+        <button
+          type="button"
+          className="btn-primary"
+          disabled={locked || !ready || !onRecord}
+          onClick={onRecord}
+        >
+          {recording ? `Kaydediliyor… %${Math.round(Math.max(0, Math.min(1, recording.progress)) * 100)}` : "Videoyu kaydet"}
+        </button>
+        {recording && (
+          <button type="button" className="btn-secondary" onClick={onCancelRecording} disabled={!onCancelRecording}>
+            İptal
+          </button>
+        )}
+      </div>
+      {recordingError && <p className="compose-morph-status error" role="alert">{recordingError}</p>}
       <p className="muted compose-morph-hint">Geçiş sırasında DC renk kullanılır. Önizleme sahne kaydına ve export’a dahil değildir.</p>
     </section>
   );

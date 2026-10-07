@@ -21,6 +21,7 @@
 .compose-left, .compose-right { background: var(--bg-1); padding: 10px 12px; overflow: auto; min-height: 0; }
 .compose-left { border-right: 1px solid var(--border); }
 .compose-right { border-left: 1px solid var(--border); }
+.compose-inspector-lock { border: 0; padding: 0; margin: 0; min-width: 0; }
 .compose-left h3 { margin: 12px 0 6px; font-size: 12px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.04em; }
 .compose-viewport { position: relative; min-height: 0; min-width: 0; }
 .compose-object-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }

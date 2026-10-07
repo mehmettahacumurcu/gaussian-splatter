@@ -3,12 +3,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Job } from "../../api";
 import type { AssetOrientation, SceneDoc } from "../types";
 import type { MorphPlayback, MorphState, MorphStatus } from "../morphTypes";
+import type { MorphRecordOptions, MorphVideoRecorder, OnMorphRecorder } from "../morphCapture";
 
 interface ViewportProps {
   morph: MorphState;
   morphPlayback: MorphPlayback;
   onMorphChange: (patch: Partial<MorphState>) => void;
   onMorphStatus: (status: MorphStatus) => void;
+  onMorphRecorder: OnMorphRecorder;
+  recording: boolean;
+  doc: SceneDoc;
 }
 const viewport = vi.hoisted(() => ({ props: null as ViewportProps | null }));
 
@@ -100,6 +104,47 @@ async function openScene() {
   await screen.findByTestId("viewport");
 }
 
+async function openRecordingScene() {
+  api.getScene.mockResolvedValue({ ...DOC, objects: [...DOC.objects, STATUE] });
+  const view = render(<ComposePage active />);
+  fireEvent.click(await screen.findByRole("button", { name: "Aç" }));
+  await screen.findByTestId("viewport");
+  fireEvent.click(screen.getByRole("button", { name: "garden Morph A" }));
+  fireEvent.click(screen.getByRole("button", { name: "statue Morph B" }));
+  fireEvent.click(screen.getByRole("button", { name: "Morph hazırla" }));
+  act(() => viewport.props!.onMorphStatus({ phase: "ready", count: 200000 }));
+  fireEvent.click(screen.getByRole("button", { name: "Oynat" }));
+  viewport.props!.morphPlayback.t = 0.625;
+  return view;
+}
+
+/** The viewport owns capture; resolve it manually to cover late completion after abort. */
+function registerPendingRecorder() {
+  let options!: MorphRecordOptions;
+  let finish!: (blob: Blob | null) => void;
+  let fail!: (error: Error) => void;
+  const record = vi.fn<MorphVideoRecorder>((next) => {
+    options = next;
+    return new Promise((resolve, reject) => { finish = resolve; fail = reject; });
+  });
+  act(() => viewport.props!.onMorphRecorder(record));
+  return { record, get options() { return options; }, finish: (blob: Blob | null) => finish(blob), fail: (error: Error) => fail(error) };
+}
+
+function mockVideoDownload() {
+  const createObjectURL = vi.fn(() => "blob:recorded-morph");
+  const revokeObjectURL = vi.fn();
+  vi.stubGlobal("URL", class extends URL {
+    static createObjectURL = createObjectURL;
+    static revokeObjectURL = revokeObjectURL;
+  });
+  const downloads: { href: string; filename: string }[] = [];
+  const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+    downloads.push({ href: this.href, filename: this.download });
+  });
+  return { createObjectURL, revokeObjectURL, click, downloads };
+}
+
 function makeDirty() {
   fireEvent.change(screen.getByDisplayValue("+Y"), { target: { value: "-y" } });
   expect(screen.getByText(/Bahçe •/)).toBeInTheDocument();
@@ -107,6 +152,7 @@ function makeDirty() {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  viewport.props = null;
   api.listScenes.mockResolvedValue([{ id: "s1", name: "Bahçe", updated_ts: 0, object_count: 1 }]);
   api.listAssets.mockResolvedValue([]);
   api.getScene.mockResolvedValue(DOC);
@@ -115,9 +161,132 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("ComposePage", () => {
+  it("records the configured duration, shows progress, downloads the seed name, and restores live playback", async () => {
+    await openRecordingScene();
+    expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
+    const capture = registerPendingRecorder();
+    const download = mockVideoDownload();
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "Videoyu kaydet" }));
+    expect(capture.record).toHaveBeenCalledOnce();
+    expect(capture.options.duration).toBe(6);
+    expect(capture.options.signal.aborted).toBe(false);
+    expect(viewport.props?.recording).toBe(true);
+    expect(viewport.props?.morph).toMatchObject({ t: 0.625, playing: false });
+    act(() => {
+      viewport.props!.morphPlayback.t = 0.9;
+      capture.options.onProgress(0.375);
+    });
+    expect(screen.getByRole("button", { name: "Kaydediliyor… %38" })).toBeDisabled();
+
+    const blob = new Blob(["video"], { type: "video/webm" });
+    await act(async () => capture.finish(blob));
+    expect(download.createObjectURL).toHaveBeenCalledWith(blob);
+    expect(download.downloads).toEqual([{ href: "blob:recorded-morph", filename: "splat-morph-42.webm" }]);
+    expect(viewport.props?.recording).toBe(false);
+    expect(viewport.props?.morph).toMatchObject({ t: 0.625, playing: true });
+    expect(viewport.props?.morphPlayback).toEqual({ t: 0.625, playing: true });
+    expect(screen.getByRole("button", { name: "Videoyu kaydet" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Duraklat" })).not.toBeDisabled();
+    expect(document.querySelector("a[download]")).toBeNull();
+    await act(async () => vi.advanceTimersByTimeAsync(1000));
+    expect(download.revokeObjectURL).toHaveBeenCalledWith("blob:recorded-morph");
+  }, 15_000); // Includes opening/preparing the editor and the full download lifecycle.
+
+  it("locks scene, pair, and inspector controls and shortcuts until recording cancellation finishes", async () => {
+    await openRecordingScene();
+    fireEvent.click(screen.getByText("statue", { selector: ".compose-object-name" }));
+    makeDirty();
+    const before = viewport.props!.doc;
+    const capture = registerPendingRecorder();
+    const download = mockVideoDownload();
+    fireEvent.click(screen.getByRole("button", { name: "Videoyu kaydet" }));
+
+    for (const name of ["← Sahneler", "Kaydet", "Export", "Taşı (W)", "Döndür (E)", "Ölçekle (R)", "garden Morph A", "statue Morph B", "statue gizle", "statue kopyala", "statue sil"]) {
+      expect(screen.getByRole("button", { name })).toBeDisabled();
+      fireEvent.click(screen.getByRole("button", { name }));
+    }
+    expect(screen.getByDisplayValue("−Y (COLMAP)")).toBeDisabled();
+    expect(screen.getByDisplayValue("statue")).toBeDisabled();
+    expect(screen.getByLabelText("Konum X")).toBeDisabled();
+    expect(screen.getByLabelText("Süre (sn)")).toBeDisabled();
+    fireEvent.keyDown(window, { key: "Delete" });
+    fireEvent.keyDown(window, { key: "d", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "s", ctrlKey: true });
+    fireEvent.keyDown(window, { key: "e" });
+    expect(viewport.props!.doc).toBe(before);
+    expect(viewport.props?.morph).toMatchObject({ sourceId: "base", targetId: "o_statue" });
+    expect(screen.getByRole("button", { name: "Taşı (W)" })).toHaveAttribute("aria-pressed", "true");
+    expect(api.saveScene).not.toHaveBeenCalled();
+    expect(api.exportScene).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "İptal" }));
+    expect(capture.options.signal.aborted).toBe(true);
+    expect(screen.getByRole("button", { name: "statue Morph B" })).toBeDisabled();
+    // A recorder may return buffered data after stop; cancellation must suppress it.
+    await act(async () => capture.finish(new Blob(["partial video"])));
+    expect(download.createObjectURL).not.toHaveBeenCalled();
+    expect(download.click).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(viewport.props?.morphPlayback).toEqual({ t: 0.625, playing: true });
+    expect(screen.getByRole("button", { name: "statue Morph B" })).not.toBeDisabled();
+    expect(screen.getByLabelText("Konum X")).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Kaydet" })).not.toBeDisabled();
+  });
+
+  it("reports capture failure and restores the previous paused time without a download", async () => {
+    await openRecordingScene();
+    fireEvent.click(screen.getByRole("button", { name: "Duraklat" }));
+    const capture = registerPendingRecorder();
+    const download = mockVideoDownload();
+    fireEvent.click(screen.getByRole("button", { name: "Videoyu kaydet" }));
+    viewport.props!.morphPlayback.t = 1;
+    await act(async () => capture.fail(new Error("WebM codec failed")));
+    expect(screen.getByRole("alert")).toHaveTextContent("WebM codec failed");
+    expect(viewport.props?.morph).toMatchObject({ t: 0.625, playing: false });
+    expect(viewport.props?.morphPlayback).toEqual({ t: 0.625, playing: false });
+    expect(screen.getByRole("button", { name: "Videoyu kaydet" })).not.toBeDisabled();
+    expect(download.createObjectURL).not.toHaveBeenCalled();
+  });
+
+  it("cancels recording when inactive and restores the previous time without resuming playback", async () => {
+    const view = await openRecordingScene();
+    const capture = registerPendingRecorder();
+    const download = mockVideoDownload();
+    fireEvent.click(screen.getByRole("button", { name: "Videoyu kaydet" }));
+    viewport.props!.morphPlayback.t = 0.9;
+    view.rerender(<ComposePage active={false} />);
+    expect(capture.options.signal.aborted).toBe(true);
+    await act(async () => capture.finish(new Blob(["partial video"])));
+    expect(viewport.props?.recording).toBe(false);
+    expect(viewport.props?.morph).toMatchObject({ t: 0.625, playing: false });
+    expect(viewport.props?.morphPlayback).toEqual({ t: 0.625, playing: false });
+    expect(download.createObjectURL).not.toHaveBeenCalled();
+    view.rerender(<ComposePage active />);
+    expect(screen.getByRole("button", { name: "Oynat" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Videoyu kaydet" })).not.toBeDisabled();
+  });
+
+  it("aborts on unmount and ignores late progress and recorded data", async () => {
+    const view = await openRecordingScene();
+    const capture = registerPendingRecorder();
+    const download = mockVideoDownload();
+    fireEvent.click(screen.getByRole("button", { name: "Videoyu kaydet" }));
+    view.unmount();
+    expect(capture.options.signal.aborted).toBe(true);
+    await act(async () => {
+      capture.options.onProgress(1);
+      capture.finish(new Blob(["late video"]));
+    });
+    expect(download.createObjectURL).not.toHaveBeenCalled();
+    expect(download.click).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("viewport")).not.toBeInTheDocument();
+  });
+
   it("keeps morph selection transient and ends the preview when an endpoint is deleted", async () => {
     api.getScene.mockResolvedValue({ ...DOC, objects: [...DOC.objects, STATUE] });
     await openScene();

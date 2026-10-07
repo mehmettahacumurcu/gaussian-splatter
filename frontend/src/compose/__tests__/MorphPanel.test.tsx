@@ -80,6 +80,76 @@ describe("Morph controls", () => {
     expect(screen.getByRole("button", { name: "Önizlemeyi kapat" })).not.toBeDisabled();
   });
 
+  it("offers recording only for a ready pair with a recording handler", () => {
+    const onRecord = vi.fn();
+    const props = { morph: prepared, playback: { t: 0, playing: false }, objects, onChange: vi.fn(), onRecord };
+    const { rerender } = render(<MorphPanel {...props} status={{ phase: "loading" }} />);
+    expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
+    rerender(<MorphPanel {...props} status={{ phase: "error" }} />);
+    expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
+    rerender(<MorphPanel {...props} status={{ phase: "ready" }} morph={{ ...prepared, enabled: false }} />);
+    expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
+    rerender(<MorphPanel {...props} status={{ phase: "ready" }} morph={{ ...prepared, targetId: "a" }} />);
+    expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
+    rerender(<MorphPanel {...props} status={{ phase: "ready" }} onRecord={undefined} />);
+    expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
+    rerender(<MorphPanel {...props} status={{ phase: "ready" }} />);
+    fireEvent.click(screen.getByRole("button", { name: "Videoyu kaydet" }));
+    expect(onRecord).toHaveBeenCalledOnce();
+  });
+
+  it("locks all morph controls, discards pending numeric edits, and keeps cancel available", () => {
+    const onChange = vi.fn();
+    const onRecord = vi.fn();
+    const onCancelRecording = vi.fn();
+    const props = { morph: prepared, playback: { t: 0, playing: false }, objects, onChange, onRecord, onCancelRecording };
+    const { rerender } = render(<MorphPanel {...props} status={{ phase: "ready" }} />);
+    const duration = screen.getByLabelText("Süre (sn)");
+    fireEvent.change(duration, { target: { value: "12" } });
+
+    rerender(<MorphPanel {...props} status={{ phase: "ready" }} recording={{ progress: 0.375 }} />);
+    for (const input of [...screen.getAllByRole("slider"), ...screen.getAllByRole("spinbutton")]) {
+      expect(input).toBeDisabled();
+    }
+    for (const button of screen.getAllByRole("button")) {
+      if (button.textContent !== "İptal") expect(button).toBeDisabled();
+    }
+    expect(screen.getByRole("button", { name: "Kaydediliyor… %38" })).toBeDisabled();
+    fireEvent.blur(duration);
+    expect(duration).toHaveValue(prepared.duration);
+    fireEvent.change(screen.getByLabelText("Zaman çizelgesi"), { target: { value: "0.9" } });
+    fireEvent.click(screen.getByRole("button", { name: "Önizlemeyi kapat" }));
+    expect(onChange).not.toHaveBeenCalled();
+    expect(onRecord).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "İptal" }));
+    expect(onCancelRecording).toHaveBeenCalledOnce();
+  });
+
+  it("unlocks the controls and shows the restored playback after recording", () => {
+    const morph = { ...prepared, t: 0.43, playing: true };
+    const props = { morph, playback: { t: 0.43, playing: true }, objects, onChange: vi.fn(), onRecord: vi.fn(), onCancelRecording: vi.fn() };
+    const { rerender } = render(<MorphPanel {...props} status={{ phase: "ready" }} recording={{ progress: 1 }} />);
+    rerender(<MorphPanel {...props} status={{ phase: "ready" }} recording={null} />);
+    expect(screen.queryByRole("button", { name: "İptal" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Videoyu kaydet" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Duraklat" })).not.toBeDisabled();
+    expect(screen.getByRole("button", { name: "Önizlemeyi kapat" })).not.toBeDisabled();
+    for (const input of [...screen.getAllByRole("slider"), ...screen.getAllByRole("spinbutton")]) {
+      expect(input).not.toBeDisabled();
+    }
+    expect(screen.getByLabelText("Morph ilerleme")).toHaveTextContent("43%");
+    expect(screen.getByLabelText("Süre (sn)")).toHaveValue(morph.duration);
+    expect(screen.getByLabelText("Seed")).toHaveValue(morph.seed);
+    fireEvent.click(screen.getByRole("button", { name: "Duraklat" }));
+    expect(props.onChange).toHaveBeenCalledWith({ playing: false, t: 0.43 });
+  });
+
+  it("announces recording errors while leaving retry available", () => {
+    render(<MorphPanel morph={prepared} playback={{ t: 0, playing: false }} status={{ phase: "ready" }} objects={objects} onChange={vi.fn()} onRecord={vi.fn()} recordingError="WebM kaydı desteklenmiyor." />);
+    expect(screen.getByRole("alert")).toHaveTextContent("WebM kaydı desteklenmiyor.");
+    expect(screen.getByRole("button", { name: "Videoyu kaydet" })).not.toBeDisabled();
+  });
+
   it("picks A/B without moving the inspector selection and excludes mesh objects", () => {
     const onSelect = vi.fn();
     const onMorphSelect = vi.fn();
@@ -105,5 +175,38 @@ describe("Morph controls", () => {
     const moved = selectMorphSlot({ ...prepared, playing: true, t: 0.6 }, "sourceId", "b");
     expect(moved).toMatchObject({ sourceId: "b", targetId: null, enabled: false, playing: false, t: 0 });
     expect(selectMorphSlot(moved, "sourceId", "b").sourceId).toBeNull();
+  });
+
+  it("locks pair selection, inspector selection, and object actions during recording", () => {
+    const props = {
+      objects,
+      selectedId: "a",
+      errors: {},
+      onSelect: vi.fn(),
+      onToggleVisible: vi.fn(),
+      onDuplicate: vi.fn(),
+      onRemove: vi.fn(),
+      onMorphSelect: vi.fn(),
+    };
+    const { rerender } = render(<ObjectListPanel {...props} locked />);
+    for (const button of screen.getAllByRole("button")) {
+      expect(button).toBeDisabled();
+      fireEvent.click(button);
+    }
+    for (const item of screen.getAllByRole("listitem")) {
+      expect(item).toHaveAttribute("aria-disabled", "true");
+      expect(item).toHaveAttribute("tabindex", "-1");
+      fireEvent.click(item);
+      fireEvent.keyDown(item, { key: "Enter" });
+    }
+    for (const callback of [props.onSelect, props.onToggleVisible, props.onDuplicate, props.onRemove, props.onMorphSelect]) {
+      expect(callback).not.toHaveBeenCalled();
+    }
+    rerender(<ObjectListPanel {...props} locked={false} />);
+    for (const button of screen.getAllByRole("button")) expect(button).not.toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "splat b Morph B" }));
+    expect(props.onMorphSelect).toHaveBeenCalledWith("targetId", "b");
+    fireEvent.click(screen.getAllByRole("listitem")[1]);
+    expect(props.onSelect).toHaveBeenCalledWith("b");
   });
 });

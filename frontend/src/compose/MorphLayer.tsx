@@ -2,6 +2,8 @@ import { useEffect, useRef } from "react";
 import { useFrame, useThree } from "@react-three/fiber";
 import { SparkRenderer } from "@sparkjsdev/spark";
 import type { PreparedMorph } from "./morphData";
+import { createMorphCapture, nextMorphPaint, type MorphVideoRecorder, type OnMorphRecorder } from "./morphCapture";
+import { recordMorphVideo } from "./morphRecording";
 import { createMorphGpu, type MorphGpu } from "./morphGpu";
 import { extractMorphSource } from "./morphSource";
 import type { MorphWorkerRequest, MorphWorkerResponse } from "./morph.worker";
@@ -25,6 +27,7 @@ interface Props {
   onChange: (patch: Partial<MorphState>) => void;
   onStatus: (status: MorphStatus) => void;
   onDisplay: (display: MorphDisplay | null) => void;
+  onRecorder?: OnMorphRecorder;
 }
 
 function prepareInWorker(a: Float32Array, b: Float32Array, seed: number, signal: AbortSignal) {
@@ -68,15 +71,19 @@ export function MorphLayer(props: Props) {
   const { source, target, sourceUrl, targetUrl, morph, playback, onDisplay } = props;
   const scene = useThree((state) => state.scene);
   const gl = useThree((state) => state.gl);
+  const camera = useThree((state) => state.camera);
   const latest = useRef(props);
   latest.current = props;
   const gpu = useRef<MorphGpu | null>(null);
   const display = useRef<MorphDisplay["endpoint"] | null>(null);
+  const recording = useRef<AbortController | null>(null);
+  const recordingFinished = useRef<Promise<void>>(Promise.resolve());
   // A rename must not rebuild 200k pairs. Geometry/appearance edits must.
   const sourceKey = JSON.stringify([source.id, source.asset, source.visible, source.transform, source.crop, source.color]);
   const targetKey = JSON.stringify([target.id, target.asset, target.visible, target.transform, target.crop, target.color]);
 
   useEffect(() => {
+    if (recording.current) return;
     playback.t = morph.t;
     playback.playing = morph.playing;
   }, [morph.t, morph.playing, playback]);
@@ -127,13 +134,74 @@ export function MorphLayer(props: Props) {
       abort.abort();
       if (gpu.current === resource) gpu.current = null;
       const spark = scene.children.find((child): child is SparkRenderer => child instanceof SparkRenderer);
-      resource?.dispose(spark);
+      if (recording.current) {
+        recording.current.abort();
+        // A Spark prepare/sort cannot be aborted. Dispose its inputs after it settles.
+        void recordingFinished.current.then(() => resource?.dispose(spark));
+      } else resource?.dispose(spark);
       display.current = null;
       onDisplay(null);
     };
   }, [sourceKey, targetKey, sourceUrl, targetUrl, morph.seed, scene, gl, playback, onDisplay]);
 
+  useEffect(() => {
+    if (!props.onRecorder) return;
+    const record: MorphVideoRecorder = async ({ duration, signal, onProgress }) => {
+      const resource = gpu.current;
+      const spark = scene.children.find((child): child is SparkRenderer => child instanceof SparkRenderer);
+      if (!resource || !spark || recording.current) throw new Error("Morph kayda hazır değil.");
+      if (signal.aborted) return null;
+      const abort = new AbortController();
+      const cancel = () => abort.abort();
+      signal.addEventListener("abort", cancel, { once: true });
+      recording.current = abort;
+      let finished!: () => void;
+      recordingFinished.current = new Promise<void>((resolve) => { finished = resolve; });
+      let capture: ReturnType<typeof createMorphCapture> | undefined;
+      try {
+        capture = createMorphCapture(spark, gl, scene, camera);
+        return await recordMorphVideo({
+          canvas: gl.domElement, duration, signal: abort.signal, onProgress,
+          renderFrame: async (t, frameSignal, requestCapture, waitForCapture) => {
+            frameSignal.throwIfAborted();
+            playback.t = t;
+            playback.playing = false;
+            const current = latest.current;
+            const progress = t * current.morph.targetBlend;
+            const endpoint = progress <= 0 ? "source" : progress >= 1 ? "target" : "particles";
+            resource.object.visible = endpoint === "particles";
+            resource.update(t, current.morph.dissolve, current.morph.targetBlend);
+            if (display.current !== endpoint || t === 0) {
+              display.current = endpoint;
+              current.onDisplay({ sourceId: current.source.id, targetId: current.target.id, endpoint });
+              // Let React commit suppression across the R3F root. Always wait
+              // at t=0 so recording locks/hiding crop outlines have committed too.
+              await nextMorphPaint(frameSignal);
+              await nextMorphPaint(frameSignal);
+            }
+            await capture!.render(frameSignal, () => {
+              if (resource.object.generatorError) throw resource.object.generatorError;
+              requestCapture();
+            }, waitForCapture);
+          },
+        });
+      } finally {
+        try { await capture?.dispose(); } finally {
+          recording.current = null;
+          signal.removeEventListener("abort", cancel);
+          finished();
+        }
+      }
+    };
+    props.onRecorder(record);
+    return () => {
+      recording.current?.abort();
+      props.onRecorder?.(null, record);
+    };
+  }, [props.onRecorder, scene, gl, camera, playback]);
+
   useFrame((_, delta) => {
+    if (recording.current) return;
     const resource = gpu.current;
     if (!resource) return;
     const current = latest.current;
