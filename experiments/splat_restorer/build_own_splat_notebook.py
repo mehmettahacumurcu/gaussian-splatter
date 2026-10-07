@@ -95,9 +95,12 @@ if not (raw / ".unzipped").exists():
     with zipfile.ZipFile(DATASET_ZIP) as z:
         z.extractall(raw)
     (raw / ".unzipped").touch()
-src = next(p.parent.parent for p in raw.rglob("sparse/*/cameras.bin"))
+# <dataset>/sparse/<model>/cameras.bin -> dataset root and model name
+cams_bin = next(raw.rglob("sparse/*/cameras.bin"))
+src, model_name = cams_bin.parents[2], cams_bin.parent.name
+print("Dataset:", src, "| COLMAP modeli:", model_name)
 data = own_splat.prepare_dataset(src, Path("/content/own_prepared"), long_edge=manifest["config"].get("long_edge", 1920),
-                                 workers=os.cpu_count() or 4)
+                                 model_name=model_name, workers=os.cpu_count() or 4)
 report_path = run_dir / "import_report.json"
 if report_path.exists():
     report = json.loads(report_path.read_text())
