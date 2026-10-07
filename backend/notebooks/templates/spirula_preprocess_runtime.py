@@ -21,6 +21,14 @@ SAM_MODELS = {
 }
 
 
+def sha256_stream(stream):
+    # hashlib.file_digest requires Python 3.11; keep offline checks usable on 3.10.
+    digest = hashlib.sha256()
+    for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
 def image_files(root):
     return sorted(p for p in Path(root).rglob('*') if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
 
@@ -192,7 +200,7 @@ class Preprocessor:
             if not target.is_file() or target.stat().st_size != size:
                 return False
             with target.open('rb') as stream:
-                return hashlib.file_digest(stream, 'sha256').hexdigest() == expected
+                return sha256_stream(stream) == expected
         if not valid():
             partial = target.with_suffix('.download')
             url = f'https://huggingface.co/PABannier/sam3.cpp/resolve/main/{key}.ggml'
@@ -433,7 +441,7 @@ class Preprocessor:
                 archive.write(file, file.name)
         partial.replace(output)
         with output.open('rb') as stream:
-            checksum = hashlib.file_digest(stream, 'sha256').hexdigest()
+            checksum = sha256_stream(stream)
         self.write_json(self.reports / 'archive.json', {'bytes': output.stat().st_size, 'sha256': checksum})
         print('Dataset ZIP hazır:', output)
         return output
