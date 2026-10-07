@@ -8,6 +8,7 @@ export interface MorphWorkerRequest {
   b: Float32Array;
   seed: number;
   mode: MorphMode;
+  autoAlign: boolean;
 }
 
 export type MorphWorkerResponse =
@@ -22,7 +23,7 @@ const workerScope = self as unknown as {
 
 workerScope.onmessage = ({ data }) => {
   try {
-    const result = prepareMorph(data.a, data.b, data.seed, data.mode);
+    const result = prepareMorph(data.a, data.b, data.seed, data.mode, data.autoAlign);
     workerScope.postMessage({ id: data.id, ok: true, result }, [result.a.buffer, result.b.buffer]);
   } catch (error) {
     workerScope.postMessage({

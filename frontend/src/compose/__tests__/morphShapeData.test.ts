@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
+import { createHash } from "node:crypto";
 import { MORPH_STRIDE, prepareMorph, robustMorphBounds } from "../morphData";
 import { meanNormalizedTravel, nearestNeighborLowerBound, noisySphere } from "./fixtures/morphSpheres";
+import { asymmetricCloud, rotatedCloud } from "./fixtures/morphAlignment";
+import { alignMorphCoordinates } from "../morphAlignment";
 
 function splats(positions: number[][]): Float32Array {
   const attributes = new Float32Array(positions.length * MORPH_STRIDE);
@@ -148,6 +151,82 @@ describe("robust percentile selection", () => {
         expect(actual.min[axis]).toBe(sorted[Math.floor((count - 1) * 0.02)]);
         expect(actual.max[axis]).toBe(sorted[Math.ceil((count - 1) * 0.98)]);
       }
+    }
+  });
+});
+
+describe("optional automatic shape alignment", () => {
+  it.each([53, 217, 1234, 93789])("recovers a shuffled arbitrarily rotated copy (seed %i)", (seed) => {
+    const a = asymmetricCloud(4093);
+    const b = rotatedCloud(a, seed, 3, 7, true);
+    const off = prepareMorph(a, b, 42, "shape");
+    const aligned = prepareMorph(a, b, 42, "shape", true);
+    expect(off.matchingTravel).toBeGreaterThan(0.02);
+    expect(aligned.matchingTravel).toBeLessThan(1e-5);
+    // Alignment changes correspondence only: the far-away, rotated endpoint
+    // still has a large rendered path, and every attribute is preserved.
+    expect(aligned.meanTravel).toBeGreaterThan(1);
+    expect(aligned.alignmentMs).toBeGreaterThan(0);
+    if (seed === 53) {
+      assertOriginals(a, aligned.a);
+      assertOriginals(b, aligned.b);
+    }
+  });
+
+  it("keeps alignment off and cloud mode byte-identical to the default path", () => {
+    const a = asymmetricCloud(137), b = rotatedCloud(a, 123);
+    // Full attribute-buffer hashes captured from e348246 before this change.
+    const legacyHashes = {
+      shape: "43f29d39de8f679188e21329b5b1dbef98c0bf3379351ebc1607496fca31addf",
+      cloud: "4cf6a6e4398b3c661739da3ca5a0ec6c293f788425e50c66d5f1a7b75a4d3e8f",
+    };
+    for (const mode of ["shape", "cloud"] as const) {
+      const result = prepareMorph(a, b, 42, mode, false);
+      expect(result).toEqual(prepareMorph(a, b, 42, mode));
+      expect(createHash("sha256").update(new Uint8Array(result.a.buffer)).update(new Uint8Array(result.b.buffer)).digest("hex")).toBe(legacyHashes[mode]);
+    }
+    expect(prepareMorph(a, b, 42, "cloud", true)).toEqual(prepareMorph(a, b, 42, "cloud"));
+  });
+
+  it("is deterministic and seed-independent, including unequal counts and refinement", () => {
+    const a = asymmetricCloud(777, 35), b = rotatedCloud(asymmetricCloud(1021, 72), 167);
+    const first = prepareMorph(a, b, 42, "shape", true);
+    const second = prepareMorph(a, b, 42, "shape", true);
+    expect({ ...first, alignmentMs: 0 }).toEqual({ ...second, alignmentMs: 0 });
+    const otherSeed = prepareMorph(a, b, 72, "shape", true);
+    expect(otherSeed.matchingTravel).toBe(first.matchingTravel);
+    expect(otherSeed.meanTravel).toBe(first.meanTravel);
+    assertOriginals(a, first.a);
+    assertOriginals(b, first.b);
+  });
+
+  it("never reflects an asymmetric mirrored shape", () => {
+    const a = asymmetricCloud(521), b = a.slice();
+    for (let offset = 0; offset < b.length; offset += MORPH_STRIDE) b[offset] *= -1;
+    const { rotation: r } = alignMorphCoordinates(a, b);
+    const det = r[0] * (r[4] * r[8] - r[5] * r[7]) - r[1] * (r[3] * r[8] - r[5] * r[6]) + r[2] * (r[3] * r[7] - r[4] * r[6]);
+    expect(det).toBeCloseTo(1, 10);
+    expect(prepareMorph(a, b, 42, "shape", true).matchingTravel).toBeGreaterThan(0.01);
+  });
+
+  it("handles coincident points and lines without invalid coordinates", () => {
+    for (const points of [Array.from({ length: 63 }, () => [1, 2, 3]), Array.from({ length: 63 }, (_, i) => [i, 0, 0])]) {
+      const a = splats(points), b = rotatedCloud(a, 173);
+      const result = prepareMorph(a, b, 42, "shape", true);
+      expect(Number.isFinite(result.matchingTravel)).toBe(true);
+      expect(result.matchingTravel).toBeLessThan(1e-5);
+      assertOriginals(a, result.a);
+      assertOriginals(b, result.b);
+    }
+  });
+
+  it("reports real world endpoint travel as a fraction of the robust scene diagonal", () => {
+    const a = splats([[0, 0, 0], [1, 0, 0]]), b = splats([[10, 0, 0], [11, 0, 0]]);
+    for (const mode of ["shape", "cloud"] as const) {
+      const result = prepareMorph(a, b, 42, mode);
+      expect(result.meanTravel).toBe(10);
+      expect(result.matchingTravel).toBe(0);
+      expect(result.alignmentMs).toBe(0);
     }
   });
 });

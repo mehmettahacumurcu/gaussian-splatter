@@ -29,6 +29,8 @@ describe("Morph controls", () => {
     expect(screen.getByRole("slider", { name: /Dalga/ })).toHaveValue("0");
     expect(screen.getByRole("slider", { name: /Yay/ })).toHaveValue("0");
     expect(screen.queryByRole("slider", { name: /Dissolve/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Otomatik hizala" })).not.toBeChecked();
+    expect(screen.getByText(/Yalnızca eşleştirme için/)).toBeInTheDocument();
   });
 
   it("switches modes from a running preview, resets playback, and keeps preview enabled for rebuilding", () => {
@@ -44,8 +46,44 @@ describe("Morph controls", () => {
     expect(screen.getByRole("slider", { name: /Dissolve/ })).toHaveValue(String(cloud.dissolve));
     expect(screen.queryByRole("slider", { name: /Dalga/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("slider", { name: /Yay/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: "Otomatik hizala" })).not.toBeInTheDocument();
     fireEvent.change(screen.getByRole("combobox", { name: "Mod" }), { target: { value: "shape" } });
     expect(onChange).toHaveBeenLastCalledWith({ mode: "shape", playing: false, t: 0 });
+  });
+
+  it("changes automatic alignment, resets playback for rebuilding, and blocks recording until ready again", () => {
+    const onChange = vi.fn();
+    const onRecord = vi.fn();
+    const running = { ...prepared, playing: true, t: 0.6 };
+    const props = { playback: { t: 0.6, playing: true }, objects, onChange, onRecord };
+    const { rerender } = render(<MorphPanel {...props} morph={running} status={{ phase: "ready", meanTravel: 0.45 }} />);
+    fireEvent.click(screen.getByRole("checkbox", { name: "Otomatik hizala" }));
+    expect(onChange).toHaveBeenLastCalledWith({ autoAlign: true, playing: false, t: 0 });
+    const aligned = { ...running, ...onChange.mock.lastCall![0] };
+    expect(aligned.enabled).toBe(true);
+    rerender(<MorphPanel {...props} morph={aligned} status={{ phase: "loading" }} />);
+    expect(screen.getByRole("checkbox", { name: "Otomatik hizala" })).toBeChecked();
+    expect(screen.queryByText(/ortalama yol:/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Oynat" })).toBeDisabled();
+    const record = screen.getByRole("button", { name: "Videoyu kaydet" });
+    expect(record).toBeDisabled();
+    fireEvent.click(record);
+    expect(onRecord).not.toHaveBeenCalled();
+    rerender(<MorphPanel {...props} morph={aligned} status={{ phase: "ready", meanTravel: 0.25 }} />);
+    expect(record).not.toBeDisabled();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Otomatik hizala" }));
+    expect(onChange).toHaveBeenLastCalledWith({ autoAlign: false, playing: false, t: 0 });
+  });
+
+  it("shows the world endpoint travel estimate and explains its normalization", () => {
+    const props = { morph: prepared, playback: { t: 0, playing: false }, objects, onChange: vi.fn() };
+    const { rerender } = render(<MorphPanel {...props} status={{ phase: "ready", count: 1200, precomputeMs: 875, meanTravel: 1.234 }} />);
+    expect(screen.getByRole("status", { name: "Morph durumu" })).toHaveTextContent("0.88 sn hazırlık · ortalama yol: %123.4 sahne boyutu");
+    expect(screen.getByText(/ortalama yol:/)).toHaveAttribute("title", expect.stringContaining("A ve B uçları arasındaki ortalama düz mesafe"));
+    expect(screen.getByText(/ortalama yol:/)).toHaveAttribute("title", expect.stringContaining("%2–%98"));
+    rerender(<MorphPanel {...props} status={{ phase: "ready", meanTravel: 0 }} />);
+    expect(screen.getByText(/ortalama yol:/)).toHaveTextContent("ortalama yol: %0.0 sahne boyutu");
+    expect(screen.getByText(/Kaydet, morph ayarlarını saklar/)).toHaveTextContent("Export sabit sahneyi dışa aktarır ve animasyon içermez.");
   });
 
   it("changes wave and arc independently and preserves the common blend control", () => {
@@ -126,6 +164,8 @@ describe("Morph controls", () => {
     const props = { morph: selected, playback: { t: 0, playing: false }, objects, onChange: vi.fn(), onRecord };
     const { rerender } = render(<MorphPanel {...props} status={{ phase: "loading" }} />);
     expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
+    rerender(<MorphPanel {...props} status={{ phase: "idle" }} />);
+    expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
     rerender(<MorphPanel {...props} status={{ phase: "error" }} />);
     expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
     rerender(<MorphPanel {...props} status={{ phase: "ready" }} morph={{ ...selected, enabled: false }} />);
@@ -149,7 +189,7 @@ describe("Morph controls", () => {
     fireEvent.change(duration, { target: { value: "12" } });
 
     rerender(<MorphPanel {...props} status={{ phase: "ready" }} recording={{ progress: 0.375 }} />);
-    for (const input of [...screen.getAllByRole("slider"), ...screen.getAllByRole("spinbutton"), ...screen.getAllByRole("combobox")]) {
+    for (const input of [...screen.getAllByRole("slider"), ...screen.getAllByRole("spinbutton"), ...screen.getAllByRole("combobox"), ...screen.queryAllByRole("checkbox")]) {
       expect(input).toBeDisabled();
     }
     for (const button of screen.getAllByRole("button")) {
@@ -163,6 +203,7 @@ describe("Morph controls", () => {
     for (const slider of screen.getAllByRole("slider")) {
       fireEvent.change(slider, { target: { value: "0.5" } });
     }
+    for (const checkbox of screen.queryAllByRole("checkbox")) fireEvent.click(checkbox);
     fireEvent.click(screen.getByRole("button", { name: "Önizlemeyi kapat" }));
     expect(onChange).not.toHaveBeenCalled();
     expect(onRecord).not.toHaveBeenCalled();
@@ -179,7 +220,7 @@ describe("Morph controls", () => {
     expect(screen.getByRole("button", { name: "Videoyu kaydet" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "Duraklat" })).not.toBeDisabled();
     expect(screen.getByRole("button", { name: "Önizlemeyi kapat" })).not.toBeDisabled();
-    for (const input of [...screen.getAllByRole("slider"), ...screen.getAllByRole("spinbutton"), ...screen.getAllByRole("combobox")]) {
+    for (const input of [...screen.getAllByRole("slider"), ...screen.getAllByRole("spinbutton"), ...screen.getAllByRole("combobox"), ...screen.queryAllByRole("checkbox")]) {
       expect(input).not.toBeDisabled();
     }
     expect(screen.getByLabelText("Morph ilerleme")).toHaveTextContent("43%");

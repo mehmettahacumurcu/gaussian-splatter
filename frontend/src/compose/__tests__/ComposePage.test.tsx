@@ -4,6 +4,8 @@ import type { Job } from "../../api";
 import type { AssetOrientation, SceneDoc } from "../types";
 import type { MorphPlayback, MorphState, MorphStatus } from "../morphTypes";
 import type { MorphRecordOptions, MorphVideoRecorder, OnMorphRecorder } from "../morphCapture";
+import { INITIAL_MORPH_STATE } from "../morphTypes";
+import { pickMorphSettings } from "../morphSettings";
 
 interface ViewportProps {
   morph: MorphState;
@@ -165,6 +167,106 @@ afterEach(() => {
 });
 
 describe("ComposePage", () => {
+  it("saves every morph setting, restores it on open, and keeps playback transient", async () => {
+    await openRecordingScene();
+    api.saveScene.mockImplementation(async (saved) => saved);
+    act(() => viewport.props!.onMorphChange({
+      mode: "cloud", duration: 9.5, dissolve: 0.3, wave: 0.4, arc: 0.2,
+      targetBlend: 0.8, seed: 1234, autoAlign: true,
+    }));
+    const expected = pickMorphSettings(viewport.props!.morph);
+    fireEvent.click(screen.getByRole("button", { name: "Kaydet" }));
+    await screen.findByText("Kaydedildi");
+    const saved = api.saveScene.mock.calls[0][0];
+    expect(saved.morph).toEqual(expected);
+    expect(Object.keys(saved.morph!)).toHaveLength(10);
+    expect(saved.morph).not.toHaveProperty("playing");
+    act(() => viewport.props!.onMorphStatus({ phase: "ready" }));
+    act(() => viewport.props!.onMorphChange({ t: 0.7, playing: true }));
+    expect(screen.getByRole("button", { name: "Kaydet" })).toBeDisabled();
+    api.getScene.mockResolvedValue(saved);
+    fireEvent.click(screen.getByRole("button", { name: "← Sahneler" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Aç" }));
+    await screen.findByTestId("viewport");
+    expect(viewport.props!.morph).toEqual({ ...INITIAL_MORPH_STATE, ...expected });
+    expect(viewport.props!.morphPlayback).toEqual({ t: 0, playing: false });
+    expect(screen.getByRole("button", { name: "Kaydet" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Morph hazırla" })).toBeEnabled();
+  });
+
+  it("exports the saved morph metadata and leaves later edits dirty during a pending save", async () => {
+    await openRecordingScene();
+    let finish!: (doc: SceneDoc) => void;
+    api.saveScene.mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    api.exportScene.mockResolvedValue({ job_id: "j1" });
+    jobStatus.mockResolvedValue(job({ status: "completed", overall_progress: 1 }));
+    fireEvent.click(screen.getByRole("button", { name: "Export" }));
+    expect(api.saveScene).toHaveBeenCalledOnce();
+    const snapshot = api.saveScene.mock.calls[0][0];
+    expect(snapshot.morph).toMatchObject({ sourceId: "base", targetId: "o_statue", duration: 6 });
+    act(() => viewport.props!.onMorphChange({ duration: 12 }));
+    await act(async () => finish(snapshot));
+    expect(api.exportScene).toHaveBeenCalledWith("s1");
+    expect(viewport.props!.doc.morph!.duration).toBe(12);
+    expect(screen.getByRole("button", { name: "Kaydet" })).toBeEnabled();
+  });
+
+  it("toggles Space only in the focused viewport and ignores repeats, modifiers and preparation", async () => {
+    await openRecordingScene();
+    const region = screen.getByRole("region", { name: "Sahne görünümü" });
+    const duration = screen.getByLabelText("Süre (sn)");
+    duration.focus();
+    fireEvent.keyDown(duration, { key: " " });
+    fireEvent.keyDown(window, { key: " " });
+    expect(viewport.props!.morph.playing).toBe(true);
+    fireEvent.pointerDown(screen.getByTestId("viewport"));
+    expect(region).toHaveFocus();
+    fireEvent.keyDown(region, { key: " ", repeat: true });
+    fireEvent.keyDown(region, { key: " ", ctrlKey: true });
+    expect(viewport.props!.morph.playing).toBe(true);
+    expect(fireEvent.keyDown(region, { key: " " })).toBe(false);
+    expect(viewport.props!.morph).toMatchObject({ playing: false, t: 0.625 });
+    fireEvent.keyDown(region, { key: " " });
+    expect(viewport.props!.morph.playing).toBe(true);
+    act(() => viewport.props!.onMorphStatus({ phase: "loading" }));
+    fireEvent.keyDown(region, { key: " " });
+    expect(viewport.props!.morph.playing).toBe(true);
+    act(() => viewport.props!.onMorphChange({ playing: false, t: 1 }));
+    act(() => viewport.props!.onMorphStatus({ phase: "ready" }));
+    fireEvent.keyDown(region, { key: " " });
+    expect(viewport.props!.morph).toMatchObject({ playing: true, t: 0 });
+  });
+
+  it("invalidates recording readiness immediately when auto alignment changes", async () => {
+    await openRecordingScene();
+    const capture = registerPendingRecorder();
+    expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("checkbox", { name: "Otomatik hizala" }));
+    expect(viewport.props!.morph).toMatchObject({ autoAlign: true, playing: false, t: 0 });
+    const record = screen.getByRole("button", { name: "Videoyu kaydet" });
+    expect(record).toBeDisabled();
+    fireEvent.click(record);
+    expect(capture.record).not.toHaveBeenCalled();
+  });
+
+  it("invalidates ready geometry before the renderer commits and ignores stale worker status", async () => {
+    await openRecordingScene();
+    const capture = registerPendingRecorder();
+    const oldStatus = viewport.props!.onMorphStatus;
+    fireEvent.click(screen.getByText("statue", { selector: ".compose-object-name" }));
+    const x = screen.getByLabelText("Konum X");
+    fireEvent.change(x, { target: { value: "5" } });
+    fireEvent.keyDown(x, { key: "Enter" });
+    expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
+    act(() => oldStatus({ phase: "ready", count: 200000 }));
+    const button = screen.getByRole("button", { name: "Videoyu kaydet" });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(capture.record).not.toHaveBeenCalled();
+    act(() => viewport.props!.onMorphStatus({ phase: "ready", count: 200000 }));
+    expect(button).toBeEnabled();
+  });
+
   it("records the configured duration, shows progress, downloads the seed name, and restores live playback", async () => {
     await openRecordingScene();
     expect(screen.getByRole("button", { name: "Videoyu kaydet" })).toBeDisabled();
@@ -287,24 +389,27 @@ describe("ComposePage", () => {
     expect(screen.queryByTestId("viewport")).not.toBeInTheDocument();
   });
 
-  it("keeps morph selection transient and ends the preview when an endpoint is deleted", async () => {
+  it("persists morph selection and clears the saved pair when an endpoint is deleted", async () => {
     api.getScene.mockResolvedValue({ ...DOC, objects: [...DOC.objects, STATUE] });
     await openScene();
     fireEvent.click(screen.getByRole("button", { name: "garden Morph A" }));
     fireEvent.click(screen.getByRole("button", { name: "statue Morph B" }));
     fireEvent.click(screen.getByRole("button", { name: "Morph hazırla" }));
     expect(viewport.props?.morph).toMatchObject({ sourceId: "base", targetId: "o_statue", enabled: true });
-    expect(screen.getByRole("button", { name: "Kaydet" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Kaydet" })).not.toBeDisabled();
+    expect(viewport.props?.doc.morph).toMatchObject({ sourceId: "base", targetId: "o_statue" });
     act(() => viewport.props?.onMorphStatus({ phase: "ready", count: 200000 }));
     fireEvent.click(screen.getByRole("button", { name: "Oynat" }));
     expect(viewport.props?.morph.playing).toBe(true);
     fireEvent.click(screen.getByText("statue", { selector: ".compose-object-name" }));
     fireEvent.keyDown(window, { key: "Delete" });
-    expect(viewport.props?.morph).toMatchObject({ sourceId: "base", targetId: null, enabled: false, playing: false, t: 0 });
+    expect(viewport.props?.morph).toMatchObject({ sourceId: null, targetId: null, enabled: false, playing: false, t: 0 });
+    expect(viewport.props?.doc.morph).toBeNull();
     expect(viewport.props?.morphPlayback).toEqual({ t: 0, playing: false });
   });
 
   it("pauses morph at the live time when the editor becomes inactive and clears it on scene close", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true);
     api.getScene.mockResolvedValue({ ...DOC, objects: [...DOC.objects, STATUE] });
     const { rerender } = render(<ComposePage active />);
     fireEvent.click(await screen.findByRole("button", { name: "Aç" }));

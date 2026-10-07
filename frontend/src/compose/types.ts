@@ -36,6 +36,20 @@ export interface SceneObject {
   color?: ColorAdjust | null;
 }
 
+/** Persisted morph recipe. Playback, timeline position and prepared buffers are transient. */
+export interface MorphSettings {
+  sourceId: string | null;
+  targetId: string | null;
+  mode: "cloud" | "shape";
+  duration: number;
+  dissolve: number;
+  wave: number;
+  arc: number;
+  targetBlend: number;
+  seed: number;
+  autoAlign: boolean;
+}
+
 export interface SceneDoc {
   version: 1;
   id: string;
@@ -47,6 +61,8 @@ export interface SceneDoc {
    */
   up?: Vec3 | null;
   objects: SceneObject[];
+  /** Optional additive v1 field; absent/null means use the default preview controls. */
+  morph?: MorphSettings | null;
 }
 
 /** GET /compose/assets/{id}/orientation. `up` is only meaningful when `measured`. */

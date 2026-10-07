@@ -100,6 +100,20 @@ export function MorphPanel({ morph, playback, status, objects, onChange, recordi
           <option value="cloud">Parçacık bulutu</option>
         </select>
       </label>
+      {morph.mode === "shape" && (
+        <label className="compose-field">
+          <span className="compose-check">
+            <input
+              type="checkbox"
+              aria-label="Otomatik hizala"
+              checked={morph.autoAlign}
+              disabled={locked}
+              onChange={(event) => change({ autoAlign: event.target.checked, playing: false, t: 0 })}
+            />{" "}Otomatik hizala
+          </span>
+          <small className="muted">Yalnızca eşleştirme için döndürür; sahnedeki A ve B dönüşümleri korunur.</small>
+        </label>
+      )}
       <div className="compose-row">
         <button
           type="button"
@@ -129,6 +143,11 @@ export function MorphPanel({ morph, playback, status, objects, onChange, recordi
         <p className={`compose-morph-status${status.phase === "error" ? " error" : ""}`} role="status" aria-label="Morph durumu">
           {status.phase === "loading" || status.phase === "idle" ? "Splatlar eşleştiriliyor…" : null}
           {status.phase === "ready" ? `${(status.count ?? 0).toLocaleString()} parçacık${status.precomputeMs !== undefined ? ` · ${(status.precomputeMs / 1000).toFixed(2)} sn hazırlık` : ""}` : null}
+          {status.phase === "ready" && status.meanTravel !== undefined && (
+            <span title="Eşleşen parçacıkların sahnedeki A ve B uçları arasındaki ortalama düz mesafe / iki objeden büyük olanın sağlam sınır kutusu köşegeni (%2–%98). Hizalama yalnızca eşleştirmeyi değiştirir; bu değer sahnedeki dönüş ve konum farklarını içerir.">
+              {` · ortalama yol: %${(status.meanTravel * 100).toFixed(1)} sahne boyutu`}
+            </span>
+          )}
           {status.phase === "error" ? status.message ?? "Morph hazırlanamadı." : null}
         </p>
       )}
@@ -234,7 +253,7 @@ export function MorphPanel({ morph, playback, status, objects, onChange, recordi
         )}
       </div>
       {recordingError && <p className="compose-morph-status error" role="alert">{recordingError}</p>}
-      <p className="muted compose-morph-hint">Geçiş sırasında DC renk kullanılır. Önizleme sahne kaydına ve export’a dahil değildir.</p>
+      <p className="muted compose-morph-hint">Geçiş sırasında DC renk kullanılır. Kaydet, morph ayarlarını saklar; Export sabit sahneyi dışa aktarır ve animasyon içermez.</p>
     </section>
   );
 }
