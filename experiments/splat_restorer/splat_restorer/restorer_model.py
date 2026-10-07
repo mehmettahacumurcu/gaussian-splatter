@@ -108,9 +108,11 @@ class Restorer(torch.nn.Module):
         device: str = "cuda",
         pretrained: bool = True,
         unet_overrides: dict | None = None,
+        base_model: str = BASE_MODEL,
     ):
         """``pretrained=False`` builds random weights from the configs only, and
-        ``unet_overrides`` can shrink that random UNet (tests on small GPUs)."""
+        ``unet_overrides`` can shrink that random UNet (tests on small GPUs).
+        ``base_model`` is the Hugging Face repo the parts are loaded from."""
         super().__init__()
         from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
         from diffusers.models.attention_processor import AttnProcessor2_0
@@ -119,16 +121,16 @@ class Restorer(torch.nn.Module):
 
         def load(cls, sub, overrides=None):
             if pretrained:
-                return cls.from_pretrained(BASE_MODEL, subfolder=sub)
-            config = dict(cls.load_config(BASE_MODEL, subfolder=sub))
+                return cls.from_pretrained(base_model, subfolder=sub)
+            config = dict(cls.load_config(base_model, subfolder=sub))
             config.update(overrides or {})
             return cls.from_config(config)
 
-        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, subfolder="tokenizer")
+        tokenizer = AutoTokenizer.from_pretrained(base_model, subfolder="tokenizer")
         if pretrained:
-            text_encoder = CLIPTextModel.from_pretrained(BASE_MODEL, subfolder="text_encoder")
+            text_encoder = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder")
         else:
-            text_encoder = CLIPTextModel(CLIPTextConfig.from_pretrained(BASE_MODEL, subfolder="text_encoder"))
+            text_encoder = CLIPTextModel(CLIPTextConfig.from_pretrained(base_model, subfolder="text_encoder"))
         text_encoder = text_encoder.to(device)
         with torch.no_grad():
             ids = tokenizer(PROMPT, max_length=tokenizer.model_max_length, padding="max_length",
@@ -136,7 +138,7 @@ class Restorer(torch.nn.Module):
             self.register_buffer("prompt_embeds", text_encoder(ids)[0].float(), persistent=False)
         del text_encoder
 
-        sched = DDPMScheduler.from_pretrained(BASE_MODEL, subfolder="scheduler")
+        sched = DDPMScheduler.from_pretrained(base_model, subfolder="scheduler")
         self.prediction_type = sched.config.prediction_type
         self.register_buffer("alphas_cumprod", sched.alphas_cumprod.float(), persistent=False)
         self.timestep = int(timestep)
@@ -167,6 +169,23 @@ class Restorer(torch.nn.Module):
         )
         self.unet = unet
         self.to(device)
+
+    @classmethod
+    def from_difix(cls, repo: str = "nvidia/difix", device: str = "cuda") -> "Restorer":
+        """NVIDIA's released Difix weights ("nvidia/difix" or "nvidia/difix_ref").
+
+        Their VAE (skip convs + "vae_skip" LoRA) and UNet have exactly this
+        class's parameter names and shapes, so they load strictly.
+        """
+        from huggingface_hub import hf_hub_download
+        from safetensors.torch import load_file
+
+        model = cls(device=device, base_model=repo)
+        for part, module in (("vae", model.vae), ("unet", model.unet)):
+            path = hf_hub_download(repo, f"{part}/diffusion_pytorch_model.safetensors")
+            module.load_state_dict(load_file(path), strict=True)
+        model.set_eval()
+        return model
 
     # ----- trainable parameter groups -------------------------------------------------
     def vae_trainable_parameters(self):
@@ -220,7 +239,11 @@ class Restorer(torch.nn.Module):
             x = torch.stack([x, ref * 2 - 1], dim=1)
         else:
             x = x[:, None]
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        # bf16 where the GPU supports it (A100/H100/L4); fp32 otherwise (T4), since
+        # the SD VAE can overflow in fp16.
+        # (is_bf16_supported() is also True on T4, where bf16 is only emulated and slow.)
+        bf16 = x.is_cuda and torch.cuda.get_device_capability(x.device)[0] >= 8
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
             out = self.forward(x, sample_latent=False)[:, 0]
         return (out.float() * 0.5 + 0.5).clamp(0, 1)
 

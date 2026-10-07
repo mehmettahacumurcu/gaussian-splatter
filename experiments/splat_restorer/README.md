@@ -18,6 +18,15 @@ After changing anything in `splat_restorer/`, rebuild the notebook:
 python experiments/splat_restorer/build_notebook.py
 ```
 
+## Quick test: pretrained Difix on a render video
+
+`colab/difix_video_test.ipynb` runs NVIDIA's released `nvidia/difix` (or
+`difix_ref`) on every frame of a splat render video, with no training. Their
+weights load strictly into `Restorer` (`Restorer.from_difix`), so it uses the
+same pinned libraries as the pilot. Output: side-by-side video, zoomed
+comparison sheet and change / sharpness / flicker numbers (`video.py`). Rebuild
+with `python experiments/splat_restorer/build_video_notebook.py`.
+
 ## Pipeline
 
 | Stage | Module | Output on Drive (`MyDrive/splat_restorer/`) |
