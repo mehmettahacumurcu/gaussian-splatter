@@ -280,10 +280,10 @@ def _worst_box(err: np.ndarray, size: int) -> tuple[int, int]:
     return (idx % nx) * step, (idx // nx) * step
 
 
-def comparison_image(tiles: dict[str, np.ndarray], out: Path, tile_width: int = 640) -> None:
-    """One column per image: full frame on top, 3x zoom below where the raw render
+def comparison_image(tiles: dict[str, np.ndarray], out: Path, tile_width: int = 640, box_from: str = "render") -> None:
+    """One column per image: full frame on top, 3x zoom below where ``tiles[box_from]``
     is furthest from the photo (red box)."""
-    gt, rnd = tiles["foto"].astype(np.float32), tiles["render"].astype(np.float32)
+    gt, rnd = tiles["foto"].astype(np.float32), tiles[box_from].astype(np.float32)
     h, w = gt.shape[:2]
     crop = max(48, min(h, w) // 4)
     x, y = _worst_box(np.abs(gt - rnd).mean(-1), crop)
