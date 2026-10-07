@@ -17,7 +17,7 @@ SH_C0 = 0.28209479177387814
 
 @dataclass
 class View:
-    image: torch.Tensor  # (H, W, 3) float in [0, 1], on device
+    image: torch.Tensor  # (H, W, 3) float in [0, 1] or uint8; any device
     w2c: torch.Tensor  # (4, 4)
     K: torch.Tensor  # (3, 3)
     weight: float = 1.0
@@ -152,7 +152,7 @@ def train_gaussians(
     """Optimise Gaussians on ``views``. Pass ``params`` to fine-tune existing ones."""
     from gsplat.strategy import DefaultStrategy
 
-    device = views[0].image.device
+    device = views[0].w2c.device
     gen = torch.Generator().manual_seed(cfg.seed)
     if params is None:
         assert init_xyz is not None and init_rgb is not None
@@ -179,8 +179,12 @@ def train_gaussians(
         img, info = render(params, v.w2c, v.K, width, height, sh_deg)
         if strategy is not None:
             strategy.step_pre_backward(params, optimizers, state, step, info)
-        l1 = (img - v.image).abs().mean()
-        loss = (1 - cfg.ssim_lambda) * l1 + cfg.ssim_lambda * (1 - ssim(img, v.image))
+        # Large photo sets may live on the CPU and/or as uint8 to save GPU memory.
+        gt = v.image.to(img.device, non_blocking=True)
+        if not gt.dtype.is_floating_point:
+            gt = gt.float() / 255.0
+        l1 = (img - gt).abs().mean()
+        loss = (1 - cfg.ssim_lambda) * l1 + cfg.ssim_lambda * (1 - ssim(img, gt))
         loss.backward()
         if strategy is not None:
             strategy.step_post_backward(params, optimizers, state, step, info, packed=False)
