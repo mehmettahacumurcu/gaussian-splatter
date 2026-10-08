@@ -150,6 +150,8 @@ for name in VARIANTS:
         print(f"!!! {name} BAŞARISIZ, atlanıyor:\\n{e}")
         (out_dir / name).mkdir(parents=True, exist_ok=True)
         (out_dir / name / "failed.txt").write_text(str(e), encoding="utf-8")
+        if (run_dir / "train.log").exists():
+            shutil.copy2(run_dir / "train.log", out_dir / name / "train.log")
         failed.append(name)
         continue
     params, deg = tb.load_checkpoint(run_dir)

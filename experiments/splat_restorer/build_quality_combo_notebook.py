@@ -210,6 +210,8 @@ for name in VARIANTS:
         print(f"!!! {name} BAŞARISIZ, atlanıyor:\\n{e}")
         vdir.mkdir(parents=True, exist_ok=True)
         (vdir / "failed.txt").write_text(str(e), encoding="utf-8")
+        if (run_dir / "train.log").exists():   # tam log: çöküşten önceki relocate/add sayıları
+            shutil.copy2(run_dir / "train.log", vdir / "train.log")
         failed.append(name)
         continue
     params, deg = tb.load_checkpoint(run_dir)
@@ -217,6 +219,7 @@ for name in VARIANTS:
     frames = train_ab.evaluate_params(params, deg, d, holdout[v.sfm], None, net_lpips, vdir / "renders",
                                       rasterize_mode=gs.rasterize_mode, **gs.render)
     tb.save_ply(params, vdir / "final.ply")
+    shutil.copy2(run_dir / "train.log", vdir / "train.log")
     info = {"variant": qc.variant_dict(v), "train_seconds": seconds, "steps": steps,
             "splats": int(params["means"].shape[0]), "excluded_train_images": len(exclude)}
     results[name] = {"sfm": v.sfm, "note": v.note, "info": info, "frames": by_name(frames, d)}

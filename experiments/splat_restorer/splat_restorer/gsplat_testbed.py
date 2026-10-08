@@ -301,6 +301,10 @@ def fix_gsplat_install(examples_dir: Path, python: str = sys.executable) -> None
     1. ``examples/datasets`` has no ``__init__.py``, so it is a namespace package and loses to
        the regular Hugging Face ``datasets`` package that Colab preinstalls.
     2. The pinned pycolmap fork defines ``np.uint64(-1)``, an OverflowError under numpy 2.
+    3. MCMC relocate/sample_add pass unclamped split counts to the relocation kernel, which
+       indexes a 51x51 binomial table with them: once one Gaussian is sampled more than 50
+       times (mass opacity death, seen with cap 3M+), the kernel reads out of bounds and dies
+       with "illegal memory access". The reference MCMC code clamps to N_max; so do we.
     Then imports both exactly as the trainer does, in a subprocess from ``examples_dir``.
     """
     import importlib.util
@@ -309,6 +313,16 @@ def fix_gsplat_install(examples_dir: Path, python: str = sys.executable) -> None
     init = Path(examples_dir) / "datasets" / "__init__.py"
     if not init.exists():
         init.write_text("", encoding="utf-8")
+    gs_spec = importlib.util.find_spec("gsplat")
+    if gs_spec and gs_spec.origin:
+        ops = Path(gs_spec.origin).parent / "strategy" / "ops.py"
+        text = ops.read_text(encoding="utf-8")
+        fixed = text.replace("ratios=torch.bincount(sampled_idxs)[sampled_idxs] + 1,",
+                             "ratios=(torch.bincount(sampled_idxs)[sampled_idxs] + 1).clamp(max=binoms.shape[0]),")
+        if fixed != text:
+            ops.write_text(fixed, encoding="utf-8")
+        if ".clamp(max=binoms.shape[0])" not in fixed:
+            print("UYARI: gsplat MCMC yaması uygulanamadı (kod değişmiş); 3M+ MCMC çökebilir.")
     spec = importlib.util.find_spec("pycolmap")  # locate without importing (import would fail)
     if spec and spec.submodule_search_locations:
         sm = Path(next(iter(spec.submodule_search_locations))) / "scene_manager.py"
