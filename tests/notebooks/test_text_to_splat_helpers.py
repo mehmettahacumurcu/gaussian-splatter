@@ -193,3 +193,29 @@ def test_runtime_pins_attention_backends_and_disables_build_fallback(tmp_path):
     assert env['SPARSE_BACKEND'] == 'spconv'
     assert env['SPCONV_ALGO'] == 'native' and env['SPCONV_DISABLE_JIT'] == '1'
     assert str(tmp_path) in env['HF_HOME'] and env['PYTHONNOUSERSITE'] == '1'
+
+
+@pytest.mark.parametrize('degree', [0, 1, 2, 3])
+def test_mesh_sh_rotation_preserves_directional_color_and_channel_major_ply(tmp_path, degree):
+    from backend.notebooks.templates.text_to_splat_helpers import sh_basis, rotate_sh_to_y_up
+    rng = np.random.default_rng(93)
+    rest = rng.normal(size=(3, (degree+1)**2-1, 3)).astype(np.float32)
+    rotated = rotate_sh_to_y_up(rest)
+    directions = rng.normal(size=(100, 3))
+    # Independent coordinate matrix used by geometric normalization.
+    rotation = np.array([[1, 0, 0], [0, 0, 1], [0, -1, 0]])
+    original_colors = np.einsum('dk,nkc->ndc', sh_basis(directions @ rotation, degree)[:, 1:], rest)
+    output_colors = np.einsum('dk,nkc->ndc', sh_basis(directions, degree)[:, 1:], rotated)
+    np.testing.assert_allclose(output_colors, original_colors, atol=1e-6)
+    cloud, info = normalize_gaussians(**sample(), sh_rest=rest)
+    assert info['source_sh_degree'] == info['export_sh_degree'] == degree
+    np.testing.assert_array_equal(cloud['sh_rest'], rotated)
+    path = write_ply(tmp_path / 'mesh.ply', cloud)
+    header, payload = path.read_bytes().split(b'end_header\n', 1)
+    k = (degree+1)**2-1
+    assert header.count(b'property float f_rest_') == 3*k
+    matrix = np.frombuffer(payload, dtype='<f4').reshape(3, 17+3*k)
+    np.testing.assert_array_equal(matrix[:, 9:9+3*k], rotated.transpose(0, 2, 1).reshape(3, 3*k))
+    loaded = read_ply(path)
+    assert loaded.sh_degree == degree
+    np.testing.assert_array_equal(loaded.sh_rest, rotated)

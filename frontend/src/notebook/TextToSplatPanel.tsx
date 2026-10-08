@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { generatePipelineNotebook, getPipelineNotebookPresets } from "../api";
 import { resolveDriveFolder } from "./drivePath";
 import { NotebookDownload } from "./NotebookDownload";
-import type { PipelinePreset, PipelinePresets, TextToSplatNotebookSpec } from "./PipelineNotebookPanel";
-import { BACKGROUND_MODELS, GPU_PRESETS, IMAGE_MODELS, RECONSTRUCTION_MODELS } from "./textToSplatSettings";
+import type { TextQualityPreset, PipelinePresets, TextToSplatNotebookSpec } from "./PipelineNotebookPanel";
+import { BACKGROUND_MODELS, MAX_DETAIL, PIPELINE_VRAM, estimateTextRequirements, restoreTextToSplatSettings, GPU_PRESETS, IMAGE_MODELS, RECONSTRUCTION_MODELS } from "./textToSplatSettings";
 import type { BackgroundModel, GpuPreset, ImageModel, ReconstructionModel, TextToSplatModelSettings } from "./textToSplatSettings";
 import type { GeneratedNotebook } from "./types";
 
@@ -38,8 +38,8 @@ export function TextToSplatPanel() {
   const [negative, setNegative] = useState("");
   const [style, setStyle] = useState("");
   const [seed, setSeed] = useState("42");
-  const [preset, setPreset] = useState<PipelinePreset>("baseline");
-  const [settings, setSettings] = useState<TextToSplatModelSettings>({ ...GPU_PRESETS.l4.settings });
+  const [preset, setPreset] = useState<TextQualityPreset>("baseline");
+  const [settings, setSettings] = useState<TextToSplatModelSettings>(() => restoreTextToSplatSettings({}));
   const [outputDir, setOutputDir] = useState("");
   const [targetCount, setTargetCount] = useState("");
   const [loading, setLoading] = useState(false);
@@ -67,10 +67,9 @@ export function TextToSplatPanel() {
   const imageModel = IMAGE_MODELS[settings.image_model];
   const gpu = GPU_PRESETS[settings.gpu_preset];
   const meshRoute = settings.reconstruction_model === "trellis2";
-  const minimumVram = Math.max(imageModel.vram, meshRoute ? 28 + (settings.mesh_splat_cap > 150000 ? 4 : 0) : 20,
-    preset === "ultra" ? 38 : 0);
+  const { minimum: minimumVram, lower } = estimateTextRequirements(settings, preset);
   const gpuError = minimumVram > gpu.capacity
-    ? `Seçilen modeller için en az ${minimumVram} GiB gerekir; ${gpu.label} profili yeterli değil. Daha büyük GPU profili veya daha hafif model seç.`
+    ? `Seçilen modeller için en az ${minimumVram} GiB gerekir; ${gpu.label} profili yeterli değil. ${lower ? `${lower} pipeline türünü seç.` : "Daha büyük GPU profili veya daha hafif model/render/splat bütçesi seç."}`
     : "";
   const blackwellWarning = settings.gpu_preset === "rtx_pro_6000" && !meshRoute;
   const output = outputDir.trim() ? resolveDriveFolder(outputDir, { allowResultFolder: true }) : null;
@@ -82,24 +81,30 @@ export function TextToSplatPanel() {
     && [512, 768, 1024].includes(settings.image_resolution) && inRange(settings.trellis_seed, 0, 2147483647)
     && inRange(settings.sparse_steps, 1, 100) && inRange(settings.sparse_cfg, 0, 20, false)
     && inRange(settings.slat_steps, 1, 100) && inRange(settings.slat_cfg, 0, 20, false)
-    && inRange(settings.mesh_views, 12, 120) && inRange(settings.mesh_fit_iterations, 100, 10000)
-    && inRange(settings.mesh_splat_cap, 1000, 300000) && settings.reconstruction_model !== "hunyuan3d";
+    && inRange(settings.mesh_views, 12, 200) && inRange(settings.mesh_fit_iterations, 100, 30000)
+    && inRange(settings.mesh_splat_cap, 1000, 3000000)
+    && inRange(settings.mesh_render_resolution, 512, 2048) && inRange(settings.mesh_sh_degree, 0, 3)
+    && [2048, 4096].includes(settings.mesh_texture_size) && settings.trellis2_pipeline_type in PIPELINE_VRAM && settings.reconstruction_model !== "hunyuan3d";
   const valid = promptValid && seedValid && countValid && settingsValid && !gpuError && (!output || output.ok)
     && (!imageModel.negative || (Array.from(negative).length <= 2000 && !negative.includes("\0")))
     && Array.from(style).length <= 500 && !style.includes("\0") && Boolean(defaults);
 
   function chooseGpu(value: string) {
     if (!(value in GPU_PRESETS)) return;
-    setSettings({ ...GPU_PRESETS[value as GpuPreset].settings });
-    setPreset("baseline");
+    setSettings(restoreTextToSplatSettings({ gpu_preset: value as GpuPreset }));
+    setPreset(value === "rtx_pro_6000" ? "max_detail" : "baseline");
   }
   function chooseImage(value: string) {
     if (!(value in IMAGE_MODELS)) return;
     const model = IMAGE_MODELS[value as ImageModel];
     setSettings(previous => ({ ...previous, image_model: value as ImageModel, image_steps: model.steps, image_guidance: model.guidance }));
   }
-  function chooseQuality(value: PipelinePreset) {
+  function chooseQuality(value: TextQualityPreset) {
     setPreset(value);
+    if (value === "max_detail") {
+      setSettings(previous => ({ ...previous, ...MAX_DETAIL }));
+      return;
+    }
     const recipe = catalog?.presets.text_to_splat[value];
     if (recipe) setSettings(previous => ({ ...previous, sparse_steps: recipe.sparse_steps, slat_steps: recipe.slat_steps,
       image_steps: previous.image_model === "sdxl" ? recipe.image_steps : previous.image_steps }));
@@ -150,7 +155,7 @@ export function TextToSplatPanel() {
 
         <section className="nb-model-settings" aria-labelledby="text-splat-model-heading">
           <h2 id="text-splat-model-heading">Model ayarları (MODEL SETTINGS)</h2>
-          <p className="nb-help">GPU profili modelleri ve kalite bütçelerini birlikte seçer; tüm profiller kararlı TRELLIS yoluyla başlar. TRELLIS.2 deneysel yolunu ayrıca seçebilirsin. Sonrasında her aşamayı değiştirebilirsin. Büyük model tek başına daha iyi 3D sonucu garanti etmez.</p>
+          <p className="nb-help">GPU profili modelleri ve kalite bütçelerini birlikte seçer; L4/A100/H100 kararlı TRELLIS ile, RTX PRO 6000 Max detay mesh yoluyla başlar. Diğer profillerde de Max detay seçebilirsin. Sonrasında her aşamayı değiştirebilirsin. Büyük model tek başına daha iyi 3D sonucu garanti etmez.</p>
           <div className="nb-model-option">
             <label>GPU profili<select value={settings.gpu_preset} onChange={event => chooseGpu(event.target.value)} aria-describedby="text-splat-gpu-help">
               {Object.entries(GPU_PRESETS).map(([value, option]) => <option key={value} value={value}>{option.label}</option>)}
@@ -189,11 +194,12 @@ export function TextToSplatPanel() {
         </section>
 
         <div className="nb-inline-fields">
-          <div><label>Kalite ayarı<select value={preset} onChange={event => chooseQuality(event.target.value as PipelinePreset)}>
+          <div><label>Kalite ayarı<select value={preset} onChange={event => chooseQuality(event.target.value as TextQualityPreset)}>
             <option value="baseline">Dengeli</option>
             <option value="quality">Kaliteli</option>
             <option value="ultra">Ultra · en az 38 GiB</option>
-          </select></label><p className="nb-help">TRELLIS örnekleme adımlarını ve SDXL seçiliyse görsel adımlarını ayarlar. Aşağıdaki değerleri ayrıca değiştirebilirsin.</p></div>
+            <option value="max_detail" disabled={!catalog?.presets.text_to_splat.max_detail}>Max detay · mesh · en az 60 GiB</option>
+          </select></label><p className="nb-help">Eski ayarlar TRELLIS/SDXL adımlarını ayarlar. Max detay: 1536 cascade, 4096 doku, 160 × 1536px görüş, 1.5M cap, 30k adım, SH2; en az 60 GiB, kurulum ve eğitim saatler sürebilir (ölçülmedi). Aşağıdaki değerleri ayrıca değiştirebilirsin.</p></div>
           <div><label>Tohum (SEED)<input type="number" min="0" max="2147483647" step="1" required value={seed}
             onChange={event => setSeed(event.target.value)} aria-invalid={!seedValid} /></label>
             <p className="nb-help">Görselin rastgelelik tohumu. Aynı ayarlar ve tohum benzer sonuçları tekrar üretmeyi sağlar.</p></div>
@@ -226,13 +232,23 @@ export function TextToSplatPanel() {
             <NumberSetting name="slat_cfg" label="SLAT CFG" value={settings.slat_cfg} min={0} max={20} fractional onChange={setNumber}
               help={meshRoute ? "TRELLIS.2 şeklinin görsele bağlılığı; yüksek değerler kusurları artırabilir. Doku guidance değeri bu yolda 1 olarak sabittir." : "İnce yapı ve görünüşün görsele bağlılığı. Yüksek değerler kusurları artırabilir; başlangıç 3."} />
           </div>
-          {meshRoute && <><h3>Mesh → 3DGS eğitimi</h3><p className="nb-help">Bu sürümde TRELLIS.2 mesh üretimi 512 çözünürlükte, eğitim görüntüleri 512 × 512 px olarak sabittir. Yukarıdaki görsel çözünürlüğü yalnızca ilk metin → görsel aşamasını değiştirir.</p><div className="nb-advanced-grid">
-            <NumberSetting name="mesh_views" label="Mesh görüş sayısı" value={settings.mesh_views} min={12} max={120} onChange={setNumber}
-              help="12–120 kamera açısından render alır. Daha fazla görüş yüzey kapsamını iyileştirir; hazırlık süresi ve depolama artar." />
-            <NumberSetting name="mesh_fit_iterations" label="3DGS fit iterasyonları" value={settings.mesh_fit_iterations} min={100} max={10000} onChange={setNumber}
-              help="100–10000 optimizasyon adımı. Daha uzun eğitim mesh görüntülerine daha iyi uyabilir; süre artar, görünmeyen ayrıntı yaratmaz." />
-            <NumberSetting name="mesh_splat_cap" label="Mesh splat üst sınırı" value={settings.mesh_splat_cap} min={1000} max={300000} onChange={setNumber}
-              help="1000–300000 Gaussian bütçesi. Büyük bütçe ince ayrıntı için alan sağlar; GPU belleği ve PLY boyutu artar. 150000 üzerinde ön kontrol 32 GiB olur." />
+          {meshRoute && <><h3>Mesh → 3DGS eğitimi</h3><p className="nb-help">UV temel renk dokusu, hafif/ışıksız görünüş ve küresel kameralar kullanılır. Her 12. görüş eğitimden ayrılır; PSNR/SSIM manifest içine yazılır. SH boya/cam görünüşüne alan sağlar; fiziksel yansıma üretmez. VRAM yetersizse alt pipeline önerilir ve indirmeden önce durulur.</p><div className="nb-advanced-grid">
+            <div><label>TRELLIS.2 pipeline türü<select value={settings.trellis2_pipeline_type} onChange={event => {
+              const value = event.target.value;
+              if (value === "512" || value === "1024_cascade" || value === "1536_cascade") setSettings(previous => ({ ...previous, trellis2_pipeline_type: value }));
+            }}>{Object.keys(PIPELINE_VRAM).map(value => <option key={value} value={value}>{value}</option>)}</select></label>
+              <p className="nb-help">512: 28 GiB; 1024 cascade: 40 GiB; 1536 cascade: 60 GiB. Bunlar tahmini kabul eşikleri, ölçülmüş tepe değerleri değil. 1536, token sınırı nedeniyle daha düşük gerçek çözünürlük üretebilir.</p></div>
+            <NumberSetting name="mesh_render_resolution" label="Mesh render çözünürlüğü" value={settings.mesh_render_resolution} min={512} max={2048} onChange={setNumber} help="512–2048 px; varsayılan 1024. Büyük çözünürlük GPU belleği, disk ve süreyi artırır." />
+            <NumberSetting name="mesh_sh_degree" label="Mesh SH derecesi" value={settings.mesh_sh_degree} min={0} max={3} onChange={setNumber} help="0–3; varsayılan 2. Her 1000 adımda bir derece açılır; kısa koşularda üst dereceler öğrenilemez." />
+            <div><label>Mesh doku boyutu<select value={settings.mesh_texture_size} onChange={event => setNumber("mesh_texture_size", Number(event.target.value))}>
+              <option value="2048">2048</option><option value="4096">4096</option>
+            </select></label><p className="nb-help">GLB UV temel renk dokusu; 4096 daha fazla bellek ve süre ister.</p></div>
+            <NumberSetting name="mesh_views" label="Mesh görüş sayısı" value={settings.mesh_views} min={12} max={200} onChange={setNumber}
+              help="12–200 kamera açısından render alır. Daha fazla görüş yüzey kapsamını iyileştirir; hazırlık süresi ve depolama artar." />
+            <NumberSetting name="mesh_fit_iterations" label="3DGS fit iterasyonları" value={settings.mesh_fit_iterations} min={100} max={30000} onChange={setNumber}
+              help="100–30000 optimizasyon adımı. Daha uzun eğitim mesh görüntülerine daha iyi uyabilir; süre artar, görünmeyen ayrıntı yaratmaz." />
+            <NumberSetting name="mesh_splat_cap" label="Mesh splat üst sınırı" value={settings.mesh_splat_cap} min={1000} max={3000000} onChange={setNumber}
+              help="1000–3000000 Gaussian bütçesi. Büyük bütçe ince ayrıntı için alan sağlar; GPU belleği ve PLY boyutu artar. Adaptif büyüme bu sınırı aşmaz; çözünürlük ve SH de bellek ihtiyacını artırır." />
           </div></>}
           {!settingsValid && <p className="nb-error" role="alert">Kalite değerlerini belirtilen aralıklarda doldur; adım, görüş, tohum ve splat sayıları tam sayı olmalı.</p>}
         </details>

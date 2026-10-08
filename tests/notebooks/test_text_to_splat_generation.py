@@ -58,7 +58,7 @@ def test_text_output_can_be_named_result_without_relaxing_input_rules():
         PipelineNotebookSpec(pipeline='native', input_mode='folder', input_path=spec.output_dir)
 
 
-@pytest.mark.parametrize('preset', ['baseline', 'quality', 'ultra'])
+@pytest.mark.parametrize('preset', ['baseline', 'quality', 'ultra', 'max_detail'])
 def test_text_generation_embeds_portable_runtime_and_compiles_every_cell(preset):
     spec = PipelineNotebookSpec(pipeline='text_to_splat', prompt='a red sports car', preset=preset)
     notebook = build_pipeline_notebook(spec, source=SOURCE)

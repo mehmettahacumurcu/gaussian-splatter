@@ -7,6 +7,7 @@ import type { TextToSplatModelSettings } from "./textToSplatSettings";
 
 export type TrainingPipeline = "hybrid" | "spirula";
 export type ExternalPipeline = TrainingPipeline | "text_to_splat";
+export type TextQualityPreset = PipelinePreset | "max_detail";
 export type PipelinePreset = "baseline" | "quality" | "ultra";
 export interface TrainingPipelineNotebookSpec {
   pipeline: TrainingPipeline;
@@ -30,7 +31,7 @@ export interface TextToSplatNotebookSpec extends TextToSplatModelSettings {
   negative_prompt: string;
   style: string;
   seed: number;
-  preset: PipelinePreset;
+  preset: TextQualityPreset;
   output_dir: string | null;
   target_splat_count: number | null;
 }
@@ -39,9 +40,9 @@ export interface PipelinePresets {
   template_version: number;
   presets: Record<TrainingPipeline, Record<PipelinePreset, {
     iterations: number; max_gaussians: number; min_vram: number; recipe: string;
-  }>> & { text_to_splat: Record<PipelinePreset, {
+  }>> & { text_to_splat: Partial<Record<TextQualityPreset, {
     min_vram: number; recipe: string; image_steps: number; sparse_steps: number; slat_steps: number; resolution: number;
-  }> };
+  }>> };
 }
 
 export function PipelineNotebookPanel({ pipeline }: { pipeline: TrainingPipeline }) {

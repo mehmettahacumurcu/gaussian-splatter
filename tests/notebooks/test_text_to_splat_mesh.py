@@ -13,7 +13,7 @@ from backend.notebooks.templates import text_to_splat_helpers as helpers
 from backend.notebooks.templates import text_to_splat_mesh as mesh
 
 
-@pytest.mark.parametrize('count', [12, 48, 120])
+@pytest.mark.parametrize('count', [12, 48, 120, 160, 200])
 def test_cameras_are_right_handed_centered_and_keep_object_in_front(count):
     size = 512
     views, intrinsic = mesh.camera_matrices(count, size)
@@ -228,3 +228,82 @@ def test_model_directory_rejects_upstream_path_drift_before_weight_fetch(tmp_pat
         mesh.pinned_model_directory(tmp_path)
     assert len(downloads) == 1 and downloads[0][1] == 'pipeline.json'
     assert snapshots == links == []
+
+
+@pytest.mark.parametrize('pipeline_type', ['1024_cascade', '1536_cascade'])
+def test_cascades_fetch_pinned_1024_shape_and_texture(tmp_path, monkeypatch, pipeline_type):
+    _, _, downloads, _, _ = fake_model_hub(tmp_path, monkeypatch)
+    directory = mesh.pinned_model_directory(tmp_path, pipeline_type)
+    config = json.loads((directory / 'pipeline.json').read_text())['args']
+    assert config['default_pipeline_type'] == pipeline_type
+    assert 'shape_slat_flow_model_512' in config['models']
+    assert 'shape_slat_flow_model_1024' in config['models']
+    assert 'tex_slat_flow_model_1024' in config['models']
+    assert 'tex_slat_flow_model_512' not in config['models']
+    assert any(filename == 'ckpts/shape_1024.safetensors' for _, filename, _ in downloads)
+    assert any(filename == 'ckpts/tex_1024.safetensors' for _, filename, _ in downloads)
+
+
+@pytest.mark.parametrize('count', [12, 24, 160, 200])
+def test_held_out_views_disjoint_complete_and_deterministic(count):
+    train, evaluation = mesh.split_view_indices(count)
+    np.testing.assert_array_equal(evaluation, np.arange(0, count, 12))
+    assert not set(train) & set(evaluation)
+    assert sorted([*train, *evaluation]) == list(range(count))
+    assert .08 <= len(evaluation)/count <= .09
+
+
+def test_glb_texture_preferred_over_vertex_color_and_axes_uv_restored():
+    from PIL import Image
+    rgba = np.array([[[255, 0, 0, 255], [0, 255, 0, 128]],
+                     [[0, 0, 255, 255], [255, 255, 255, 255]]], dtype=np.uint8)
+    model = SimpleNamespace(vertices=np.array([[1, 3, -2], [2, 4, -3], [3, 5, -4]]), faces=[[0, 1, 2]],
+        visual=SimpleNamespace(uv=[[0, 1], [1, 1], [0, 0]], vertex_colors=np.zeros((3, 4)),
+            material=SimpleNamespace(baseColorTexture=Image.fromarray(rgba), baseColorFactor=[255]*4)))
+    arrays = mesh.mesh_arrays(model)
+    np.testing.assert_array_equal(arrays['vertices'], [[1, 2, 3], [2, 3, 4], [3, 4, 5]])
+    np.testing.assert_array_equal(arrays['texture'], rgba)
+    np.testing.assert_array_equal(arrays['uv'], [[0, 0], [1, 0], [0, 1]])
+    np.testing.assert_array_equal(arrays['colors'], np.eye(3))
+    assert arrays['alpha'][1, 0] == pytest.approx(128/255)
+    model.visual = SimpleNamespace(vertex_colors=np.tile([128, 64, 32, 255], (3, 1)))
+    fallback = mesh.mesh_arrays(model)
+    assert 'texture' not in fallback
+    np.testing.assert_allclose(fallback['colors'][0], np.array([128, 64, 32])/255)
+
+
+def test_ssim_cpu_identity_and_degradation():
+    import torch
+    # CPU tensors only. No real gsplat/TRELLIS module or CUDA kernel is imported.
+    x = torch.linspace(0, 1, 32*32*3, device='cpu').reshape(1, 32, 32, 3)
+    assert mesh.image_ssim(x, x).item() == pytest.approx(1, abs=1e-6)
+    assert mesh.image_ssim(x, 1-x).item() < .5
+
+
+@pytest.mark.parametrize('cap,n', [(20, 20), (21, 20), (22, 20), (100, 20)])
+def test_growth_budget_before_allocation_with_mock_gsplat(monkeypatch, cap, n):
+    import torch
+    class FakeDefault:
+        grow_scale3d = .01
+        revised_opacity = False
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+    calls = []
+    def mutate(*, params, optimizers, state, mask, revised_opacity=None):
+        assert mask.device.type == 'cpu'
+        added = int(mask.sum())
+        assert len(params['means']) + added <= cap
+        calls.append(added)
+        params['means'] = torch.cat([params['means'], torch.zeros(added, 3)])
+    monkeypatch.setitem(sys.modules, 'gsplat.strategy', SimpleNamespace(DefaultStrategy=FakeDefault))
+    monkeypatch.setitem(sys.modules, 'gsplat.strategy.ops', SimpleNamespace(duplicate=mutate, split=mutate))
+    strategy = mesh.capped_strategy(cap, 30000)
+    scales = torch.full((n, 3), np.log(.001), device='cpu')
+    scales[-1] = np.log(.1)  # highest gradient is a split; next is a duplicate
+    params = {'means': torch.zeros(n, 3, device='cpu'), 'scales': scales}
+    state = {'grad2d': torch.arange(1, n+1, device='cpu').float(),
+             'count': torch.ones(n, device='cpu'), 'scene_scale': 1.}
+    nd, ns = strategy._grow_gs(params, {}, state, 600)
+    assert nd + ns == min(cap-n, n//10)
+    assert len(params['means']) <= cap
+    assert sum(calls) == nd + ns

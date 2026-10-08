@@ -12,9 +12,9 @@ import sys
 from pathlib import Path
 
 if __package__:
-    from .text_to_splat_settings import estimate_requirements, model_provenance, validate_settings
+    from .text_to_splat_settings import estimate_requirements, model_provenance, require_mesh_memory, validate_settings
 else:
-    from text_to_splat_settings import estimate_requirements, model_provenance, validate_settings
+    from text_to_splat_settings import estimate_requirements, model_provenance, require_mesh_memory, validate_settings
 
 PYTHON_VERSION = '3.11.11'
 UV_VERSION = '0.8.22'
@@ -76,6 +76,8 @@ def host_preflight(config):
         raise RuntimeError('GPU bulunamadı. Colab: Çalışma zamanı → Çalışma zamanı türünü değiştir → L4 veya A100.') from exc
     gib = float(memory) / 1024
     requirements = estimate_requirements(config)
+    if config['reconstruction_model'] == 'trellis2':
+        require_mesh_memory(config, gib, gib)
     if gib < requirements['min_vram']:
         raise RuntimeError(f'Yetersiz VRAM: {gpu.strip()} {gib:.1f} GiB. Seçilen modeller/ayarlar en az {requirements["min_vram"]} GiB ister. Daha küçük model veya çözünürlük seçin; T4 desteklenmez.')
     if int(driver.strip().split('.')[0]) < 570:

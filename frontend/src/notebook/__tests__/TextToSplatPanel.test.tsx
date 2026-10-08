@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { generatePipelineNotebook, getPipelineNotebookPresets } from "../../api";
 import { TextToSplatPanel } from "../TextToSplatPanel";
+import { MAX_DETAIL, MESH_DEFAULTS } from "../textToSplatSettings";
 import type { PipelinePresets } from "../PipelineNotebookPanel";
 
 vi.mock("../../api", () => ({ generatePipelineNotebook: vi.fn(), getPipelineNotebookPresets: vi.fn() }));
@@ -12,6 +13,7 @@ const catalog: PipelinePresets = { template_version: 2, presets: {
   hybrid: { baseline: training, quality: training, ultra: training },
   spirula: { baseline: training, quality: training, ultra: training },
   text_to_splat: { baseline: text, quality: { ...text, image_steps: 40, sparse_steps: 20, slat_steps: 20 },
+    max_detail: { ...text, ...MAX_DETAIL, min_vram: 60 },
     ultra: { ...text, image_steps: 50, sparse_steps: 25, slat_steps: 25, min_vram: 38 } },
 } };
 const download = () => screen.getByRole("button", { name: "Metinden splat notebook’unu indir" });
@@ -51,7 +53,7 @@ describe("TextToSplatPanel", () => {
       image_model: "sdxl", background_model: "birefnet", reconstruction_model: "trellis", gpu_preset: "a100",
       image_steps: 50, image_guidance: 7, image_resolution: 1024, trellis_seed: 42,
       sparse_steps: 25, sparse_cfg: 7.5, slat_steps: 25, slat_cfg: 3,
-      mesh_views: 48, mesh_fit_iterations: 3000, mesh_splat_cap: 100000,
+      ...MESH_DEFAULTS, mesh_views: 48, mesh_fit_iterations: 3000, mesh_splat_cap: 100000,
     }));
     expect(await screen.findByText("car_text_to_splat.ipynb")).toBeVisible();
     edit("Nesne tarifi (PROMPT)", "a blue car");
@@ -107,7 +109,7 @@ describe("TextToSplatPanel", () => {
     ["l4", "sdxl", "u2net", "trellis", 25, 7, 12, 24, 1500, 50000],
     ["a100", "flux1_dev", "birefnet", "trellis", 28, 3.5, 20, 48, 3000, 100000],
     ["h100", "qwen_image", "birefnet", "trellis", 40, 4, 24, 64, 4000, 150000],
-    ["rtx_pro_6000", "qwen_image", "birefnet", "trellis", 40, 4, 24, 72, 5000, 200000],
+    ["rtx_pro_6000", "qwen_image", "birefnet", "trellis2", 40, 4, 24, 160, 30000, 1500000],
   ])("applies the %s GPU profile to every stage and submits its budgets", async (gpu, image, background, route, imageSteps, guidance, samplerSteps, views, iterations, cap) => {
     render(<TextToSplatPanel />);
     await screen.findByText(/En az 20 GiB/);
@@ -126,7 +128,7 @@ describe("TextToSplatPanel", () => {
     })));
   });
 
-  it("blocks insufficient VRAM and explains Blackwell compatibility without opting into the experimental route", async () => {
+  it("blocks insufficient VRAM and defaults Blackwell to max detail while explaining an explicit stable override", async () => {
     render(<TextToSplatPanel />);
     await screen.findByText(/En az 20 GiB/);
     edit("Nesne tarifi (PROMPT)", "a car");
@@ -139,7 +141,8 @@ describe("TextToSplatPanel", () => {
     expect(screen.getByText(/Bu sürümde çalıştırılmaz/)).toBeVisible();
     edit("GPU profili", "rtx_pro_6000");
     expect(screen.getByRole("option", { name: "TRELLIS-image-large → Gaussian" })).toBeEnabled();
-    expect(screen.getByLabelText("3D üretim yolu")).toHaveValue("trellis");
+    expect(screen.getByLabelText("3D üretim yolu")).toHaveValue("trellis2");
+    edit("3D üretim yolu", "trellis");
     expect(screen.getByRole("note")).toHaveTextContent(/Blackwell GPU’da çalışmaz/);
     expect(download()).toBeEnabled();
     expect(screen.queryByText(/Yardımcı DINOv3 modeli Meta lisanslıdır/)).not.toBeInTheDocument();
@@ -149,7 +152,7 @@ describe("TextToSplatPanel", () => {
     fireEvent.click(download());
     await waitFor(() => expect(generatePipelineNotebook).toHaveBeenCalledWith(expect.objectContaining({
       gpu_preset: "rtx_pro_6000", reconstruction_model: "trellis2", image_model: "qwen_image", background_model: "birefnet",
-      mesh_views: 72, mesh_fit_iterations: 5000, mesh_splat_cap: 200000,
+      mesh_views: 160, mesh_fit_iterations: 30000, mesh_splat_cap: 1500000,
     })));
   });
 
@@ -206,8 +209,9 @@ describe("TextToSplatPanel", () => {
       ["Görsel adımları", "0", "30"], ["Görsel guidance / CFG", "20.1", "5.5"],
       ["TRELLIS tohumu", "2147483648", "123"], ["Sparse-structure adımları", "1.5", "18"],
       ["Sparse-structure CFG", "-1", "8.5"], ["SLAT adımları", "101", "22"], ["SLAT CFG", "", "4.5"],
-      ["Mesh görüş sayısı", "11", "36"], ["3DGS fit iterasyonları", "10001", "2500"],
-      ["Mesh splat üst sınırı", "300001", "75000"],
+      ["Mesh render çözünürlüğü", "2049", "2048"], ["Mesh SH derecesi", "4", "3"],
+      ["Mesh görüş sayısı", "201", "200"], ["3DGS fit iterasyonları", "30001", "30000"],
+      ["Mesh splat üst sınırı", "3000001", "3000000"],
     ]) {
       edit(label, invalid);
       expect(download()).toBeDisabled();
@@ -223,7 +227,26 @@ describe("TextToSplatPanel", () => {
       reconstruction_model: "trellis2",
       image_steps: 30, image_guidance: 5.5, image_resolution: 768, trellis_seed: 123,
       sparse_steps: 18, sparse_cfg: 8.5, slat_steps: 22, slat_cfg: 4.5,
-      mesh_views: 36, mesh_fit_iterations: 2500, mesh_splat_cap: 75000, target_splat_count: null,
+      mesh_views: 200, mesh_render_resolution: 2048, mesh_sh_degree: 3, mesh_fit_iterations: 30000, mesh_splat_cap: 3000000, target_splat_count: null,
+    })));
+  });
+
+  it("selects max detail on A100 and H100 while preserving their stable defaults", async () => {
+    render(<TextToSplatPanel />);
+    await screen.findByText(/En az 20 GiB/);
+    edit("Nesne tarifi (PROMPT)", "a car");
+    for (const gpu of ["a100", "h100"]) {
+      edit("GPU profili", gpu);
+      expect(screen.getByLabelText("3D üretim yolu")).toHaveValue("trellis");
+      edit("Kalite ayarı", "max_detail");
+      expect(screen.getByLabelText("3D üretim yolu")).toHaveValue("trellis2");
+      expect(screen.getByLabelText("TRELLIS.2 pipeline türü")).toHaveValue("1536_cascade");
+      expect(screen.getByLabelText("Mesh render çözünürlüğü")).toHaveValue(1536);
+      expect(download()).toBeEnabled();
+    }
+    fireEvent.click(download());
+    await waitFor(() => expect(generatePipelineNotebook).toHaveBeenCalledWith(expect.objectContaining({
+      ...MAX_DETAIL, preset: "max_detail",
     })));
   });
 

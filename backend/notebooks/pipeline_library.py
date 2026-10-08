@@ -21,7 +21,7 @@ from .models import StrictModel, StaticNotebookRunSpec
 from .source import (
     GENERATOR_ID, GENERATOR_VERSION, REPOSITORY_URL, NotebookSource, NotebookSourceError,
 )
-from .templates.text_to_splat_settings import IMAGE_MODELS, SETTING_FIELDS, model_provenance, validate_settings
+from .templates.text_to_splat_settings import IMAGE_MODELS, MAX_DETAIL, SETTING_FIELDS, model_provenance, validate_settings
 
 ASSETS = Path(__file__).parent / 'templates'
 ROOT = Path(__file__).resolve().parents[2]
@@ -40,6 +40,7 @@ PRESETS = {
         'baseline': dict(min_vram=20, recipe='sdxl_trellis', image_steps=25, sparse_steps=12, slat_steps=12, resolution=1024),
         'quality': dict(min_vram=20, recipe='sdxl_trellis', image_steps=40, sparse_steps=20, slat_steps=20, resolution=1024),
         'ultra': dict(min_vram=38, recipe='sdxl_trellis', image_steps=50, sparse_steps=25, slat_steps=25, resolution=1024),
+        'max_detail': dict(min_vram=60, recipe='trellis2_max_detail', image_steps=25, resolution=1024, **MAX_DETAIL),
     },
 }
 
@@ -68,7 +69,7 @@ class PipelineNotebookSpec(StrictModel):
     pipeline: Literal['native', 'hybrid', 'spirula', 'text_to_splat']
     input_mode: Literal['folder', 'video', 'dataset_zip', 'dataset_folder', 'text'] | None = None
     input_path: str = ''
-    preset: Literal['baseline', 'quality', 'ultra'] = 'baseline'
+    preset: Literal['baseline', 'quality', 'ultra', 'max_detail'] = 'baseline'
     iterations: int | None = Field(default=None, ge=1000, le=120000)
     max_gaussians: int | None = Field(default=None, ge=50000, le=20000000)
     fps: int = Field(default=4, ge=1, le=30)
@@ -95,9 +96,14 @@ class PipelineNotebookSpec(StrictModel):
     sparse_cfg: float | None = Field(default=None, ge=0, le=20, allow_inf_nan=False, strict=True)
     slat_steps: int | None = Field(default=None, ge=1, le=100, strict=True)
     slat_cfg: float | None = Field(default=None, ge=0, le=20, allow_inf_nan=False, strict=True)
-    mesh_views: int | None = Field(default=None, ge=12, le=120, strict=True)
-    mesh_fit_iterations: int | None = Field(default=None, ge=100, le=10000, strict=True)
-    mesh_splat_cap: int | None = Field(default=None, ge=1000, le=300000, strict=True)
+    mesh_views: int | None = Field(default=None, ge=12, le=200, strict=True)
+    mesh_fit_iterations: int | None = Field(default=None, ge=100, le=30000, strict=True)
+    mesh_splat_cap: int | None = Field(default=None, ge=1000, le=3000000, strict=True)
+
+    trellis2_pipeline_type: Literal['512', '1024_cascade', '1536_cascade'] | None = None
+    mesh_render_resolution: int | None = Field(default=None, ge=512, le=2048, strict=True)
+    mesh_sh_degree: int | None = Field(default=None, ge=0, le=3, strict=True)
+    mesh_texture_size: Literal[2048, 4096] | None = None
 
     @field_validator('prompt', 'negative_prompt', 'style')
     @classmethod
@@ -131,6 +137,8 @@ class PipelineNotebookSpec(StrictModel):
             for field in SETTING_FIELDS:
                 setattr(self, field, resolved[field])
         else:
+            if self.preset == 'max_detail':
+                raise ValueError('Max detay yalnızca text_to_splat tarifi için kullanılabilir')
             if any(getattr(self, field) != type(self).model_fields[field].default
                    for field in self.model_fields_set & SETTING_FIELDS):
                 raise ValueError('Model ayarları yalnızca text_to_splat tarifi için kullanılabilir')

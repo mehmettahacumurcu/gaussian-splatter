@@ -1,6 +1,7 @@
 export type ImageModel = "sdxl" | "flux1_dev" | "flux1_schnell" | "flux2_klein_4b" | "qwen_image";
 export type BackgroundModel = "u2net" | "birefnet";
 export type ReconstructionModel = "trellis" | "trellis2" | "hunyuan3d";
+export type Trellis2PipelineType = "512" | "1024_cascade" | "1536_cascade";
 export type GpuPreset = "l4" | "a100" | "h100" | "rtx_pro_6000";
 
 export interface TextToSplatModelSettings {
@@ -16,6 +17,10 @@ export interface TextToSplatModelSettings {
   sparse_cfg: number;
   slat_steps: number;
   slat_cfg: number;
+  trellis2_pipeline_type: Trellis2PipelineType;
+  mesh_render_resolution: number;
+  mesh_sh_degree: number;
+  mesh_texture_size: number;
   mesh_views: number;
   mesh_fit_iterations: number;
   mesh_splat_cap: number;
@@ -65,11 +70,11 @@ export const BACKGROUND_MODELS: Record<BackgroundModel, { label: string; descrip
 export const RECONSTRUCTION_MODELS: Record<ReconstructionModel, { label: string; description: string }> = {
   trellis: {
     label: "TRELLIS-image-large → Gaussian",
-    description: "Tüm GPU profillerinde kararlı varsayılan yol; görselden doğrudan Gaussian üretir. Ön kontrol eşiği 20 GiB. microsoft/TRELLIS-image-large MIT, açık erişim. Eski CUDA bağımlılıkları nedeniyle RTX PRO 6000 Blackwell desteklenmez.",
+    description: "L4/A100/H100 profillerinde kararlı varsayılan yol; görselden doğrudan Gaussian üretir. Ön kontrol eşiği 20 GiB. microsoft/TRELLIS-image-large MIT, açık erişim. Eski CUDA bağımlılıkları nedeniyle RTX PRO 6000 Blackwell desteklenmez.",
   },
   trellis2: {
     label: "TRELLIS.2 → mesh → 3DGS · deneysel",
-    description: "Yalnızca açıkça seçildiğinde kullanılan deneysel yol; temiz Colab GPU oturumunda uçtan uca doğrulanmadı. 4B model önce mesh üretir; farklı açılardan görüntüler render edilip gsplat ile standart 3DGS PLY eğitilir. Daha uzun sürer; mesh görünüşünü yaklaşık temsil eder. Ön kontrol eşiği 28 GiB; büyük splat bütçesinde 32 GiB. microsoft/TRELLIS.2-4B MIT; gsplat Apache 2.0. Yardımcı DINOv3 modeli Meta lisanslıdır: Hugging Face üzerinden önceden Meta erişim onayı ve Colab secrets/env içinde HF_TOKEN gerekir. CUDA nvcc ve g++ derlemesi gerektiren ilk kurulum uzundur.",
+    description: "Yüksek çözünürlüklü deneysel yol; temiz Colab GPU oturumunda uçtan uca doğrulanmadı. 4B model önce mesh üretir; farklı açılardan görüntüler render edilip gsplat ile standart 3DGS PLY eğitilir. Daha uzun sürer; mesh görünüşünü yaklaşık temsil eder. 512/1024 cascade/1536 cascade için geometri eşikleri 28/40/60 GiB; render ve splat bütçesi daha fazla bellek isteyebilir. microsoft/TRELLIS.2-4B MIT; gsplat Apache 2.0. Yardımcı DINOv3 modeli Meta lisanslıdır: Hugging Face üzerinden önceden Meta erişim onayı ve Colab secrets/env içinde HF_TOKEN gerekir. CUDA nvcc ve g++ derlemesi gerektiren ilk kurulum uzundur.",
   },
   hunyuan3d: {
     label: "Hunyuan3D-2.x · deneysel / sonra",
@@ -77,7 +82,11 @@ export const RECONSTRUCTION_MODELS: Record<ReconstructionModel, { label: string;
   },
 };
 
-const shared = { image_resolution: 1024, trellis_seed: 42, sparse_cfg: 7.5, slat_cfg: 3 };
+export const MESH_DEFAULTS = { trellis2_pipeline_type: "512" as Trellis2PipelineType, mesh_render_resolution: 1024, mesh_sh_degree: 2, mesh_texture_size: 2048 };
+export const MAX_DETAIL = { reconstruction_model: "trellis2" as ReconstructionModel, trellis2_pipeline_type: "1536_cascade" as Trellis2PipelineType, mesh_render_resolution: 1536, mesh_texture_size: 4096, mesh_sh_degree: 2, sparse_steps: 24, slat_steps: 24, mesh_views: 160, mesh_fit_iterations: 30000, mesh_splat_cap: 1500000 };
+export const PIPELINE_VRAM = { "512": 28, "1024_cascade": 40, "1536_cascade": 60 };
+
+const shared = { ...MESH_DEFAULTS, image_resolution: 1024, trellis_seed: 42, sparse_cfg: 7.5, slat_cfg: 3 };
 
 export const GPU_PRESETS: Record<GpuPreset, {
   label: string; description: string; capacity: number; settings: TextToSplatModelSettings;
@@ -99,7 +108,38 @@ export const GPU_PRESETS: Record<GpuPreset, {
   },
   rtx_pro_6000: {
     label: "RTX PRO 6000 · 96 GB", capacity: 96,
-    description: "Qwen-Image + BiRefNet + kararlı TRELLIS varsayılanı. Bu profil Blackwell uyumluluğu sağlamaz; Colab ön kontrolü mevcut TRELLIS ortamını gerçek Blackwell GPU’da durdurur. TRELLIS.2 yalnızca ayrıca seçilen deneysel yoldur; seçilirse 72 görüş, 5000 fit adımı kullanılır.",
-    settings: { ...shared, gpu_preset: "rtx_pro_6000", image_model: "qwen_image", background_model: "birefnet", reconstruction_model: "trellis", image_steps: 40, image_guidance: 4, sparse_steps: 24, slat_steps: 24, mesh_views: 72, mesh_fit_iterations: 5000, mesh_splat_cap: 200000 },
+    description: "Qwen-Image + BiRefNet + TRELLIS.2 Max detay. Blackwell için modern cu128 ortamı; 1536 cascade, 4096 doku, 160 görüş, 1.5M splat sınırı, 30k adım, SH2. En az 60 GiB; ilk derleme ve eğitim saatler sürebilir, süre ölçülmedi. DINOv3 erişim onayı gerekir.",
+    settings: { ...shared, gpu_preset: "rtx_pro_6000", image_model: "qwen_image", background_model: "birefnet", image_steps: 40, image_guidance: 4, ...MAX_DETAIL },
   },
 };
+// Defaults fill older saved settings; unknown selectors are ignored during hydration.
+// API validation remains strict and returns a validation error for invalid requests.
+export function restoreTextToSplatSettings(saved: Partial<TextToSplatModelSettings>): TextToSplatModelSettings {
+  const gpu = saved.gpu_preset && Object.prototype.hasOwnProperty.call(GPU_PRESETS, saved.gpu_preset) ? saved.gpu_preset : "l4";
+  const result = { ...GPU_PRESETS[gpu].settings };
+  const selectors = { gpu_preset: GPU_PRESETS, image_model: IMAGE_MODELS,
+    background_model: BACKGROUND_MODELS, reconstruction_model: RECONSTRUCTION_MODELS,
+    trellis2_pipeline_type: PIPELINE_VRAM };
+  for (const [key, value] of Object.entries(saved)) {
+    if (!Object.prototype.hasOwnProperty.call(result, key)) continue;
+    if (Object.prototype.hasOwnProperty.call(selectors, key)) {
+      const options = selectors[key as keyof typeof selectors];
+      if (typeof value === "string" && Object.prototype.hasOwnProperty.call(options, value) && value !== "hunyuan3d") Object.assign(result, { [key]: value });
+    } else if (typeof value === "number" && Number.isFinite(value)) Object.assign(result, { [key]: value });
+  }
+  return result;
+}
+
+export function estimateTextRequirements(settings: TextToSplatModelSettings, preset: string) {
+  const mesh = settings.reconstruction_model === "trellis2";
+  const millions = settings.mesh_splat_cap / 1000000;
+  const fit = Math.ceil(12 + 6 * millions + 4 * (settings.mesh_render_resolution / 1024) ** 2
+    + .25 * millions * (settings.mesh_sh_degree + 1) ** 2);
+  const geometry = mesh ? Math.max(PIPELINE_VRAM[settings.trellis2_pipeline_type] ?? 28, fit) : 20;
+  const minimum = Math.max(IMAGE_MODELS[settings.image_model].vram, geometry, preset === "ultra" ? 38 : 0);
+  const capacity = GPU_PRESETS[settings.gpu_preset].capacity;
+  const lower = Object.entries(PIPELINE_VRAM).filter(([, vram]) => mesh
+    && vram <= PIPELINE_VRAM[settings.trellis2_pipeline_type]
+    && Math.max(vram, fit, IMAGE_MODELS[settings.image_model].vram) <= capacity).at(-1)?.[0];
+  return { minimum, lower };
+}

@@ -24,7 +24,6 @@ def spec(**kwargs):
     ('l4', 'sdxl', 'u2net', 25, 7.0, 12, (24, 1500, 50000)),
     ('a100', 'flux1_dev', 'birefnet', 28, 3.5, 20, (48, 3000, 100000)),
     ('h100', 'qwen_image', 'birefnet', 40, 4.0, 24, (64, 4000, 150000)),
-    ('rtx_pro_6000', 'qwen_image', 'birefnet', 40, 4.0, 24, (72, 5000, 200000)),
 ])
 def test_gpu_presets_default_to_stable_trellis_and_preserve_explicit_opt_in(
         gpu, image, background, image_steps, image_guidance, sampling_steps, mesh_budget):
@@ -90,10 +89,12 @@ def test_all_model_route_notebooks_validate_compile_and_record_real_pins(image, 
     {'reconstruction_model': 'hunyuan3d'}, {'reconstruction_model': 'anything'},
     {'image_steps': 0}, {'image_steps': 101}, {'image_steps': True}, {'image_steps': '25'},
     {'image_guidance': float('nan')}, {'image_guidance': float('inf')}, {'image_guidance': True},
+    {'trellis2_pipeline_type': '1024'}, {'mesh_render_resolution': 2049}, {'mesh_render_resolution': 511},
+    {'mesh_sh_degree': 4}, {'mesh_sh_degree': -1}, {'mesh_sh_degree': True}, {'mesh_texture_size': 8192},
     {'image_resolution': 1536}, {'trellis_seed': -1}, {'trellis_seed': True},
     {'sparse_steps': 0}, {'sparse_cfg': -1}, {'slat_steps': 101}, {'slat_cfg': 20.1},
-    {'mesh_views': 11}, {'mesh_views': 121}, {'mesh_fit_iterations': 99}, {'mesh_fit_iterations': 10001},
-    {'mesh_splat_cap': 999}, {'mesh_splat_cap': 300001}, {'mesh_splat_cap': 1.1},
+    {'mesh_views': 11}, {'mesh_views': 201}, {'mesh_fit_iterations': 99}, {'mesh_fit_iterations': 30001},
+    {'mesh_splat_cap': 999}, {'mesh_splat_cap': 3000001}, {'mesh_splat_cap': 1.1},
     {'image_model': 'flux1_schnell', 'negative_prompt': 'blurry'},
     {'image_model': 'flux2_klein_4b', 'negative_prompt': 'blurry'},
     {'image_model': 'flux1_schnell', 'image_steps': 5},
@@ -129,11 +130,11 @@ def test_stage_thresholds_use_peak_not_sum_and_mesh_cap_adds_headroom():
     flux = estimate_requirements(spec(image_model='flux1_dev').model_dump())
     assert flux['min_vram'] == 36
     qwen = estimate_requirements(spec(image_model='qwen_image', reconstruction_model='trellis2').model_dump())
-    assert qwen['min_vram'] == 60 and qwen['disk_gib'] == 130
+    assert qwen['min_vram'] == 60 and qwen['disk_gib'] == 131
     small = spec(reconstruction_model='trellis2', mesh_splat_cap=150000).model_dump()
-    large = spec(reconstruction_model='trellis2', mesh_splat_cap=150001).model_dump()
+    large = spec(reconstruction_model='trellis2', mesh_splat_cap=3000000).model_dump()
     assert estimate_requirements(small)['min_vram'] == 28
-    assert estimate_requirements(large)['min_vram'] == 32
+    assert estimate_requirements(large)['min_vram'] == 41
     assert estimate_requirements(spec(preset='ultra').model_dump())['min_vram'] == 38
 
 
@@ -180,3 +181,53 @@ def test_cli_exposes_new_selectors_and_custom_knobs(tmp_path):
     assert result.metadata.pipeline.spec.image_model == 'flux2_klein_4b'
     assert result.metadata.pipeline.spec.mesh_views == 36
     assert result.metadata.pipeline.spec.trellis_seed == 19
+
+
+@pytest.mark.parametrize('preset,gpu', [('max_detail', 'a100'), ('max_detail', 'h100'), ('baseline', 'rtx_pro_6000')])
+def test_max_detail_and_blackwell_defaults_and_notebook_literals(preset, gpu):
+    from backend.notebooks.templates.text_to_splat_settings import MAX_DETAIL
+    selected = spec(preset=preset, gpu_preset=gpu)
+    for key, value in MAX_DETAIL.items():
+        assert getattr(selected, key) == value
+    notebook = build_pipeline_notebook(selected, source=SOURCE)
+    cell = next(c for c in notebook.cells if c.metadata.get('stage') == 'config')
+    literals = {node.targets[0].id: ast.literal_eval(node.value) for node in ast.parse(cell.source).body}
+    for key in MAX_DETAIL:
+        assert literals[key.upper()] == getattr(selected, key)
+    assert notebook.metadata.pipeline.models.reconstruction.id == 'microsoft/TRELLIS.2-4B'
+    explicit = spec(gpu_preset=gpu, reconstruction_model='trellis', mesh_views=72, mesh_fit_iterations=5000,
+                    mesh_splat_cap=200000, trellis2_pipeline_type='512')
+    assert explicit.reconstruction_model == 'trellis' and explicit.mesh_views == 72
+
+
+@pytest.mark.parametrize('pipeline_type,minimum', [('512', 28), ('1024_cascade', 40), ('1536_cascade', 60)])
+def test_pipeline_vram_admission_and_recommendations(pipeline_type, minimum):
+    from backend.notebooks.templates.text_to_splat_settings import require_mesh_memory
+    config = spec(reconstruction_model='trellis2', trellis2_pipeline_type=pipeline_type).model_dump()
+    requirements = estimate_requirements(config, available_vram=minimum)
+    assert requirements['min_vram'] == minimum and requirements['fits']
+    assert require_mesh_memory(config, minimum, minimum)['geometry_vram'] == minimum
+    with pytest.raises(RuntimeError, match='yetersiz VRAM'):
+        require_mesh_memory(config, minimum-1, minimum-1)
+    with pytest.raises(RuntimeError, match='boş'):
+        require_mesh_memory(config, 96, 10)
+    if pipeline_type == '1536_cascade':
+        assert estimate_requirements(config, 48)['recommended_pipeline_type'] == '1024_cascade'
+        with pytest.raises(RuntimeError, match='1024_cascade'):
+            require_mesh_memory(config, 48, 48)
+    assert not estimate_requirements(config, 8)['fits']
+    assert estimate_requirements(config, 8)['recommended_pipeline_type'] is None
+
+
+def test_maximum_controls_accepted_and_legacy_missing_fields_resolve():
+    selected = spec(reconstruction_model='trellis2', mesh_views=200, mesh_fit_iterations=30000,
+                    mesh_splat_cap=3000000, mesh_render_resolution=2048, mesh_sh_degree=3, mesh_texture_size=4096)
+    assert estimate_requirements(selected.model_dump())['geometry_vram'] == 58
+    legacy = spec().model_dump()
+    for key in ('trellis2_pipeline_type', 'mesh_render_resolution', 'mesh_sh_degree', 'mesh_texture_size'):
+        legacy.pop(key)
+    loaded = PipelineNotebookSpec(**legacy)
+    assert loaded.trellis2_pipeline_type == '512' and loaded.mesh_render_resolution == 1024
+    assert loaded.mesh_sh_degree == 2 and loaded.mesh_texture_size == 2048
+    with pytest.raises(ValidationError, match='Max detay'):
+        PipelineNotebookSpec(pipeline='native', input_mode='folder', input_path='capture', preset='max_detail')

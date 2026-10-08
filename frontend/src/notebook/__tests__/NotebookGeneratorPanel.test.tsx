@@ -81,6 +81,7 @@ describe("NotebookGeneratorPanel", () => {
       image_steps: 25, image_guidance: 7, image_resolution: 1024, trellis_seed: 42,
       sparse_steps: 12, sparse_cfg: 7.5, slat_steps: 12, slat_cfg: 3,
       mesh_views: 24, mesh_fit_iterations: 1500, mesh_splat_cap: 50000,
+      trellis2_pipeline_type: "512", mesh_render_resolution: 1024, mesh_sh_degree: 2, mesh_texture_size: 2048,
     }));
     expect(generateStaticNotebook).not.toHaveBeenCalled();
   });

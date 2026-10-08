@@ -18,7 +18,7 @@ def main(argv=None):
     parser.add_argument('--pipeline', choices=['native', 'hybrid', 'spirula', 'text_to_splat'], required=True)
     parser.add_argument('--input-mode', choices=['folder', 'video', 'dataset_zip', 'dataset_folder', 'text'])
     parser.add_argument('--input-path', default='', help='Path relative to MyDrive; required except for text_to_splat')
-    parser.add_argument('--preset', choices=['baseline', 'quality', 'ultra'], default='baseline')
+    parser.add_argument('--preset', choices=['baseline', 'quality', 'ultra', 'max_detail'], default='baseline')
     parser.add_argument('--iterations', type=int)
     parser.add_argument('--max-gaussians', type=int)
     parser.add_argument('--fps', type=int, default=4)
@@ -34,6 +34,7 @@ def main(argv=None):
     parser.add_argument('--output-dir', help='Text splat output folder relative to MyDrive (not the notebook destination)')
     parser.add_argument('--target-splat-count', type=int)
     for flag, choices in {
+        'trellis2-pipeline-type': ['512', '1024_cascade', '1536_cascade'],
         'gpu-preset': ['l4', 'a100', 'h100', 'rtx_pro_6000'],
         'image-model': ['sdxl', 'flux1_dev', 'flux1_schnell', 'flux2_klein_4b', 'qwen_image'],
         'background-model': ['u2net', 'birefnet'],
@@ -41,7 +42,7 @@ def main(argv=None):
     }.items():
         parser.add_argument('--' + flag, choices=choices, default=argparse.SUPPRESS)
     for flag in ('image-steps', 'image-resolution', 'trellis-seed', 'sparse-steps', 'slat-steps',
-                 'mesh-views', 'mesh-fit-iterations', 'mesh-splat-cap'):
+                 'mesh-views', 'mesh-fit-iterations', 'mesh-splat-cap', 'mesh-render-resolution', 'mesh-sh-degree', 'mesh-texture-size'):
         parser.add_argument('--' + flag, type=int, default=argparse.SUPPRESS)
     for flag in ('image-guidance', 'sparse-cfg', 'slat-cfg'):
         parser.add_argument('--' + flag, type=float, default=argparse.SUPPRESS)
