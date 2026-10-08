@@ -299,9 +299,12 @@ def render_views(output, config):
         uv = torch.tensor(mesh['uv'], device='cuda') if 'texture' in mesh else None
         texture = torch.tensor(mesh['texture'], device='cuda', dtype=torch.float32)[None] / 255 if uv is not None else None
     views, intrinsic = camera_matrices(count, size)
-    # Disk-backed arrays: neither GPU nor CPU RAM grows with view count.
-    images = np.lib.format.open_memmap(output / 'mesh_images.npy', mode='w+', dtype=np.uint8, shape=(count, size, size, 3))
-    masks = np.lib.format.open_memmap(output / 'mesh_masks.npy', mode='w+', dtype=np.uint8, shape=(count, size, size, 1))
+    # Disk-backed arrays on LOCAL /content disk (Drive FUSE is slow for memmap
+    # writes); moved to the Drive output only after every view is complete.
+    scratch = Path(config['work_dir']) / 'mesh-views-partial'
+    scratch.mkdir(parents=True, exist_ok=True)
+    images = np.lib.format.open_memmap(scratch / 'mesh_images.npy', mode='w+', dtype=np.uint8, shape=(count, size, size, 3))
+    masks = np.lib.format.open_memmap(scratch / 'mesh_masks.npy', mode='w+', dtype=np.uint8, shape=(count, size, size, 1))
     preview = Image.new('RGB', (4 * 256, 4 * 256), 'white')
     preview_ids = list(np.linspace(0, count-1, min(count, 16), dtype=int))
     context = dr.RasterizeCudaContext()
@@ -327,6 +330,8 @@ def render_views(output, config):
     images.flush()
     masks.flush()
     del images, masks
+    for name in ('mesh_images.npy', 'mesh_masks.npy'):
+        shutil.move(str(scratch / name), str(output / name))
     train, heldout = split_view_indices(count)
     save_npz(output / 'mesh_views.npz', viewmats=views, K=intrinsic, train_indices=train, eval_indices=heldout)
     preview.save(output / 'views_preview.jpg', quality=92)
@@ -439,8 +444,10 @@ def fit_gaussians(output, config):
     strategy = capped_strategy(cap, iterations)
     strategy.check_sanity(params, optimizers)
     state = strategy.initialize_state(scene_scale=scene_scale)
-    targets = np.load(output / 'mesh_images.npy', mmap_mode='r', allow_pickle=False)
-    masks = np.load(output / 'mesh_masks.npy', mmap_mode='r', allow_pickle=False)
+    # One sequential read into CPU RAM (<=3.4 GB at 200 x 2048^2); random
+    # per-step memmap reads from Drive FUSE would stall the GPU.
+    targets = np.load(output / 'mesh_images.npy', allow_pickle=False)
+    masks = np.load(output / 'mesh_masks.npy', allow_pickle=False)
     with np.load(output / 'mesh_views.npz', allow_pickle=False) as dataset:
         views = torch.tensor(dataset['viewmats'], device='cuda')
         intrinsic = torch.tensor(dataset['K'], device='cuda')[None]
