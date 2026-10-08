@@ -59,6 +59,16 @@ VARIANTS = {
                                note="derinlik desteği 5x (0.01 -> 0.05)"),
     "high_native": Variant("high_native", quality="high", iterations=50000, cap=3_000_000,
                            note="Spirula high: 3M / 50k", minutes_rtx6000=45, min_gib=22),
+    # Final-pipeline candidate: high's capacity with honest PLY colours (appearance
+    # compensation off; medium_no_appearance scored 26.94 raw in Spirula's own eval vs ~24.0).
+    "high_no_appearance": Variant(
+        "high_no_appearance", quality="high", iterations=50000, cap=3_000_000,
+        flags={"use_bilateral_grid": "false", "use_ppisp": "false"},
+        note="Spirula high + renk telafisi kapalı (final adayı)", minutes_rtx6000=60, min_gib=22),
+    "high_no_appearance_floater": Variant(
+        "high_no_appearance_floater", quality="high", iterations=50000, cap=3_000_000,
+        flags={"use_bilateral_grid": "false", "use_ppisp": "false", "floater_suppression": "mild"},
+        note="high_no_appearance + floater bastırma mild", minutes_rtx6000=60, min_gib=22),
     "ultra": Variant("ultra", quality="ultra", iterations=80000, cap=10_000_000,
                      note="Spirula ultra: 10M / 80k", minutes_rtx6000=150, min_gib=38),
 }

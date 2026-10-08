@@ -94,6 +94,8 @@ kameralarımızla render edilip **aynı ölçümle** puanlanır; referans satır
 | `medium_floater_mild` | `floater_suppression=mild` | ~15 dk |
 | `medium_depth_x5` | derinlik desteği 0,05 | ~15 dk |
 | `high_native` | Spirula high: 3M / 50k | ~45 dk |
+| `high_no_appearance` | high + renk telafisi kapalı: PLY renkleri dürüst (final adayı) | ~60 dk |
+| `high_no_appearance_floater` | üstüne floater bastırma mild (isteğe bağlı) | ~60 dk |
 | `ultra` *(varsayılan kapalı)* | 10M / 80k, 80 GB GPU önerilir | ~2,5 sa |
 
 **Kullanım:** Runtime → **RTX PRO 6000** (yoksa A100 80 GB; `ultra` için şart), **High-RAM** → **Run all**.
@@ -105,7 +107,7 @@ yerelde arşivdeki Spirula PLY'siyle doğrulandı.
 """)
     settings = code('''
 OUT_DIR = "/content/drive/MyDrive/GaussianTests/spirula_quality/IMG_5966"  # @param {type:"string"}
-VARIANTS = "medium_holdout,medium_no_appearance,medium_floater_mild,medium_depth_x5,high_native"  # @param {type:"string"}
+VARIANTS = "medium_holdout,medium_no_appearance,medium_floater_mild,medium_depth_x5,high_native,high_no_appearance"  # @param {type:"string"}
 REFERENCE_PLY = "/content/drive/MyDrive/GaussianTests/training_ab/IMG_5966/lr_decay/final.ply"  # @param {type:"string"}
 # VARIANTS'a "ultra" eklenebilir (10M / 80k, ~2,5 saat, 80 GB GPU).
 VARIANTS = [v.strip() for v in VARIANTS.split(",") if v.strip()]
