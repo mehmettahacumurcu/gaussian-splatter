@@ -106,8 +106,8 @@ describe("TextToSplatPanel", () => {
   it.each([
     ["l4", "sdxl", "u2net", "trellis", 25, 7, 12, 24, 1500, 50000],
     ["a100", "flux1_dev", "birefnet", "trellis", 28, 3.5, 20, 48, 3000, 100000],
-    ["h100", "qwen_image", "birefnet", "trellis2", 40, 4, 24, 64, 4000, 150000],
-    ["rtx_pro_6000", "qwen_image", "birefnet", "trellis2", 40, 4, 24, 72, 5000, 200000],
+    ["h100", "qwen_image", "birefnet", "trellis", 40, 4, 24, 64, 4000, 150000],
+    ["rtx_pro_6000", "qwen_image", "birefnet", "trellis", 40, 4, 24, 72, 5000, 200000],
   ])("applies the %s GPU profile to every stage and submits its budgets", async (gpu, image, background, route, imageSteps, guidance, samplerSteps, views, iterations, cap) => {
     render(<TextToSplatPanel />);
     await screen.findByText(/En az 20 GiB/);
@@ -126,7 +126,7 @@ describe("TextToSplatPanel", () => {
     })));
   });
 
-  it("blocks model and GPU mismatches and explains the unimplemented route", async () => {
+  it("blocks insufficient VRAM and explains Blackwell compatibility without opting into the experimental route", async () => {
     render(<TextToSplatPanel />);
     await screen.findByText(/En az 20 GiB/);
     edit("Nesne tarifi (PROMPT)", "a car");
@@ -138,9 +138,19 @@ describe("TextToSplatPanel", () => {
     expect(screen.getByRole("option", { name: /Hunyuan3D-2.x/ })).toBeDisabled();
     expect(screen.getByText(/Bu sürümde çalıştırılmaz/)).toBeVisible();
     edit("GPU profili", "rtx_pro_6000");
-    expect(screen.getByRole("option", { name: "TRELLIS-image-large → Gaussian" })).toBeDisabled();
+    expect(screen.getByRole("option", { name: "TRELLIS-image-large → Gaussian" })).toBeEnabled();
+    expect(screen.getByLabelText("3D üretim yolu")).toHaveValue("trellis");
+    expect(screen.getByRole("note")).toHaveTextContent(/Blackwell GPU’da çalışmaz/);
     expect(download()).toBeEnabled();
+    expect(screen.queryByText(/Yardımcı DINOv3 modeli Meta lisanslıdır/)).not.toBeInTheDocument();
+    edit("3D üretim yolu", "trellis2");
+    expect(screen.queryByRole("note")).not.toBeInTheDocument();
     expect(screen.getByText(/Yardımcı DINOv3 modeli Meta lisanslıdır/)).toBeVisible();
+    fireEvent.click(download());
+    await waitFor(() => expect(generatePipelineNotebook).toHaveBeenCalledWith(expect.objectContaining({
+      gpu_preset: "rtx_pro_6000", reconstruction_model: "trellis2", image_model: "qwen_image", background_model: "birefnet",
+      mesh_views: 72, mesh_fit_iterations: 5000, mesh_splat_cap: 200000,
+    })));
   });
 
   it.each([
@@ -189,6 +199,7 @@ describe("TextToSplatPanel", () => {
     await screen.findByText(/En az 20 GiB/);
     edit("Nesne tarifi (PROMPT)", "a car");
     edit("GPU profili", "h100");
+    edit("3D üretim yolu", "trellis2");
     fireEvent.click(screen.getByText("Aşama kalite ayarları"));
     expect(screen.queryByLabelText("Hedef splat sayısı")).not.toBeInTheDocument();
     for (const [label, invalid, corrected] of [
@@ -209,6 +220,7 @@ describe("TextToSplatPanel", () => {
     edit("Görsel çözünürlüğü", "768");
     fireEvent.click(download());
     await waitFor(() => expect(generatePipelineNotebook).toHaveBeenCalledWith(expect.objectContaining({
+      reconstruction_model: "trellis2",
       image_steps: 30, image_guidance: 5.5, image_resolution: 768, trellis_seed: 123,
       sparse_steps: 18, sparse_cfg: 8.5, slat_steps: 22, slat_cfg: 4.5,
       mesh_views: 36, mesh_fit_iterations: 2500, mesh_splat_cap: 75000, target_splat_count: null,

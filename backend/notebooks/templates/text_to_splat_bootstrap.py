@@ -83,7 +83,7 @@ def host_preflight(config):
     # Original TRELLIS wheels were built before Blackwell. Fail before install
     # or downloads instead of presenting a large-memory preset as compatible.
     if config['reconstruction_model'] == 'trellis' and any(word in gpu.lower() for word in ('blackwell', 'rtx pro 6000', 'b100', 'b200', 'rtx 50')):
-        raise RuntimeError('Bu Blackwell GPU, TRELLIS Torch 2.4 cu121 çekirdekleriyle uyumlu değil. TRELLIS.2 mesh → splat yolunu seçin.')
+        raise RuntimeError('Bu Blackwell GPU, kararlı TRELLIS Torch 2.4 cu121 çekirdekleriyle uyumlu değil. Kararlı yol için uyumlu bir GPU oturumu seçin veya deneysel TRELLIS.2 mesh → splat yolunu açıkça seçin.')
     if config['reconstruction_model'] == 'trellis2':
         _mesh_module().compiler_preflight()
     if shutil.disk_usage('/content').free < requirements['disk_gib'] * 1024**3:

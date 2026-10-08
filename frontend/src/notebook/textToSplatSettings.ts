@@ -65,11 +65,11 @@ export const BACKGROUND_MODELS: Record<BackgroundModel, { label: string; descrip
 export const RECONSTRUCTION_MODELS: Record<ReconstructionModel, { label: string; description: string }> = {
   trellis: {
     label: "TRELLIS-image-large → Gaussian",
-    description: "Görselden doğrudan Gaussian üretir; en kısa 3D yol. Ön kontrol eşiği 20 GiB. microsoft/TRELLIS-image-large MIT, açık erişim. Eski CUDA bağımlılıkları nedeniyle RTX PRO 6000 Blackwell desteklenmez.",
+    description: "Tüm GPU profillerinde kararlı varsayılan yol; görselden doğrudan Gaussian üretir. Ön kontrol eşiği 20 GiB. microsoft/TRELLIS-image-large MIT, açık erişim. Eski CUDA bağımlılıkları nedeniyle RTX PRO 6000 Blackwell desteklenmez.",
   },
   trellis2: {
-    label: "TRELLIS.2 → mesh → 3DGS",
-    description: "4B model önce mesh üretir; farklı açılardan görüntüler render edilip gsplat ile standart 3DGS PLY eğitilir. Daha uzun sürer; mesh görünüşünü yaklaşık temsil eder. Ön kontrol eşiği 28 GiB; büyük splat bütçesinde 32 GiB. microsoft/TRELLIS.2-4B MIT; gsplat Apache 2.0. Yardımcı DINOv3 modeli Meta lisanslıdır: Hugging Face üzerinden önceden Meta erişim onayı ve Colab secrets/env içinde HF_TOKEN gerekir. CUDA 12.8 derleyicisi gerektiren ilk kurulum uzundur.",
+    label: "TRELLIS.2 → mesh → 3DGS · deneysel",
+    description: "Yalnızca açıkça seçildiğinde kullanılan deneysel yol; temiz Colab GPU oturumunda uçtan uca doğrulanmadı. 4B model önce mesh üretir; farklı açılardan görüntüler render edilip gsplat ile standart 3DGS PLY eğitilir. Daha uzun sürer; mesh görünüşünü yaklaşık temsil eder. Ön kontrol eşiği 28 GiB; büyük splat bütçesinde 32 GiB. microsoft/TRELLIS.2-4B MIT; gsplat Apache 2.0. Yardımcı DINOv3 modeli Meta lisanslıdır: Hugging Face üzerinden önceden Meta erişim onayı ve Colab secrets/env içinde HF_TOKEN gerekir. CUDA nvcc ve g++ derlemesi gerektiren ilk kurulum uzundur.",
   },
   hunyuan3d: {
     label: "Hunyuan3D-2.x · deneysel / sonra",
@@ -94,12 +94,12 @@ export const GPU_PRESETS: Record<GpuPreset, {
   },
   h100: {
     label: "H100 · 80 GB", capacity: 80,
-    description: "Qwen-Image + BiRefNet + TRELLIS.2 mesh eğitimi; daha yüksek bütçe ve uzun çalışma süresi. GPU modelinin hesabında sunulması ayrıca Colab kullanılabilirliğine bağlıdır.",
-    settings: { ...shared, gpu_preset: "h100", image_model: "qwen_image", background_model: "birefnet", reconstruction_model: "trellis2", image_steps: 40, image_guidance: 4, sparse_steps: 24, slat_steps: 24, mesh_views: 64, mesh_fit_iterations: 4000, mesh_splat_cap: 150000 },
+    description: "Qwen-Image + BiRefNet + kararlı TRELLIS varsayılanı; daha yüksek görsel ve örnekleme bütçesi. TRELLIS.2 deneysel yolunu ayrıca seçebilirsin. GPU modelinin hesabında sunulması Colab kullanılabilirliğine bağlıdır.",
+    settings: { ...shared, gpu_preset: "h100", image_model: "qwen_image", background_model: "birefnet", reconstruction_model: "trellis", image_steps: 40, image_guidance: 4, sparse_steps: 24, slat_steps: 24, mesh_views: 64, mesh_fit_iterations: 4000, mesh_splat_cap: 150000 },
   },
   rtx_pro_6000: {
     label: "RTX PRO 6000 · 96 GB", capacity: 96,
-    description: "Qwen-Image + BiRefNet + TRELLIS.2; 72 görüş, 5000 fit adımı. Blackwell için modern CUDA ortamı kullanılır; özgün TRELLIS yolu bu GPU’da seçilemez.",
-    settings: { ...shared, gpu_preset: "rtx_pro_6000", image_model: "qwen_image", background_model: "birefnet", reconstruction_model: "trellis2", image_steps: 40, image_guidance: 4, sparse_steps: 24, slat_steps: 24, mesh_views: 72, mesh_fit_iterations: 5000, mesh_splat_cap: 200000 },
+    description: "Qwen-Image + BiRefNet + kararlı TRELLIS varsayılanı. Bu profil Blackwell uyumluluğu sağlamaz; Colab ön kontrolü mevcut TRELLIS ortamını gerçek Blackwell GPU’da durdurur. TRELLIS.2 yalnızca ayrıca seçilen deneysel yoldur; seçilirse 72 görüş, 5000 fit adımı kullanılır.",
+    settings: { ...shared, gpu_preset: "rtx_pro_6000", image_model: "qwen_image", background_model: "birefnet", reconstruction_model: "trellis", image_steps: 40, image_guidance: 4, sparse_steps: 24, slat_steps: 24, mesh_views: 72, mesh_fit_iterations: 5000, mesh_splat_cap: 200000 },
   },
 };

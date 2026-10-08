@@ -26,11 +26,13 @@ RECONSTRUCTION_MODELS = {
     'hunyuan3d': dict(id='tencent/Hunyuan3D-2.1', revision='0b94677654c57bb9a6b6845cd7b704ccf551d327', license='Tencent Hunyuan 3D 2.1 Community License', gated=False, implemented=False),
 }
 
+# Every GPU preset starts with stable TRELLIS; TRELLIS.2 requires explicit opt-in.
+# Larger image models, masks and optional mesh-fitting budgets remain GPU-specific.
 GPU_PRESETS = {
     'l4': dict(image_model='sdxl', background_model='u2net', reconstruction_model='trellis', image_steps=25, image_guidance=7.0, image_resolution=1024, sparse_steps=12, sparse_cfg=7.5, slat_steps=12, slat_cfg=3.0, mesh_views=24, mesh_fit_iterations=1500, mesh_splat_cap=50000),
     'a100': dict(image_model='flux1_dev', background_model='birefnet', reconstruction_model='trellis', image_steps=28, image_guidance=3.5, image_resolution=1024, sparse_steps=20, sparse_cfg=7.5, slat_steps=20, slat_cfg=3.0, mesh_views=48, mesh_fit_iterations=3000, mesh_splat_cap=100000),
-    'h100': dict(image_model='qwen_image', background_model='birefnet', reconstruction_model='trellis2', image_steps=40, image_guidance=4.0, image_resolution=1024, sparse_steps=24, sparse_cfg=7.5, slat_steps=24, slat_cfg=3.0, mesh_views=64, mesh_fit_iterations=4000, mesh_splat_cap=150000),
-    'rtx_pro_6000': dict(image_model='qwen_image', background_model='birefnet', reconstruction_model='trellis2', image_steps=40, image_guidance=4.0, image_resolution=1024, sparse_steps=24, sparse_cfg=7.5, slat_steps=24, slat_cfg=3.0, mesh_views=72, mesh_fit_iterations=5000, mesh_splat_cap=200000),
+    'h100': dict(image_model='qwen_image', background_model='birefnet', reconstruction_model='trellis', image_steps=40, image_guidance=4.0, image_resolution=1024, sparse_steps=24, sparse_cfg=7.5, slat_steps=24, slat_cfg=3.0, mesh_views=64, mesh_fit_iterations=4000, mesh_splat_cap=150000),
+    'rtx_pro_6000': dict(image_model='qwen_image', background_model='birefnet', reconstruction_model='trellis', image_steps=40, image_guidance=4.0, image_resolution=1024, sparse_steps=24, sparse_cfg=7.5, slat_steps=24, slat_cfg=3.0, mesh_views=72, mesh_fit_iterations=5000, mesh_splat_cap=200000),
 }
 SETTING_FIELDS = set(GPU_PRESETS['l4']) | {'gpu_preset', 'trellis_seed'}
 INTEGER_RANGES = {'image_steps': (1, 100), 'trellis_seed': (0, 2147483647),

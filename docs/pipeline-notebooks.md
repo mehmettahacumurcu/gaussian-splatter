@@ -68,8 +68,9 @@ provenance; it does **not** require pushing a feature branch.
 1. In **Notebook Generator**, choose **Metinden hedef splat (Colab)**.
 2. Enter **Nesne tarifi (PROMPT)**, for example `a red sports car`, and a seed.
    Open **MODEL SETTINGS / MODEL AYARLARI** to choose a GPU profile, image model,
-   background remover and 3D route. **L4 24 GB** retains SDXL + U2Net + native
-   TRELLIS as a first experiment. Each choice includes a Turkish explanation.
+   background remover and 3D route. Every GPU profile defaults to stable native
+   TRELLIS; **L4 24 GB** pairs it with SDXL + U2Net. TRELLIS.2 is an experimental
+   opt-in. Each choice includes a Turkish explanation.
 3. Adjust image steps/guidance/resolution and 3D sampler controls if needed.
    Negative prompt is available for SDXL, FLUX.1-dev and Qwen-Image; it is disabled
    for schnell and klein. Mesh view/fit controls appear for TRELLIS.2.
@@ -122,8 +123,17 @@ options or implemented routes. No unverified model ID is accepted.
 | --- | --- | --- | --- | --- |
 | L4 24 GB | SDXL / U2Net / TRELLIS | 25 / 12 / 12 | 24 / 1,500 / 50k; inactive | 20 GiB |
 | A100 80 GB | FLUX.1-dev / BiRefNet / TRELLIS | 28 / 20 / 20 | 48 / 3,000 / 100k; inactive | 36 GiB |
-| H100 80 GB | Qwen / BiRefNet / TRELLIS.2 | 40 / 24 / 24 | 64 / 4,000 / 150k | 60 GiB |
-| RTX PRO 6000 96 GB | Qwen / BiRefNet / TRELLIS.2 | 40 / 24 / 24 | 72 / 5,000 / 200k | 60 GiB |
+| H100 80 GB | Qwen / BiRefNet / TRELLIS | 40 / 24 / 24 | 64 / 4,000 / 150k; inactive | 60 GiB |
+| RTX PRO 6000 96 GB | Qwen / BiRefNet / TRELLIS | 40 / 24 / 24 | 72 / 5,000 / 200k; inactive | 60 GiB |
+
+All presets use stable TRELLIS by default and retain their image models,
+background removers and quality budgets. Mesh budgets apply only after explicitly
+selecting experimental TRELLIS.2. That route requires CUDA source builds with
+`nvcc`/`g++` and manual DINOv3 license approval. It has not been validated end to
+end in a clean Colab GPU session.
+The RTX PRO 6000 preset does not add native Blackwell support: its default can
+be generated with a compatibility warning, but actual Blackwell hardware is
+rejected by the native route's runtime preflight before downloads.
 
 - **Image steps / guidance / resolution:** more steps usually take longer;
   guidance changes prompt adherence and can overconstrain the image. Choose
@@ -169,10 +179,13 @@ values are in the [research notes](text-to-splat-research.md). An incompatible
 combination fails in Turkish instead of silently choosing a smaller model.
 T4 and local 8 GB GPUs do not meet the complete pipeline's minimum.
 
-RTX PRO 6000 Blackwell is explicitly rejected with the old native TRELLIS route;
-its profile selects TRELLIS.2. The latter requires a CUDA 12.8/12.9
-toolkit/compiler in Colab; CUDA 13 is rejected for this cu128 recipe. This adaptation has not been smoke-tested on those
-GPUs. GPU memory alone cannot guarantee native extension compatibility.
+RTX PRO 6000 Blackwell is explicitly rejected with the old native TRELLIS route
+because its pinned torch 2.4/CUDA 12.1 wheels do not support that architecture.
+Its preset still defaults to stable TRELLIS; it never silently selects an
+experimental route. Explicitly opting into TRELLIS.2 requires a CUDA 12.8/12.9
+toolkit/compiler in Colab; CUDA 13 is rejected for this cu128 recipe. This
+adaptation has not been smoke-tested on those GPUs. GPU memory alone cannot
+guarantee native extension compatibility.
 
 For FLUX.1-dev/schnell, accept the model's HF conditions. For TRELLIS.2,
 request and receive access to

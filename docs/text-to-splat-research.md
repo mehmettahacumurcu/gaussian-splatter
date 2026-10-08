@@ -41,8 +41,17 @@ hair, holes or transparent objects.
 | --- | --- | --- | --- | --- |
 | L4 24 GB | SDXL + U2Net + native TRELLIS | 25 / 12 / 12 | 24 / 1,500 / 50,000; inactive on native route | 20 GiB |
 | A100 80 GB | FLUX.1-dev + BiRefNet + native TRELLIS | 28 / 20 / 20 | 48 / 3,000 / 100,000; inactive on native route | 36 GiB |
-| H100 80 GB | Qwen-Image + BiRefNet + TRELLIS.2 | 40 / 24 / 24 | 64 / 4,000 / 150,000 | 60 GiB |
-| RTX PRO 6000 96 GB | Qwen-Image + BiRefNet + TRELLIS.2 | 40 / 24 / 24 | 72 / 5,000 / 200,000 | 60 GiB |
+| H100 80 GB | Qwen-Image + BiRefNet + native TRELLIS | 40 / 24 / 24 | 64 / 4,000 / 150,000; inactive on native route | 60 GiB |
+| RTX PRO 6000 96 GB | Qwen-Image + BiRefNet + native TRELLIS | 40 / 24 / 24 | 72 / 5,000 / 200,000; inactive on native route | 60 GiB |
+
+Every preset defaults to stable native TRELLIS, including the larger GPU
+profiles. H100 and RTX PRO 6000 retain Qwen-Image, BiRefNet and their quality
+budgets. TRELLIS.2 is an experimental opt-in; only an explicit selection activates
+the mesh view/fit budgets and introduces CUDA source builds with `nvcc`/`g++`
+and manual DINOv3 license approval. The mesh route has not been run end to end
+in Colab. The stable preset policy does not establish native Blackwell support:
+RTX PRO 6000 notebook generation shows a compatibility warning, and runtime
+preflight still rejects actual Blackwell hardware with the native route.
 
 Profiles set combinations; they do not provision or guarantee GPU availability
 in Colab. Explicit overrides win over defaults. Legacy `baseline`/`quality`/
@@ -74,10 +83,11 @@ generation performs no local model download or package installation.
 
 The image stack requires NVIDIA driver 570+ by policy. RTX PRO 6000 Blackwell
 cannot use the old native TRELLIS torch 2.4/CUDA 12.1 extensions: that combination
-is rejected before downloads and its preset selects the modern mesh route.
-Large VRAM alone does not establish GPU architecture compatibility. The mesh
-route also needs a compatible CUDA toolkit/compiler; native imports and small
-CUDA kernels are checked before expensive model inference.
+is rejected before downloads. Its preset defaults to stable TRELLIS without
+silently switching to experimental TRELLIS.2. Large VRAM alone does not establish
+GPU architecture compatibility. The optional mesh route also needs a compatible
+CUDA toolkit/compiler; native imports and small CUDA kernels are checked before
+expensive model inference.
 
 Current image policies reserve 35/60/60/40/90 GiB free disk and 12/40/40/20/56
 GiB available system RAM for SDXL/dev/schnell/klein/Qwen respectively. Mesh setup

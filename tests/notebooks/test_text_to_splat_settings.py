@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from backend.notebooks.pipeline_library import PipelineNotebookSpec, build_pipeline_notebook, replace_assignments
 from backend.notebooks.source import NotebookSource, REPOSITORY_URL
 from backend.notebooks.templates.text_to_splat_settings import (
-    GPU_PRESETS, IMAGE_MODELS, SETTING_FIELDS, estimate_requirements, model_provenance, validate_settings,
+    IMAGE_MODELS, SETTING_FIELDS, estimate_requirements, model_provenance, validate_settings,
 )
 from scripts import generate_pipeline_notebook
 
@@ -20,11 +20,34 @@ def spec(**kwargs):
     return PipelineNotebookSpec(pipeline='text_to_splat', prompt='a car', **kwargs)
 
 
-@pytest.mark.parametrize('gpu', list(GPU_PRESETS))
-def test_gpu_presets_resolve_models_and_knobs_but_preserve_explicit_overrides(gpu):
+@pytest.mark.parametrize('gpu,image,background,image_steps,image_guidance,sampling_steps,mesh_budget', [
+    ('l4', 'sdxl', 'u2net', 25, 7.0, 12, (24, 1500, 50000)),
+    ('a100', 'flux1_dev', 'birefnet', 28, 3.5, 20, (48, 3000, 100000)),
+    ('h100', 'qwen_image', 'birefnet', 40, 4.0, 24, (64, 4000, 150000)),
+    ('rtx_pro_6000', 'qwen_image', 'birefnet', 40, 4.0, 24, (72, 5000, 200000)),
+])
+def test_gpu_presets_default_to_stable_trellis_and_preserve_explicit_opt_in(
+        gpu, image, background, image_steps, image_guidance, sampling_steps, mesh_budget):
     selected = spec(gpu_preset=gpu)
-    for field, value in GPU_PRESETS[gpu].items():
-        assert getattr(selected, field) == value
+    assert (selected.image_model, selected.background_model, selected.reconstruction_model) == (
+        image, background, 'trellis')
+    assert (selected.image_steps, selected.image_guidance) == (image_steps, image_guidance)
+    assert (selected.sparse_steps, selected.slat_steps) == (sampling_steps, sampling_steps)
+    assert (selected.mesh_views, selected.mesh_fit_iterations, selected.mesh_splat_cap) == mesh_budget
+    notebook = build_pipeline_notebook(selected, source=SOURCE)
+    assert notebook.metadata.pipeline.spec.reconstruction_model == 'trellis'
+    assert notebook.metadata.pipeline.models.reconstruction.id == 'microsoft/TRELLIS-image-large'
+    assert notebook.metadata.pipeline.models.encoder.id == 'facebookresearch/dinov2:dinov2_vitl14_reg'
+    assert 'sparse_structure_decoder' not in notebook.metadata.pipeline.models
+
+    experimental = spec(gpu_preset=gpu, reconstruction_model='trellis2')
+    assert experimental.model_dump() == dict(selected.model_dump(), reconstruction_model='trellis2')
+    notebook = build_pipeline_notebook(experimental, source=SOURCE)
+    assert notebook.metadata.pipeline.spec.reconstruction_model == 'trellis2'
+    assert notebook.metadata.pipeline.models.reconstruction.id == 'microsoft/TRELLIS.2-4B'
+    assert notebook.metadata.pipeline.models.encoder.id == 'facebook/dinov3-vitl16-pretrain-lvd1689m'
+    assert notebook.metadata.pipeline.models.encoder.gated
+
     overridden = spec(gpu_preset=gpu, image_model='sdxl', image_steps=17, sparse_cfg=4.5, trellis_seed=101)
     assert (overridden.image_model, overridden.image_steps, overridden.image_guidance) == ('sdxl', 17, 7)
     assert overridden.sparse_cfg == 4.5 and overridden.trellis_seed == 101

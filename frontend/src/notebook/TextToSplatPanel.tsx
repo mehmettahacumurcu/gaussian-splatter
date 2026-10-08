@@ -69,11 +69,10 @@ export function TextToSplatPanel() {
   const meshRoute = settings.reconstruction_model === "trellis2";
   const minimumVram = Math.max(imageModel.vram, meshRoute ? 28 + (settings.mesh_splat_cap > 150000 ? 4 : 0) : 20,
     preset === "ultra" ? 38 : 0);
-  const gpuError = settings.gpu_preset === "rtx_pro_6000" && !meshRoute
-    ? "RTX PRO 6000 Blackwell, özgün TRELLIS’in CUDA bağımlılıklarıyla uyumlu değil. TRELLIS.2 yolunu seç."
-    : minimumVram > gpu.capacity
-      ? `Seçilen modeller için en az ${minimumVram} GiB gerekir; ${gpu.label} profili yeterli değil. Daha büyük GPU profili veya daha hafif model seç.`
-      : "";
+  const gpuError = minimumVram > gpu.capacity
+    ? `Seçilen modeller için en az ${minimumVram} GiB gerekir; ${gpu.label} profili yeterli değil. Daha büyük GPU profili veya daha hafif model seç.`
+    : "";
+  const blackwellWarning = settings.gpu_preset === "rtx_pro_6000" && !meshRoute;
   const output = outputDir.trim() ? resolveDriveFolder(outputDir, { allowResultFolder: true }) : null;
   const promptValid = prompt.trim().length >= 1 && Array.from(prompt.trim()).length <= 2000 && !prompt.includes("\0");
   const seedValid = integerInRange(seed, 0, 2147483647);
@@ -151,7 +150,7 @@ export function TextToSplatPanel() {
 
         <section className="nb-model-settings" aria-labelledby="text-splat-model-heading">
           <h2 id="text-splat-model-heading">Model ayarları (MODEL SETTINGS)</h2>
-          <p className="nb-help">GPU profili modelleri ve kalite bütçelerini birlikte seçer. Sonrasında her aşamayı değiştirebilirsin. Büyük model tek başına daha iyi 3D sonucu garanti etmez.</p>
+          <p className="nb-help">GPU profili modelleri ve kalite bütçelerini birlikte seçer; tüm profiller kararlı TRELLIS yoluyla başlar. TRELLIS.2 deneysel yolunu ayrıca seçebilirsin. Sonrasında her aşamayı değiştirebilirsin. Büyük model tek başına daha iyi 3D sonucu garanti etmez.</p>
           <div className="nb-model-option">
             <label>GPU profili<select value={settings.gpu_preset} onChange={event => chooseGpu(event.target.value)} aria-describedby="text-splat-gpu-help">
               {Object.entries(GPU_PRESETS).map(([value, option]) => <option key={value} value={value}>{option.label}</option>)}
@@ -179,13 +178,14 @@ export function TextToSplatPanel() {
               }
             }} aria-describedby="text-splat-route-help text-splat-hunyuan-help">
               {Object.entries(RECONSTRUCTION_MODELS).map(([value, option]) => <option key={value} value={value}
-                disabled={value === "hunyuan3d" || (value === "trellis" && settings.gpu_preset === "rtx_pro_6000")}>{option.label}</option>)}
+                disabled={value === "hunyuan3d"}>{option.label}</option>)}
             </select></label>
             <p id="text-splat-route-help" className="nb-help">{RECONSTRUCTION_MODELS[settings.reconstruction_model].description}</p>
             <p id="text-splat-hunyuan-help" className="nb-help">Hunyuan3D-2.x — deneysel / sonra: {RECONSTRUCTION_MODELS.hunyuan3d.description}</p>
           </div>
           {defaults && <p className="nb-help" role="status">En az {minimumVram} GiB GPU belleği için ön kontrol uygulanır. Bu proje eşiği ölçülmüş bellek tüketimi veya OOM garantisi değildir. Aşamalar sırayla çalışır; Colab gerçek GPU belleğini indirmelerden önce kontrol eder.</p>}
           {gpuError && <p className="nb-error" role="alert">{gpuError}</p>}
+          {blackwellWarning && <p className="nb-help" role="note">Notebook indirilebilir; mevcut kararlı TRELLIS ortamı gerçek RTX PRO 6000 Blackwell GPU’da çalışmaz ve indirmelerden önce durur. Kararlı yol için uyumlu bir GPU oturumu kullan veya deneysel TRELLIS.2 yolunu açıkça seç.</p>}
         </section>
 
         <div className="nb-inline-fields">
