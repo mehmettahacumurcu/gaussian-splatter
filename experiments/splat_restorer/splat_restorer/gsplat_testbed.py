@@ -103,7 +103,7 @@ def prepare_factor_images(data_dir: Path, factor: int, workers: int = 8, log=pri
         return
     src, dst = Path(data_dir) / "images", Path(data_dir) / f"images_{factor}"
     dst.mkdir(exist_ok=True)
-    files = sorted(p for p in src.rglob("*") if p.is_file())
+    files = sorted(p for p in src.rglob("*") if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg"))
 
     def convert(p: Path):
         out = dst / p.relative_to(src).with_suffix(".png")

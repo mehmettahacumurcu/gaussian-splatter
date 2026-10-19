@@ -144,7 +144,7 @@ def extract_sharpest(video: Path, out_dir: Path, prefix: str, target_fps: float,
     """Write the sharpest frame of every window as ``<prefix>NNNNN.png`` (full resolution). Resumable:
     a finished extraction leaves ``.<prefix>frames.json`` (picked frame numbers + scores) and is skipped."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    done = out_dir / f".{prefix}frames.json"
+    done = out_dir.parent / f".{prefix}frames.json"  # not in the image folder: trainers read every file there
     if done.exists():
         return json.loads(done.read_text())
     for old in out_dir.glob(f"{prefix}*.png"):
