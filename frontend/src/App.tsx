@@ -8,6 +8,7 @@
  *   - Analiz / Eval: training metrikleri + held-out NVS
  *   - Interactive: gezilebilir splat dünyası (D+E)
  *   - Sahne Editörü: splat/mesh objeleri bir base sahneye yerleştir + export
+ *   - Kapsama: splatın çekimde az görülen yerleri (ısı haritası, yan yana)
  */
 import { useCallback, useEffect, useState } from "react";
 import "./App.css";
@@ -19,6 +20,7 @@ import { NvsEvalPanel } from "./components/NvsEvalPanel";
 import { ConnectionSettings } from "./components/ConnectionSettings";
 import { InteractivePage } from "./interactive/InteractivePage";
 import { ComposePage } from "./compose/ComposePage";
+import { CoveragePage } from "./coverage/CoveragePage";
 import { isComposeJob } from "./compose/isComposeJob";
 import { NotebookGeneratorPanel } from "./notebook/NotebookGeneratorPanel";
 import {
@@ -33,7 +35,7 @@ import {
 } from "./api";
 import { getConnection, isLocal, onConnectionChange } from "./connection";
 
-type Tab = "notebook" | "submit" | "jobs" | "viewer" | "analytics" | "eval" | "interactive" | "compose";
+type Tab = "notebook" | "submit" | "jobs" | "viewer" | "analytics" | "eval" | "interactive" | "compose" | "coverage";
 
 type ViewerState =
   | { kind: "idle" }
@@ -87,6 +89,9 @@ function App() {
   // Render sırasında set edilir (effect değil) → ilk açılışta boş bir frame olmaz.
   const [composeMounted, setComposeMounted] = useState(false);
   if (tab === "compose" && !composeMounted) setComposeMounted(true);
+  // Kapsama: tarama sürerken sekme değişse de ilerleme kaybolmasın; görüntüleyiciler gizliyken kapanır.
+  const [coverageMounted, setCoverageMounted] = useState(false);
+  if (tab === "coverage" && !coverageMounted) setCoverageMounted(true);
 
   // Health poll (her 5 sn)
   useEffect(() => {
@@ -251,6 +256,12 @@ function App() {
             onClick={() => setTab("compose")}
           >
             Sahne Editörü
+          </button>
+          <button
+            className={`tab-btn ${tab === "coverage" ? "active" : ""}`}
+            onClick={() => setTab("coverage")}
+          >
+            Kapsama
           </button>
         </nav>
         <div className="app-status">
@@ -485,6 +496,12 @@ function App() {
         {composeMounted && (
           <div className="compose-host" style={{ display: tab === "compose" ? "block" : "none" }}>
             <ComposePage active={tab === "compose"} />
+          </div>
+        )}
+
+        {coverageMounted && (
+          <div className="compose-host" style={{ display: tab === "coverage" ? "block" : "none" }}>
+            <CoveragePage active={tab === "coverage"} />
           </div>
         )}
       </main>

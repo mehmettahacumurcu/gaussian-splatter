@@ -1,0 +1,42 @@
+.coverage-page { display: grid; grid-template-columns: clamp(210px, 18vw, 280px) minmax(0, 1fr) clamp(230px, 20vw, 300px); height: 100%; min-height: 0; }
+.coverage-side { background: var(--bg-1); padding: 10px 12px; overflow: auto; min-height: 0; border-right: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
+.coverage-right { border-right: 0; border-left: 1px solid var(--border); }
+.coverage-side h3 { margin: 10px 0 2px; font-size: 12px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.04em; }
+.coverage-side .muted { color: var(--text-muted); font-size: 12px; margin: 0; }
+.coverage-field { display: grid; gap: 4px; font-size: 12px; color: var(--text-muted); margin-bottom: 6px; }
+.coverage-field input { background: var(--bg-2); color: var(--text); border: 1px solid var(--border-1); border-radius: 4px; padding: 6px 8px; font: inherit; font-size: 12px; }
+.coverage-side details summary { cursor: pointer; font-size: 12px; color: var(--text-muted); margin-bottom: 6px; }
+.coverage-progress { font-size: 12px; display: flex; align-items: center; gap: 6px; }
+.coverage-progress progress { width: 90px; }
+.coverage-error { color: var(--err); font-size: 12px; white-space: pre-wrap; }
+.coverage-results, .coverage-views { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.coverage-results li { display: grid; grid-template-columns: 1fr auto; align-items: center; background: var(--bg-2); border: 1px solid var(--border); border-radius: 6px; }
+.coverage-results li.selected { outline: 1px solid var(--accent); }
+.coverage-result-open { display: grid; gap: 2px; text-align: left; background: none; border: 0; color: var(--text); padding: 6px 8px; cursor: pointer; }
+.coverage-result-open small { color: var(--text-muted); }
+.coverage-icon-btn { background: none; border: 0; color: var(--text-muted); cursor: pointer; padding: 6px 8px; }
+.coverage-main { position: relative; min-width: 0; min-height: 0; background: #000; }
+.coverage-empty { display: grid; place-items: center; height: 100%; color: var(--text-muted); padding: 24px; text-align: center; }
+.coverage-dual { display: flex; gap: 2px; height: 100%; background: var(--border-1); }
+.coverage-pane { position: relative; flex: 1; min-width: 0; background: #000; }
+.coverage-pane canvas { width: 100%; height: 100%; display: block; outline: none; }
+.coverage-label { position: absolute; top: 8px; left: 10px; padding: 3px 8px; background: #000a; border-radius: 4px; font-size: 12px; pointer-events: none; }
+.coverage-legend { position: absolute; bottom: 10px; left: 10px; padding: 6px 8px; background: #000a; border-radius: 4px; font-size: 11px; pointer-events: none; }
+.coverage-ramp { width: 180px; height: 10px; margin: 4px 0 2px; border-radius: 2px; background: linear-gradient(90deg, #f21f1a, #ffd91a, #1acc40); }
+.coverage-ramp-labels { display: flex; justify-content: space-between; width: 180px; color: var(--text-muted); }
+.coverage-stats { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; margin: 0; font-size: 12px; }
+.coverage-stats dt { color: var(--text-muted); }
+.coverage-stats dd { margin: 0; }
+.coverage-views-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.coverage-inline { display: inline-flex; gap: 4px; align-items: center; font-size: 12px; color: var(--text-muted); }
+.coverage-step { display: flex; gap: 6px; align-items: center; }
+.coverage-step button { background: var(--bg-2); color: var(--text); border: 1px solid var(--border-1); border-radius: 4px; padding: 2px 10px; cursor: pointer; }
+.coverage-views { max-height: 40vh; overflow: auto; }
+.coverage-views button { width: 100%; display: grid; grid-template-columns: 1fr 70px 46px; gap: 8px; align-items: center; background: none; border: 0; color: var(--text); padding: 3px 6px; border-radius: 4px; cursor: pointer; font-size: 12px; text-align: left; }
+.coverage-views button:hover { background: var(--bg-2); }
+.coverage-views button.active { background: var(--bg-3); outline: 1px solid var(--accent); }
+.coverage-views small { color: var(--text-muted); text-align: right; }
+.coverage-bar { height: 6px; border-radius: 3px; background: linear-gradient(90deg, #f21f1a var(--w), var(--bg-3) var(--w)); }
+.coverage-photo { margin: 6px 0 0; }
+.coverage-photo img { width: 100%; border-radius: 4px; display: block; }
+.coverage-photo figcaption { font-size: 11px; color: var(--text-muted); margin-top: 3px; }

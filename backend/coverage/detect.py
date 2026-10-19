@@ -98,11 +98,14 @@ def detect(path: str = "", ply_path: str = "", sparse_dir: str = "") -> tuple[Pa
         if not has_model(sparse):
             raise DetectError(f"Bu klasörde COLMAP modeli (cameras/images .bin/.txt) yok: {sparse}")
     else:
-        # A given run folder is searched as is. A lone splat climbs a few levels
-        # with a shallow search (run folder layouts) so a Drive root is never
-        # crawled; a sibling run's model is caught later by the alignment check.
+        # The given folder first, then a few levels up with a shallow search: the
+        # final-pipeline layout keeps the model next to the per-trainer folders
+        # (ROOM2/sfm/sparse_0 + ROOM2/spirula_high/splat.ply). Shallow, so a
+        # Drive root is never crawled; a model of another run is caught later by
+        # the alignment check.
         sparse = None
-        bases = [(root, _MAX_DEPTH)] if root else [(p, 3) for p in list(ply.parents)[:4]]
+        start = root if root else ply.parent
+        bases = ([(root, _MAX_DEPTH)] if root else []) + [(p, 3) for p in [start, *start.parents][:4] if p != root]
         for base, depth in bases:
             models = find_sparse(base, depth)
             if models:

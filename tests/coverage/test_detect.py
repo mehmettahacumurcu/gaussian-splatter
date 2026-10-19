@@ -34,6 +34,15 @@ def test_a_ply_path_climbs_to_the_run_folder_model(tmp_path):
     assert ply == splat and sparse == ds / "sparse" / "0"
 
 
+def test_trainer_folder_finds_the_shared_model_one_level_up(tmp_path):
+    """Final-pipeline layout: ROOM2/sfm/sparse_0 next to ROOM2/<trainer>/splat.ply."""
+    room = tmp_path / "ROOM2"
+    sparse = write_model(room / "sfm" / "sparse_0", ["train_0001.png"], [np.eye(4)])
+    splat = write_splat(room / "spirula_high" / "splat.ply", plane_cloud(10))
+    write_splat(room / "spirula_ultra" / "splat.ply", plane_cloud(30))
+    assert detect(str(room / "spirula_high")) == (splat, sparse)
+
+
 def test_explicit_paths_win(tmp_path):
     splat, ds = _spirula_run(tmp_path)
     other = write_model(tmp_path / "other", ["a.png"], [np.eye(4)], fmt="txt")
@@ -47,9 +56,9 @@ def test_missing_folder(tmp_path):
 
 
 def test_folder_without_model(tmp_path):
-    write_splat(tmp_path / "s.ply")
+    write_splat(tmp_path / "a" / "b" / "c" / "d" / "s.ply")
     with pytest.raises(DetectError, match="COLMAP"):
-        detect(str(tmp_path))
+        detect(str(tmp_path / "a" / "b" / "c" / "d"))
 
 
 def test_folder_without_splat(tmp_path):

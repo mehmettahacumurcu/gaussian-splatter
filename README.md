@@ -252,6 +252,18 @@ data/compose/
 - Mesh aydınlatması sahneye uydurulmaz.
 - Henüz undo/redo yok.
 
+## Kapsama (çekimde eksik kalan yerler)
+
+**Kapsama** sekmesi, eğitilmiş bir splatın hangi bölgelerinin çekimde az görüldüğünü gösterir; ikinci bir video çekmeden önce nereye odaklanacağını söyler.
+
+- **Girdi:** koşu klasörü (Drive'daki Spirula koşusu ya da final pipeline klasörü, örn. `ROOM2/spirula_high`) veya doğrudan `splat.ply`. Splat ve COLMAP modeli (`sparse/0`, `sfm/sparse_0`; `.bin` ya da `.txt`) kendiliğinden bulunur; bulunamazsa "Elle belirt" ile verilir.
+- **Hesap:** Jobs kuyruğunda bir job. Her eğitim kamerası için splatın derinliği gsplat ile düşük çözünürlükte çizilir; her splat merkezi o kameradan görünüyorsa sayılır. Skor = log(görüş sayısı), 40 görüşte doyar. 3M splat × 1000 kamera ≈ 1,5 dk (3060 Ti). `eval_`/`test_` adlı görüntüler sayıma girmez, yalnızca puanlanır.
+- **Görünüm:** solda splat, sağda ısı haritası (kırmızı: ≤5 kamera, sarı: ~6, yeşil: 40+), tek kamera; WASD/oklar ile yürü, sürükleyerek bak. Sağdaki liste görüşleri zayıf splat payına göre sıralar (test görüşü varsa önce onlar); birine tıklamak kamerayı o kareye ışınlar. Eğitim kareleri modelin yanında duruyorsa (`images/`) seçilen kare fotoğrafıyla gösterilir.
+- **Doğrulama (ROOM2, ayrı test yürüyüşü, 130 kare):** kare başına zayıf splat payı ile LPIPS arasında Spearman 0.62.
+- **Sınırlama:** hiç çekilmemiş yerde splat da oluşmaz; haritada boş/siyah kalan alanlar da eksik sayılmalı. PLY ile model aynı koordinatlarda değilse (başka koşunun modeli) job hata verir.
+
+Sonuçlar `data/coverage/<id>/` altında (`meta.json`, `views.json`, `heat.ply`, `coverage.npz`); asıl splat kopyalanmaz, yolundan okunur.
+
 ## Faz faz çalıştır
 
 ```bash
