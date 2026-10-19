@@ -264,8 +264,9 @@ def train_spirula(c, vdir):
           + ("" if n_gt == len(eval_ids) else "  !!! UYUŞMUYOR, train.log'a bak"), flush=True)
     if n_gt == 0:
         raise RuntimeError("Spirula hiç kare saklamadı: test kareleri eğitime girmiş olabilir (--eval-mode filename)")
+    native = sq.native_metrics(found["metrics"])  # klasör silinmeden önce oku
     shutil.rmtree(prefix, ignore_errors=True)  # yerel diski boşalt
-    return {"native": sq.native_metrics(found["metrics"]), "spirula_held_out": n_gt}
+    return {"native": native, "spirula_held_out": n_gt}
 
 # Uzun eğitimlerden önce birkaç dakikalık deneme: Spirula test karelerini isimle gerçekten dışarıda tutuyor mu?
 check_path = out_dir / "split_check.json"
@@ -381,6 +382,9 @@ import base64
 from IPython.display import HTML, Image as IPImage, Markdown, display
 if failed:
     print("Başarısız adaylar (ayrıntı Drive'da <aday>/failed.txt):", failed)
+for n in trained:   # eski koşularda native boş kalmıştı: Drive'daki kopyadan doldur
+    if not summary[n]["native"] and (out_dir / n / "spirula_metrics.json").exists():
+        summary[n]["native"] = sq.native_metrics(out_dir / n / "spirula_metrics.json")
 baseline = "spirula_high" if "spirula_high" in summary else trained[0]
 md_text = fp.markdown(summary, split, baseline, post)
 (out_dir / "summary.md").write_text(md_text, encoding="utf-8")
