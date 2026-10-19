@@ -74,8 +74,11 @@ VARIANTS = {
 }
 
 
+INTERVAL_SPLIT = ["--eval-mode", "interval", "--eval-interval", "10"]
+
+
 def train_args(binary: Path, dataset: Path, recon_dir: str, out_prefix: Path, v: Variant,
-               device: str, depth_maps: bool = True) -> list[str]:
+               device: str, depth_maps: bool = True, split: list[str] = INTERVAL_SPLIT) -> list[str]:
     """CLI for one variant; mirrors the app's Spirula notebook plus the held-out split."""
     args = [str(binary), "train", "3dgs", "--data", str(dataset), "--colmap-recon-dir", str(recon_dir),
             "--output-dir-prefix", str(out_prefix), "--output-dir-name", "training",
@@ -86,7 +89,7 @@ def train_args(binary: Path, dataset: Path, recon_dir: str, out_prefix: Path, v:
             "--disable-viewer", "true", "--keep-viewer-alive", "false",
             "--load-normals", "true", "--normal-supervision-weight", "0.01",
             "--load-depths", str(depth_maps).lower(), "--depth-supervision-weight", "0.01" if depth_maps else "0",
-            "--eval-mode", "interval", "--eval-interval", "10", "--validation-fraction", "0",
+            *split, "--validation-fraction", "0",
             "--save-eval-images", "true",
             "--device", device, "--lang", "en"]
     for key, value in v.flags.items():
