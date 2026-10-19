@@ -32,6 +32,7 @@ from .api_models import (
     ProcessResponse,
 )
 from .compose.routes import build_compose_router
+from .coverage.routes import build_coverage_router
 from .config import DATA_ROOT, default_config, cloud_config, local_max_config, safe_4d_8gb_config, scene_paths
 from .job_manager import JobManager, get_manager
 from .pipeline import run_pipeline
@@ -63,6 +64,7 @@ app = FastAPI(
 )
 app.include_router(static_notebook_router)
 app.include_router(build_compose_router(DATA_ROOT, get_manager))
+app.include_router(build_coverage_router(DATA_ROOT, get_manager))
 
 
 # CORS — Tauri / localhost client'ları için.

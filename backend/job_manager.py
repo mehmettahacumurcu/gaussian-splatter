@@ -38,6 +38,14 @@ COMPOSE_PHASE_WEIGHTS = {
     "compose_write": 0.25,
 }
 
+# Coverage scans: one depth render per camera for counting, one more for view scores.
+COVERAGE_PHASE_WEIGHTS = {
+    "coverage_load":  0.10,
+    "coverage_scan":  0.55,
+    "coverage_views": 0.25,
+    "coverage_write": 0.10,
+}
+
 
 def _progress_in(weights: dict[str, float], phase_name: str, phase_progress: float) -> float:
     total = sum(weights.values()) or 1.0
@@ -59,6 +67,8 @@ def _compute_overall(phase_name: str, phase_progress: float,
     """
     if phase_name in COMPOSE_PHASE_WEIGHTS:
         return _progress_in(COMPOSE_PHASE_WEIGHTS, phase_name, phase_progress)
+    if phase_name in COVERAGE_PHASE_WEIGHTS:
+        return _progress_in(COVERAGE_PHASE_WEIGHTS, phase_name, phase_progress)
     if phase_name in PHASE_WEIGHTS:
         weights = dict(PHASE_WEIGHTS)
         if skip_foundation:
