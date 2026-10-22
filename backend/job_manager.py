@@ -46,6 +46,15 @@ COVERAGE_PHASE_WEIGHTS = {
     "coverage_write": 0.10,
 }
 
+# Local Spirula runs (backend/spirula_run): rough shares of a 3M / 50k-step run on the 3060 Ti.
+SPIRULA_PHASE_WEIGHTS = {
+    "spirula_frames":   0.03,
+    "spirula_sfm":      0.20,
+    "spirula_geometry": 0.07,
+    "spirula_train":    0.69,
+    "spirula_export":   0.01,
+}
+
 
 def _progress_in(weights: dict[str, float], phase_name: str, phase_progress: float) -> float:
     total = sum(weights.values()) or 1.0
@@ -69,6 +78,8 @@ def _compute_overall(phase_name: str, phase_progress: float,
         return _progress_in(COMPOSE_PHASE_WEIGHTS, phase_name, phase_progress)
     if phase_name in COVERAGE_PHASE_WEIGHTS:
         return _progress_in(COVERAGE_PHASE_WEIGHTS, phase_name, phase_progress)
+    if phase_name in SPIRULA_PHASE_WEIGHTS:
+        return _progress_in(SPIRULA_PHASE_WEIGHTS, phase_name, phase_progress)
     if phase_name in PHASE_WEIGHTS:
         weights = dict(PHASE_WEIGHTS)
         if skip_foundation:

@@ -60,7 +60,7 @@ def test_generate_route_rejects_invalid_body(monkeypatch) -> None:
 def test_pipeline_catalog_and_download(monkeypatch):
     client = _client(monkeypatch)
     catalog = client.get('/notebooks/static/pipelines').json()
-    assert catalog['presets']['spirula']['quality']['max_gaussians'] == 6000000
+    assert catalog['presets']['spirula']['quality']['max_gaussians'] == 3000000
     response = client.post('/notebooks/static/pipeline', json={
         'pipeline': 'spirula', 'input_mode': 'video', 'input_path': 'captures/room.MOV',
         'preset': 'quality', 'iterations': 65000})

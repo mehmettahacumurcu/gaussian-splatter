@@ -46,12 +46,34 @@ def test_spirula_configuration_and_recovery():
     src = '\n'.join(c.source for c in nb.cells if c.cell_type == 'code')
     tree = ast.parse(src)
     vals = {n.targets[0].id: n.value for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)}
-    assert ast.literal_eval(vals['TRAIN_ITERATIONS']) == 60000
-    assert ast.literal_eval(vals['TRAIN_CAP_MAX']) == 6000000
+    assert ast.literal_eval(vals['TRAIN_ITERATIONS']) == 50000
+    assert ast.literal_eval(vals['TRAIN_CAP_MAX']) == 3000000
+    assert ast.literal_eval(vals['SFM_QUALITY']) == 'extreme'
+    assert ast.literal_eval(vals['TRAIN_APPEARANCE']) is True
+    assert ast.literal_eval(vals['FLOATER_SUPPRESSION']) == 'off'
     assert ast.literal_eval(vals['TARGET_FPS']) == 8
     assert 'accepted_exit_codes=(0, 3)' in src
     assert 'validate_geometry_maps' in src
     assert "'--quality', TRAIN_QUALITY" in src
+
+
+def test_spirula_notebook_matches_local_settings():
+    """'Notebook üret' and 'local başlat' resolve the same run from the same settings."""
+    from backend.spirula_run.settings import SpirulaSettings, resolve
+    knobs = dict(preset='baseline', iterations=42000, cap_max=2_000_000, sfm_quality='extreme',
+                 appearance=False, floater_suppression='mild', resolution_divisor=2)
+    nb = build_pipeline_notebook(PipelineNotebookSpec(pipeline='spirula', input_mode='video', input_path='c/t.MOV',
+        **{('max_gaussians' if k == 'cap_max' else k): v for k, v in knobs.items()}), source=SOURCE)
+    src = '\n'.join(c.source for c in nb.cells if c.cell_type == 'code')
+    vals = {n.targets[0].id: ast.literal_eval(n.value) for n in ast.parse(src).body
+            if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name) and isinstance(n.value, ast.Constant)}
+    run = resolve(SpirulaSettings(**knobs))
+    assert (vals['TRAIN_QUALITY'], vals['TRAIN_ITERATIONS'], vals['TRAIN_CAP_MAX'], vals['SFM_QUALITY']) == \
+        (run.quality, run.iterations, run.cap_max, run.sfm_quality)
+    assert (vals['TRAIN_APPEARANCE'], vals['FLOATER_SUPPRESSION'], vals['TRAIN_RESOLUTION_DIVISOR']) == \
+        (run.appearance, run.floater_suppression, run.resolution_divisor)
+    assert "'--use-bilateral-grid', 'false', '--use-ppisp', 'false'" in src
+    assert "'--floater-suppression', FLOATER_SUPPRESSION" in src
 
 
 @pytest.mark.parametrize('kwargs', [

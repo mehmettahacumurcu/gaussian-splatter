@@ -17,6 +17,7 @@ from pydantic import Field, field_validator, model_validator
 
 from .builder import build_static_notebook
 from .drive_paths import normalize_input_folder
+from ..spirula_run.settings import PRESETS as SPIRULA_PRESETS
 from .models import StrictModel, StaticNotebookRunSpec
 from .source import (
     GENERATOR_ID, GENERATOR_VERSION, REPOSITORY_URL, NotebookSource, NotebookSourceError,
@@ -31,10 +32,11 @@ PRESETS = {
         'quality': dict(iterations=50000, max_gaussians=3000000, min_vram=38, recipe='quality_3m'),
         'ultra': dict(iterations=60000, max_gaussians=5000000, min_vram=70, recipe='stress_5m'),
     },
+    # Same presets as the local runner (backend.spirula_run.settings); min_vram is the notebook's GPU gate.
     'spirula': {
-        'baseline': dict(iterations=30000, max_gaussians=1000000, min_vram=14, recipe='medium'),
-        'quality': dict(iterations=60000, max_gaussians=6000000, min_vram=22, recipe='high'),
-        'ultra': dict(iterations=80000, max_gaussians=10000000, min_vram=38, recipe='ultra'),
+        name: dict(iterations=p['iterations'], max_gaussians=p['cap_max'], min_vram=vram, recipe=p['quality'],
+                   sfm_quality=p['sfm_quality'], label=p['label'])
+        for (name, p), vram in zip(SPIRULA_PRESETS.items(), (14, 22, 38))
     },
     'text_to_splat': {
         'baseline': dict(min_vram=20, recipe='sdxl_trellis', image_steps=25, sparse_steps=12, slat_steps=12, resolution=1024),
@@ -70,13 +72,16 @@ class PipelineNotebookSpec(StrictModel):
     input_path: str = ''
     preset: Literal['baseline', 'quality', 'ultra'] = 'baseline'
     iterations: int | None = Field(default=None, ge=1000, le=120000)
-    max_gaussians: int | None = Field(default=None, ge=50000, le=20000000)
+    max_gaussians: int | None = Field(default=None, ge=50000, le=100000000)
     fps: int = Field(default=4, ge=1, le=30)
     model_name: str = Field(default='0', pattern=r'^\d+$')
     allow_partial: bool = False
     generate_depth: bool = True
     geometry_model: Literal['moge2-vits', 'moge2-vitb', 'moge2-vitl'] = 'moge2-vitb'
-    sfm_quality: Literal['high', 'extreme'] = 'high'
+    sfm_quality: Literal['high', 'extreme'] | None = None  # None: the preset's value
+    appearance: bool = True
+    floater_suppression: Literal['off', 'mild', 'strong'] = 'off'
+    resolution_divisor: Literal[1, 2, 4] = 1
     prompt: str = Field(default='', max_length=2000)
     negative_prompt: str = Field(default='', max_length=2000)
     style: str = Field(default='', max_length=500)
@@ -249,8 +254,11 @@ def build_pipeline_notebook(spec: PipelineNotebookSpec, *, source: NotebookSourc
                 'INPUT_DATASET_FOLDER': path if spec.input_mode == 'dataset_folder' else '',
                 'TARGET_FPS': spec.fps, 'TRAIN_ITERATIONS': steps, 'TRAIN_CAP_MAX': cap,
                 'MIN_TRAIN_VRAM_GIB': vram, 'GEOMETRY_MODEL': spec.geometry_model,
-                'ALLOW_PARTIAL_RECONSTRUCTION': spec.allow_partial, 'GENERATE_DEPTH': spec.generate_depth})
-            cell.source += f'\nTRAIN_QUALITY = {cfg["recipe"]!r}\nSFM_QUALITY = {spec.sfm_quality!r}\n'
+                'ALLOW_PARTIAL_RECONSTRUCTION': spec.allow_partial, 'GENERATE_DEPTH': spec.generate_depth,
+                'TRAIN_RESOLUTION_DIVISOR': spec.resolution_divisor, 'TRAIN_APPEARANCE': spec.appearance,
+                'FLOATER_SUPPRESSION': spec.floater_suppression})
+            sfm_quality = spec.sfm_quality or cfg['sfm_quality']
+            cell.source += f'\nTRAIN_QUALITY = {cfg["recipe"]!r}\nSFM_QUALITY = {sfm_quality!r}\n'
     notebook.metadata['pipeline'] = {'id': spec.pipeline, 'template_version': 1, 'spec': spec.model_dump(),
                                     'generator_commit': source.commit_sha}
     if spec.pipeline == 'text_to_splat':
