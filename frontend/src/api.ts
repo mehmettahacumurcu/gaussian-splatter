@@ -57,6 +57,8 @@ export interface Job {
   error: string | null;
   ply_dir: string | null;
   download_url: string | null;
+  result?: Record<string, unknown> | null;
+  cancel_requested?: boolean;
 }
 
 export interface SceneListItem {

@@ -37,12 +37,21 @@ function errorText(err: unknown): string {
   return detail ? detail[1] : text;
 }
 
-export function CoveragePage({ active }: { active: boolean }) {
+/** `prefill` (e.g. from a finished Spirula run) fills the scan form; a new object re-applies it. */
+export interface CoveragePrefill { path: string; plyPath?: string; sparseDir?: string }
+
+export function CoveragePage({ active, prefill }: { active: boolean; prefill?: CoveragePrefill | null }) {
   const [results, setResults] = useState<CoverageMeta[]>([]);
   const [selected, setSelected] = useState<CoverageDetail | null>(null);
   const [path, setPath] = useState("");
   const [plyPath, setPlyPath] = useState("");
   const [sparseDir, setSparseDir] = useState("");
+  useEffect(() => {
+    if (!prefill) return;
+    setPath(prefill.path);
+    setPlyPath(prefill.plyPath ?? "");
+    setSparseDir(prefill.sparseDir ?? "");
+  }, [prefill]);
   const [run, setRun] = useState<RunState>({ kind: "idle" });
   const [view, setView] = useState<CoverageView | null>(null);
   const [showTrain, setShowTrain] = useState(false);

@@ -166,6 +166,8 @@ class JobManager:
                 job.result = result
             if result and result.get("download_url"):
                 job.download_url = result["download_url"]
+                if result.get("ply_dir"):
+                    job.ply_dir = result["ply_dir"]
             else:
                 # İndirilebilir URL'i set et
                 ply_dir = self.data_dir / job.scene / "output" / "ply"

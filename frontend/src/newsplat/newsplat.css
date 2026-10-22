@@ -1,0 +1,209 @@
+/* Yeni Splat: settings form + sticky live cost panel. Uses the App.css tokens. */
+.ns-page {
+  height: 100%;
+  overflow-y: auto;
+  min-height: 0;
+}
+.ns-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+  gap: 24px;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 20px 24px 40px;
+  align-items: start;
+}
+@media (max-width: 900px) {
+  .ns-layout { grid-template-columns: minmax(0, 1fr); padding: 16px; }
+  .ns-cost { position: static; }
+}
+
+.ns-head h2 { margin: 0 0 4px; font-size: 20px; font-weight: 600; }
+.ns-head p { margin: 0 0 18px; color: var(--text-muted); }
+
+.ns-section {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 16px 18px 18px;
+  margin-bottom: 14px;
+}
+.ns-section h3 {
+  margin: 0 0 12px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+.ns-segment {
+  display: inline-flex;
+  background: var(--bg);
+  border: 1px solid var(--border-1);
+  border-radius: 8px;
+  padding: 3px;
+  margin-bottom: 12px;
+}
+.ns-segment button, .ns-cost-targets button, .ns-chips button {
+  background: transparent;
+  color: var(--text-muted);
+  border: 0;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font: inherit;
+  cursor: pointer;
+}
+.ns-segment button:hover, .ns-cost-targets button:hover, .ns-chips button:hover { color: var(--text); }
+.ns-segment button.active, .ns-cost-targets button.active, .ns-chips button.active {
+  background: var(--bg-3);
+  color: var(--text);
+}
+
+.ns-field { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; min-width: 0; }
+.ns-field-narrow { max-width: 280px; }
+.ns-label { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; font-weight: 500; }
+.ns-label em { font-style: normal; font-weight: 400; color: var(--text-muted); font-size: 12px; }
+.ns-field input, .ns-field select {
+  width: 100%;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border-1);
+  border-radius: 6px;
+  padding: 7px 10px;
+  font: inherit;
+}
+.ns-field input:focus, .ns-field select:focus { outline: none; border-color: var(--accent); }
+.ns-field input[aria-invalid="true"] { border-color: var(--err); }
+.ns-hint { color: var(--text-muted); font-size: 12px; line-height: 1.35; }
+
+.ns-cost-tag {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--accent);
+  background: rgba(74, 140, 255, 0.12);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ns-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+.ns-chips button { padding: 2px 9px; font-size: 12px; border: 1px solid var(--border-1); }
+
+.ns-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  column-gap: 18px;
+}
+
+.ns-presets {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.ns-preset {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  text-align: left;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border-1);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font: inherit;
+  cursor: pointer;
+}
+.ns-preset span { color: var(--text-muted); font-size: 12px; }
+.ns-preset:hover { border-color: #555; }
+.ns-preset.active { border-color: var(--accent); background: rgba(74, 140, 255, 0.08); }
+
+.ns-advanced { margin-top: 4px; }
+.ns-advanced summary {
+  cursor: pointer;
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 4px 0 10px;
+  user-select: none;
+}
+.ns-advanced summary:hover { color: var(--text); }
+.ns-checks { display: flex; flex-direction: column; gap: 10px; grid-column: 1 / -1; margin-bottom: 8px; }
+.ns-check { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; }
+.ns-check input { margin-top: 3px; }
+.ns-check > span { display: flex; flex-direction: column; gap: 1px; }
+.ns-check strong { font-weight: 500; }
+
+.ns-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 14px;
+  margin-bottom: 12px;
+}
+.ns-action { display: flex; flex-direction: column; gap: 6px; }
+.ns-btn {
+  background: var(--bg-3);
+  color: var(--text);
+  border: 1px solid var(--border-1);
+  border-radius: 8px;
+  padding: 10px 16px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.ns-btn:hover:not(:disabled) { border-color: #555; }
+.ns-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.ns-btn-primary { background: var(--accent-bg); border-color: var(--accent-bg); color: #fff; }
+.ns-btn-primary:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); }
+
+.ns-msg { margin: 0 0 12px; font-size: 13px; }
+.ns-ok { color: var(--ok); }
+.ns-err { color: var(--err); white-space: pre-wrap; }
+
+/* ---- cost panel ---- */
+.ns-cost {
+  position: sticky;
+  top: 20px;
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.ns-cost-targets { display: flex; flex-wrap: wrap; gap: 2px; }
+.ns-cost-targets button { padding: 4px 9px; font-size: 12px; }
+.ns-cost-targets button.nofit:not(.active) { color: var(--err); }
+.ns-cost-main { display: flex; flex-direction: column; gap: 6px; }
+.ns-cost-caption { color: var(--text-muted); font-size: 12px; }
+.ns-cost-big { font-size: 30px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.ns-cost-big small { font-size: 13px; font-weight: 500; color: var(--text-muted); }
+
+.ns-bar {
+  display: flex;
+  height: 10px;
+  border-radius: 5px;
+  background: var(--bg-3);
+  overflow: hidden;
+}
+.ns-bar span { height: 100%; transition: width 0.25s; }
+.ns-bar-others { background: #555; }
+.ns-bar-run { background: var(--accent); }
+.ns-bar-run.bad { background: var(--err); }
+
+.ns-fit { margin: 0; font-weight: 500; font-size: 13px; }
+.ns-fit.good, .ns-cost-table td.good { color: var(--ok); }
+.ns-fit.bad, .ns-cost-table td.bad { color: var(--err); }
+
+.ns-cost-facts { margin: 0; display: flex; flex-direction: column; gap: 4px; }
+.ns-cost-facts div { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; }
+.ns-cost-facts dt { color: var(--text-muted); }
+.ns-cost-facts dd { margin: 0; font-variant-numeric: tabular-nums; }
+
+.ns-cost-table { width: 100%; border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+.ns-cost-table th { text-align: left; color: var(--text-muted); font-weight: 500; padding: 0 4px 4px; }
+.ns-cost-table td { padding: 4px; border-top: 1px solid var(--border); }
+.ns-cost-table tr { cursor: pointer; }
+.ns-cost-table tr.active td { background: var(--bg-2); }

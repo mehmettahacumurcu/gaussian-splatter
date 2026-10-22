@@ -65,6 +65,10 @@ def free_port(preferred: int = VIEWER_PORT) -> int:
     raise RunError("Spirula görüntüleyicisi için boş port bulunamadı")
 
 
+def _num(n: int) -> str:
+    return f"{n:,}".replace(",", ".")
+
+
 def parse_step(line: str) -> dict | None:
     m = STEP_RE.search(line)
     if not m:
@@ -148,7 +152,7 @@ class _Ctx:
             def watchdog():
                 while not stop.wait(1.0):
                     if self.cancelled() and proc.poll() is None:
-                        proc.terminate()
+                        _kill_tree(proc)
 
             threading.Thread(target=watchdog, daemon=True).start()
             try:
@@ -169,7 +173,7 @@ class _Ctx:
             finally:
                 stop.set()
                 if proc.poll() is None:
-                    proc.kill()
+                    _kill_tree(proc)
         text = log_path.read_text(encoding="utf-8", errors="replace")
         if self.cancelled():
             raise Cancelled("İptal edildi")
@@ -177,6 +181,14 @@ class _Ctx:
             tail = "\n".join(text.splitlines()[-25:])
             raise RunError(f"{label} {code} koduyla bitti. Log: {log_path}\n{tail}")
         return code, text
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    """Stop the command and its children (a .cmd wrapper or helper processes would keep the pipe open)."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        proc.kill()
 
 
 def _video_fps(video: Path) -> float:
@@ -294,19 +306,32 @@ def run_local(req: LocalRunRequest, data_root: Path, on_progress: ProgressFn,
     info = {"viewer_url": viewer_url, "total": run.iterations}
     on_progress("spirula_train", 0.0, "Eğitim başlıyor", info)
 
+    last: dict = {}
+
     def on_line(line: str) -> None:
         st = parse_step(line)
         if st:
+            last.update(st)
             on_progress("spirula_train", st["step"] / max(st["total"], 1),
-                        f"{st['step']:,}/{st['total']:,} adım · {st['splats']:,} splat", {**info, **st})
+                        f"{_num(st['step'])}/{_num(st['total'])} adım · {_num(st['splats'])} splat", {**info, **st})
 
     ctx.run("train", S.train_args(b, str(train_ds), "sparse/0", str(out_prefix), run, viewer_port=port),
             "spirula_train", on_line=on_line)
     plys = sorted((out_prefix / "training").rglob("splat.ply"), key=lambda p: p.stat().st_mtime)
     if not plys:
         raise RunError("Eğitim bitti ama splat.ply bulunamadı")
-    splat = plys[-1]
-    ctx.manifest.update({"status": "completed", "splat": str(splat), "finished_at": time.time()})
+    # result/ holds only the final splat, so the viewer's "every .ply is a frame" rule sees one frame.
+    result_dir = ws / "result"
+    result_dir.mkdir(exist_ok=True)
+    final = result_dir / "splat.ply"
+    final.unlink(missing_ok=True)
+    try:
+        os.link(plys[-1], final)
+    except OSError:
+        shutil.copy2(plys[-1], final)
+    train = {k: last[k] for k in ("step", "total", "splats", "psnr") if k in last}
+    ctx.manifest.update({"status": "completed", "splat": str(final), "train": train, "finished_at": time.time()})
     ctx.save()
-    on_progress("spirula_export", 1.0, "Splat hazır", {"splat": str(splat)})
-    return {"splat_path": str(splat), "workspace": str(ws), "sfm": report, "settings": run.as_dict()}
+    on_progress("spirula_export", 1.0, "Splat hazır", {"splat": str(final), **train})
+    return {"splat_path": str(final), "ply_dir": str(result_dir), "workspace": str(ws), "sfm": report,
+            "train": train, "settings": run.as_dict()}

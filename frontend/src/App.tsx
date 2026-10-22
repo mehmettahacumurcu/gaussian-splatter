@@ -1,28 +1,29 @@
 /**
- * 4DGS Viewer — ana uygulama (tab navigation).
+ * 4DGS Studio — ana uygulama (tab navigation).
  *
- * Tab'lar:
- *   - Yeni Job: static 3DGS submit + hiperparametreler
- *   - Jobs: aktif + geçmiş job listesi, auto-refresh
+ * Ana sekmeler:
+ *   - Yeni Splat: Spirula ayarları + canlı VRAM/süre tahmini → local başlat ya da notebook üret
+ *   - İşler: tüm job'lar, canlı eğitim önizlemesi, log, sonuç eylemleri
  *   - Viewer: seçilen job'ın splat render'ı
- *   - Analiz / Eval: training metrikleri + held-out NVS
- *   - Interactive: gezilebilir splat dünyası (D+E)
- *   - Sahne Editörü: splat/mesh objeleri bir base sahneye yerleştir + export
  *   - Kapsama: splatın çekimde az görülen yerleri (ısı haritası, yan yana)
+ *   - Sahne Editörü: splat/mesh objeleri bir base sahneye yerleştir + export
+ *   - Interactive: gezilebilir splat dünyası (D+E)
+ * "Diğer" menüsü: diğer notebook tarifleri, 4D local eğitim, Analiz, Eval.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
 import { SplatViewer } from "./components/SplatViewer";
 import { JobSubmitPanel } from "./components/JobSubmitPanel";
-import { JobsList } from "./components/JobsList";
 import { TrainingAnalytics } from "./components/TrainingAnalytics";
 import { NvsEvalPanel } from "./components/NvsEvalPanel";
 import { ConnectionSettings } from "./components/ConnectionSettings";
 import { InteractivePage } from "./interactive/InteractivePage";
 import { ComposePage } from "./compose/ComposePage";
-import { CoveragePage } from "./coverage/CoveragePage";
+import { CoveragePage, type CoveragePrefill } from "./coverage/CoveragePage";
 import { isComposeJob } from "./compose/isComposeJob";
 import { NotebookGeneratorPanel } from "./notebook/NotebookGeneratorPanel";
+import { NewSplatPage } from "./newsplat/NewSplatPage";
+import { JobsPage } from "./jobs/JobsPage";
 import {
   getHealth,
   getSplatInfo,
@@ -35,7 +36,23 @@ import {
 } from "./api";
 import { getConnection, isLocal, onConnectionChange } from "./connection";
 
-type Tab = "notebook" | "submit" | "jobs" | "viewer" | "analytics" | "eval" | "interactive" | "compose" | "coverage";
+type Tab = "new" | "jobs" | "viewer" | "coverage" | "compose" | "interactive"
+  | "notebook" | "submit" | "analytics" | "eval";
+
+const MAIN_TABS: { id: Tab; label: string }[] = [
+  { id: "new", label: "Yeni Splat" },
+  { id: "jobs", label: "İşler" },
+  { id: "viewer", label: "Viewer" },
+  { id: "coverage", label: "Kapsama" },
+  { id: "compose", label: "Sahne Editörü" },
+  { id: "interactive", label: "Interactive" },
+];
+const MORE_TABS: { id: Tab; label: string; hint: string }[] = [
+  { id: "notebook", label: "Diğer notebook'lar", hint: "Native, hybrid, metin → splat, ön işleme" },
+  { id: "submit", label: "4D local eğitim", hint: "Eski Trainer4DGS job formu" },
+  { id: "analytics", label: "Analiz", hint: "4D eğitim metrikleri" },
+  { id: "eval", label: "Eval", hint: "Held-out NVS değerlendirmesi" },
+];
 
 type ViewerState =
   | { kind: "idle" }
@@ -64,8 +81,25 @@ function formatTime(ts: number): string {
 }
 
 function App() {
-  const [tab, setTab] = useState<Tab>("notebook");
+  const [tab, setTab] = useState<Tab>("new");
   const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
+  const [coveragePrefill, setCoveragePrefill] = useState<CoveragePrefill | null>(null);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!moreOpen) return;
+    const close = (e: MouseEvent) => {
+      if (!moreRef.current?.contains(e.target as Node)) setMoreOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setMoreOpen(false); };
+    document.addEventListener("mousedown", close);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [moreOpen]);
 
   // Viewer state
   const [viewerState, setViewerState] = useState<ViewerState>({ kind: "idle" });
@@ -130,11 +164,22 @@ function App() {
     }
   }, []);
 
-  const handleJobSubmitted = useCallback((_resp: any, sceneName: string) => {
-    // Job başarıyla gönderildi, Jobs tab'ına geç — kullanıcı ilerlemeyi takip etsin
+  const handleJobSubmitted = useCallback((resp: any, sceneName: string) => {
+    // Job başarıyla gönderildi, İşler tab'ına geç — kullanıcı ilerlemeyi takip etsin
     // Analytics'e de aynı sahneyi otomatik bağla
     setAnalyticsScene(sceneName);
+    if (resp?.job_id) setSelectedJobId(resp.job_id);
     setTab("jobs");
+  }, []);
+
+  const handleLocalStarted = useCallback((jobId: string) => {
+    setSelectedJobId(jobId);
+    setTab("jobs");
+  }, []);
+
+  const openCoverage = useCallback((prefill: CoveragePrefill) => {
+    setCoveragePrefill({ ...prefill });
+    setTab("coverage");
   }, []);
 
   const handleViewJob = useCallback((job: Job) => {
@@ -203,66 +248,47 @@ function App() {
       {/* Üst bar */}
       <header className="app-topbar">
         <div className="app-brand">
-          <h1>4DGS Viewer</h1>
+          <h1>4DGS Studio</h1>
         </div>
         <nav className="app-tabs">
-          <button
-            className={`tab-btn ${tab === "notebook" ? "active" : ""}`}
-            onClick={() => setTab("notebook")}
-          >
-            Notebook
-          </button>
-          <button
-            className={`tab-btn ${tab === "submit" ? "active" : ""}`}
-            onClick={() => setTab("submit")}
-          >
-            Local Job
-          </button>
-          <button
-            className={`tab-btn ${tab === "jobs" ? "active" : ""}`}
-            onClick={() => setTab("jobs")}
-          >
-            Jobs
-            {health && health.active_jobs > 0 && (
-              <span className="tab-badge">{health.active_jobs}</span>
+          {MAIN_TABS.map((t) => (
+            <button
+              key={t.id}
+              className={`tab-btn ${tab === t.id ? "active" : ""}`}
+              aria-current={tab === t.id ? "page" : undefined}
+              onClick={() => setTab(t.id)}
+            >
+              {t.label}
+              {t.id === "jobs" && health && health.active_jobs > 0 && (
+                <span className="tab-badge">{health.active_jobs}</span>
+              )}
+            </button>
+          ))}
+          <div className="tab-more" ref={moreRef}>
+            <button
+              className={`tab-btn ${MORE_TABS.some((t) => t.id === tab) ? "active" : ""}`}
+              aria-haspopup="menu"
+              aria-expanded={moreOpen}
+              onClick={() => setMoreOpen((v) => !v)}
+            >
+              {MORE_TABS.find((t) => t.id === tab)?.label ?? "Diğer"} ▾
+            </button>
+            {moreOpen && (
+              <div className="tab-more-menu" role="menu">
+                {MORE_TABS.map((t) => (
+                  <button
+                    key={t.id}
+                    role="menuitem"
+                    className={tab === t.id ? "active" : ""}
+                    onClick={() => { setTab(t.id); setMoreOpen(false); }}
+                  >
+                    <span>{t.label}</span>
+                    <small>{t.hint}</small>
+                  </button>
+                ))}
+              </div>
             )}
-          </button>
-          <button
-            className={`tab-btn ${tab === "viewer" ? "active" : ""}`}
-            onClick={() => setTab("viewer")}
-          >
-            Viewer
-          </button>
-          <button
-            className={`tab-btn ${tab === "analytics" ? "active" : ""}`}
-            onClick={() => setTab("analytics")}
-          >
-            Analiz
-          </button>
-          <button
-            className={`tab-btn ${tab === "eval" ? "active" : ""}`}
-            onClick={() => setTab("eval")}
-          >
-            Eval
-          </button>
-          <button
-            className={`tab-btn ${tab === "interactive" ? "active" : ""}`}
-            onClick={() => setTab("interactive")}
-          >
-            Interactive
-          </button>
-          <button
-            className={`tab-btn ${tab === "compose" ? "active" : ""}`}
-            onClick={() => setTab("compose")}
-          >
-            Sahne Editörü
-          </button>
-          <button
-            className={`tab-btn ${tab === "coverage" ? "active" : ""}`}
-            onClick={() => setTab("coverage")}
-          >
-            Kapsama
-          </button>
+          </div>
         </nav>
         <div className="app-status">
           {backendBadge}
@@ -280,6 +306,11 @@ function App() {
 
       {/* İçerik */}
       <main className="app-content">
+        {/* Yeni Splat stays mounted so the form survives a trip to İşler and back. */}
+        <div className="compose-host" style={{ display: tab === "new" ? "block" : "none" }}>
+          <NewSplatPage active={tab === "new"} onLocalStarted={handleLocalStarted} />
+        </div>
+
         {tab === "notebook" && <NotebookGeneratorPanel />}
 
         {tab === "submit" && (
@@ -287,10 +318,13 @@ function App() {
         )}
 
         {tab === "jobs" && (
-          <div className="tab-content">
-            <h2 className="tab-title">Tüm Jobs</h2>
-            <JobsList onViewJob={handleViewJob} />
-          </div>
+          <JobsPage
+            selectedId={selectedJobId}
+            onSelect={setSelectedJobId}
+            onViewJob={handleViewJob}
+            onCoverage={openCoverage}
+            onNewSplat={() => setTab("new")}
+          />
         )}
 
         {tab === "analytics" && (
@@ -501,7 +535,7 @@ function App() {
 
         {coverageMounted && (
           <div className="compose-host" style={{ display: tab === "coverage" ? "block" : "none" }}>
-            <CoveragePage active={tab === "coverage"} />
+            <CoveragePage active={tab === "coverage"} prefill={coveragePrefill} />
           </div>
         )}
       </main>

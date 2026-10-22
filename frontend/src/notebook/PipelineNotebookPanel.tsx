@@ -20,7 +20,10 @@ export interface TrainingPipelineNotebookSpec {
   allow_partial: boolean;
   generate_depth: boolean;
   geometry_model: "moge2-vits" | "moge2-vitb" | "moge2-vitl";
-  sfm_quality: "high" | "extreme";
+  sfm_quality: "high" | "extreme" | null;
+  appearance?: boolean;
+  floater_suppression?: "off" | "mild" | "strong";
+  resolution_divisor?: 1 | 2 | 4;
 }
 export interface TextToSplatNotebookSpec extends TextToSplatModelSettings {
   pipeline: "text_to_splat";
@@ -60,7 +63,7 @@ export function PipelineNotebookPanel({ pipeline }: { pipeline: TrainingPipeline
   const [partial, setPartial] = useState(false);
   const [depth, setDepth] = useState(true);
   const [geometry, setGeometry] = useState<TrainingPipelineNotebookSpec["geometry_model"]>("moge2-vitb");
-  const [sfm, setSfm] = useState<TrainingPipelineNotebookSpec["sfm_quality"]>("high");
+  const [sfm, setSfm] = useState<"high" | "extreme">("high");
   useEffect(() => {
     alive.current = true;
     getPipelineNotebookPresets().then(

@@ -23,8 +23,8 @@ GPU_CACHE_SECONDS = 3.0
 
 class EstimateRequest(BaseModel):
     settings: S.SpirulaSettings = Field(default_factory=S.SpirulaSettings)
-    image_width: int = Field(default=1920, ge=64, le=16384)
-    image_height: int = Field(default=1080, ge=64, le=16384)
+    image_width: int = Field(default=1920, ge=16, le=16384)
+    image_height: int = Field(default=1080, ge=16, le=16384)
 
 
 class ProbeRequest(BaseModel):
@@ -78,7 +78,8 @@ def probe_input(mode: str, path: Path, fps: float) -> dict:
         except (OSError, UnidentifiedImageError):
             pass
     has_model = any((path / "sparse").glob("*/images.bin")) or (path / "sparse" / "images.bin").is_file()
-    return {"kind": mode, "frames": len(images), "width": w, "height": h, "has_sfm": has_model}
+    return {"kind": mode, "frames": len(images), "width": w, "height": h, "has_sfm": has_model,
+            "images_subdir": folder != path}
 
 
 def build_spirula_router(data_root: str | Path, get_manager: Callable[[], Any]) -> APIRouter:

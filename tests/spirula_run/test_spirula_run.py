@@ -14,7 +14,7 @@ from backend.spirula_run import estimate as E
 from backend.spirula_run import settings as S
 from backend.spirula_run.gpu import parse_smi
 from backend.spirula_run.routes import build_spirula_router
-from backend.spirula_run.runner import LocalRunRequest, RunError, parse_step, run_local
+from backend.spirula_run.runner import Cancelled, LocalRunRequest, RunError, parse_step, run_local
 
 FAKE = Path(__file__).with_name("fake_spirula.py")
 
@@ -117,6 +117,7 @@ def test_run_local_images_end_to_end(tmp_path, fake_binary):
     splat = Path(result["splat_path"])
     assert splat.is_file() and splat.name == "splat.ply"
     assert result["sfm"]["registered_images"] == 12 and result["sfm"]["coverage"] == 1.0
+    assert result["train"] == {"step": 1000, "total": 1000, "splats": 10000, "psnr": 25.5}
     train = [e for e in events if e[0] == "spirula_train" and e[3].get("step")]
     assert train[-1][1] == 1.0 and train[-1][3]["splats"] == 10000 and train[-1][3]["viewer_url"].startswith("http")
     ws = tmp_path / "data" / "spirula" / "r1"
@@ -135,6 +136,14 @@ def test_run_local_stops_on_low_sfm_coverage(tmp_path, fake_binary, monkeypatch)
     out = run_local(LocalRunRequest("r3", "images", images, S.SpirulaSettings(allow_partial=True, iterations=1000)),
                     tmp_path / "data", lambda *a: None)
     assert out["sfm"]["registered_images"] == 6
+
+
+def test_run_local_cancel_stops_before_training(tmp_path, fake_binary):
+    images = _images(tmp_path / "capture")
+    with pytest.raises(Cancelled):
+        run_local(LocalRunRequest("rc", "images", images, S.SpirulaSettings()), tmp_path / "data", lambda *a: None,
+                  cancelled=lambda: True)
+    assert not (tmp_path / "data" / "spirula" / "rc" / "logs" / "train.log").exists()
 
 
 def test_run_local_needs_enough_images(tmp_path, fake_binary):
